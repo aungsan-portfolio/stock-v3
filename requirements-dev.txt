@@ -1,0 +1,8 @@
+# Development / CI dependencies.
+#
+# The test suite (test_logic.py) and the verification script
+# (verify_watchlist.py) use only Python's standard-library `unittest` — no
+# pytest, no lint/type tooling — to keep the dependency surface small.
+#
+# Installing the runtime requirements is enough to run everything:
+-r requirements.txt
