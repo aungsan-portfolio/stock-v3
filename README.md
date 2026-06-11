@@ -57,8 +57,31 @@ python main.py paper
   - If both RF and LSTM are missing, action is forced to `HOLD`.
 - `BACKTEST_TRANSACTION_COST_PCT = 0.0005`
 - `BACKTEST_SLIPPAGE_PCT = 0.0005`
-- `MAX_OPEN_POSITIONS = 5`
 - Opening trades use bracket orders; closing trades use plain limit orders.
+
+## Safe Paper Config
+
+Conservative defaults validated end-to-end against IBKR paper (tag `paper-e2e-v1`).
+
+| Setting | Value | Meaning |
+|---|---|---|
+| `MAX_TRADE_VALUE` | `1000.0` | Hard dollar cap per trade. Final size = `min(cash * MAX_POSITION_PCT, MAX_TRADE_VALUE)`, so a large account never sizes a single trade above this. |
+| `MAX_POSITION_PCT` | `0.01` | Percent-of-cash cap, applied before the dollar cap. |
+| `MAX_OPEN_POSITIONS` | `1` | Only one open position at a time. |
+| `ALLOW_SHORT` | `False` | Long-only. SELL closes longs; it never opens shorts. |
+| `IBKR_PORT` | `7497` | TWS/Gateway must be in **Paper** mode on this port. |
+| `IBKR_MARKET_DATA_TYPE` | `3` | Delayed (15-min) data, so paper accounts without a real-time subscription still get prices. Falls back to last daily close when snapshots fail. |
+
+**TWS prerequisites:** API enabled, **Read-Only API unchecked**, socket clients enabled on port 7497.
+
+**Windows:** always run with `python -X utf8 ...` so the emoji/box-drawing output does not crash on the `cp1252` console.
+
+```bash
+python -X utf8 main.py paper --dry-run   # preview, no orders
+python -X utf8 main.py paper             # place paper orders
+```
+
+Helper scripts: `test_ibkr_connect.py` (connection check), `check_positions.py` (positions + open orders), `cancel_open_orders.py` (cancel all working orders), `flatten_vti.py` (market-sell a position).
 
 ## Important Notes
 
