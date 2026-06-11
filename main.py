@@ -134,12 +134,19 @@ def cmd_paper(args) -> int:
         return 0
 
     # Windows asyncio policy fix for ib_insync.
-    if sys.platform == "win32":
-        import asyncio
+    import asyncio
+    if sys.platform == "win32" and hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
         try:
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         except Exception:
             pass
+
+    # Python 3.14+ no longer auto-creates an event loop on first access, but
+    # eventkit (ib_insync dependency) calls get_event_loop() at import time.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
     try:
         from ibkr_bridge import IBKRBridge

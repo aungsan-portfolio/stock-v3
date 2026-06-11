@@ -76,10 +76,13 @@ WEIGHT_TECHNICAL    = 0.25
 MIN_ML_MODELS_FOR_SIGNAL = 1
 
 # ── Risk Management ──────────────────────────────
-MAX_POSITION_PCT    = 0.20
+MAX_POSITION_PCT    = 0.01
+# Absolute dollar cap per trade. Final size = min(cash * MAX_POSITION_PCT,
+# MAX_TRADE_VALUE) so a large account never sizes a single trade above this.
+MAX_TRADE_VALUE     = 1000.0
 STOP_LOSS_PCT       = 0.05
 TAKE_PROFIT_PCT     = 0.15
-MAX_OPEN_POSITIONS  = 5
+MAX_OPEN_POSITIONS  = 1
 
 # ── Production Safety Guards ─────────────────────
 # Default is long-only. SELL closes existing long positions; it does not open shorts.
@@ -104,6 +107,9 @@ IBKR_HOST           = "127.0.0.1"
 IBKR_PORT           = 7497
 IBKR_CLIENT_ID      = 1
 PAPER_CAPITAL       = 100_000.0
+# Market data type: 1=live, 2=frozen, 3=delayed (15-min), 4=delayed-frozen.
+# 3 lets paper accounts without a real-time subscription still get prices.
+IBKR_MARKET_DATA_TYPE = 3
 
 # ── Logging ──────────────────────────────────────
 LOG_FILE            = LOG_DIR / "stock_engine.log"

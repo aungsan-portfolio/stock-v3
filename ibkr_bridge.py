@@ -50,6 +50,12 @@ class IBKRBridge:
                 port=config.IBKR_PORT,
                 clientId=config.IBKR_CLIENT_ID,
             )
+            # Fall back to delayed (15-min) data when the account lacks a
+            # real-time market-data subscription. 3 = DELAYED, 4 = DELAYED_FROZEN.
+            try:
+                self.ib.reqMarketDataType(config.IBKR_MARKET_DATA_TYPE)
+            except Exception:
+                logger.warning("Could not set market data type", exc_info=True)
             logger.info("Connected to IBKR | account=%s", self.ib.managedAccounts())
             return True
         except Exception:
@@ -117,7 +123,7 @@ class IBKRBridge:
         for _ in range(max(1, int(timeout * 4))):
             self.ib.sleep(0.25)
 
-            for attr in ("last", "close"):
+            for attr in ("last", "close", "delayedLast", "delayedClose"):
                 price = _finite_positive(getattr(ticker, attr, None))
                 if price is not None:
                     _cancel_snapshot()
@@ -134,20 +140,56 @@ class IBKRBridge:
                 except Exception:
                     pass
 
-            bid = _finite_positive(getattr(ticker, "bid", None))
-            ask = _finite_positive(getattr(ticker, "ask", None))
+            bid = _finite_positive(getattr(ticker, "bid", None)) \
+                or _finite_positive(getattr(ticker, "delayedBid", None))
+            ask = _finite_positive(getattr(ticker, "ask", None)) \
+                or _finite_positive(getattr(ticker, "delayedAsk", None))
             if bid is not None and ask is not None:
                 _cancel_snapshot()
                 return (bid + ask) / 2.0
 
         _cancel_snapshot()
+
+        # Fallback: last daily close from historical data. Works without a
+        # real-time subscription and when delayed snapshots fail to populate
+        # (e.g. outside regular trading hours).
+        hist_price = self._historical_close(contract)
+        if hist_price is not None:
+            return hist_price
+
         return 0.0
+
+    def _historical_close(self, contract) -> Optional[float]:
+        try:
+            bars = self.ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr="5 D",
+                barSizeSetting="1 day",
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+            )
+        except Exception:
+            logger.warning("Historical data request failed for %s", contract.symbol, exc_info=True)
+            return None
+        for bar in reversed(bars or []):
+            try:
+                close = float(bar.close)
+                if close > 0 and not math.isnan(close):
+                    return close
+            except (TypeError, ValueError):
+                continue
+        return None
 
     # ── Quantity / pricing helpers ───────────────────────────────
     def _calc_quantity(self, price: float, cash: float) -> int:
         if price <= 0:
             return 0
         max_value = cash * config.MAX_POSITION_PCT
+        cap = getattr(config, "MAX_TRADE_VALUE", None)
+        if cap is not None:
+            max_value = min(max_value, float(cap))
         return max(int(max_value / price), 0)
 
     def _limit_price(self, action: str, price: float) -> float:
