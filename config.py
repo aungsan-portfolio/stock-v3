@@ -58,7 +58,8 @@ LSTM_PATIENCE       = 7
 LSTM_WINDOW         = 30
 
 # ── Signal Thresholds ────────────────────────────
-BUY_THRESHOLD       = 0.60
+# Higher BUY threshold = fewer entries, better fit for risk-controlled trading.
+BUY_THRESHOLD       = 0.65
 SELL_THRESHOLD      = 0.40
 
 # Minimum bars a position is held before an opposite signal may close it.
@@ -76,13 +77,21 @@ WEIGHT_TECHNICAL    = 0.25
 MIN_ML_MODELS_FOR_SIGNAL = 1
 
 # ── Risk Management ──────────────────────────────
-MAX_POSITION_PCT    = 0.01
+# Small-basket mode: allow a few tiny positions instead of one large holding.
+MAX_POSITION_PCT    = 0.005
 # Absolute dollar cap per trade. Final size = min(cash * MAX_POSITION_PCT,
 # MAX_TRADE_VALUE) so a large account never sizes a single trade above this.
-MAX_TRADE_VALUE     = 1000.0
-STOP_LOSS_PCT       = 0.05
-TAKE_PROFIT_PCT     = 0.15
-MAX_OPEN_POSITIONS  = 1
+MAX_TRADE_VALUE     = 500.0
+MAX_OPEN_POSITIONS  = 3
+
+# Fast loss control. Kept small because the goal is to be wrong small.
+STOP_LOSS_PCT       = 0.004   # -0.40% initial protective stop
+TAKE_PROFIT_PCT     = 0.015   # fallback fixed-bracket TP when trailing is disabled
+
+# Winner management. Native trailing stop lets a correct trade keep running while
+# protecting profit when price reverses from its high.
+USE_TRAILING_EXIT   = True
+TRAILING_STOP_PCT   = 0.004   # sell if price reverses ~0.40% from the high
 
 # ── Production Safety Guards ─────────────────────
 # Default is long-only. SELL closes existing long positions; it does not open shorts.
