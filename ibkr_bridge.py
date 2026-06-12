@@ -3,11 +3,12 @@ ibkr_bridge.py — IBKR Paper Trading bridge via ib_insync.
 TWS/Gateway must be running with API enabled on port 7497 (paper).
 
 Production hardening:
+- Paper-only lock by default; refuses non-paper ports unless config opts out.
 - Long-only by default. SELL closes existing longs; never opens accidental shorts.
-- Duplicate-entry guard: BUY skipped when already long; SELL skipped when flat.
+- Duplicate-entry guard: pending/working orders count as occupied symbols.
 - Opening trades use either a fixed TP/SL bracket or a parent limit + trailing stop.
 - Snapshot price fetch waits for the snapshot to populate (event-driven, not
-  fixed sleep). Falls back to bid/ask/close, never NaN.
+  fixed sleep). Historical close fallback is blocked for order placement by default.
 - qualifyContracts() result captured (the contract is mutated in place but we
   also return the qualified contract from a single source of truth).
 """
@@ -18,6 +19,7 @@ from typing import List, Optional
 from ib_insync import IB, Stock, LimitOrder, Contract, Order
 
 import config
+import risk_state
 from predictor import Signal
 
 logger = logging.getLogger(__name__)
@@ -38,6 +40,10 @@ def _is_order_accepted(status: str) -> bool:
     return status in ACCEPTED_ORDER_STATUSES
 
 
+def _is_order_working(status: str) -> bool:
+    return str(status) in WORKING_ORDER_STATUSES
+
+
 class IBKRBridge:
     def __init__(self) -> None:
         self.ib = IB()
@@ -45,11 +51,21 @@ class IBKRBridge:
 
     # ── Connection ───────────────────────────────────────────────
     def connect(self) -> bool:
+        if bool(getattr(config, "REQUIRE_PAPER_PORT", True)):
+            paper_port = int(getattr(config, "PAPER_IBKR_PORT", 7497))
+            if int(config.IBKR_PORT) != paper_port:
+                logger.error(
+                    "Refusing to connect: IBKR_PORT=%s is not paper port %s",
+                    config.IBKR_PORT,
+                    paper_port,
+                )
+                return False
+
         try:
             self.ib.connect(
                 host=config.IBKR_HOST,
                 port=config.IBKR_PORT,
-                clientId=config.IBKR_CLIENT_ID,
+                clientId=getattr(config, "CLIENT_ID_BOT", config.IBKR_CLIENT_ID),
             )
             # Fall back to delayed (15-min) data when the account lacks a
             # real-time market-data subscription. 3 = DELAYED, 4 = DELAYED_FROZEN.
@@ -88,13 +104,30 @@ class IBKRBridge:
                     return 0.0
         return 0.0
 
+    def working_order_symbols(self) -> set:
+        """Symbols with working orders, across all visible client ids."""
+        try:
+            self.ib.reqAllOpenOrders()
+            self.ib.sleep(1)
+        except Exception:
+            logger.warning("Could not refresh open orders", exc_info=True)
+
+        symbols = set()
+        for trade in self.ib.openTrades():
+            status = _order_status_name(trade)
+            if _is_order_working(status):
+                symbol = str(getattr(trade.contract, "symbol", "")).upper().strip()
+                if symbol:
+                    symbols.add(symbol)
+        return symbols
+
     def has_working_order(self, symbol: str, action: Optional[str] = None) -> bool:
         """Return True when IBKR already has a working order for this symbol.
 
-        This prevents duplicate entries when a previous limit/bracket order is
-        still PendingSubmit/PreSubmitted/Submitted but has not yet become a
-        position. reqAllOpenOrders is used so orders from other clientIds are
-        visible too.
+        This prevents duplicate entries when a previous limit/bracket/trailing
+        order is still PendingSubmit/PreSubmitted/Submitted but has not yet
+        become a position. reqAllOpenOrders is used so orders from other
+        clientIds are visible too.
         """
         symbol = symbol.upper().strip()
         action = action.upper().strip() if action else None
@@ -106,13 +139,13 @@ class IBKRBridge:
             logger.warning("Could not refresh open orders", exc_info=True)
 
         for trade in self.ib.openTrades():
-            contract_symbol = str(getattr(trade.contract, "symbol", "")).upper()
-            order_action = str(getattr(trade.order, "action", "")).upper()
+            contract_symbol = str(getattr(trade.contract, "symbol", "")).upper().strip()
+            order_action = str(getattr(trade.order, "action", "")).upper().strip()
             status = _order_status_name(trade)
 
             if contract_symbol != symbol:
                 continue
-            if status not in WORKING_ORDER_STATUSES:
+            if not _is_order_working(status):
                 continue
             if action is not None and order_action != action:
                 continue
@@ -133,7 +166,7 @@ class IBKRBridge:
         self._contract_cache[symbol] = qualified[0]
         return qualified[0]
 
-    def get_price(self, symbol: str, timeout: float = 5.0) -> float:
+    def get_price(self, symbol: str, timeout: float = 5.0, allow_historical: bool = True) -> float:
         contract = self._contract(symbol)
         ticker = self.ib.reqMktData(contract, "", True, False)
 
@@ -182,9 +215,14 @@ class IBKRBridge:
 
         _cancel_snapshot()
 
+        if not allow_historical:
+            logger.warning("No live/delayed snapshot price for %s; historical fallback disabled", symbol)
+            return 0.0
+
         # Fallback: last daily close from historical data. Works without a
         # real-time subscription and when delayed snapshots fail to populate
-        # (e.g. outside regular trading hours).
+        # (e.g. outside regular trading hours). This should not be used for
+        # order placement unless config explicitly allows it.
         hist_price = self._historical_close(contract)
         if hist_price is not None:
             return hist_price
@@ -280,7 +318,7 @@ class IBKRBridge:
         contract = self._contract(symbol)
         limit_price = self._limit_price(action, price)
         stop_price = self._initial_stop_price(action, price)
-        trailing_pct = round(float(config.TRAILING_STOP_PCT) * 100.0, 3)
+        trailing_pct = round(float(config.TRAILING_STOP_PCT) * 100.0, 4)
 
         parent = LimitOrder(action, qty, limit_price)
         parent.orderId = self.ib.client.getReqId()
@@ -306,7 +344,7 @@ class IBKRBridge:
         statuses = [_order_status_name(t) for t in trades]
         accepted = all(_is_order_accepted(status) for status in statuses)
         logger.info(
-            "Open trailing | %s %s x%d limit=%.2f | initial_stop=%.2f trail=%.3f%% | conf=%.2f | statuses=%s accepted=%s",
+            "Open trailing | %s %s x%d limit=%.2f | initial_stop=%.2f trail=%.4f%% | conf=%.2f | statuses=%s accepted=%s",
             action, symbol, qty, limit_price, stop_price, trailing_pct, confidence, statuses, accepted,
         )
         return accepted
@@ -365,9 +403,12 @@ class IBKRBridge:
             return False
 
         position = self.get_position(symbol)
-        price = self.get_price(symbol)
+        price = self.get_price(
+            symbol,
+            allow_historical=bool(getattr(config, "ALLOW_HISTORICAL_PRICE_FOR_ORDERS", False)),
+        )
         if price <= 0:
-            logger.warning("Could not get valid price for %s", symbol)
+            logger.warning("Could not get valid order price for %s", symbol)
             return False
 
         if action == "BUY":
@@ -378,6 +419,10 @@ class IBKRBridge:
                 qty = int(abs(position))
                 return self._place_limit_order(symbol, "BUY", qty, price, "Close short")
 
+            if not risk_state.can_open_more():
+                logger.warning("Max daily trades (%d) reached — skipping BUY %s", config.MAX_DAILY_TRADES, symbol)
+                return False
+
             cash = self.get_cash()
             if cash < min_cash:
                 logger.warning("Insufficient cash for BUY %s: $%.2f", symbol, cash)
@@ -386,7 +431,11 @@ class IBKRBridge:
             if qty == 0:
                 logger.warning("Qty=0 for BUY %s price=%.2f cash=%.2f", symbol, price, cash)
                 return False
-            return self._place_open_bracket(symbol, "BUY", qty, price, signal.confidence)
+            accepted = self._place_open_bracket(symbol, "BUY", qty, price, signal.confidence)
+            if accepted:
+                trades = risk_state.record_trade()
+                logger.info("Recorded daily trade #%d for %s", trades, symbol)
+            return accepted
 
         # action == "SELL"
         if position > 0:
@@ -399,6 +448,10 @@ class IBKRBridge:
             logger.info("No long in %s — skipping SELL (ALLOW_SHORT=False)", symbol)
             return False
 
+        if not risk_state.can_open_more():
+            logger.warning("Max daily trades (%d) reached — skipping short SELL %s", config.MAX_DAILY_TRADES, symbol)
+            return False
+
         cash = self.get_cash()
         if cash < min_cash:
             logger.warning("Insufficient cash for short SELL %s: $%.2f", symbol, cash)
@@ -407,7 +460,11 @@ class IBKRBridge:
         if qty == 0:
             logger.warning("Qty=0 for short SELL %s price=%.2f cash=%.2f", symbol, price, cash)
             return False
-        return self._place_open_bracket(symbol, "SELL", qty, price, signal.confidence)
+        accepted = self._place_open_bracket(symbol, "SELL", qty, price, signal.confidence)
+        if accepted:
+            trades = risk_state.record_trade()
+            logger.info("Recorded daily trade #%d for %s", trades, symbol)
+        return accepted
 
     def execute_all(self, signals: List[Signal]) -> dict:
         open_symbols = {
@@ -415,6 +472,8 @@ class IBKRBridge:
             for p in self.ib.positions()
             if float(p.position) != 0.0
         }
+        working_symbols = self.working_order_symbols()
+        occupied_symbols = open_symbols | working_symbols
         planned_new_symbols: set = set()
         placed, skipped = 0, 0
         allow_short = bool(config.ALLOW_SHORT)
@@ -427,6 +486,11 @@ class IBKRBridge:
                 skipped += 1
                 continue
 
+            if symbol in working_symbols:
+                logger.info("Working order already exists for %s — skipping", symbol)
+                skipped += 1
+                continue
+
             current_position = self.get_position(symbol)
             opens_new = (
                 (action == "BUY" and current_position == 0)
@@ -434,12 +498,7 @@ class IBKRBridge:
             )
 
             if opens_new:
-                if self.has_working_order(symbol):
-                    logger.info("Working order already exists for %s — skipping new entry", symbol)
-                    skipped += 1
-                    continue
-
-                planned_total = len(open_symbols | planned_new_symbols)
+                planned_total = len(occupied_symbols | planned_new_symbols)
                 if planned_total >= config.MAX_OPEN_POSITIONS:
                     logger.warning(
                         "Max positions (%d) reached — skipping %s",
