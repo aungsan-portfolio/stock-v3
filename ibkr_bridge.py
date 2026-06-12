@@ -5,7 +5,7 @@ TWS/Gateway must be running with API enabled on port 7497 (paper).
 Production hardening:
 - Long-only by default. SELL closes existing longs; never opens accidental shorts.
 - Duplicate-entry guard: BUY skipped when already long; SELL skipped when flat.
-- Bracket children only on opening trades (closing trades use plain LimitOrder).
+- Opening trades use either a fixed TP/SL bracket or a parent limit + trailing stop.
 - Snapshot price fetch waits for the snapshot to populate (event-driven, not
   fixed sleep). Falls back to bid/ask/close, never NaN.
 - qualifyContracts() result captured (the contract is mutated in place but we
@@ -15,7 +15,7 @@ import logging
 import math
 from typing import List, Optional
 
-from ib_insync import IB, Stock, LimitOrder, Contract
+from ib_insync import IB, Stock, LimitOrder, Contract, Order
 
 import config
 from predictor import Signal
@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 ACCEPTED_ORDER_STATUSES = {"PendingSubmit", "PreSubmitted", "Submitted", "Filled", "ApiPending"}
 BAD_ORDER_STATUSES = {"Cancelled", "ApiCancelled", "Inactive", "Rejected"}
+WORKING_ORDER_STATUSES = {"PendingSubmit", "ApiPending", "PreSubmitted", "Submitted"}
 
 
 def _order_status_name(trade) -> str:
@@ -87,6 +88,38 @@ class IBKRBridge:
                     return 0.0
         return 0.0
 
+    def has_working_order(self, symbol: str, action: Optional[str] = None) -> bool:
+        """Return True when IBKR already has a working order for this symbol.
+
+        This prevents duplicate entries when a previous limit/bracket order is
+        still PendingSubmit/PreSubmitted/Submitted but has not yet become a
+        position. reqAllOpenOrders is used so orders from other clientIds are
+        visible too.
+        """
+        symbol = symbol.upper().strip()
+        action = action.upper().strip() if action else None
+
+        try:
+            self.ib.reqAllOpenOrders()
+            self.ib.sleep(1)
+        except Exception:
+            logger.warning("Could not refresh open orders", exc_info=True)
+
+        for trade in self.ib.openTrades():
+            contract_symbol = str(getattr(trade.contract, "symbol", "")).upper()
+            order_action = str(getattr(trade.order, "action", "")).upper()
+            status = _order_status_name(trade)
+
+            if contract_symbol != symbol:
+                continue
+            if status not in WORKING_ORDER_STATUSES:
+                continue
+            if action is not None and order_action != action:
+                continue
+            return True
+
+        return False
+
     # ── Contracts & pricing ──────────────────────────────────────
     def _contract(self, symbol: str) -> Contract:
         symbol = symbol.upper().strip()
@@ -128,7 +161,6 @@ class IBKRBridge:
                 if price is not None:
                     _cancel_snapshot()
                     return price
-
             # In ib_insync marketPrice is a method, not a numeric attribute.
             market_price_fn = getattr(ticker, "marketPrice", None)
             if callable(market_price_fn):
@@ -198,6 +230,23 @@ class IBKRBridge:
             return round(price * (1 + offset), 2)
         return round(price * (1 - offset), 2)
 
+    def _initial_stop_price(self, action: str, price: float) -> float:
+        if action == "BUY":
+            return round(price * (1 - config.STOP_LOSS_PCT), 2)
+        return round(price * (1 + config.STOP_LOSS_PCT), 2)
+
+    def _take_profit_price(self, action: str, price: float) -> float:
+        if action == "BUY":
+            return round(price * (1 + config.TAKE_PROFIT_PCT), 2)
+        return round(price * (1 - config.TAKE_PROFIT_PCT), 2)
+
+    def _validate_bracket_prices(self, action: str, limit_price: float, stop_price: float, profit_price: float) -> bool:
+        if action == "BUY":
+            return stop_price < limit_price < profit_price
+        if action == "SELL":
+            return profit_price < limit_price < stop_price
+        return False
+
     # ── Order placement ──────────────────────────────────────────
     def _place_limit_order(self, symbol: str, action: str, qty: int, price: float, note: str) -> bool:
         if qty <= 0:
@@ -218,24 +267,72 @@ class IBKRBridge:
         )
         return accepted
 
+    def _place_open_trailing_exit(
+        self, symbol: str, action: str, qty: int, price: float, confidence: float,
+    ) -> bool:
+        """Open with a limit parent and a trailing stop child.
+
+        This matches the desired behavior: be wrong small via the initial stop,
+        but let correct trades keep running until price reverses by the trailing
+        percent from its high. Kept long/short-aware, although shorts are disabled
+        by default in config.
+        """
+        contract = self._contract(symbol)
+        limit_price = self._limit_price(action, price)
+        stop_price = self._initial_stop_price(action, price)
+        trailing_pct = round(float(config.TRAILING_STOP_PCT) * 100.0, 3)
+
+        parent = LimitOrder(action, qty, limit_price)
+        parent.orderId = self.ib.client.getReqId()
+        parent.transmit = False
+
+        exit_action = "SELL" if action == "BUY" else "BUY"
+        trailing_stop = Order(
+            action=exit_action,
+            orderType="TRAIL",
+            totalQuantity=qty,
+            parentId=parent.orderId,
+            trailingPercent=trailing_pct,
+            trailStopPrice=stop_price,
+            transmit=True,
+        )
+        trailing_stop.orderId = self.ib.client.getReqId()
+
+        trades = [
+            self.ib.placeOrder(contract, parent),
+            self.ib.placeOrder(contract, trailing_stop),
+        ]
+        self.ib.sleep(1)
+        statuses = [_order_status_name(t) for t in trades]
+        accepted = all(_is_order_accepted(status) for status in statuses)
+        logger.info(
+            "Open trailing | %s %s x%d limit=%.2f | initial_stop=%.2f trail=%.3f%% | conf=%.2f | statuses=%s accepted=%s",
+            action, symbol, qty, limit_price, stop_price, trailing_pct, confidence, statuses, accepted,
+        )
+        return accepted
+
     def _place_open_bracket(
         self, symbol: str, action: str, qty: int, price: float, confidence: float,
     ) -> bool:
-        contract = self._contract(symbol)
+        if bool(getattr(config, "USE_TRAILING_EXIT", False)):
+            return self._place_open_trailing_exit(symbol, action, qty, price, confidence)
 
-        if action == "BUY":
-            stop_price = round(price * (1 - config.STOP_LOSS_PCT), 2)
-            profit_price = round(price * (1 + config.TAKE_PROFIT_PCT), 2)
-        elif action == "SELL":
-            stop_price = round(price * (1 + config.STOP_LOSS_PCT), 2)
-            profit_price = round(price * (1 - config.TAKE_PROFIT_PCT), 2)
-        else:
-            raise ValueError(f"Unsupported bracket action: {action}")
+        contract = self._contract(symbol)
+        limit_price = self._limit_price(action, price)
+        stop_price = self._initial_stop_price(action, price)
+        profit_price = self._take_profit_price(action, price)
+
+        if not self._validate_bracket_prices(action, limit_price, stop_price, profit_price):
+            logger.warning(
+                "Invalid bracket prices | %s %s limit=%.2f stop=%.2f profit=%.2f",
+                action, symbol, limit_price, stop_price, profit_price,
+            )
+            return False
 
         bracket = self.ib.bracketOrder(
             action=action,
             quantity=qty,
-            limitPrice=self._limit_price(action, price),
+            limitPrice=limit_price,
             takeProfitPrice=profit_price,
             stopLossPrice=stop_price,
         )
@@ -245,8 +342,8 @@ class IBKRBridge:
         statuses = [_order_status_name(t) for t in trades]
         accepted = all(_is_order_accepted(status) for status in statuses)
         logger.info(
-            "Open bracket | %s %s x%d @ %.2f | SL=%.2f TP=%.2f | conf=%.2f | statuses=%s accepted=%s",
-            action, symbol, qty, price, stop_price, profit_price, confidence, statuses, accepted,
+            "Open bracket | %s %s x%d limit=%.2f | SL=%.2f TP=%.2f | conf=%.2f | statuses=%s accepted=%s",
+            action, symbol, qty, limit_price, stop_price, profit_price, confidence, statuses, accepted,
         )
         return accepted
 
@@ -261,6 +358,10 @@ class IBKRBridge:
             return False
         if action not in {"BUY", "SELL"}:
             logger.warning("Unsupported signal action for %s: %s", symbol, signal.action)
+            return False
+
+        if self.has_working_order(symbol):
+            logger.info("Working order already exists for %s — skipping %s", symbol, action)
             return False
 
         position = self.get_position(symbol)
@@ -333,6 +434,11 @@ class IBKRBridge:
             )
 
             if opens_new:
+                if self.has_working_order(symbol):
+                    logger.info("Working order already exists for %s — skipping new entry", symbol)
+                    skipped += 1
+                    continue
+
                 planned_total = len(open_symbols | planned_new_symbols)
                 if planned_total >= config.MAX_OPEN_POSITIONS:
                     logger.warning(
