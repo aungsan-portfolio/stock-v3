@@ -91,13 +91,20 @@ TAKE_PROFIT_PCT     = 0.015   # fallback fixed-bracket TP when trailing is disab
 # Winner management. Native trailing stop lets a correct trade keep running while
 # protecting profit when price reverses from its high.
 USE_TRAILING_EXIT   = True
-TRAILING_STOP_PCT   = 0.004   # sell if price reverses ~0.40% from the high
+TRAILING_STOP_PCT   = 0.004   # fraction; IBKR trailingPercent uses this * 100 = 0.4%
 
 # ── Production Safety Guards ─────────────────────
 # Default is long-only. SELL closes existing long positions; it does not open shorts.
 ALLOW_SHORT          = False
 MIN_TRADE_CASH       = 100.0
 LIMIT_ORDER_OFFSET_PCT = 0.001
+
+# Daily safety caps. These are intentionally conservative for paper-testing.
+MAX_DAILY_TRADES     = 6
+MAX_DAILY_LOSS_USD   = 150.0
+
+# Do not use yesterday's/daily historical close as the price source for order placement.
+ALLOW_HISTORICAL_PRICE_FOR_ORDERS = False
 
 # ── Backtest Settings ────────────────────────────
 # Daily position-state simulation costs. These are conservative defaults.
@@ -114,7 +121,17 @@ BACKTEST_LSTM_BATCH           = 64
 # ── IBKR Paper Trading ───────────────────────────
 IBKR_HOST           = "127.0.0.1"
 IBKR_PORT           = 7497
-IBKR_CLIENT_ID      = 1
+PAPER_IBKR_PORT     = 7497
+REQUIRE_PAPER_PORT  = True
+
+CLIENT_ID_BOT       = 1
+CLIENT_ID_CHECK     = 11
+CLIENT_ID_CANCEL    = 12
+CLIENT_ID_FLATTEN   = 13
+
+# Backward-compatible name used by older code.
+IBKR_CLIENT_ID      = CLIENT_ID_BOT
+
 PAPER_CAPITAL       = 100_000.0
 # Market data type: 1=live, 2=frozen, 3=delayed (15-min), 4=delayed-frozen.
 # 3 lets paper accounts without a real-time subscription still get prices.
