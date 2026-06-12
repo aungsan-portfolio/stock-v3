@@ -14,7 +14,12 @@ import config
 
 ib = IB()
 ib.RequestTimeout = 30
-ib.connect(host=config.IBKR_HOST, port=config.IBKR_PORT, clientId=1, timeout=30)
+ib.connect(
+    host=config.IBKR_HOST,
+    port=config.IBKR_PORT,
+    clientId=config.CLIENT_ID_FLATTEN,
+    timeout=30,
+)
 ib.sleep(1)
 
 target = "VTI"
