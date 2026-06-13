@@ -20,6 +20,67 @@ WATCHLIST = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",
 ]
 
+# ── Full-Market Hot Scanner ──────────────────────
+# Safe, opt-in broad market discovery. This ONLY produces candidate symbols.
+# Prediction + risk rules still decide BUY/HOLD/SELL and whether any paper
+# order is placed. Nothing here enables live trading or auto-buying.
+FULL_MARKET_SCAN_ENABLED        = True
+# How long the downloaded Nasdaq Trader symbol directory is cached before a
+# re-download is attempted (data/symbol_universe.csv).
+FULL_MARKET_CACHE_HOURS         = 24
+# Hard cap on how many symbols a single full-market scan will fetch OHLCV for.
+# Beginner-safe default; raise deliberately once you understand the runtime cost.
+FULL_MARKET_MAX_SYMBOLS_TO_CHECK = 500
+
+# ── Full-market symbol SELECTION (which symbols out of the universe to scan) ──
+# The universe is stored alphabetically. Taking the first N would scan only A/AB
+# tickers, so selection decides *which* slice of the broad market each run looks
+# at. This is discovery only — it never places orders or changes risk rules.
+#   "alphabetical" : first N symbols (original behavior; for debugging only)
+#   "random"       : seeded random sample from the whole universe
+#   "rotation"     : a different sequential slice each run (covers the market over time)
+#   "hybrid"       : always include the core symbols below, then fill with a
+#                    rotating, shuffled sample of the rest (DEFAULT)
+FULL_MARKET_SELECTION_MODE = "hybrid"
+
+# Anchors always scanned in "hybrid" mode (when present in the universe) so a
+# broad scan never loses sight of the most liquid, widely-followed names.
+FULL_MARKET_CORE_SYMBOLS = [
+    "SPY", "QQQ", "VTI",
+    "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "META", "AMZN",
+    "GOOGL", "AVGO", "NFLX", "COST", "JPM", "BAC", "XOM", "UNH",
+]
+
+# Seed for the "random" sample and the hybrid fill shuffle — fixed for
+# reproducible selections; change it to draw a different sample.
+FULL_MARKET_RANDOM_SEED = 42
+
+# Persisted rotation cursor so "rotation"/"hybrid" advance through the universe
+# across runs instead of always starting in the same place.
+FULL_MARKET_ROTATION_STATE_FILE = DATA_DIR / "scan_rotation_state.json"
+# Keep only this many top-ranked candidates after scoring.
+HOT_SCAN_TOP_N                  = 30
+# Price band: skip penny stocks and very expensive tickers.
+HOT_SCAN_MIN_PRICE              = 5.0
+HOT_SCAN_MAX_PRICE              = 1000.0
+# Liquidity floor: skip thinly traded names.
+HOT_SCAN_MIN_AVG_VOLUME         = 1_000_000
+# When True, ETFs are excluded from candidates (common stocks only).
+HOT_SCAN_EXCLUDE_ETFS           = False
+# Reject names whose ATR% (volatility) is above this fraction of price.
+HOT_SCAN_MAX_ATR_PCT            = 0.12
+# Batch sizing + polite throttling for the data fetch loop.
+HOT_SCAN_CHUNK_SIZE             = 50
+HOT_SCAN_SLEEP_SECONDS          = 1.0
+
+# Nasdaq Trader official symbol directory files (pipe-delimited text).
+NASDAQ_LISTED_URL  = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
+OTHER_LISTED_URL   = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
+SYMBOL_UNIVERSE_FILE = DATA_DIR / "symbol_universe.csv"
+HOT_CANDIDATES_FILE  = REPORTS_DIR / "hot_candidates.csv"
+# Audit trail of exactly which symbols a scan selected (and why) before scanning.
+SELECTED_SCAN_SYMBOLS_FILE = REPORTS_DIR / "selected_scan_symbols.csv"
+
 # ── Data Settings ────────────────────────────────
 PRICE_PERIOD        = "5y"
 PRICE_INTERVAL      = "1d"
