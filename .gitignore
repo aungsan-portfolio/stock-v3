@@ -13,3 +13,7 @@ models/
 .DS_Store
 .idea/
 .vscode/
+
+data/
+reports/
+models_backup_before_train_hot/
