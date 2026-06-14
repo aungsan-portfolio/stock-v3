@@ -22,6 +22,10 @@ Threshold tuning (read-only â€” never connects to IBKR, never places orders
   python main.py threshold-report --full-market    # Sweep on broad-market candidates
   python main.py threshold-report --full-market --max-symbols 100 --top-n 30
 
+Model readiness (no IBKR connection, no orders â€” diagnostics + maintenance only):
+  python main.py model-doctor                      # Coverage/freshness for report candidates
+  python main.py model-refresh --from-report --top-n 30  # Train/update + MERGE report candidates
+
 Guided Paper Trading Coach (beginner-friendly; preview-first, never auto-buys):
   python main.py coach                    # Lessons on WATCHLIST (no IBKR, no orders)
   python main.py coach-hot                # Lessons on reports/hot_candidates.csv (no IBKR)
@@ -57,6 +61,7 @@ from predictor import Predictor
 from backtest import run_backtest
 import hot_scanner
 from hot_scanner import scan_hot_stocks
+import model_doctor
 from trade_coach import (
     build_trade_lesson, build_trade_preview, print_trade_lesson, print_trade_preview,
     write_trade_note, select_coach_candidates,
@@ -574,6 +579,30 @@ def cmd_coach_hot(_args) -> int:
     return 0
 
 
+# â”€â”€ Model Doctor / Model Refresh (read / maintenance only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+def cmd_model_doctor(args) -> int:
+    """Inspect RF/LSTM coverage + freshness for the report candidates.
+
+    Read-only: no IBKR connection, no orders. Writes reports/model_doctor_report.md.
+    """
+    return model_doctor.run_doctor(top_n=getattr(args, "top_n", None))
+
+
+def cmd_model_refresh(args) -> int:
+    """Train/update models for the exact report candidates, preserving existing
+    models (merge + backup). No IBKR connection, no orders, no live trading.
+    """
+    if not bool(getattr(args, "from_report", False)):
+        print(
+            "model-refresh currently supports only --from-report "
+            "(symbols from reports/hot_candidates.csv)."
+        )
+        print("Run: python -X utf8 main.py model-refresh --from-report --top-n 30")
+        return 3
+    top_n = int(getattr(args, "top_n", 30) or 30)
+    return model_doctor.run_refresh(top_n=top_n)
+
+
 def cmd_paper_coach(args) -> int:
     """Preview (and, only with --confirm --chart-checked, place) ONE paper trade.
 
@@ -941,7 +970,10 @@ def cmd_daily_coach(args) -> int:
 
 def _run_daily_coach(args, verbose: bool) -> int:
     print("\n=== Guided Daily Trading Coach (PAPER ONLY) ===")
-    print("Scans the full market, previews the best BUY candidates, and - only with")
+    if bool(getattr(args, "from_report", False)):
+        print("Uses the saved hot-candidate report, previews the best BUY candidates, and - only with")
+    else:
+        print("Scans the full market, previews the best BUY candidates, and - only with")
     print(
         "BOTH --confirm AND --chart-checked - may place up to "
         f"{int(getattr(config, 'COACH_MAX_PAPER_TRADES_PER_RUN', 3))} PAPER trades. "
@@ -966,15 +998,29 @@ def _run_daily_coach(args, verbose: bool) -> int:
 
     min_conf = float(getattr(config, "COACH_MIN_CONFIDENCE_FOR_CANDIDATE", 0.65))
 
-    # -- Full-market scan (discovery only; never places orders) --
-    hot_symbols = scan_hot_stocks(
-        full_market=True,
-        max_symbols=getattr(args, "max_symbols", None),
-        top_n=getattr(args, "top_n", None),
-        write_report=True,
-        selection_mode=getattr(args, "selection_mode", None),
-    )
-    scanned = int(hot_scanner.LAST_SCAN_STATS.get("scanned", 0))
+    from_report = bool(getattr(args, "from_report", False))
+    if from_report:
+        # Use the already-trained saved report; never re-scan, never overwrite it.
+        # This keeps daily-coach aligned with the symbols model-refresh trained.
+        hot_symbols = _read_hot_candidate_symbols()
+        if not hot_symbols:
+            print("No hot candidate report found. Run scan-hot first.")
+            return 0
+        print("Using saved hot candidates from reports/hot_candidates.csv")
+        top_n = getattr(args, "top_n", None)
+        if top_n is not None and top_n > 0:
+            hot_symbols = hot_symbols[:top_n]
+        scanned = len(hot_symbols)
+    else:
+        # -- Full-market scan (discovery only; never places orders) --
+        hot_symbols = scan_hot_stocks(
+            full_market=True,
+            max_symbols=getattr(args, "max_symbols", None),
+            top_n=getattr(args, "top_n", None),
+            write_report=True,
+            selection_mode=getattr(args, "selection_mode", None),
+        )
+        scanned = int(hot_scanner.LAST_SCAN_STATS.get("scanned", 0))
 
     if not hot_symbols:
         lines = build_daily_coach_summary(scanned, [], [], min_conf)
@@ -996,6 +1042,21 @@ def _run_daily_coach(args, verbose: bool) -> int:
         s for s in signals
         if s.action == "BUY" and float(s.confidence) >= min_conf
     ]
+
+    # -- Model readiness note (clearer message only; no trading change) --
+    # Candidates with neither RF nor LSTM are forced to HOLD by the predictor.
+    # If that's the majority, surface a clear next step instead of silently
+    # returning no BUY candidates. This does not force or skip any trade.
+    n_missing = sum(1 for s in signals if "models missing" in s.reason)
+    if signals and n_missing >= len(signals) / 2:
+        print(
+            f"\n[MODEL] {n_missing}/{len(signals)} candidates have no ML model "
+            "(forced HOLD)."
+        )
+        print(
+            "Model coverage is low. Run model-refresh --from-report before "
+            "expecting reliable BUY signals."
+        )
 
     # -- Always print/write the clean beginner-friendly summary first --
     summary_lines = build_daily_coach_summary(
@@ -1083,6 +1144,28 @@ def main() -> int:
         help="Acknowledge you manually checked the chart before any execution",
     )
 
+    # â”€â”€ Model Doctor / Model Refresh (read / maintenance only; no IBKR) â”€â”€â”€â”€â”€â”€
+    md = sub.add_parser(
+        "model-doctor",
+        help="Inspect RF/LSTM coverage + freshness for report candidates (no IBKR, no orders)",
+    )
+    md.add_argument(
+        "--top-n", type=int, default=None,
+        help="Only inspect the first N candidates from hot_candidates.csv (default: all)",
+    )
+    mr = sub.add_parser(
+        "model-refresh",
+        help="Train/update models for report candidates, preserving existing models (no IBKR, no orders)",
+    )
+    mr.add_argument(
+        "--from-report", action="store_true",
+        help="Load symbols from reports/hot_candidates.csv (required source)",
+    )
+    mr.add_argument(
+        "--top-n", type=int, default=30,
+        help="Train/update the first N report candidates (default: 30)",
+    )
+
     # â”€â”€ Guided Daily Trading Coach (full-market scan, multi-trade PAPER) â”€â”€â”€â”€
     dc = sub.add_parser(
         "daily-coach",
@@ -1105,6 +1188,12 @@ def main() -> int:
             "How many top candidates to preview / max PAPER trades to place. "
             "Clamped to COACH_MAX_PAPER_TRADES_PER_RUN; cannot raise the cap."
         ),
+    )
+    dc.add_argument(
+        "--from-report", action="store_true",
+        help="Use the saved reports/hot_candidates.csv symbols instead of running a "
+             "fresh full-market scan. Does not overwrite the report (keeps trained "
+             "coverage aligned with model-refresh).",
     )
     dc.add_argument(
         "--verbose", action="store_true",
@@ -1147,6 +1236,10 @@ def main() -> int:
         return cmd_coach_hot(args)
     if args.command == "paper-coach":
         return cmd_paper_coach(args)
+    if args.command == "model-doctor":
+        return cmd_model_doctor(args)
+    if args.command == "model-refresh":
+        return cmd_model_refresh(args)
     if args.command == "daily-coach":
         return cmd_daily_coach(args)
 
