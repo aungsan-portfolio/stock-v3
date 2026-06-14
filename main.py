@@ -50,6 +50,7 @@ Exit codes:
 """
 import argparse
 import csv
+import json
 import logging
 import sys
 
@@ -1155,6 +1156,205 @@ def _run_daily_coach(args, verbose: bool) -> int:
     return _daily_coach_execute(candidates, n_candidates)
 
 
+def _bt_summary_pct(x) -> str:
+    """Format a fraction (0.05) as a percent string (+5.00%). Returns 'n/a' if None."""
+    if x is None:
+        return "n/a"
+    return f"{x * 100:+.2f}%"
+
+
+def _bt_parse_date(s: str):
+    """Parse YYYY-MM-DD to a date, or None on failure (read-only, never raises)."""
+    try:
+        from datetime import date
+        y, m, d = (int(p) for p in str(s).split("-"))
+        return date(y, m, d)
+    except Exception:
+        return None
+
+
+def cmd_backtest_summary(_args) -> int:
+    """Read-only summary of the most recent backtest artifacts.
+
+    Reads reports/backtest_metrics.json and reports/backtest_trades.csv.
+    Does NOT run a backtest, train models, connect to IBKR, or place orders.
+    Writes reports/backtest_summary.md.
+    """
+    metrics_path = config.REPORTS_DIR / "backtest_metrics.json"
+    trades_path = config.REPORTS_DIR / "backtest_trades.csv"
+
+    # ---- Load metrics (optional) -------------------------------------------
+    metrics = {}
+    if metrics_path.exists():
+        try:
+            with metrics_path.open("r", encoding="utf-8") as fh:
+                metrics = json.load(fh)
+        except Exception as exc:  # pragma: no cover - defensive read-only
+            print(f"Could not read {metrics_path.name}: {exc}")
+    else:
+        print(f"No metrics file at {metrics_path} (continuing).")
+
+    symbols_tested = metrics.get("symbols_tested")
+    model_name = metrics.get("backtest_model", "unknown")
+    include_lstm = metrics.get("include_lstm", False)
+    max_drawdown = metrics.get("avg_max_drawdown")
+
+    # ---- Load trades (optional) --------------------------------------------
+    rows = []
+    if trades_path.exists():
+        try:
+            with trades_path.open("r", encoding="utf-8", newline="") as fh:
+                rows = list(csv.DictReader(fh))
+        except Exception as exc:  # pragma: no cover - defensive read-only
+            print(f"Could not read {trades_path.name}: {exc}")
+    else:
+        print(f"No trades file at {trades_path} (continuing).")
+
+    # Actual simulated orders are those where order_executed == True.
+    executed = [r for r in rows if str(r.get("order_executed")).strip().lower() == "true"]
+    entries = [r for r in executed if r.get("old_position") == "0" and r.get("new_position") == "1"]
+    exits = [r for r in executed if r.get("old_position") == "1" and r.get("new_position") == "0"]
+    open_positions_left = len(entries) - len(exits)
+
+    # ---- Pair entries and exits in order -----------------------------------
+    closed_trades = []
+    for entry, exit_ in zip(entries, exits):
+        try:
+            entry_eq = float(entry.get("equity"))
+            exit_eq = float(exit_.get("equity"))
+            ret = (exit_eq / entry_eq) - 1.0 if entry_eq else None
+        except (TypeError, ValueError, ZeroDivisionError):
+            ret = None
+        if ret is None:
+            continue
+        ed = _bt_parse_date(entry.get("date"))
+        xd = _bt_parse_date(exit_.get("date"))
+        hold_days = (xd - ed).days if (ed and xd) else None
+        closed_trades.append({
+            "entry_date": entry.get("date"),
+            "exit_date": exit_.get("date"),
+            "return": ret,
+            "hold_days": hold_days,
+        })
+
+    wins = [t for t in closed_trades if t["return"] > 0]
+    losses = [t for t in closed_trades if t["return"] <= 0]
+    n_closed = len(closed_trades)
+    win_rate = (len(wins) / n_closed) if n_closed else None
+    avg_win = (sum(t["return"] for t in wins) / len(wins)) if wins else None
+    avg_loss = (sum(t["return"] for t in losses) / len(losses)) if losses else None
+
+    gross_win = sum(t["return"] for t in wins)
+    gross_loss = sum(-t["return"] for t in losses)  # positive magnitude
+    if gross_loss > 0:
+        profit_factor = gross_win / gross_loss
+    elif gross_win > 0:
+        profit_factor = float("inf")
+    else:
+        profit_factor = None
+
+    best = max(closed_trades, key=lambda t: t["return"]) if closed_trades else None
+    worst = min(closed_trades, key=lambda t: t["return"]) if closed_trades else None
+
+    hold_days_vals = [t["hold_days"] for t in closed_trades if t["hold_days"] is not None]
+    avg_hold_days = (sum(hold_days_vals) / len(hold_days_vals)) if hold_days_vals else None
+
+    # ---- Beginner-friendly notes -------------------------------------------
+    notes = []
+    if symbols_tested == 1:
+        notes.append("This is a SPY-only backtest (symbols_tested = 1), not a broad test.")
+    notes.append("This is NOT the full-market daily-coach backtest.")
+    if avg_hold_days is not None and avg_hold_days >= 14:
+        notes.append(
+            f"This is NOT a quick in/out strategy — trades are held ~{avg_hold_days:.0f} days "
+            "(weeks to months) on average."
+        )
+    notes.append("Live trading is NOT recommended from this result alone.")
+
+    def fmt_trade(t):
+        if not t:
+            return "n/a"
+        hold = f", held {t['hold_days']}d" if t.get("hold_days") is not None else ""
+        return f"{_bt_summary_pct(t['return'])} ({t['entry_date']} -> {t['exit_date']}{hold})"
+
+    decision = "Useful for learning, but not live-ready yet."
+
+    # ---- Print summary ------------------------------------------------------
+    print("\nBacktest Summary")
+    print(f"Symbols tested: {symbols_tested if symbols_tested is not None else 'unknown'}")
+    print(f"Model: {model_name}")
+    print(f"LSTM included: {include_lstm}")
+    print(f"Executed orders: {len(executed)}")
+    print(f"Entries: {len(entries)}")
+    print(f"Exits: {len(exits)}")
+    print(f"Open positions left: {open_positions_left}")
+    print(f"Closed trades: {n_closed}")
+    print(f"Wins / Losses: {len(wins)} / {len(losses)}")
+    print(f"Win rate: {win_rate * 100:.1f}%" if win_rate is not None else "Win rate: n/a")
+    print(f"Average win: {_bt_summary_pct(avg_win)}")
+    print(f"Average loss: {_bt_summary_pct(avg_loss)}")
+    if profit_factor is None:
+        print("Profit factor (approx): n/a")
+    elif profit_factor == float("inf"):
+        print("Profit factor (approx): inf (no losing trades)")
+    else:
+        print(f"Profit factor (approx): {profit_factor:.2f}")
+    print(f"Best trade: {fmt_trade(best)}")
+    print(f"Worst trade: {fmt_trade(worst)}")
+    print(f"Max drawdown: {_bt_summary_pct(max_drawdown)}")
+    print("\nWhat this means:")
+    for n in notes:
+        print(f"  - {n}")
+    print(f"\nDecision:\n{decision}")
+
+    # ---- Write report -------------------------------------------------------
+    config.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = config.REPORTS_DIR / "backtest_summary.md"
+
+    def md_trade(t):
+        return fmt_trade(t)
+
+    pf_str = (
+        "n/a" if profit_factor is None
+        else ("inf (no losing trades)" if profit_factor == float("inf") else f"{profit_factor:.2f}")
+    )
+    lines = [
+        "# Backtest Summary",
+        "",
+        "_Read-only summary of existing backtest artifacts. No backtest was run, "
+        "no models trained, no IBKR connection, no orders placed._",
+        "",
+        f"- **Symbols tested:** {symbols_tested if symbols_tested is not None else 'unknown'}",
+        f"- **Model:** {model_name}",
+        f"- **LSTM included:** {include_lstm}",
+        f"- **Executed orders:** {len(executed)}",
+        f"- **Entries:** {len(entries)}",
+        f"- **Exits:** {len(exits)}",
+        f"- **Open positions left:** {open_positions_left}",
+        f"- **Closed trades:** {n_closed}",
+        f"- **Wins / Losses:** {len(wins)} / {len(losses)}",
+        f"- **Win rate:** {win_rate * 100:.1f}%" if win_rate is not None else "- **Win rate:** n/a",
+        f"- **Average win:** {_bt_summary_pct(avg_win)}",
+        f"- **Average loss:** {_bt_summary_pct(avg_loss)}",
+        f"- **Profit factor (approx):** {pf_str}",
+        f"- **Best trade:** {md_trade(best)}",
+        f"- **Worst trade:** {md_trade(worst)}",
+        f"- **Max drawdown:** {_bt_summary_pct(max_drawdown)}",
+        "",
+        "## What this means",
+        "",
+    ]
+    lines += [f"- {n}" for n in notes]
+    lines += ["", "## Decision", "", decision, ""]
+
+    with out_path.open("w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+
+    print(f"\nReport written -> {out_path}")
+    print("No IBKR connection was made and no orders were placed.")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stock Prediction Engine â€” IBKR Paper Trading")
     sub = parser.add_subparsers(dest="command")
@@ -1166,6 +1366,11 @@ def main() -> int:
     bt.add_argument("--train-min", type=int, default=252)
     bt.add_argument("--step", type=int, default=21)
     bt.add_argument("--include-lstm", action="store_true", help="Slow full-ensemble RF+LSTM+Technical backtest")
+
+    sub.add_parser(
+        "backtest-summary",
+        help="Read-only summary of reports/backtest_* (no backtest, no IBKR, no orders)",
+    )
 
     pp = sub.add_parser("paper", help="Execute signals on IBKR paper")
     pp.add_argument("--dry-run", action="store_true", help="Preview signals without placing orders")
@@ -1297,6 +1502,8 @@ def main() -> int:
         return cmd_predict(args)
     if args.command == "backtest":
         return cmd_backtest(args)
+    if args.command == "backtest-summary":
+        return cmd_backtest_summary(args)
     if args.command == "paper":
         return cmd_paper(args)
     if args.command == "scan-hot":
