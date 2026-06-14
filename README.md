@@ -208,6 +208,176 @@ symbols, and how many core symbols were included, and writes the full selection
 - If no BUY/SELL signal exists, no orders are placed.
 - Existing positions / working orders are skipped, with the reason logged.
 
+## Guided Paper Trading Coach
+
+A **beginner-friendly, preview-first** flow that turns the same RF + LSTM +
+Technical signals into a plain-English trade *lesson* and a safe **paper-trade
+preview**. It is designed to help you *learn* while paper trading — it **never
+auto-buys**. A paper order is placed only when you explicitly pass **both**
+`--confirm` **and** `--chart-checked`.
+
+### Recommended workflow
+
+```bash
+# 1) Learn: signals + lessons for your WATCHLIST (no IBKR, no orders)
+python -X utf8 main.py coach
+
+# 2) Preview: connect to paper, see ONE proposed trade with full risk math (no orders)
+python -X utf8 main.py paper-coach
+
+# 3) Check the chart manually — support/resistance, recent news, the proposed stop
+
+# 4) Place at most ONE paper order, only after the chart check
+python -X utf8 main.py paper-coach --confirm --chart-checked
+```
+
+If you run `paper-coach --confirm` *without* `--chart-checked`, the coach
+refuses with **"Chart check required before paper execution."** and places
+nothing.
+
+### What the coach explains
+
+For each signal it teaches: what the **ticker** is, what **BUY / HOLD / SELL**
+mean, what **confidence** means and whether the signal is **strong or
+borderline**, what the **RF / LSTM / Technical** sub-scores mean, **why** a name
+is or is not a trade candidate, the **estimated quantity and cost**, the
+**average cost** if adding, the **stop / trailing stop** and the **estimated max
+loss** if the stop triggers, and **why a manual chart check is required** before
+any execution.
+
+### Commands
+
+```bash
+# Lessons on WATCHLIST (no IBKR connection, no orders)
+python -X utf8 main.py coach
+
+# Lessons on the latest reports/hot_candidates.csv (run `scan-hot` first);
+# prints only the top 1-3 candidates. No IBKR connection, no orders.
+python -X utf8 main.py coach-hot
+
+# Connect to the paper account (read cash / positions / open orders) and PREVIEW
+# the single best BUY candidate. No order is placed.
+python -X utf8 main.py paper-coach
+
+# Refuses — chart check is required before any paper execution.
+python -X utf8 main.py paper-coach --confirm
+
+# Place at most ONE paper order through the existing IBKRBridge risk controls.
+python -X utf8 main.py paper-coach --confirm --chart-checked
+```
+
+A markdown audit trail is appended to `reports/trade_coach_report.md` on every
+run (date/time, candidate, signal, confidence, RF/LSTM/Tech, price, estimated
+quantity/cost, stop and trailing-stop explanation, max estimated loss, chart
+check reminder, and whether the run was *preview only* or *paper order placed*).
+
+### Coach safety
+
+- **Default is no orders.** `coach` and `coach-hot` never connect to IBKR;
+  `paper-coach` connects read-only unless you confirm.
+- **One trade max per run** (`COACH_MAX_NEW_TRADES_PER_RUN = 1`).
+- **Chart check required** before any execution (`--chart-checked`).
+- **Paper account only** — `REQUIRE_PAPER_PORT = True`, paper port `7497`.
+- **All existing risk controls preserved** — `ALLOW_SHORT = False`,
+  `MAX_TRADE_VALUE`, `MAX_POSITION_PCT`, `MAX_OPEN_POSITIONS`, `MAX_DAILY_TRADES`,
+  and the duplicate-order guard all still apply. The coach decides *whether* to
+  call `IBKRBridge.execute_signal`; it never bypasses it.
+- **No `--execute` and no historical-close pricing** in the coach flow. Orders
+  go through the live snapshot pricing path (`ALLOW_HISTORICAL_PRICE_FOR_ORDERS`
+  stays `False`).
+
+### Coach config (in `config.py`)
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `COACH_MIN_CONFIDENCE_FOR_CANDIDATE` | `0.65` | Confidence floor for a BUY to be a coach candidate. |
+| `COACH_REQUIRE_CHART_CHECK` | `True` | Require a manual chart check before execution. |
+| `COACH_REQUIRE_USER_CONFIRM` | `True` | Require explicit `--confirm` before execution. |
+| `COACH_MAX_NEW_TRADES_PER_RUN` | `1` | Hard cap on new trades for the single-symbol `paper-coach` flow. |
+| `COACH_REPORT_FILE` | `reports/trade_coach_report.md` | Where the lesson/preview audit trail is written. |
+
+## Guided Daily Trading Coach
+
+`daily-coach` is the **multi-trade PAPER practice** flow. It scans the **full
+market** (the hybrid scanner), previews the strongest BUY candidates, and — only
+when you pass **both `--confirm` and `--chart-checked`** — may place **more than
+one** paper order in a single run (up to `COACH_MAX_PAPER_TRADES_PER_RUN`, default
+**3**) so you can **learn faster while paper trading**. It is still **paper-only**
+and every existing risk control is preserved.
+
+> **Live trading remains disabled. This bot is paper-trading only.** There is no
+> live-trading mode and no live account port. Do **not** move to live trading
+> until you have reviewed your paper results.
+
+### Commands
+
+```bash
+# Default: full-market scan, preview the top 3 candidates. No orders.
+python -X utf8 main.py daily-coach
+
+# Preview up to 3 best candidates. No orders.
+python -X utf8 main.py daily-coach --max-trades 3
+
+# Refuses — chart check is required before any paper execution.
+python -X utf8 main.py daily-coach --confirm --max-trades 3
+
+# May place up to 3 PAPER trades (only valid candidates, only if they exist).
+python -X utf8 main.py daily-coach --confirm --chart-checked --max-trades 3
+```
+
+A beginner can safely run the first two to **preview the top 3 candidates** with
+full risk math. **Paper execution** (up to 3 trades) requires
+`--confirm --chart-checked --max-trades 3`.
+
+### What it prints
+
+- **Scanned market count** and the top candidates.
+- For **each candidate**: symbol, bot action, confidence, chart status, *why
+  selected*, *why skipped or accepted*, estimated quantity, estimated cost,
+  stop / trailing stop, and estimated possible loss.
+- An **execution summary**: requested max trades, valid candidates, orders
+  placed, every skipped candidate with its reason, and the reminder
+  *"This is paper trading practice."*
+
+### Execution gates (all must hold to place a paper order)
+
+`--confirm` **and** `--chart-checked` are both required (without `--chart-checked`
+the run refuses with *"Chart check required before paper execution."*). Then each
+candidate must independently satisfy:
+
+- a **BUY** signal with **confidence ≥ `BUY_THRESHOLD`**;
+- **no existing position** and **no working order** in the same symbol;
+- a chart status that is **not** `TOO_EXTENDED`, `BELOW_TREND`, `LOW_VOLUME`, or
+  `MODEL_MISSING`;
+- the run-level caps: `--max-trades` (clamped to `COACH_MAX_PAPER_TRADES_PER_RUN`,
+  it can only lower the cap), `MAX_OPEN_POSITIONS`, and `MAX_DAILY_TRADES`.
+
+If only 1 candidate is valid, exactly 1 order is placed; if 0 are valid, no orders
+are placed. Every candidate that is not traded prints a skip reason.
+
+### Daily-coach safety
+
+- **Paper only — live trading is hard-blocked.** `daily-coach` calls an explicit
+  guard before doing anything: if any config or command attempts live trading it
+  refuses with *"Live trading is disabled. This bot is paper-trading only."* The
+  guard requires `COACH_LIVE_TRADING_ENABLED = False`, `REQUIRE_PAPER_PORT = True`,
+  `IBKR_PORT == PAPER_IBKR_PORT`, `ALLOW_SHORT = False`, and
+  `ALLOW_HISTORICAL_PRICE_FOR_ORDERS = False`.
+- **No live account port** is ever added or used.
+- **All existing risk controls preserved** — `MAX_TRADE_VALUE`,
+  `MAX_POSITION_PCT`, `MAX_OPEN_POSITIONS`, `MAX_DAILY_TRADES`, the
+  duplicate-position / working-order guards, and live-snapshot-only pricing all
+  still apply. Orders go only through the existing `IBKRBridge`; nothing bypasses
+  it or its caps.
+
+### Daily-coach config (in `config.py`)
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `COACH_MAX_PAPER_TRADES_PER_RUN` | `3` | Hard upper bound on PAPER trades one `daily-coach` run may place. `--max-trades` can only lower it. |
+| `COACH_DEFAULT_PREVIEW_CANDIDATES` | `3` | How many top candidates the default (preview-only) run shows. |
+| `COACH_LIVE_TRADING_ENABLED` | `False` | Master live-trading kill switch. Must stay `False` — this bot is paper-only. |
+
 ## Important Notes
 
 The default backtest is `RF_TECHNICAL_WALK_FORWARD` because fold-local LSTM training can be slow. To test RF + LSTM + Technical without leakage, use `--include-lstm`; it trains a small LSTM inside each walk-forward fold using only past rows.

@@ -37,6 +37,18 @@ REPORT_COLUMNS = [
     "hot_score", "reason",
 ]
 
+# Stats from the most recent scan_hot_stocks() call. Read-only convenience for
+# callers (e.g. daily-coach) that want to report how much market was scanned
+# without changing the function's list[str] return type. Updated in place each
+# scan; never relied upon for any trading decision.
+LAST_SCAN_STATS: Dict[str, int] = {
+    "universe_size": 0,
+    "scanned": 0,
+    "passed_filters": 0,
+    "kept": 0,
+    "failed": 0,
+}
+
 
 # ── Metric computation ──────────────────────────────────────────────────────
 def _compute_metrics(df: pd.DataFrame) -> Optional[dict]:
@@ -233,6 +245,9 @@ def scan_hot_stocks(
 
     if not symbols:
         print("⚠️  No symbols to scan (empty universe).")
+        LAST_SCAN_STATS.update(
+            {"universe_size": 0, "scanned": 0, "passed_filters": 0, "kept": 0, "failed": 0}
+        )
         if write_report:
             _write_report([])
         return []
@@ -279,6 +294,14 @@ def scan_hot_stocks(
 
     candidates.sort(key=lambda c: c["hot_score"], reverse=True)
     top = candidates[:top_n]
+
+    LAST_SCAN_STATS.update({
+        "universe_size": total,
+        "scanned": scanned,
+        "passed_filters": len(candidates),
+        "kept": len(top),
+        "failed": failed,
+    })
 
     print(
         f"✅ Scan complete: {scanned} scanned, {len(candidates)} passed filters, "

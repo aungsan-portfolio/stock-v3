@@ -202,3 +202,41 @@ IBKR_MARKET_DATA_TYPE = 3
 LOG_FILE            = LOG_DIR / "stock_engine.log"
 LOG_MAX_BYTES       = 10 * 1024 * 1024
 LOG_BACKUP_COUNT    = 5
+
+
+# ─── Guided Paper Trading Coach ─────────────────────────────────────────────
+# A read-mostly, beginner-friendly flow that turns ensemble signals into a
+# trade lesson + paper preview, and only places a paper order when the user
+# explicitly confirms with BOTH `--confirm` AND `--chart-checked`.
+# Default behavior is preview only; nothing here auto-buys.
+COACH_MIN_CONFIDENCE_FOR_CANDIDATE = 0.65
+COACH_REQUIRE_CHART_CHECK          = True
+COACH_REQUIRE_USER_CONFIRM         = True
+# Cap how many new trades a single `paper-coach` run can propose. That older
+# single-symbol flow is meant to teach, not to generate a batch of orders.
+COACH_MAX_NEW_TRADES_PER_RUN       = 1
+# Where the human-readable lesson / preview is written. Always written, even
+# when no order is placed, so the user has an audit trail.
+COACH_REPORT_FILE                  = REPORTS_DIR / "trade_coach_report.md"
+# When True, the coach refuses to propose a paper trade for any symbol that is
+# already in positions() or has a working order on the paper account.
+COACH_SKIP_IF_POSITION_OR_WORKING  = True
+
+# ─── Guided Daily Trading Coach (multi-trade PAPER practice) ────────────────
+# The `daily-coach` command scans the full market, previews the best BUY
+# candidates, and — only with BOTH --confirm AND --chart-checked — may place
+# up to COACH_MAX_PAPER_TRADES_PER_RUN *paper* orders in a single run so the
+# user can practice and learn faster. Every existing risk control still
+# applies (MAX_TRADE_VALUE, MAX_POSITION_PCT, MAX_OPEN_POSITIONS,
+# MAX_DAILY_TRADES, ALLOW_SHORT=False, REQUIRE_PAPER_PORT=True, the
+# duplicate-position/working-order guards, and live-snapshot-only pricing).
+#
+# Hard cap on how many PAPER trades one daily-coach run may place. This is an
+# upper bound: --max-trades can only LOWER it, never raise it.
+COACH_MAX_PAPER_TRADES_PER_RUN     = 3
+# How many top candidates the default (preview-only) daily-coach run shows.
+COACH_DEFAULT_PREVIEW_CANDIDATES   = 3
+# Master live-trading kill switch. This bot is PAPER-TRADING ONLY. This must
+# stay False; daily-coach refuses to run if anything tries to flip it True or
+# tries to connect on a non-paper port while REQUIRE_PAPER_PORT is True.
+COACH_LIVE_TRADING_ENABLED         = False
