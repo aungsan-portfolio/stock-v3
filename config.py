@@ -81,6 +81,15 @@ HOT_CANDIDATES_FILE  = REPORTS_DIR / "hot_candidates.csv"
 # Audit trail of exactly which symbols a scan selected (and why) before scanning.
 SELECTED_SCAN_SYMBOLS_FILE = REPORTS_DIR / "selected_scan_symbols.csv"
 
+# ── IPO / New Listing Watch (WATCH-ONLY) ─────────
+# Symbols tracked for visibility only. daily-coach always shows a separate
+# "IPO / New Listing Watch" section for these. They are NEVER auto-trained,
+# NEVER auto-traded, and NEVER placed as orders. A symbol here only becomes an
+# official BUY candidate if it independently passes the normal model/risk rules
+# (i.e. it is also discovered/scanned and the ensemble issues a BUY). New
+# listings with fewer than MIN_HISTORY_DAYS of history are flagged watch-only.
+IPO_WATCH_SYMBOLS = ["SPCX"]
+
 # ── Data Settings ────────────────────────────────
 PRICE_PERIOD        = "5y"
 PRICE_INTERVAL      = "1d"

@@ -68,6 +68,7 @@ from trade_coach import (
     assert_paper_trading_only, LiveTradingDisabledError,
     assess_chart_status, evaluate_daily_candidate, print_daily_candidate,
     build_daily_coach_summary, print_daily_coach_summary, write_daily_coach_summary,
+    build_ipo_watch_section,
 )
 
 # Candidate BUY thresholds swept by `threshold-report`. SELL_THRESHOLD is held
@@ -780,6 +781,76 @@ def _resolve_daily_n_candidates(args) -> "tuple[int, int, bool]":
     return n, hard_cap, clamped
 
 
+def _ipo_watch_fetch(symbol: str):
+    """Read-only OHLCV fetch for the IPO / New Listing watch section.
+
+    Deliberately bypasses data_manager.fetch_ohlcv's MIN_HISTORY_DAYS gate,
+    because a brand-new listing legitimately has very little history and this
+    section must still display it. Display-only: no caching into the trading
+    pipeline, no training, no trading, no orders. Returns a DataFrame or None.
+    """
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker(str(symbol).upper().strip())
+        df = ticker.history(period="max", interval="1d", auto_adjust=True)
+        if df is None or df.empty or "Close" not in df.columns:
+            return None
+        return df
+    except Exception:
+        return None
+
+
+def _ipo_watch_price_lookup(symbol: str):
+    """Read-only last-price lookup for the IPO / New Listing watch section.
+
+    Watch-only display. Never trains, never trades, never places an order.
+    Returns None if no data.
+    """
+    df = _ipo_watch_fetch(symbol)
+    if df is None or df.empty:
+        return None
+    try:
+        return float(df["Close"].iloc[-1])
+    except Exception:
+        return None
+
+
+def _ipo_watch_history_lookup(symbol: str):
+    """Read-only count of available daily history bars for a watch symbol.
+
+    Used only to flag insufficient model history (vs MIN_HISTORY_DAYS) so the
+    coach can mark a new listing as watch-only. Returns None if unavailable.
+    """
+    df = _ipo_watch_fetch(symbol)
+    if df is None or df.empty:
+        return None
+    try:
+        return int(len(df))
+    except Exception:
+        return None
+
+
+def _print_and_write_ipo_watch_section(report_path: str) -> None:
+    """Build, print, and append the watch-only IPO / New Listing section.
+
+    Always shown. Read-only display: no training, no trading, no orders.
+    """
+    section = build_ipo_watch_section(
+        price_lookup=_ipo_watch_price_lookup,
+        history_lookup=_ipo_watch_history_lookup,
+    )
+    print()
+    for ln in section:
+        print(ln)
+    try:
+        with open(report_path, "a", encoding="utf-8") as f:
+            f.write("\n## IPO / New Listing Watch\n\n```\n")
+            f.write("\n".join(section))
+            f.write("\n```\n")
+    except Exception:
+        pass
+
+
 def _daily_coach_preview(candidates, n_candidates: int, confirm: bool, chart_checked: bool) -> int:
     """Preview-only path: build lessons/previews, print, write notes. No orders."""
     print(
@@ -1027,6 +1098,7 @@ def _run_daily_coach(args, verbose: bool) -> int:
         print_daily_coach_summary(lines)
         report = write_daily_coach_summary(lines)
         print(f"\nReport written to {report}")
+        _print_and_write_ipo_watch_section(report)
         return 0
 
     signals = Predictor().predict_all(symbols=hot_symbols)
@@ -1035,6 +1107,7 @@ def _run_daily_coach(args, verbose: bool) -> int:
         print_daily_coach_summary(lines)
         report = write_daily_coach_summary(lines)
         print(f"\nReport written to {report}")
+        _print_and_write_ipo_watch_section(report)
         return 0
 
     candidates = select_coach_candidates(signals, max_n=n_candidates)
@@ -1065,6 +1138,12 @@ def _run_daily_coach(args, verbose: bool) -> int:
     print_daily_coach_summary(summary_lines)
     report = write_daily_coach_summary(summary_lines)
     print(f"\nReport written to {report}")
+
+    # -- Always show the watch-only IPO / New Listing section --
+    # Read-only display: never trains, trades, or places orders. A watch symbol
+    # only becomes an official BUY candidate if it independently passes the
+    # normal model/risk rules in the candidate flow above.
+    _print_and_write_ipo_watch_section(report)
 
     if not candidates:
         # No actionable BUY candidate; the summary above already explains why.

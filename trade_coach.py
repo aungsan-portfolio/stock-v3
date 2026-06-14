@@ -627,6 +627,67 @@ def build_daily_coach_summary(
     return lines
 
 
+def build_ipo_watch_section(price_lookup=None, history_lookup=None) -> List[str]:
+    """Build the watch-only "IPO / New Listing Watch" section.
+
+    Pure formatting + read-only data lookups. This NEVER trains, NEVER trades,
+    NEVER places an order, and NEVER promotes a symbol to an official BUY
+    candidate. Symbols come from config.IPO_WATCH_SYMBOLS and are always labelled
+    WATCH_ONLY_NEW_LISTING.
+
+    Args:
+        price_lookup:   optional callable(symbol) -> float|None for last price.
+        history_lookup: optional callable(symbol) -> int|None for number of
+                        available history days (used to flag insufficient model
+                        history vs config.MIN_HISTORY_DAYS).
+
+    The section is ALWAYS rendered (even with no data) so the user consistently
+    sees that these symbols are watch-only.
+    """
+    symbols = list(getattr(config, "IPO_WATCH_SYMBOLS", []) or [])
+    min_history = int(getattr(config, "MIN_HISTORY_DAYS", 252))
+
+    lines: List[str] = []
+    lines.append("IPO / New Listing Watch")
+    lines.append("These symbols are WATCH_ONLY_NEW_LISTING: shown for visibility")
+    lines.append("only. They are never auto-trained, auto-traded, or ordered, and")
+    lines.append("only become a BUY candidate if they pass the normal model/risk rules.")
+    if not symbols:
+        lines.append("(no IPO / new listing symbols configured)")
+        return lines
+
+    for sym in symbols:
+        sym = str(sym).upper().strip()
+        if not sym:
+            continue
+
+        price = None
+        if callable(price_lookup):
+            try:
+                price = price_lookup(sym)
+            except Exception:  # read-only display must never break the coach
+                price = None
+
+        history_days = None
+        if callable(history_lookup):
+            try:
+                history_days = history_lookup(sym)
+            except Exception:
+                history_days = None
+
+        price_str = _format_money(price) if price is not None else "n/a (no data)"
+        lines.append("")
+        lines.append(f"{sym} | WATCH_ONLY_NEW_LISTING | Price: {price_str}")
+
+        if history_days is not None and history_days < min_history:
+            lines.append(
+                f"{sym} is a new listing. Model history is insufficient, "
+                "so this is watch-only."
+            )
+
+    return lines
+
+
 def print_daily_coach_summary(lines: List[str]) -> None:
     """Print the daily-coach summary lines (ASCII, Windows-safe)."""
     print()
