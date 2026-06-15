@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.model_selection import TimeSeriesSplit
 
 import config
 from data_manager import (
@@ -45,6 +46,19 @@ def _atomic_dump(obj, path) -> None:
     except OSError:
         pass
     os.replace(tmp, path)
+
+
+def _subsample_train_indices(n: int, horizon: int) -> np.ndarray:
+    """Decorrelate overlapping horizon labels by keeping every ``horizon``-th
+    training row. Labels built with a forward horizon share future bars with
+    their neighbors, so adjacent rows are not independent; striding by the
+    horizon removes most of that overlap. Applied to TRAINING rows only —
+    evaluation/test rows are always kept intact.
+    """
+    horizon = max(1, int(horizon))
+    if n <= 0:
+        return np.empty(0, dtype=int)
+    return np.arange(0, n, horizon, dtype=int)
 
 
 def build_rf(oob_score: bool = False) -> RandomForestClassifier:
@@ -88,31 +102,68 @@ class StockRFEngine:
                     logger.warning("Only one class in labels for %s — skipping", symbol)
                     continue
 
-                split = int(len(X) * (1 - config.ML_TEST_RATIO))
-                X_tr, X_te = X[:split], X[split:]
-                y_tr, y_te = y[:split], y[split:]
+                # ── Walk-forward cross-validation (no shuffling, no leakage) ──
+                # TimeSeriesSplit always trains on the past and tests on the
+                # immediate future. Training rows in each fold are decorrelated
+                # by striding ML_HORIZON; TEST rows are kept untouched so the
+                # reported metrics reflect every out-of-sample bar.
+                horizon = int(config.ML_HORIZON)
+                n_splits = 5
+                fold_acc, fold_prec, fold_rec, fold_f1 = [], [], [], []
+                n_train_eval = 0
+                n_test_eval = 0
 
-                if len(X_te) == 0 or len(np.unique(y_tr)) < 2:
-                    logger.warning("Invalid RF split for %s — skipping", symbol)
+                if len(X) < n_splits + 1:
+                    logger.warning("Not enough rows for CV on %s (n=%d)", symbol, len(X))
                     continue
 
-                eval_clf = build_rf(oob_score=True)
-                eval_clf.fit(X_tr, y_tr)
-                pred = eval_clf.predict(X_te)
+                tscv = TimeSeriesSplit(n_splits=n_splits)
+                for tr_idx, te_idx in tscv.split(X):
+                    sub = _subsample_train_indices(len(tr_idx), horizon)
+                    tr_idx_sub = tr_idx[sub]
+                    X_tr, y_tr = X[tr_idx_sub], y[tr_idx_sub]
+                    X_te, y_te = X[te_idx], y[te_idx]
 
-                # Refit the saved production model on all valid rows after evaluation.
+                    if len(X_tr) == 0 or len(np.unique(y_tr)) < 2 or len(X_te) == 0:
+                        continue
+
+                    fold_clf = build_rf()
+                    fold_clf.fit(X_tr, y_tr)
+                    pred = fold_clf.predict(X_te)
+
+                    fold_acc.append(accuracy_score(y_te, pred))
+                    fold_prec.append(precision_score(y_te, pred, zero_division=0))
+                    fold_rec.append(recall_score(y_te, pred, zero_division=0))
+                    fold_f1.append(f1_score(y_te, pred, zero_division=0))
+                    n_train_eval += len(X_tr)
+                    n_test_eval += len(X_te)
+
+                if not fold_acc:
+                    logger.warning("No usable CV folds for %s — skipping", symbol)
+                    continue
+
+                # Refit the saved production model after evaluation. Train on the
+                # same ML_HORIZON-strided rows the CV folds used so the production
+                # model sees the decorrelated label set; fall back to all rows if
+                # the subsample collapses to a single class.
+                final_sub = _subsample_train_indices(len(X), horizon)
+                X_final, y_final = X[final_sub], y[final_sub]
+                if len(np.unique(y_final)) < 2:
+                    X_final, y_final = X, y
                 final_clf = build_rf(oob_score=True)
-                final_clf.fit(X, y)
+                final_clf.fit(X_final, y_final)
 
                 new_models[symbol] = final_clf
                 results[symbol] = {
                     "oob_score": round(float(getattr(final_clf, "oob_score_", float("nan"))), 4),
-                    "test_acc": round(float(accuracy_score(y_te, pred)), 4),
-                    "test_precision": round(float(precision_score(y_te, pred, zero_division=0)), 4),
-                    "test_recall": round(float(recall_score(y_te, pred, zero_division=0)), 4),
-                    "test_f1": round(float(f1_score(y_te, pred, zero_division=0)), 4),
-                    "n_train_eval": int(len(X_tr)),
-                    "n_test_eval": int(len(X_te)),
+                    "test_acc": round(float(np.mean(fold_acc)), 4),
+                    "test_precision": round(float(np.mean(fold_prec)), 4),
+                    "test_recall": round(float(np.mean(fold_rec)), 4),
+                    "test_f1": round(float(np.mean(fold_f1)), 4),
+                    "cv_folds": int(len(fold_acc)),
+                    "n_train_eval": int(n_train_eval),
+                    "n_test_eval": int(n_test_eval),
+                    "n_train_final": int(len(X_final)),
                     "n_samples": int(len(X)),
                     "positive_rate": round(float(np.mean(y)), 4),
                 }

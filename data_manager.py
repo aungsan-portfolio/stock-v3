@@ -72,7 +72,10 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     f["sma_short"] = close.rolling(config.SMA_SHORT).mean()
     f["sma_long"] = close.rolling(config.SMA_LONG).mean()
     f["ema"] = close.ewm(span=config.EMA_PERIOD, adjust=False).mean()
-    f["sma_cross"] = f["sma_short"] - f["sma_long"]
+    # Close-normalized so the feature is comparable across price levels/symbols
+    # instead of carrying raw dollar magnitude.
+    f["sma_cross"] = (f["sma_short"] - f["sma_long"]) / close
+    f["dist_ema"] = (close - f["ema"]) / close
 
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(config.RSI_PERIOD).mean()
@@ -82,9 +85,13 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
     ema_fast = close.ewm(span=config.MACD_FAST, adjust=False).mean()
     ema_slow = close.ewm(span=config.MACD_SLOW, adjust=False).mean()
-    f["macd"] = ema_fast - ema_slow
-    f["macd_sig"] = f["macd"].ewm(span=config.MACD_SIGNAL, adjust=False).mean()
-    f["macd_hist"] = f["macd"] - f["macd_sig"]
+    macd = ema_fast - ema_slow
+    macd_sig = macd.ewm(span=config.MACD_SIGNAL, adjust=False).mean()
+    macd_hist = macd - macd_sig
+    # Close-normalized MACD family so magnitudes are price-level independent.
+    f["macd"] = macd / close
+    f["macd_sig"] = macd_sig / close
+    f["macd_hist"] = macd_hist / close
 
     bb_mid = close.rolling(config.BOLLINGER_PERIOD).mean()
     bb_std = close.rolling(config.BOLLINGER_PERIOD).std()
@@ -119,36 +126,46 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return f
 
 
-def make_labels(df: pd.DataFrame, horizon: int = None) -> pd.Series:
+def make_labels(
+    df: pd.DataFrame, horizon: int = None, min_profit_margin: float = None
+) -> pd.Series:
     """
     Create binary labels for future direction.
 
+    A row is labeled 1.0 only when the forward return clears
+    ``min_profit_margin`` (default ``config.MIN_PROFIT_MARGIN``), so the models
+    learn to predict moves big enough to cover round-trip costs, not microscopic
+    noise that nets a loss after fees + slippage.
+
     Returns:
-        1.0 if Close[t+horizon] > Close[t]
-        0.0 if Close[t+horizon] <= Close[t]
+        1.0 if Close[t+horizon] / Close[t] - 1 > min_profit_margin
+        0.0 otherwise (move too small, flat, or negative)
         NaN for rows where the future close is unknown
 
-    Important: do NOT cast `(future_return > 0)` directly to int, because
-    NaN > 0 becomes False and silently creates fake 0 labels at the end.
+    Important: do NOT cast `(future_return > margin)` directly to int over the
+    whole series, because NaN > margin becomes False and silently creates fake
+    0 labels at the end.
     """
     horizon = horizon or config.ML_HORIZON
     if horizon <= 0:
         raise ValueError("horizon must be a positive integer")
     if "Close" not in df.columns:
         raise ValueError("make_labels() requires a 'Close' column")
+    if min_profit_margin is None:
+        min_profit_margin = config.MIN_PROFIT_MARGIN
 
     future_return = df["Close"].shift(-horizon) / df["Close"] - 1.0
     labels = pd.Series(index=df.index, dtype="float64")
 
     valid = future_return.notna()
-    labels.loc[valid] = (future_return.loc[valid] > 0).astype(float)
+    labels.loc[valid] = (future_return.loc[valid] > min_profit_margin).astype(float)
     return labels
 
 
 def get_feature_columns() -> list:
     return [
         "sma_cross",
-        "ema",
+        "dist_ema",
         "rsi",
         "macd",
         "macd_sig",

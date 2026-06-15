@@ -139,6 +139,9 @@ def apply_position_rule_with_hold(
     allow_short: bool,
     bars_held: int,
     min_hold: int,
+    entry_price: Optional[float] = None,
+    current_price: Optional[float] = None,
+    hard_stop_pct: Optional[float] = None,
 ) -> Tuple[int, bool, str, int]:
     """Advance a unit position by one bar according to a broker-like rule.
 
@@ -151,19 +154,39 @@ def apply_position_rule_with_hold(
       signals are ignored and the position is kept.
     - BUY/SELL never flip the position in a single bar; they close to flat first
       (mirrors ``IBKRBridge.execute_signal``).
+    - Hard-stop backstop: a long position whose current return has fallen below
+      ``-hard_stop_pct`` is closed immediately, BYPASSING the ``min_hold`` guard
+      and whatever signal arrived this bar. This is the worst-case loss cap and
+      applies to LONGS ONLY (shorts are intentionally not bypassed here).
 
     Args:
-        position:   current unit position, one of -1, 0, +1.
-        signal:     "BUY", "SELL" or "HOLD".
-        allow_short: whether a flat SELL may open a short.
-        bars_held:  bars the current position has been open (0 when flat).
-        min_hold:   minimum bars before an opposite signal may close.
+        position:      current unit position, one of -1, 0, +1.
+        signal:        "BUY", "SELL" or "HOLD".
+        allow_short:   whether a flat SELL may open a short.
+        bars_held:     bars the current position has been open (0 when flat).
+        min_hold:      minimum bars before an opposite signal may close.
+        entry_price:   fill price of the open long (required for the hard stop).
+        current_price: latest price used to evaluate the hard stop.
+        hard_stop_pct: positive fraction; long closes when current return
+                       < -hard_stop_pct. Pass None to disable the hard stop.
 
     Returns:
         (new_position, executed, note, new_bars_held)
     """
     signal = signal.upper()
     min_hold = max(1, int(min_hold))
+
+    # ── Hard-stop backstop (long-only, bypasses min_hold and the signal) ──
+    if (
+        position > 0
+        and hard_stop_pct is not None
+        and entry_price is not None
+        and current_price is not None
+        and entry_price > 0
+    ):
+        current_return = float(current_price) / float(entry_price) - 1.0
+        if current_return < -abs(float(hard_stop_pct)):
+            return 0, True, f"hard-stop ({current_return:.4f})", 0
 
     if signal == "BUY":
         if position > 0:

@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 import config
-from ai_engine import build_rf
+from ai_engine import build_rf, _subsample_train_indices
 from data_manager import fetch_ohlcv, build_features, make_labels, get_feature_columns
 from predictor import (
     action_from_confidence,
@@ -168,6 +168,7 @@ def run_backtest(
     include_lstm = bool(config.BACKTEST_INCLUDE_LSTM if include_lstm is None else include_lstm)
     allow_short = bool(config.ALLOW_SHORT)
     min_hold = int(config.MIN_HOLD_BARS)
+    horizon = int(config.ML_HORIZON)
     cost_per_order = float(config.BACKTEST_TRANSACTION_COST_PCT) + float(config.BACKTEST_SLIPPAGE_PCT)
 
     all_rows: list = []
@@ -189,6 +190,7 @@ def run_backtest(
             X_all = feat.loc[valid_idx, FEATURE_COLS].values.astype(np.float32)
             y_all = labels.loc[valid_idx].values.astype(int)
             next_ret_all = next_ret.loc[valid_idx].values.astype(float)
+            close_all = feat.loc[valid_idx, "Close"].values.astype(float)
             idx_all = list(valid_idx)
             tech_all = np.asarray(
                 [technical_score_from_feature_row(feat.loc[i]) for i in valid_idx],
@@ -201,11 +203,14 @@ def run_backtest(
 
             position = 0
             bars_held = 0
+            entry_price = None
             equity = [1.0]
             daily_pnls: List[float] = []
             rows: List[dict] = []
             n_orders = 0
+            n_hard_stop_exits = 0
             n_lstm_folds = 0
+            hard_stop_pct = float(config.HARD_STOP_LOSS_PCT)
 
             for start in range(train_min, len(X_all) - step + 1, step):
                 X_tr = X_all[:start]
@@ -214,12 +219,22 @@ def run_backtest(
                 ret_te = next_ret_all[start:start + step]
                 idx_te = idx_all[start:start + step]
                 tech_te = tech_all[start:start + step]
+                close_te = close_all[start:start + step]
 
                 if len(np.unique(y_tr)) < 2:
                     logger.debug("Only one class in train window: %s start=%d", symbol, start)
                     continue
 
-                rf_scores = _rf_scores_for_fold(X_tr, y_tr, X_te)
+                # Decorrelate overlapping forward-horizon labels by striding the
+                # TRAINING rows only (ML_HORIZON), matching ai_engine's CV folds.
+                # Test rows (X_te) are kept intact. Fall back to the full window
+                # if the stride collapses the labels to a single class.
+                sub = _subsample_train_indices(len(X_tr), horizon)
+                X_tr_sub, y_tr_sub = X_tr[sub], y_tr[sub]
+                if len(np.unique(y_tr_sub)) < 2:
+                    X_tr_sub, y_tr_sub = X_tr, y_tr
+
+                rf_scores = _rf_scores_for_fold(X_tr_sub, y_tr_sub, X_te)
                 rf_ok = True
                 if include_lstm:
                     lstm_scores, lstm_ok = _optional_lstm_scores_for_fold(X_all, y_all, start, len(X_te))
@@ -228,8 +243,8 @@ def run_backtest(
                     lstm_scores = np.full(len(X_te), 0.5, dtype=float)
                     lstm_ok = False
 
-                for dt, rf_score, lstm_score, tech_score, market_ret in zip(
-                    idx_te, rf_scores, lstm_scores, tech_te, ret_te
+                for dt, rf_score, lstm_score, tech_score, market_ret, close_px in zip(
+                    idx_te, rf_scores, lstm_scores, tech_te, ret_te, close_te
                 ):
                     conf = weighted_blend(
                         float(rf_score), rf_ok,
@@ -240,11 +255,37 @@ def run_backtest(
                     old_position = position
 
                     # ── horizon-aware position update (shared helper) ──
+                    # entry_price/current_price/hard_stop_pct let the helper apply
+                    # the worst-case hard-stop backstop on open longs, bypassing
+                    # min_hold — identical logic to the live bridge.
                     position, executed, exec_note, bars_held = apply_position_rule_with_hold(
                         position, signal, allow_short, bars_held, min_hold,
+                        entry_price=entry_price,
+                        current_price=float(close_px),
+                        hard_stop_pct=hard_stop_pct,
                     )
                     if executed:
                         n_orders += 1
+                        if exec_note.startswith("hard-stop"):
+                            n_hard_stop_exits += 1
+
+                    # Track entry price across bars: set it when a long opens,
+                    # clear it whenever we return to flat.
+                    prev_entry_price = entry_price
+                    if position > 0 and old_position <= 0:
+                        entry_price = float(close_px)
+                    elif position == 0:
+                        entry_price = None
+
+                    # For the ledger row, preserve the prior entry price on a
+                    # hard-stop exit (the stop has just closed the long and
+                    # cleared entry_price) so the row that triggered the stop
+                    # still shows the price it was measured against.
+                    row_entry_price = (
+                        prev_entry_price
+                        if exec_note.startswith("hard-stop")
+                        else entry_price
+                    )
 
                     # Decision at close[t], position after the order earns close[t]→close[t+1].
                     gross_pnl = float(position) * float(market_ret)
@@ -268,6 +309,9 @@ def run_backtest(
                         "bars_held": int(bars_held),
                         "order_executed": bool(executed),
                         "execution_note": exec_note,
+                        "hard_stop_exit": bool(exec_note.startswith("hard-stop")),
+                        "entry_price": round(float(row_entry_price), 6) if row_entry_price is not None else "",
+                        "close_price": round(float(close_px), 6),
                         "next_day_return": round(float(market_ret), 8),
                         "gross_pnl": round(float(gross_pnl), 8),
                         "cost": round(float(cost), 8),
@@ -297,11 +341,13 @@ def run_backtest(
                 "win_rate_active_days": round(win_rate, 4),
                 "win_rate_order_days": round(order_win_rate, 4),
                 "n_orders": int(n_orders),
+                "n_hard_stop_exits": int(n_hard_stop_exits),
                 "n_bars": int(len(rows)),
                 "n_active_days": int(sum(1 for r in rows if r["new_position"] != 0)),
                 "final_position": int(position),
                 "lstm_folds_used": int(n_lstm_folds),
                 "min_hold_bars": int(min_hold),
+                "hard_stop_pct": round(hard_stop_pct, 6),
             }
             if verbose:
                 logger.info(
@@ -317,6 +363,7 @@ def run_backtest(
         aggregate = {
             "symbols_tested": len(symbol_metrics),
             "total_trades": int(sum(m["n_orders"] for m in symbol_metrics.values())),
+            "total_hard_stop_exits": int(sum(m["n_hard_stop_exits"] for m in symbol_metrics.values())),
             "total_bars": int(sum(m["n_bars"] for m in symbol_metrics.values())),
             "avg_total_return": round(float(np.mean([m["total_return"] for m in symbol_metrics.values()])), 4),
             "avg_sharpe": round(float(np.mean([m["sharpe_ratio"] for m in symbol_metrics.values()])), 4),
@@ -328,6 +375,7 @@ def run_backtest(
         aggregate = {
             "symbols_tested": 0,
             "total_trades": 0,
+            "total_hard_stop_exits": 0,
             "total_bars": 0,
             "avg_total_return": 0.0,
             "avg_sharpe": 0.0,
@@ -341,6 +389,7 @@ def run_backtest(
         "include_lstm": bool(include_lstm),
         "allow_short": bool(allow_short),
         "min_hold_bars": int(min_hold),
+        "hard_stop_pct": round(float(config.HARD_STOP_LOSS_PCT), 6),
         "cost_per_order": round(float(cost_per_order), 8),
         "position_state_simulation": True,
         "note": (

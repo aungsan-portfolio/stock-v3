@@ -158,6 +158,13 @@ MAX_OPEN_POSITIONS  = 3
 STOP_LOSS_PCT       = 0.004   # -0.40% initial protective stop
 TAKE_PROFIT_PCT     = 0.015   # fallback fixed-bracket TP when trailing is disabled
 
+# Minimum forward return required for a BUY label. Set above broker fee + slippage
+# round trip so the model learns to cover costs, not microscopic moves.
+MIN_PROFIT_MARGIN   = 0.003
+# Absolute backstop exit. A hard stop that overrides trailing logic to cap the
+# worst-case loss on any single position regardless of other exit settings.
+HARD_STOP_LOSS_PCT  = 0.03
+
 # Winner management. Native trailing stop lets a correct trade keep running while
 # protecting profit when price reverses from its high.
 USE_TRAILING_EXIT   = True

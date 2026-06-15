@@ -133,6 +133,79 @@ class TestPositionRuleShortEnabled(unittest.TestCase):
         self.assertEqual(pos, 0)
 
 
+# ── 2b. apply_position_rule_with_hold — hard-stop backstop ───────────
+class TestHardStopBypass(unittest.TestCase):
+    def setUp(self):
+        from predictor import apply_position_rule_with_hold
+        self.step = apply_position_rule_with_hold
+
+    def test_hard_stop_closes_long_bypassing_min_hold(self):
+        # Long held only 1 bar (min_hold=5) but price fell 5% (> 3% stop) →
+        # the hard stop must close it immediately despite the hold guard.
+        pos, executed, note, held = self.step(
+            1, "HOLD", False, 1, 5,
+            entry_price=100.0, current_price=95.0, hard_stop_pct=0.03,
+        )
+        self.assertEqual(pos, 0)
+        self.assertTrue(executed)
+        self.assertEqual(held, 0)
+        self.assertTrue(note.startswith("hard-stop"))
+
+    def test_hard_stop_bypasses_even_a_buy_signal(self):
+        # A BUY arriving on a deeply underwater long still triggers the stop.
+        pos, executed, note, _ = self.step(
+            1, "BUY", False, 10, 5,
+            entry_price=50.0, current_price=40.0, hard_stop_pct=0.03,
+        )
+        self.assertEqual(pos, 0)
+        self.assertTrue(executed)
+        self.assertTrue(note.startswith("hard-stop"))
+
+    def test_no_bypass_when_loss_within_threshold(self):
+        # Down 2% only (< 3% stop) → normal min_hold rules apply, no hard stop.
+        pos, executed, note, held = self.step(
+            1, "HOLD", False, 1, 5,
+            entry_price=100.0, current_price=98.0, hard_stop_pct=0.03,
+        )
+        self.assertEqual(pos, 1)
+        self.assertFalse(executed)
+        self.assertEqual(held, 2)
+        self.assertFalse(note.startswith("hard-stop"))
+
+    def test_no_bypass_when_hard_stop_pct_is_none(self):
+        # Disabled hard stop → falls through to the ordinary hold logic.
+        pos, executed, note, _ = self.step(
+            1, "HOLD", False, 1, 5,
+            entry_price=100.0, current_price=50.0, hard_stop_pct=None,
+        )
+        self.assertEqual(pos, 1)
+        self.assertFalse(executed)
+        self.assertFalse(note.startswith("hard-stop"))
+
+    def test_no_bypass_without_prices(self):
+        # Missing entry/current price → hard stop cannot evaluate, no bypass.
+        pos, executed, _, _ = self.step(
+            1, "HOLD", False, 1, 5,
+            entry_price=None, current_price=None, hard_stop_pct=0.03,
+        )
+        self.assertEqual(pos, 1)
+        self.assertFalse(executed)
+
+    def test_hard_stop_does_not_touch_short_positions(self):
+        # Backstop is long-only: an adverse short move is not force-closed here.
+        pos, executed, _, _ = self.step(
+            -1, "HOLD", True, 1, 5,
+            entry_price=100.0, current_price=200.0, hard_stop_pct=0.03,
+        )
+        self.assertEqual(pos, -1)
+        self.assertFalse(executed)
+
+    def test_backward_compatible_without_hard_stop_args(self):
+        # Existing 5-arg callers keep working unchanged (hard stop defaults off).
+        pos, executed, note, held = self.step(0, "BUY", False, 0, 1)
+        self.assertEqual((pos, executed, note, held), (1, True, "open-long", 1))
+
+
 # ── 3. min_hold bars guard ───────────────────────────────────────────
 class TestMinHoldGuard(unittest.TestCase):
     def setUp(self):
@@ -318,6 +391,100 @@ class TestBacktestReportWrite(unittest.TestCase):
             self.assertIn(col, trades.columns)
         # min_hold reported in metrics equals config value.
         self.assertEqual(result["min_hold_bars"], config.MIN_HOLD_BARS)
+
+
+# ── 6b. Feature normalization (data_manager.build_features) ──────────
+class TestFeatureNormalization(unittest.TestCase):
+    def setUp(self):
+        from data_manager import build_features, get_feature_columns
+        self.feat = build_features(make_ohlcv(n=300, seed=3))
+        self.cols = get_feature_columns()
+
+    def test_raw_ema_dropped_dist_ema_added(self):
+        # Raw, price-scaled `ema` must no longer be a model feature; the
+        # close-normalized `dist_ema` replaces it.
+        self.assertNotIn("ema", self.cols)
+        self.assertIn("dist_ema", self.cols)
+        self.assertIn("dist_ema", self.feat.columns)
+
+    def test_dist_ema_is_close_normalized(self):
+        expected = (self.feat["Close"] - self.feat["ema"]) / self.feat["Close"]
+        np.testing.assert_allclose(
+            self.feat["dist_ema"].values, expected.values, rtol=1e-9, atol=1e-12
+        )
+
+    def test_sma_cross_is_close_normalized(self):
+        expected = (self.feat["sma_short"] - self.feat["sma_long"]) / self.feat["Close"]
+        np.testing.assert_allclose(
+            self.feat["sma_cross"].values, expected.values, rtol=1e-9, atol=1e-12
+        )
+
+    def test_macd_family_is_close_normalized(self):
+        # All three MACD features are small (divided by close), not raw dollars.
+        for col in ("macd", "macd_sig", "macd_hist"):
+            self.assertIn(col, self.feat.columns)
+            self.assertLess(
+                self.feat[col].abs().max(), 1.0,
+                f"{col} should be close-normalized, not raw price magnitude",
+            )
+
+    def test_macd_hist_equals_macd_minus_signal(self):
+        np.testing.assert_allclose(
+            self.feat["macd_hist"].values,
+            (self.feat["macd"] - self.feat["macd_sig"]).values,
+            rtol=1e-9, atol=1e-12,
+        )
+
+    def test_all_feature_columns_present_and_finite(self):
+        for col in self.cols:
+            self.assertIn(col, self.feat.columns)
+        self.assertTrue(np.isfinite(self.feat[self.cols].values).all())
+
+
+# ── 6c. make_labels MIN_PROFIT_MARGIN threshold ──────────────────────
+class TestMakeLabelsThreshold(unittest.TestCase):
+    def setUp(self):
+        from data_manager import make_labels
+        self.make_labels = make_labels
+
+    def _df(self, closes):
+        idx = pd.bdate_range("2021-01-01", periods=len(closes))
+        return pd.DataFrame({"Close": np.asarray(closes, dtype=float)}, index=idx)
+
+    def test_small_gain_below_margin_is_label_zero(self):
+        # +0.1% over the horizon, margin 0.3% → not a BUY (must be 0).
+        df = self._df([100.0, 100.1, 100.1])
+        labels = self.make_labels(df, horizon=1, min_profit_margin=0.003)
+        self.assertEqual(labels.iloc[0], 0.0)
+
+    def test_gain_above_margin_is_label_one(self):
+        # +1% over the horizon, margin 0.3% → BUY (label 1).
+        df = self._df([100.0, 101.0, 101.0])
+        labels = self.make_labels(df, horizon=1, min_profit_margin=0.003)
+        self.assertEqual(labels.iloc[0], 1.0)
+
+    def test_future_unknown_rows_are_nan(self):
+        df = self._df([100.0, 101.0, 102.0])
+        labels = self.make_labels(df, horizon=1, min_profit_margin=0.003)
+        self.assertTrue(np.isnan(labels.iloc[-1]))
+
+    def test_default_margin_comes_from_config(self):
+        # A move exactly at +MIN_PROFIT_MARGIN is NOT > margin → label 0;
+        # a clearly larger move is label 1. Confirms config wiring.
+        m = config.MIN_PROFIT_MARGIN
+        df = self._df([100.0, 100.0 * (1.0 + m), 100.0 * (1.0 + m + 0.01)])
+        labels = self.make_labels(df, horizon=1)
+        self.assertEqual(labels.iloc[0], 0.0)   # exactly at margin, not above
+        self.assertEqual(labels.iloc[1], 1.0)   # above margin
+
+    def test_higher_margin_labels_fewer_positives(self):
+        df = make_ohlcv(n=200, seed=5)
+        low = self.make_labels(df, horizon=5, min_profit_margin=0.0)
+        high = self.make_labels(df, horizon=5, min_profit_margin=0.05)
+        self.assertGreaterEqual(
+            int(low.sum()), int(high.sum()),
+            "a higher profit margin must not increase the positive count",
+        )
 
 
 # ── 7. config.MIN_HOLD_BARS = ML_HORIZON ─────────────────────────────

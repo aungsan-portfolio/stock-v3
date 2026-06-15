@@ -70,6 +70,20 @@ class LSTMModel(nn.Module):
         return self.head(out[:, -1, :]).squeeze(-1)
 
 
+def _subsample_train_sequences(
+    X_tr: np.ndarray, y_tr: np.ndarray, horizon: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Stride training sequences by ``horizon`` to decorrelate overlapping
+    forward-horizon labels. TRAINING rows only — validation sequences are never
+    touched, so early stopping still sees every out-of-sample bar.
+    """
+    horizon = max(1, int(horizon))
+    if len(X_tr) == 0:
+        return X_tr, y_tr
+    keep = np.arange(0, len(X_tr), horizon, dtype=int)
+    return X_tr[keep], y_tr[keep]
+
+
 def _make_sequences(
     features: np.ndarray,
     labels: np.ndarray,
@@ -194,6 +208,17 @@ class StockLSTMEngine:
 
                 X_tr, y_tr, X_val, y_val, mean, std = self._split_and_scale(X_raw, y_raw)
 
+                # Decorrelate overlapping horizon labels on TRAIN sequences only.
+                # Validation sequences are left intact for honest early stopping.
+                n_train_seq_full = int(len(X_tr))
+                X_tr, y_tr = _subsample_train_sequences(X_tr, y_tr, config.ML_HORIZON)
+                if len(np.unique(y_tr)) < 2:
+                    logger.warning(
+                        "%s LSTM train collapsed to one class after horizon "
+                        "subsampling — using full train sequences", symbol,
+                    )
+                    X_tr, y_tr, X_val, y_val, mean, std = self._split_and_scale(X_raw, y_raw)
+
                 neg = float((y_tr == 0).sum())
                 pos = float((y_tr == 1).sum())
                 pos_weight = torch.tensor([neg / max(pos, 1.0)], dtype=torch.float32, device=DEVICE)
@@ -264,12 +289,15 @@ class StockLSTMEngine:
                 results[symbol] = {
                     "best_val_loss": round(float(best_val_loss), 4),
                     "n_train_seq": int(len(X_tr)),
+                    "n_train_seq_full": int(n_train_seq_full),
                     "n_val_seq": int(len(X_val)),
+                    "train_subsample_horizon": int(max(1, int(config.ML_HORIZON))),
                 }
                 if verbose:
                     logger.info(
-                        "%s LSTM val_loss=%.4f train_seq=%d val_seq=%d",
-                        symbol, best_val_loss, len(X_tr), len(X_val),
+                        "%s LSTM val_loss=%.4f train_seq=%d/%d (stride=%d) val_seq=%d",
+                        symbol, best_val_loss, len(X_tr), n_train_seq_full,
+                        max(1, int(config.ML_HORIZON)), len(X_val),
                     )
 
             except Exception:
