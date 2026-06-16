@@ -7,7 +7,8 @@ reports/LIVE_TRADING_IMPLEMENTATION_PLAN_MM.md:
 
   * live_invariants  - pure safety-invariant checkers (unprotected longs, dup refs)
   * order_audit      - side-effect-only JSONL order-lifecycle log
-  * ibkr_bridge      - live-readiness capability flags (must be False in Phase 0)
+  * ibkr_bridge      - live-readiness capability flags (Phase-2 flags now True;
+                       Phases 3-6 still False until built)
   * main             - the read-only `live-readiness` scorecard (NOT READY today)
 
 Run with:
@@ -130,6 +131,7 @@ def _import_bridge():
 
 
 class TestCapabilityFlagsBaseline(unittest.TestCase):
+    # Every capability flag must exist on the bridge so the scorecard can read it.
     CAPABILITIES = [
         "SUPPORTS_FILL_VERIFICATION",
         "SUPPORTS_PARTIAL_FILL_HANDLING",
@@ -141,13 +143,43 @@ class TestCapabilityFlagsBaseline(unittest.TestCase):
         "SUPPORTS_STARTUP_RECONCILIATION",
         "SUPPORTS_ACCOUNT_TYPE_ASSERTION",
     ]
+    # Phase 2 (H4-H7) is implemented AND covered (test_order_exec.py +
+    # test_ibkr_fill_flow.py), so these flip True -- the only honest way to flip a
+    # flag. See reports/LIVE_TRADING_IMPLEMENTATION_PLAN_MM.md.
+    PHASE2_IMPLEMENTED = [
+        "SUPPORTS_FILL_VERIFICATION",
+        "SUPPORTS_PARTIAL_FILL_HANDLING",
+        "SUPPORTS_PROTECTIVE_CHILD_VERIFY",
+    ]
+    # Phases 3-6 are not built yet; their flags must stay False (fail-closed).
+    LATER_PHASE_FALSE = [
+        "SUPPORTS_SERVER_SIDE_GTC_STOP",
+        "SUPPORTS_DAILY_LOSS_KILLSWITCH",
+        "SUPPORTS_REALTIME_DATA_GUARD",
+        "SUPPORTS_MARKET_HOURS_GATE",
+        "SUPPORTS_STARTUP_RECONCILIATION",
+        "SUPPORTS_ACCOUNT_TYPE_ASSERTION",
+    ]
 
-    def test_all_capability_flags_present_and_false(self):
+    def test_all_capability_flags_present(self):
         br = _import_bridge()
         if br is None:
             self.skipTest("ib_insync/ibkr_bridge unavailable")
         for name in self.CAPABILITIES:
             self.assertTrue(hasattr(br, name), f"missing capability flag {name}")
+
+    def test_phase2_flags_true_because_implemented_and_tested(self):
+        br = _import_bridge()
+        if br is None:
+            self.skipTest("ib_insync/ibkr_bridge unavailable")
+        for name in self.PHASE2_IMPLEMENTED:
+            self.assertTrue(getattr(br, name), f"{name} must be True once Phase 2 ships")
+
+    def test_later_phase_flags_still_false(self):
+        br = _import_bridge()
+        if br is None:
+            self.skipTest("ib_insync/ibkr_bridge unavailable")
+        for name in self.LATER_PHASE_FALSE:
             self.assertFalse(getattr(br, name), f"{name} must be False until its phase ships")
 
     def test_flatten_all_method_exists(self):

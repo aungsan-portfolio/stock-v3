@@ -202,6 +202,19 @@ MAX_DAILY_LOSS_USD   = 150.0
 # Do not use yesterday's/daily historical close as the price source for order placement.
 ALLOW_HISTORICAL_PRICE_FOR_ORDERS = False
 
+# ── Phase 2: Order execution robustness (H4-H9) ──
+# Fill-driven confirmation replaces the old fixed ib.sleep(1) "accepted" check.
+# How long to wait for an order to reach a terminal (Filled/Cancelled) state
+# before classifying it WORKING/TIMEOUT, and how often to poll the event loop
+# while waiting. Kept short so a one-shot run does not hang; a timed-out order
+# still rests at the broker and is reconciled by the duplicate/working-order
+# guards on the next run.
+ORDER_FILL_TIMEOUT_SECONDS = 8.0
+ORDER_POLL_SECONDS         = 0.25
+# Robust close: how many escalating attempts (marketable-limit -> market) to make
+# to drive a close to remaining == 0 before giving up and alerting.
+CLOSE_MAX_ATTEMPTS         = 3
+
 # ── Backtest Settings ────────────────────────────
 # Daily position-state simulation costs. These are conservative defaults.
 BACKTEST_TRANSACTION_COST_PCT = 0.0005  # 5 bps per order

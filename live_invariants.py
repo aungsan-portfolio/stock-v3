@@ -114,15 +114,25 @@ def adapt_positions(ib_positions) -> list:
 
 
 def adapt_working_orders(ib_open_trades) -> list:
-    """Adapt ib_insync openTrades() output to the plain shape above."""
+    """Adapt ib_insync openTrades() output to the plain shape above.
+
+    The ``parent_id``, ``qty`` and ``status`` keys are additive (Phase 2): they
+    let order_exec.verify_protective_child confirm a stop child is attached to
+    the filled parent and covers the actual filled qty. Callers that only need
+    the base shape (e.g. unprotected_longs) simply ignore them.
+    """
     out = []
     for t in (ib_open_trades or []):
         try:
+            order = t.order
             out.append({
                 "symbol": str(t.contract.symbol).upper().strip(),
-                "action": str(t.order.action).upper().strip(),
-                "order_type": str(t.order.orderType).upper().strip(),
-                "order_ref": str(getattr(t.order, "orderRef", "") or "").strip(),
+                "action": str(order.action).upper().strip(),
+                "order_type": str(order.orderType).upper().strip(),
+                "order_ref": str(getattr(order, "orderRef", "") or "").strip(),
+                "parent_id": int(getattr(order, "parentId", 0) or 0),
+                "qty": float(getattr(order, "totalQuantity", 0) or 0),
+                "status": str(getattr(getattr(t, "orderStatus", None), "status", "") or "").strip(),
             })
         except Exception:
             continue

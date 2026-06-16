@@ -12,6 +12,7 @@ Production hardening:
 - qualifyContracts() result captured (the contract is mutated in place but we
   also return the qualified contract from a single source of truth).
 """
+import datetime as _dt
 import logging
 import math
 from typing import List, Optional
@@ -19,14 +20,18 @@ from typing import List, Optional
 from ib_insync import IB, Stock, LimitOrder, MarketOrder, Contract, Order
 
 import config
+import live_invariants
 import order_audit
+import order_exec
 import risk_state
 from predictor import Signal
 
 logger = logging.getLogger(__name__)
 
-ACCEPTED_ORDER_STATUSES = {"PendingSubmit", "PreSubmitted", "Submitted", "Filled", "ApiPending"}
-BAD_ORDER_STATUSES = {"Cancelled", "ApiCancelled", "Inactive", "Rejected"}
+# "Working" = live at the broker but not yet a position; used by the duplicate-
+# entry / open-order guards. Fill vs. acceptance classification now lives in
+# order_exec (single source of truth) so "accepted" can never be mistaken for a
+# fill (H4).
 WORKING_ORDER_STATUSES = {"PendingSubmit", "ApiPending", "PreSubmitted", "Submitted"}
 
 # ── Live-readiness capability flags ───────────────────────────────────────────
@@ -35,9 +40,9 @@ WORKING_ORDER_STATUSES = {"PendingSubmit", "ApiPending", "PreSubmitted", "Submit
 # that builds the backing logic (see reports/LIVE_TRADING_IMPLEMENTATION_PLAN_MM.md).
 # The `live-readiness` command reads them to produce an honest go-live scorecard.
 # Flipping one True without its implementation is a deliberate footgun — do not.
-SUPPORTS_FILL_VERIFICATION       = False   # Phase 2 (H4, H5): wait for real fill, not "accepted"
-SUPPORTS_PARTIAL_FILL_HANDLING   = False   # Phase 2 (H6): size children from actual filled qty
-SUPPORTS_PROTECTIVE_CHILD_VERIFY = False   # Phase 2 (H7): confirm stop child is live or flatten
+SUPPORTS_FILL_VERIFICATION       = True    # Phase 2 (H4, H5): wait for real fill, not "accepted"
+SUPPORTS_PARTIAL_FILL_HANDLING   = True    # Phase 2 (H6): size children from actual filled qty
+SUPPORTS_PROTECTIVE_CHILD_VERIFY = True    # Phase 2 (H7): confirm stop child is live or flatten
 SUPPORTS_SERVER_SIDE_GTC_STOP    = False   # Phase 3 (C2, H19): resting GTC/OCA hard stop per entry
 SUPPORTS_DAILY_LOSS_KILLSWITCH   = False   # Phase 3 (H1): loss_breached() wired into the order gate
 SUPPORTS_REALTIME_DATA_GUARD     = False   # Phase 4 (H12, H13): require real-time, reject delayed
@@ -48,13 +53,6 @@ SUPPORTS_ACCOUNT_TYPE_ASSERTION  = False   # Phase 6: assert paper(DU)/live(U) a
 
 def _order_status_name(trade) -> str:
     return str(getattr(getattr(trade, "orderStatus", None), "status", "UNKNOWN"))
-
-
-def _is_order_accepted(status: str) -> bool:
-    status = str(status)
-    if status in BAD_ORDER_STATUSES:
-        return False
-    return status in ACCEPTED_ORDER_STATUSES
 
 
 def _is_order_working(status: str) -> bool:
@@ -302,46 +300,314 @@ class IBKRBridge:
             return profit_price < limit_price < stop_price
         return False
 
-    # ── Order placement ──────────────────────────────────────────
-    def _place_limit_order(self, symbol: str, action: str, qty: int, price: float, note: str) -> bool:
+    # ── Fill-driven order primitives (Phase 2: H4-H9) ────────────────────────
+    @staticmethod
+    def _today() -> str:
+        return _dt.date.today().isoformat()
+
+    def _order_wait(self, poll: float) -> None:
+        """Yield to the event loop so fills/acks can arrive. Prefers the
+        event-driven waitOnUpdate (returns early on any update) and falls back to
+        sleep. Never raises into the order path."""
+        try:
+            self.ib.waitOnUpdate(timeout=poll)
+        except Exception:
+            try:
+                self.ib.sleep(poll)
+            except Exception:
+                pass
+
+    def _await_order_outcome(self, trade, timeout: Optional[float] = None,
+                             poll: Optional[float] = None) -> order_exec.OrderResult:
+        """Wait for `trade` to reach a terminal state, then classify the REAL
+        outcome (H4/H5). Replaces the old fixed `ib.sleep(1)` + "accepted" check.
+
+        Bounded by `ORDER_FILL_TIMEOUT_SECONDS`; a trade still working when the
+        budget is exhausted is returned WORKING/TIMEOUT (or PARTIALLY_FILLED if
+        some shares filled). Iteration-bounded so it is deterministic offline.
+        """
+        if timeout is None:
+            timeout = float(getattr(config, "ORDER_FILL_TIMEOUT_SECONDS", 8.0))
+        if poll is None:
+            poll = float(getattr(config, "ORDER_POLL_SECONDS", 0.25))
+        steps = max(1, int(math.ceil(timeout / poll))) if poll > 0 else 1
+        for _ in range(steps):
+            if order_exec.is_terminal(trade):
+                break
+            self._order_wait(poll)
+        if order_exec.is_terminal(trade):
+            return order_exec.classify_trade(trade)
+        return order_exec.outcome_on_timeout(trade)
+
+    def _working_orders_plain(self) -> list:
+        """Refresh open orders from the broker and adapt to plain dicts (with
+        parent_id/qty/status) for the pure order_exec verifiers."""
+        try:
+            self.ib.reqAllOpenOrders()
+            self.ib.sleep(getattr(config, "ORDER_POLL_SECONDS", 0.25))
+        except Exception:
+            logger.warning("Could not refresh open orders", exc_info=True)
+        return live_invariants.adapt_working_orders(self.ib.openTrades())
+
+    def _cancel_symbol_working_orders(self, symbol: str) -> int:
+        """Cancel ALL working orders for `symbol` (any side / type). Used before
+        an emergency flatten so no resting exit child can fire AFTER we go flat
+        and open an accidental short. Returns the number cancelled."""
+        symbol = symbol.upper().strip()
+        n = 0
+        for t in self.ib.openTrades():
+            if str(getattr(t.contract, "symbol", "")).upper().strip() != symbol:
+                continue
+            try:
+                self.ib.cancelOrder(t.order)
+                n += 1
+            except Exception:
+                logger.warning("Failed to cancel working order for %s", symbol, exc_info=True)
+        if n:
+            self.ib.sleep(getattr(config, "ORDER_POLL_SECONDS", 0.25))
+        return n
+
+    def _market_close_symbol(self, symbol: str) -> dict:
+        """Emergency-flatten one symbol (H7 fallback when exit protection cannot
+        be made safe). Cancels EVERY working order for the symbol first -- so no
+        resting child can execute after we go flat (which would open an accidental
+        short) -- then market-closes the whole position."""
+        symbol = symbol.upper().strip()
+        self._cancel_symbol_working_orders(symbol)
+        position = self.get_position(symbol)
+        qty = int(abs(position))
         if qty <= 0:
-            logger.warning("Invalid qty=%s for %s %s", qty, action, symbol)
+            return {"symbol": symbol, "qty": 0, "outcome": "flat"}
+        action = "SELL" if position > 0 else "BUY"
+        try:
+            contract = self._contract(symbol)
+            trade = self.ib.placeOrder(contract, MarketOrder(action, qty))
+            res = self._await_order_outcome(trade)
+        except Exception:
+            logger.error("Emergency close failed for %s", symbol, exc_info=True)
+            return {"symbol": symbol, "qty": qty, "outcome": "error"}
+        order_audit.log_event(
+            order_audit.STAGE_FLATTEN, phase="unprotected_close", symbol=symbol,
+            action=action, qty=qty, outcome=res.outcome, filled=res.filled,
+        )
+        logger.warning("Emergency close %s %s x%d -> %s (filled=%.0f)",
+                       action, symbol, qty, res.outcome, res.filled)
+        return {"symbol": symbol, "qty": qty, "action": action,
+                "outcome": res.outcome, "filled": res.filled}
+
+    def _cancel_oversized_exit_children(self, symbol: str, exit_action: str, filled: float) -> int:
+        """Cancel EVERY working exit (``exit_action``) order for `symbol` whose
+        quantity exceeds the actual filled qty -- protective stop, trailing stop,
+        AND take-profit LIMIT alike (H6). After this no resting child can sell
+        more than we hold, so a partial fill cannot leave an accidental-short
+        trap. Returns the number cancelled."""
+        symbol = symbol.upper().strip()
+        exit_action = exit_action.upper().strip()
+        cancelled = 0
+        for t in self.ib.openTrades():
+            if str(getattr(t.contract, "symbol", "")).upper().strip() != symbol:
+                continue
+            if str(getattr(t.order, "action", "")).upper().strip() != exit_action:
+                continue
+            cqty = float(getattr(t.order, "totalQuantity", 0) or 0)
+            if order_exec.child_needs_resize(cqty, filled):  # cqty > filled
+                try:
+                    self.ib.cancelOrder(t.order)
+                    cancelled += 1
+                except Exception:
+                    logger.warning("Failed to cancel oversized exit child for %s", symbol, exc_info=True)
+        if cancelled:
+            self.ib.sleep(getattr(config, "ORDER_POLL_SECONDS", 0.25))
+        return cancelled
+
+    def _place_protective_stop(self, symbol: str, filled: float, stop_price: float,
+                               exit_action: str = "SELL") -> bool:
+        """Place a protective STP sized to the ACTUAL filled qty (H6). Returns
+        True only when a correctly-sized protective stop is confirmed working."""
+        symbol = symbol.upper().strip()
+        target_qty = order_exec.protective_exit_qty(filled)
+        if target_qty <= 0:
             return False
+        try:
+            contract = self._contract(symbol)
+            stop = Order(action=exit_action, orderType="STP", totalQuantity=target_qty,
+                         auxPrice=round(float(stop_price), 2), transmit=True)
+            stop.orderRef = order_exec.deterministic_order_ref(self._today(), symbol, exit_action + "_STOP")
+            self.ib.placeOrder(contract, stop)
+            self.ib.sleep(getattr(config, "ORDER_POLL_SECONDS", 0.25))
+        except Exception:
+            logger.error("Failed to place protective stop for %s", symbol, exc_info=True)
+            return False
+        working = self._working_orders_plain()
+        verdict = order_exec.verify_protective_child(symbol, 0, target_qty, working)
+        order_audit.log_event(
+            order_audit.STAGE_STOP_PLACED, symbol=symbol, action=exit_action,
+            qty=target_qty, stop_price=round(float(stop_price), 2),
+            ok=verdict["ok"], reason=verdict["reason"],
+        )
+        return bool(verdict["ok"])
+
+    def _verify_or_protect(self, symbol: str, parent_order, result: order_exec.OrderResult,
+                           stop_price: float, exit_action: str = "SELL") -> order_exec.OrderResult:
+        """After a long parent OPEN fills (full or partial), guarantee ONE of two
+        safe end states (H6/H7):
+
+          (a) a live protective stop covers the ACTUAL filled qty AND no resting
+              exit child can sell more than we hold (no accidental short), or
+          (b) the position is flat (emergency-flattened; result marked aborted).
+
+        This covers BOTH the protective stop/trailing child AND the take-profit
+        LIMIT child: on a partial fill every oversized exit order is cancelled,
+        then a stop sized to the filled qty is (re)placed and verified, and a
+        final safety gate refuses any leftover oversized exit. Mutates `result`.
+        """
+        filled = order_exec.protective_exit_qty(result.filled)
+        parent_id = getattr(parent_order, "orderId", 0)
+
+        # 1) On a partial fill, stop chasing the remainder so the held qty is final.
+        if result.outcome == order_exec.PARTIALLY_FILLED:
+            try:
+                self.ib.cancelOrder(parent_order)
+                self.ib.sleep(getattr(config, "ORDER_POLL_SECONDS", 0.25))
+            except Exception:
+                logger.warning("Could not cancel partial parent for %s", symbol, exc_info=True)
+
+        # 2) Cancel EVERY oversized exit child (stop / trailing / take-profit limit)
+        #    so nothing resting can sell more than the filled qty.
+        self._cancel_oversized_exit_children(symbol, exit_action, filled)
+
+        # 3) Ensure a protective stop covers the actual filled qty.
+        working = self._working_orders_plain()
+        verdict = order_exec.verify_protective_child(symbol, parent_id, filled, working)
+        if not verdict["ok"]:
+            if self._place_protective_stop(symbol, filled, stop_price, exit_action):
+                working = self._working_orders_plain()
+                verdict = order_exec.verify_protective_child(symbol, parent_id, filled, working)
+
+        # 4) Safety gate: a covering stop exists AND no exit child oversells.
+        oversized = order_exec.oversized_exit_children(symbol, exit_action, filled, working)
+        if (not verdict["ok"]) or oversized:
+            reason = verdict["reason"] if not verdict["ok"] else "oversized_exit_child"
+            order_audit.log_event(
+                order_audit.STAGE_STOP_CONFIRMED, symbol=symbol, ok=False,
+                reason=reason, n_oversized=len(oversized), action="emergency_flatten",
+            )
+            logger.error("Unsafe exit protection for filled %s (stop_ok=%s, oversized=%d) -> emergency flatten",
+                         symbol, verdict["ok"], len(oversized))
+            self._market_close_symbol(symbol)
+            result.protective_ok = False
+            result.aborted = True
+            return result
+
+        result.protective_ok = True
+        order_audit.log_event(
+            order_audit.STAGE_STOP_CONFIRMED, symbol=symbol, ok=True,
+            qty=filled, stop_price=round(float(stop_price), 2),
+        )
+        return result
+
+    def _finalize_open(self, symbol: str, action: str, parent_trade, result: order_exec.OrderResult,
+                       stop_price: float, intended_qty: int) -> order_exec.OrderResult:
+        """Audit the verified open outcome and, for a real long fill, verify the
+        protective child stop (H6/H7). Returns the (possibly aborted) result."""
+        if result.outcome == order_exec.FILLED:
+            order_audit.log_event(
+                order_audit.STAGE_FILLED, symbol=symbol, action=action, filled=result.filled,
+                avg_fill_price=result.avg_fill_price, intended_qty=intended_qty,
+            )
+        elif result.outcome == order_exec.PARTIALLY_FILLED:
+            order_audit.log_event(
+                order_audit.STAGE_PARTIAL, symbol=symbol, action=action, filled=result.filled,
+                remaining=result.remaining, avg_fill_price=result.avg_fill_price, intended_qty=intended_qty,
+            )
+        else:
+            order_audit.log_event(
+                order_audit.STAGE_REJECTED if result.outcome == order_exec.REJECTED else order_audit.STAGE_ACK,
+                symbol=symbol, action=action, outcome=result.outcome, status=result.status,
+                intended_qty=intended_qty,
+            )
+            logger.info("Open %s %s x%d -> %s (no fill)", action, symbol, intended_qty, result.outcome)
+            return result
+
+        # A real (full/partial) fill. Long entries must be backed by a live stop.
+        if action == "BUY":
+            exit_action = "SELL"
+            result = self._verify_or_protect(symbol, parent_trade.order, result, stop_price, exit_action)
+        logger.info(
+            "Open %s %s -> %s filled=%.0f avg=%.2f protective_ok=%s aborted=%s",
+            action, symbol, result.outcome, result.filled, result.avg_fill_price,
+            result.protective_ok, result.aborted,
+        )
+        return result
+
+    # ── Order placement ──────────────────────────────────────────
+    def _close_position(self, symbol: str, action: str, qty: int, price: float,
+                        note: str) -> order_exec.OrderResult:
+        """Robustly close `qty` shares (H8): marketable-limit first, then escalate
+        to a market order, confirming each attempt by fill until remaining == 0 or
+        attempts are exhausted. Replaces the old single bare-limit + one-check
+        close. Never silently treats an unconfirmed close as flat."""
+        symbol = symbol.upper().strip()
+        if qty <= 0:
+            logger.warning("Invalid close qty=%s for %s %s", qty, action, symbol)
+            return order_exec.OrderResult(outcome=order_exec.REJECTED, status="bad_qty")
 
         contract = self._contract(symbol)
-        limit_price = self._limit_price(action, price)
-        order = LimitOrder(action, qty, limit_price)
-        order_audit.log_event(
-            order_audit.STAGE_SUBMIT, kind="limit", note=note,
-            symbol=symbol, action=action, qty=qty, limit_price=limit_price,
-        )
-        trade = self.ib.placeOrder(contract, order)
-        self.ib.sleep(1)
+        order_ref = order_exec.deterministic_order_ref(self._today(), symbol, action)
+        max_attempts = max(1, int(getattr(config, "CLOSE_MAX_ATTEMPTS", 3)))
+        remaining = int(qty)
+        total_filled = 0.0
+        last = order_exec.OrderResult(outcome=order_exec.WORKING)
 
-        status = _order_status_name(trade)
-        accepted = _is_order_accepted(status)
-        # NOTE: `accepted` here means "broker acknowledged", NOT "filled" (H4).
-        # Phase 2 replaces this with fill-driven confirmation.
-        order_audit.log_event(
-            order_audit.STAGE_REJECTED if not accepted else order_audit.STAGE_ACK,
-            kind="limit", note=note, symbol=symbol, action=action, qty=qty,
-            limit_price=limit_price, status=status, accepted=accepted,
-        )
-        logger.info(
-            "%s | %s %s x%d limit=%.2f | status=%s accepted=%s",
-            note, action, symbol, qty, limit_price, status, accepted,
-        )
-        return accepted
+        for attempt in range(1, max_attempts + 1):
+            if attempt == 1 and price > 0:
+                limit_price = self._limit_price(action, price)
+                order = LimitOrder(action, remaining, limit_price)
+                kind, px = "close_limit", limit_price
+            else:
+                order = MarketOrder(action, remaining)  # escalate to certainty of exit
+                kind, px = "close_market", 0.0
+            order.orderRef = order_ref
+            order_audit.log_event(
+                order_audit.STAGE_SUBMIT, kind=kind, note=note, symbol=symbol,
+                action=action, qty=remaining, attempt=attempt, limit_price=px,
+            )
+            trade = self.ib.placeOrder(contract, order)
+            res = self._await_order_outcome(trade)
+            total_filled += res.filled
+            last = res
+
+            decision = order_exec.close_followup(res, attempt, max_attempts)
+            stage = (order_audit.STAGE_FILLED if res.outcome == order_exec.FILLED
+                     else order_audit.STAGE_PARTIAL if res.outcome == order_exec.PARTIALLY_FILLED
+                     else order_audit.STAGE_REJECTED)
+            order_audit.log_event(
+                stage, kind=kind, note=note, symbol=symbol, action=action, attempt=attempt,
+                outcome=res.outcome, filled=res.filled, remaining=res.remaining, decision=decision,
+            )
+            logger.info("%s | %s %s attempt=%d -> %s filled=%.0f remaining=%.0f (%s)",
+                        note, action, symbol, attempt, res.outcome, res.filled, res.remaining, decision)
+
+            if decision == "done":
+                break
+            if decision == "giveup":
+                logger.error("Close %s %s NOT flat after %d attempts (remaining=%.0f) -> ALERT",
+                             action, symbol, attempt, res.remaining)
+                break
+            remaining = max(int(round(res.remaining)), 0)
+            if remaining <= 0:
+                break
+
+        last.filled = total_filled
+        return last
 
     def _place_open_trailing_exit(
         self, symbol: str, action: str, qty: int, price: float, confidence: float,
-    ) -> bool:
-        """Open with a limit parent and a trailing stop child.
-
-        This matches the desired behavior: be wrong small via the initial stop,
-        but let correct trades keep running until price reverses by the trailing
-        percent from its high. Kept long/short-aware, although shorts are disabled
-        by default in config.
+    ) -> order_exec.OrderResult:
+        """Open with a limit parent and a trailing-stop child, then CONFIRM the
+        parent fill before treating the entry as real (H4/H5) and verify the
+        trailing child is live (H7). Long/short-aware; shorts are disabled by
+        default in config and skip the long-only protective check.
         """
         contract = self._contract(symbol)
         limit_price = self._limit_price(action, price)
@@ -351,6 +617,7 @@ class IBKRBridge:
         parent = LimitOrder(action, qty, limit_price)
         parent.orderId = self.ib.client.getReqId()
         parent.transmit = False
+        parent.orderRef = order_exec.deterministic_order_ref(self._today(), symbol, action)
 
         exit_action = "SELL" if action == "BUY" else "BUY"
         trailing_stop = Order(
@@ -367,31 +634,16 @@ class IBKRBridge:
         order_audit.log_event(
             order_audit.STAGE_SUBMIT, kind="open_trailing", symbol=symbol, action=action,
             qty=qty, limit_price=limit_price, initial_stop=stop_price, trail_pct=trailing_pct,
+            order_ref=parent.orderRef,
         )
-        trades = [
-            self.ib.placeOrder(contract, parent),
-            self.ib.placeOrder(contract, trailing_stop),
-        ]
-        self.ib.sleep(1)
-        statuses = [_order_status_name(t) for t in trades]
-        accepted = all(_is_order_accepted(status) for status in statuses)
-        # The trailing child is placed but NOT verified live (H7); statuses here
-        # may be PreSubmitted, not Filled (H4/H5). Phase 2/3 harden this.
-        order_audit.log_event(
-            order_audit.STAGE_REJECTED if not accepted else order_audit.STAGE_ACK,
-            kind="open_trailing", symbol=symbol, action=action, qty=qty,
-            limit_price=limit_price, initial_stop=stop_price, trail_pct=trailing_pct,
-            statuses=statuses, accepted=accepted,
-        )
-        logger.info(
-            "Open trailing | %s %s x%d limit=%.2f | initial_stop=%.2f trail=%.4f%% | conf=%.2f | statuses=%s accepted=%s",
-            action, symbol, qty, limit_price, stop_price, trailing_pct, confidence, statuses, accepted,
-        )
-        return accepted
+        parent_trade = self.ib.placeOrder(contract, parent)
+        self.ib.placeOrder(contract, trailing_stop)
+        result = self._await_order_outcome(parent_trade)
+        return self._finalize_open(symbol, action, parent_trade, result, stop_price, qty)
 
     def _place_open_bracket(
         self, symbol: str, action: str, qty: int, price: float, confidence: float,
-    ) -> bool:
+    ) -> order_exec.OrderResult:
         if bool(getattr(config, "USE_TRAILING_EXIT", False)):
             return self._place_open_trailing_exit(symbol, action, qty, price, confidence)
 
@@ -405,7 +657,7 @@ class IBKRBridge:
                 "Invalid bracket prices | %s %s limit=%.2f stop=%.2f profit=%.2f",
                 action, symbol, limit_price, stop_price, profit_price,
             )
-            return False
+            return order_exec.OrderResult(outcome=order_exec.REJECTED, status="bad_prices")
 
         bracket = self.ib.bracketOrder(
             action=action,
@@ -414,28 +666,46 @@ class IBKRBridge:
             takeProfitPrice=profit_price,
             stopLossPrice=stop_price,
         )
+        order_ref = order_exec.deterministic_order_ref(self._today(), symbol, action)
+        bracket[0].orderRef = order_ref  # tag the parent for idempotency/reconcile
 
         order_audit.log_event(
             order_audit.STAGE_SUBMIT, kind="open_bracket", symbol=symbol, action=action,
             qty=qty, limit_price=limit_price, stop_price=stop_price, profit_price=profit_price,
+            order_ref=order_ref,
         )
         trades = [self.ib.placeOrder(contract, order) for order in bracket]
-        self.ib.sleep(1)
-        statuses = [_order_status_name(t) for t in trades]
-        accepted = all(_is_order_accepted(status) for status in statuses)
-        order_audit.log_event(
-            order_audit.STAGE_REJECTED if not accepted else order_audit.STAGE_ACK,
-            kind="open_bracket", symbol=symbol, action=action, qty=qty,
-            limit_price=limit_price, stop_price=stop_price, profit_price=profit_price,
-            statuses=statuses, accepted=accepted,
-        )
-        logger.info(
-            "Open bracket | %s %s x%d limit=%.2f | SL=%.2f TP=%.2f | conf=%.2f | statuses=%s accepted=%s",
-            action, symbol, qty, limit_price, stop_price, profit_price, confidence, statuses, accepted,
-        )
-        return accepted
+        parent_trade = trades[0]
+        result = self._await_order_outcome(parent_trade)
+        return self._finalize_open(symbol, action, parent_trade, result, stop_price, qty)
 
     # ── Public API ───────────────────────────────────────────────
+    def _duplicate_ref_working(self, symbol: str, action: str) -> bool:
+        """Idempotency guard (H9): refuse to place an OPEN whose deterministic
+        orderRef (date:symbol:action) is already working at the broker -- e.g. a
+        duplicate after a restart / mid-flight. Complements has_working_order with
+        intent-level matching and lays the groundwork for Phase 5 reconciliation.
+        """
+        ref = order_exec.deterministic_order_ref(self._today(), symbol, action)
+        try:
+            working = self._working_orders_plain()
+        except Exception:
+            return False
+        return order_exec.has_order_ref(ref, working)
+
+    def _record_if_filled(self, symbol: str, action: str, result: order_exec.OrderResult) -> None:
+        """Record a daily trade ONLY for a real, held fill (H4/H6) -- never on a
+        bare acknowledgement, rejection, timeout, or emergency-aborted entry."""
+        if not order_exec.should_record_trade(result):
+            return
+        trades = risk_state.record_trade()
+        order_audit.log_event(
+            order_audit.STAGE_TRADE_RECORDED, symbol=symbol, action=action,
+            qty=order_exec.protective_exit_qty(result.filled),
+            avg_fill_price=result.avg_fill_price, daily_trade_count=trades, on="fill",
+        )
+        logger.info("Recorded daily trade #%d for %s (filled=%.0f)", trades, symbol, result.filled)
+
     def execute_signal(self, signal: Signal) -> bool:
         symbol = signal.symbol.upper().strip()
         action = signal.action.upper().strip()
@@ -467,7 +737,8 @@ class IBKRBridge:
                 return False
             if position < 0:
                 qty = int(abs(position))
-                return self._place_limit_order(symbol, "BUY", qty, price, "Close short")
+                # Cover an existing short: a robust, fill-confirmed close (H8).
+                return self._close_position(symbol, "BUY", qty, price, "Close short").has_fill
 
             if not risk_state.can_open_more():
                 logger.warning("Max daily trades (%d) reached — skipping BUY %s", config.MAX_DAILY_TRADES, symbol)
@@ -481,22 +752,18 @@ class IBKRBridge:
             if qty == 0:
                 logger.warning("Qty=0 for BUY %s price=%.2f cash=%.2f", symbol, price, cash)
                 return False
-            accepted = self._place_open_bracket(symbol, "BUY", qty, price, signal.confidence)
-            if accepted:
-                trades = risk_state.record_trade()
-                # H4: recorded on "accepted", not a confirmed fill. Audited so
-                # Phase 2 can prove the move to fill-driven recording.
-                order_audit.log_event(
-                    order_audit.STAGE_TRADE_RECORDED, symbol=symbol, action="BUY",
-                    qty=qty, price=price, daily_trade_count=trades, on="accepted",
-                )
-                logger.info("Recorded daily trade #%d for %s", trades, symbol)
-            return accepted
+            if self._duplicate_ref_working(symbol, "BUY"):
+                logger.info("Deterministic orderRef already working for %s BUY — skipping (idempotency)", symbol)
+                return False
+            result = self._place_open_bracket(symbol, "BUY", qty, price, signal.confidence)
+            self._record_if_filled(symbol, "BUY", result)
+            return result.occupies_slot
 
         # action == "SELL"
         if position > 0:
             qty = int(position)
-            return self._place_limit_order(symbol, "SELL", qty, price, "Close long")
+            # Close an existing long: a robust, fill-confirmed close (H8).
+            return self._close_position(symbol, "SELL", qty, price, "Close long").has_fill
         if position < 0:
             logger.info("Already short %s position=%.2f — skipping SELL", symbol, position)
             return False
@@ -516,15 +783,12 @@ class IBKRBridge:
         if qty == 0:
             logger.warning("Qty=0 for short SELL %s price=%.2f cash=%.2f", symbol, price, cash)
             return False
-        accepted = self._place_open_bracket(symbol, "SELL", qty, price, signal.confidence)
-        if accepted:
-            trades = risk_state.record_trade()
-            order_audit.log_event(
-                order_audit.STAGE_TRADE_RECORDED, symbol=symbol, action="SELL",
-                qty=qty, price=price, daily_trade_count=trades, on="accepted",
-            )
-            logger.info("Recorded daily trade #%d for %s", trades, symbol)
-        return accepted
+        if self._duplicate_ref_working(symbol, "SELL"):
+            logger.info("Deterministic orderRef already working for %s SELL — skipping (idempotency)", symbol)
+            return False
+        result = self._place_open_bracket(symbol, "SELL", qty, price, signal.confidence)
+        self._record_if_filled(symbol, "SELL", result)
+        return result.occupies_slot
 
     def execute_all(self, signals: List[Signal]) -> dict:
         open_symbols = {
@@ -657,17 +921,16 @@ class IBKRBridge:
             try:
                 contract = self._contract(symbol)
                 trade = self.ib.placeOrder(contract, MarketOrder(action, qty))
-                self.ib.sleep(1)
-                status = _order_status_name(trade)
+                # Confirm the emergency close by fill, not a fixed sleep (H8).
+                res = self._await_order_outcome(trade)
                 result = {
-                    "symbol": symbol, "action": action, "qty": qty, "status": status,
-                    "filled": float(getattr(trade.orderStatus, "filled", 0) or 0),
-                    "avg_fill": float(getattr(trade.orderStatus, "avgFillPrice", 0) or 0),
+                    "symbol": symbol, "action": action, "qty": qty, "status": res.status,
+                    "outcome": res.outcome, "filled": res.filled, "avg_fill": res.avg_fill_price,
                 }
                 plan["flatten_results"].append(result)
                 plan["flattened"] += 1
                 order_audit.log_event(order_audit.STAGE_FLATTEN, phase="executed", **result)
-                logger.info("Flatten %s %s x%d -> status=%s", action, symbol, qty, status)
+                logger.info("Flatten %s %s x%d -> %s filled=%.0f", action, symbol, qty, res.outcome, res.filled)
             except Exception:
                 logger.warning("Failed to flatten %s", symbol, exc_info=True)
         self.ib.sleep(1)

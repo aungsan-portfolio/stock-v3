@@ -20,6 +20,8 @@ pip install -r requirements-dev.txt   # pulls in -r requirements.txt
 python -m unittest test_logic -v             # core refactor logic
 python -m unittest test_live_readiness -v    # Phase-0 live-readiness scaffolding
 python -m unittest test_model_gate -v        # Phase-1 model gate + signal parity
+python -m unittest test_order_exec -v        # Phase-2 order-execution logic (H4-H9)
+python -m unittest test_ibkr_fill_flow -v    # Phase-2 fill-driven order path (fake IBKR)
 python -m unittest discover -p "test_*.py"   # everything
 python test_logic.py                         # equivalent direct run
 ```
@@ -39,7 +41,8 @@ so they never overwrite real reports.
 | Config | `MIN_HOLD_BARS == ML_HORIZON` |
 | Backtest I/O | empty-data → empty CSV + metrics JSON; populated → CSV rows + schema |
 | Imports | `main`, `backtest`, `predictor`, `ibkr_bridge`, engines import cleanly |
-| Live-readiness (Phase 0) | `unprotected_longs` / duplicate-ref invariants; `order_audit` JSONL never raises; bridge capability flags all `False`; `live-readiness` scorecard reports NOT READY (`test_live_readiness.py`) |
+| Live-readiness (Phase 0) | `unprotected_longs` / duplicate-ref invariants; `order_audit` JSONL never raises; Phase-3+ bridge capability flags `False` (Phase-2 flags now `True`); `live-readiness` scorecard reports NOT READY (`test_live_readiness.py`) |
+| Order execution (Phase 2) | fill-vs-accepted classification (`PreSubmitted` is not a fill); partial-fill exit-child reconciliation — **all** SELL children (protective stop, trailing stop, AND take-profit LMT) cancelled/resized to the actual filled qty so nothing can over-sell into a short; protective-child verify-or-flatten; robust close marketable-limit→market escalation; deterministic `orderRef` duplicate guard; emergency flatten cancels resting children first; capability flags (`test_order_exec.py`, `test_ibkr_fill_flow.py`) |
 | Model gate (Phase 1) | `evaluate_gate` decision table (missing / stale / below-floor / ok / disabled); per-symbol metrics persist + merge RF and LSTM and never raise; a pre-gate BUY is forced to `HOLD` when blocked; backtest/live signal-construction parity; P1 scorecard gates PASS while overall stays NOT READY; `signal-parity` command (`test_model_gate.py`) |
 
 > **Model gate & signal parity (Phase 1).** `test_model_gate.py` is offline and
@@ -57,6 +60,23 @@ so they never overwrite real reports.
 > you set `RUN_IBKR_INTEGRATION=1` with TWS running on port 7497. See
 > `reports/LIVE_TRADING_IMPLEMENTATION_PLAN_MM.md` for the phased plan; live
 > trading stays disabled until every automated `live-readiness` gate passes.
+
+> **Order execution robustness (Phase 2, H4-H9).** `test_order_exec.py` is pure
+> and offline (the ib-free decision layer in `order_exec.py`); `test_ibkr_fill_flow.py`
+> drives the real `ibkr_bridge.py` order path with **fake ib_insync objects**
+> (no live IBKR, no network). Together they prove the Phase-2 go/no-go gates:
+> an accepted-but-unfilled order is **not** recorded as a trade; a partial fill
+> reconciles **every** exit-side child — protective stop, trailing stop, AND
+> take-profit LMT — down to the actual filled qty (or flattens) so a resting
+> SELL can never sell more than is held; an unprotectable fill is
+> emergency-flattened and marked aborted; closes escalate marketable-limit →
+> market until flat; and a duplicate open after a restart is refused via a
+> deterministic `orderRef`. The "Unsafe exit protection … emergency flatten" and
+> "Emergency close …" lines in the test output are the **expected** logs from the
+> flatten-path tests. Capability flags `SUPPORTS_FILL_VERIFICATION`,
+> `SUPPORTS_PARTIAL_FILL_HANDLING`, and `SUPPORTS_PROTECTIVE_CHILD_VERIFY` are
+> `True` only because the logic exists **and** is covered here; the Phase-3+ flags
+> remain `False`, so the `live-readiness` scorecard still reports NOT READY.
 
 ## Continuous integration
 
