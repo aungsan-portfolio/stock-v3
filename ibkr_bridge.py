@@ -23,6 +23,7 @@ import config
 import live_invariants
 import order_audit
 import order_exec
+import risk_engine
 import risk_state
 from predictor import Signal
 
@@ -43,8 +44,8 @@ WORKING_ORDER_STATUSES = {"PendingSubmit", "ApiPending", "PreSubmitted", "Submit
 SUPPORTS_FILL_VERIFICATION       = True    # Phase 2 (H4, H5): wait for real fill, not "accepted"
 SUPPORTS_PARTIAL_FILL_HANDLING   = True    # Phase 2 (H6): size children from actual filled qty
 SUPPORTS_PROTECTIVE_CHILD_VERIFY = True    # Phase 2 (H7): confirm stop child is live or flatten
-SUPPORTS_SERVER_SIDE_GTC_STOP    = False   # Phase 3 (C2, H19): resting GTC/OCA hard stop per entry
-SUPPORTS_DAILY_LOSS_KILLSWITCH   = False   # Phase 3 (H1): loss_breached() wired into the order gate
+SUPPORTS_SERVER_SIDE_GTC_STOP    = True    # Phase 3 (C2, H19): resting GTC/OCA hard stop per entry
+SUPPORTS_DAILY_LOSS_KILLSWITCH   = True    # Phase 3 (H1): loss_breached() wired into the order gate
 SUPPORTS_REALTIME_DATA_GUARD     = False   # Phase 4 (H12, H13): require real-time, reject delayed
 SUPPORTS_MARKET_HOURS_GATE       = False   # Phase 4 (H15): refuse orders outside RTH/holidays
 SUPPORTS_STARTUP_RECONCILIATION  = False   # Phase 5 (H18): broker = source of truth on startup
@@ -63,6 +64,10 @@ class IBKRBridge:
     def __init__(self) -> None:
         self.ib = IB()
         self._contract_cache: dict = {}
+        # Phase 3: sticky kill-switch for NEW entries. Set when the startup
+        # protection scan cannot protect an open long; closes/flatten/repair stay
+        # allowed. Daily-loss + drawdown are checked dynamically, not via this flag.
+        self._halt_new_entries = False
 
     # ── Connection ───────────────────────────────────────────────
     def connect(self) -> bool:
@@ -118,6 +123,59 @@ class IBKRBridge:
                 except (TypeError, ValueError):
                     return 0.0
         return 0.0
+
+    def get_net_liquidation(self) -> float:
+        """Current account equity (NetLiquidation, USD) -- the source of truth for
+        the daily-loss kill-switch and drawdown halt (Phase 3 H1/H3)."""
+        for av in self.ib.accountValues():
+            if av.tag == "NetLiquidation" and av.currency == "USD":
+                try:
+                    return float(av.value)
+                except (TypeError, ValueError):
+                    return 0.0
+        return 0.0
+
+    def snapshot_start_of_day_equity(self) -> float:
+        """Snapshot today's start-of-day equity ONCE (restart-safe; H1). Call at
+        connect time. Returns the persisted baseline (0.0 if equity unavailable)."""
+        equity = self.get_net_liquidation()
+        stored = risk_state.snapshot_start_of_day_equity(equity)
+        order_audit.log_event(
+            order_audit.STAGE_SNAPSHOT, phase="start_of_day_equity",
+            equity=equity, baseline=stored,
+        )
+        return stored
+
+    @staticmethod
+    def _position_basis(position) -> float:
+        """Per-share cost basis for an existing position (broker avgCost). Used to
+        price startup-repair protection from the REAL entry, not a guess. Returns
+        0.0 when avgCost is missing/invalid (caller must halt -- never guess)."""
+        try:
+            cost = float(getattr(position, "avgCost", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return cost if cost > 0 else 0.0
+
+    def _new_entries_blocked(self, symbol: str, intended_value: float = 0.0):
+        """Phase-3 entry gate for NEW opens ONLY (never closes/flatten/repair).
+
+        Returns (blocked: bool, reason: str). Checks, in order: the sticky halt
+        flag (startup protection failure), the daily-loss kill-switch (H1), the
+        account drawdown halt (H3), and the per-symbol exposure cap (H3). Each is
+        conservative: a missing baseline never spuriously blocks.
+        """
+        if self._halt_new_entries:
+            return True, "halt_flag"
+        equity = self.get_net_liquidation()
+        if risk_state.daily_loss_blocked(equity):
+            return True, "daily_loss"
+        start = risk_state.start_of_day_equity()
+        if risk_engine.drawdown_halt_breached(start, equity):
+            return True, "drawdown_halt"
+        if risk_engine.symbol_exposure_exceeded(intended_value, 0.0, equity):
+            return True, "symbol_exposure"
+        return False, ""
 
     def working_order_symbols(self) -> set:
         """Symbols with working orders, across all visible client ids."""
@@ -293,13 +351,6 @@ class IBKRBridge:
             return round(price * (1 + config.TAKE_PROFIT_PCT), 2)
         return round(price * (1 - config.TAKE_PROFIT_PCT), 2)
 
-    def _validate_bracket_prices(self, action: str, limit_price: float, stop_price: float, profit_price: float) -> bool:
-        if action == "BUY":
-            return stop_price < limit_price < profit_price
-        if action == "SELL":
-            return profit_price < limit_price < stop_price
-        return False
-
     # ── Fill-driven order primitives (Phase 2: H4-H9) ────────────────────────
     @staticmethod
     def _today() -> str:
@@ -420,49 +471,91 @@ class IBKRBridge:
             self.ib.sleep(getattr(config, "ORDER_POLL_SECONDS", 0.25))
         return cancelled
 
-    def _place_protective_stop(self, symbol: str, filled: float, stop_price: float,
-                               exit_action: str = "SELL") -> bool:
-        """Place a protective STP sized to the ACTUAL filled qty (H6). Returns
-        True only when a correctly-sized protective stop is confirmed working."""
+    def _place_protection(self, symbol: str, filled: float, entry_basis: float,
+                          exit_action: str = "SELL") -> bool:
+        """Place SERVER-SIDE GTC protective exits for a long, sized to the ACTUAL
+        filled qty and sharing ONE OCA group (C2 + H19):
+
+          * an independent catastrophe hard stop at HARD_STOP_LOSS_PCT off the
+            actual entry basis (avgFillPrice), and
+          * the primary protective exit -- a trailing stop (USE_TRAILING_EXIT) or
+            a fixed initial stop plus a take-profit limit.
+
+        Every exit is qty == filled, tif=GTC, and shares the same ocaGroup
+        (ocaType=1) so the first to fill auto-cancels the rest (no leftover
+        resting SELL -> no accidental short at the broker). Returns True only when
+        a GTC protective stop covering the fill is confirmed working AND no exit
+        child exceeds the filled qty. A non-positive basis returns False (cannot
+        price protection -- caller must flatten/halt; never guess).
+        """
         symbol = symbol.upper().strip()
         target_qty = order_exec.protective_exit_qty(filled)
         if target_qty <= 0:
             return False
+        basis = float(entry_basis or 0.0)
+        if basis <= 0:
+            logger.error("No valid entry basis (avgFillPrice/avgCost) for %s -> cannot price GTC protection", symbol)
+            return False
+
+        tif = str(getattr(config, "PROTECTIVE_TIF", "GTC"))
+        oca = order_exec.oca_group_id(self._today(), symbol)
+        hard_px = order_exec.hard_stop_price(basis, getattr(config, "HARD_STOP_LOSS_PCT", 0.03), "BUY")
+
+        specs = []  # (kind, Order); entry side is BUY (long), so exits are SELL
+        if hard_px > 0:
+            specs.append(("hard_stop", Order(action=exit_action, orderType="STP",
+                                             totalQuantity=target_qty, auxPrice=hard_px)))
+        if bool(getattr(config, "USE_TRAILING_EXIT", False)):
+            trail_pct = round(float(config.TRAILING_STOP_PCT) * 100.0, 4)
+            specs.append(("trailing_stop", Order(
+                action=exit_action, orderType="TRAIL", totalQuantity=target_qty,
+                trailingPercent=trail_pct, trailStopPrice=self._initial_stop_price("BUY", basis))))
+        else:
+            specs.append(("stop", Order(action=exit_action, orderType="STP", totalQuantity=target_qty,
+                                       auxPrice=self._initial_stop_price("BUY", basis))))
+            specs.append(("take_profit", Order(action=exit_action, orderType="LMT", totalQuantity=target_qty,
+                                              lmtPrice=self._take_profit_price("BUY", basis))))
+
         try:
             contract = self._contract(symbol)
-            stop = Order(action=exit_action, orderType="STP", totalQuantity=target_qty,
-                         auxPrice=round(float(stop_price), 2), transmit=True)
-            stop.orderRef = order_exec.deterministic_order_ref(self._today(), symbol, exit_action + "_STOP")
-            self.ib.placeOrder(contract, stop)
+            for kind, order in specs:
+                order.tif = tif
+                order.ocaGroup = oca
+                order.ocaType = 1
+                order.transmit = True
+                order.orderRef = order_exec.deterministic_order_ref(
+                    self._today(), symbol, f"{exit_action}_{kind.upper()}")
+                self.ib.placeOrder(contract, order)
             self.ib.sleep(getattr(config, "ORDER_POLL_SECONDS", 0.25))
         except Exception:
-            logger.error("Failed to place protective stop for %s", symbol, exc_info=True)
+            logger.error("Failed to place GTC protection for %s", symbol, exc_info=True)
             return False
+
         working = self._working_orders_plain()
-        verdict = order_exec.verify_protective_child(symbol, 0, target_qty, working)
+        gtc_ok = order_exec.has_gtc_protective_stop(symbol, target_qty, working)
+        oversized = order_exec.oversized_exit_children(symbol, exit_action, target_qty, working)
+        ok = bool(gtc_ok) and not oversized
         order_audit.log_event(
-            order_audit.STAGE_STOP_PLACED, symbol=symbol, action=exit_action,
-            qty=target_qty, stop_price=round(float(stop_price), 2),
-            ok=verdict["ok"], reason=verdict["reason"],
+            order_audit.STAGE_PROTECT, symbol=symbol, action=exit_action, qty=target_qty,
+            oca_group=oca, tif=tif, hard_stop=hard_px, gtc_ok=gtc_ok,
+            n_oversized=len(oversized), ok=ok,
         )
-        return bool(verdict["ok"])
+        return ok
 
     def _verify_or_protect(self, symbol: str, parent_order, result: order_exec.OrderResult,
-                           stop_price: float, exit_action: str = "SELL") -> order_exec.OrderResult:
+                           entry_basis: float, exit_action: str = "SELL") -> order_exec.OrderResult:
         """After a long parent OPEN fills (full or partial), guarantee ONE of two
-        safe end states (H6/H7):
+        safe end states (C2/H6/H7/H19):
 
-          (a) a live protective stop covers the ACTUAL filled qty AND no resting
-              exit child can sell more than we hold (no accidental short), or
+          (a) a live GTC protective stop covers the ACTUAL filled qty, all exits
+              share an OCA group, and NO exit child exceeds the filled qty, or
           (b) the position is flat (emergency-flattened; result marked aborted).
 
-        This covers BOTH the protective stop/trailing child AND the take-profit
-        LIMIT child: on a partial fill every oversized exit order is cancelled,
-        then a stop sized to the filled qty is (re)placed and verified, and a
-        final safety gate refuses any leftover oversized exit. Mutates `result`.
+        Protection is placed AFTER the fill is confirmed, sized to the actual
+        filled qty and priced off the actual avgFillPrice (entry_basis). Mutates
+        and returns `result`.
         """
         filled = order_exec.protective_exit_qty(result.filled)
-        parent_id = getattr(parent_order, "orderId", 0)
 
         # 1) On a partial fill, stop chasing the remainder so the held qty is final.
         if result.outcome == order_exec.PARTIALLY_FILLED:
@@ -472,28 +565,25 @@ class IBKRBridge:
             except Exception:
                 logger.warning("Could not cancel partial parent for %s", symbol, exc_info=True)
 
-        # 2) Cancel EVERY oversized exit child (stop / trailing / take-profit limit)
-        #    so nothing resting can sell more than the filled qty.
+        # 2) Defensively clear any pre-existing oversized exit child for the symbol.
         self._cancel_oversized_exit_children(symbol, exit_action, filled)
 
-        # 3) Ensure a protective stop covers the actual filled qty.
-        working = self._working_orders_plain()
-        verdict = order_exec.verify_protective_child(symbol, parent_id, filled, working)
-        if not verdict["ok"]:
-            if self._place_protective_stop(symbol, filled, stop_price, exit_action):
-                working = self._working_orders_plain()
-                verdict = order_exec.verify_protective_child(symbol, parent_id, filled, working)
+        # 3) Place server-side GTC/OCA protection sized to the actual filled qty.
+        placed_ok = self._place_protection(symbol, filled, entry_basis, exit_action)
 
-        # 4) Safety gate: a covering stop exists AND no exit child oversells.
+        # 4) Safety gate: a covering GTC stop exists AND no exit child oversells.
+        working = self._working_orders_plain()
+        gtc_ok = order_exec.has_gtc_protective_stop(symbol, filled, working)
         oversized = order_exec.oversized_exit_children(symbol, exit_action, filled, working)
-        if (not verdict["ok"]) or oversized:
-            reason = verdict["reason"] if not verdict["ok"] else "oversized_exit_child"
+        if (not placed_ok) or (not gtc_ok) or oversized:
+            reason = ("placement_failed" if not placed_ok
+                      else "no_gtc_protective_stop" if not gtc_ok
+                      else "oversized_exit_child")
             order_audit.log_event(
                 order_audit.STAGE_STOP_CONFIRMED, symbol=symbol, ok=False,
                 reason=reason, n_oversized=len(oversized), action="emergency_flatten",
             )
-            logger.error("Unsafe exit protection for filled %s (stop_ok=%s, oversized=%d) -> emergency flatten",
-                         symbol, verdict["ok"], len(oversized))
+            logger.error("Unsafe GTC protection for filled %s (%s) -> emergency flatten", symbol, reason)
             self._market_close_symbol(symbol)
             result.protective_ok = False
             result.aborted = True
@@ -501,15 +591,66 @@ class IBKRBridge:
 
         result.protective_ok = True
         order_audit.log_event(
-            order_audit.STAGE_STOP_CONFIRMED, symbol=symbol, ok=True,
-            qty=filled, stop_price=round(float(stop_price), 2),
+            order_audit.STAGE_STOP_CONFIRMED, symbol=symbol, ok=True, qty=filled, tif="GTC",
         )
         return result
 
+    def ensure_protective_stops(self) -> dict:
+        """Startup protection invariant (Phase 3, plan 3.6): every open long must
+        have a live GTC protective stop. Scan positions; for any unprotected long,
+        attempt repair by placing GTC/OCA protection priced off the broker
+        avgCost. If repair fails -- or avgCost is missing/invalid (cannot price;
+        never guess) -- set the sticky new-entries halt flag and alert. Never
+        continues trading silently with an unprotected long.
+
+        Returns a report dict. Places only repair orders, never opens.
+        """
+        report = {"checked": 0, "unprotected": [], "repaired": [], "failed": []}
+        try:
+            longs = [p for p in self.ib.positions() if float(p.position) > 0]
+        except Exception:
+            logger.warning("Could not read positions for startup protection scan", exc_info=True)
+            return report
+
+        working = self._working_orders_plain()
+        for p in longs:
+            symbol = str(p.contract.symbol).upper().strip()
+            qty = order_exec.protective_exit_qty(float(p.position))
+            report["checked"] += 1
+            if order_exec.has_gtc_protective_stop(symbol, qty, working):
+                continue
+            report["unprotected"].append(symbol)
+
+            basis = self._position_basis(p)
+            if basis <= 0:
+                self._halt_new_entries = True
+                report["failed"].append(symbol)
+                order_audit.log_event(order_audit.STAGE_HALT, phase="startup_unprotected_no_basis",
+                                      symbol=symbol, qty=qty)
+                logger.error("Startup: unprotected long %s with no valid avgCost -> HALT new entries", symbol)
+                continue
+
+            ok = self._place_protection(symbol, qty, basis, "SELL")
+            working = self._working_orders_plain()
+            if ok and order_exec.has_gtc_protective_stop(symbol, qty, working):
+                report["repaired"].append(symbol)
+                order_audit.log_event(order_audit.STAGE_PROTECT, phase="startup_repair",
+                                      symbol=symbol, qty=qty, basis=basis)
+                logger.warning("Startup: repaired GTC protection for unprotected long %s x%d", symbol, qty)
+            else:
+                self._halt_new_entries = True
+                report["failed"].append(symbol)
+                order_audit.log_event(order_audit.STAGE_HALT, phase="startup_repair_failed",
+                                      symbol=symbol, qty=qty)
+                logger.error("Startup: could not protect long %s -> HALT new entries", symbol)
+        return report
+
     def _finalize_open(self, symbol: str, action: str, parent_trade, result: order_exec.OrderResult,
-                       stop_price: float, intended_qty: int) -> order_exec.OrderResult:
-        """Audit the verified open outcome and, for a real long fill, verify the
-        protective child stop (H6/H7). Returns the (possibly aborted) result."""
+                       intended_qty: int) -> order_exec.OrderResult:
+        """Audit the verified open outcome and, for a real long fill, place and
+        verify SERVER-SIDE GTC/OCA protection priced off the ACTUAL avgFillPrice
+        (C2/H7/H19) -- never a stale signal price. Returns the (possibly aborted)
+        result."""
         if result.outcome == order_exec.FILLED:
             order_audit.log_event(
                 order_audit.STAGE_FILLED, symbol=symbol, action=action, filled=result.filled,
@@ -529,10 +670,11 @@ class IBKRBridge:
             logger.info("Open %s %s x%d -> %s (no fill)", action, symbol, intended_qty, result.outcome)
             return result
 
-        # A real (full/partial) fill. Long entries must be backed by a live stop.
+        # A real (full/partial) long fill must be backed by live GTC protection,
+        # priced off the ACTUAL avg fill -- not the stale signal price.
         if action == "BUY":
-            exit_action = "SELL"
-            result = self._verify_or_protect(symbol, parent_trade.order, result, stop_price, exit_action)
+            result = self._verify_or_protect(symbol, parent_trade.order, result,
+                                             result.avg_fill_price, "SELL")
         logger.info(
             "Open %s %s -> %s filled=%.0f avg=%.2f protective_ok=%s aborted=%s",
             action, symbol, result.outcome, result.filled, result.avg_fill_price,
@@ -601,83 +743,31 @@ class IBKRBridge:
         last.filled = total_filled
         return last
 
-    def _place_open_trailing_exit(
-        self, symbol: str, action: str, qty: int, price: float, confidence: float,
-    ) -> order_exec.OrderResult:
-        """Open with a limit parent and a trailing-stop child, then CONFIRM the
-        parent fill before treating the entry as real (H4/H5) and verify the
-        trailing child is live (H7). Long/short-aware; shorts are disabled by
-        default in config and skip the long-only protective check.
-        """
-        contract = self._contract(symbol)
-        limit_price = self._limit_price(action, price)
-        stop_price = self._initial_stop_price(action, price)
-        trailing_pct = round(float(config.TRAILING_STOP_PCT) * 100.0, 4)
-
-        parent = LimitOrder(action, qty, limit_price)
-        parent.orderId = self.ib.client.getReqId()
-        parent.transmit = False
-        parent.orderRef = order_exec.deterministic_order_ref(self._today(), symbol, action)
-
-        exit_action = "SELL" if action == "BUY" else "BUY"
-        trailing_stop = Order(
-            action=exit_action,
-            orderType="TRAIL",
-            totalQuantity=qty,
-            parentId=parent.orderId,
-            trailingPercent=trailing_pct,
-            trailStopPrice=stop_price,
-            transmit=True,
-        )
-        trailing_stop.orderId = self.ib.client.getReqId()
-
-        order_audit.log_event(
-            order_audit.STAGE_SUBMIT, kind="open_trailing", symbol=symbol, action=action,
-            qty=qty, limit_price=limit_price, initial_stop=stop_price, trail_pct=trailing_pct,
-            order_ref=parent.orderRef,
-        )
-        parent_trade = self.ib.placeOrder(contract, parent)
-        self.ib.placeOrder(contract, trailing_stop)
-        result = self._await_order_outcome(parent_trade)
-        return self._finalize_open(symbol, action, parent_trade, result, stop_price, qty)
-
     def _place_open_bracket(
         self, symbol: str, action: str, qty: int, price: float, confidence: float,
     ) -> order_exec.OrderResult:
-        if bool(getattr(config, "USE_TRAILING_EXIT", False)):
-            return self._place_open_trailing_exit(symbol, action, qty, price, confidence)
+        """Open a position with a plain marketable-limit entry, CONFIRM the real
+        fill (H4/H5), then -- for a long -- place and verify SERVER-SIDE GTC/OCA
+        protection sized to the actual filled qty and priced off the actual
+        avgFillPrice (C2/H7/H19).
 
+        Phase 3: protection is NOT attached at submission. It is placed only AFTER
+        the fill is confirmed, so a partial fill can never leave an oversized
+        resting exit and the hard stop is always based on the real entry price.
+        """
         contract = self._contract(symbol)
         limit_price = self._limit_price(action, price)
-        stop_price = self._initial_stop_price(action, price)
-        profit_price = self._take_profit_price(action, price)
-
-        if not self._validate_bracket_prices(action, limit_price, stop_price, profit_price):
-            logger.warning(
-                "Invalid bracket prices | %s %s limit=%.2f stop=%.2f profit=%.2f",
-                action, symbol, limit_price, stop_price, profit_price,
-            )
-            return order_exec.OrderResult(outcome=order_exec.REJECTED, status="bad_prices")
-
-        bracket = self.ib.bracketOrder(
-            action=action,
-            quantity=qty,
-            limitPrice=limit_price,
-            takeProfitPrice=profit_price,
-            stopLossPrice=stop_price,
-        )
-        order_ref = order_exec.deterministic_order_ref(self._today(), symbol, action)
-        bracket[0].orderRef = order_ref  # tag the parent for idempotency/reconcile
+        order = LimitOrder(action, qty, limit_price)
+        order.orderRef = order_exec.deterministic_order_ref(self._today(), symbol, action)
+        order.transmit = True
 
         order_audit.log_event(
-            order_audit.STAGE_SUBMIT, kind="open_bracket", symbol=symbol, action=action,
-            qty=qty, limit_price=limit_price, stop_price=stop_price, profit_price=profit_price,
-            order_ref=order_ref,
+            order_audit.STAGE_SUBMIT, kind="open", symbol=symbol, action=action,
+            qty=qty, limit_price=limit_price, confidence=confidence, order_ref=order.orderRef,
         )
-        trades = [self.ib.placeOrder(contract, order) for order in bracket]
-        parent_trade = trades[0]
-        result = self._await_order_outcome(parent_trade)
-        return self._finalize_open(symbol, action, parent_trade, result, stop_price, qty)
+        trade = self.ib.placeOrder(contract, order)
+        result = self._await_order_outcome(trade)
+        return self._finalize_open(symbol, action, trade, result, qty)
 
     # ── Public API ───────────────────────────────────────────────
     def _duplicate_ref_working(self, symbol: str, action: str) -> bool:
@@ -752,6 +842,12 @@ class IBKRBridge:
             if qty == 0:
                 logger.warning("Qty=0 for BUY %s price=%.2f cash=%.2f", symbol, price, cash)
                 return False
+            blocked, reason = self._new_entries_blocked(symbol, qty * price)
+            if blocked:
+                order_audit.log_event(order_audit.STAGE_HALT, phase="entry_gate",
+                                      symbol=symbol, action="BUY", reason=reason)
+                logger.warning("New entry blocked for %s BUY (%s)", symbol, reason)
+                return False
             if self._duplicate_ref_working(symbol, "BUY"):
                 logger.info("Deterministic orderRef already working for %s BUY — skipping (idempotency)", symbol)
                 return False
@@ -782,6 +878,12 @@ class IBKRBridge:
         qty = self._calc_quantity(price, cash)
         if qty == 0:
             logger.warning("Qty=0 for short SELL %s price=%.2f cash=%.2f", symbol, price, cash)
+            return False
+        blocked, reason = self._new_entries_blocked(symbol, qty * price)
+        if blocked:
+            order_audit.log_event(order_audit.STAGE_HALT, phase="entry_gate",
+                                  symbol=symbol, action="SELL", reason=reason)
+            logger.warning("New entry blocked for %s short SELL (%s)", symbol, reason)
             return False
         if self._duplicate_ref_working(symbol, "SELL"):
             logger.info("Deterministic orderRef already working for %s SELL — skipping (idempotency)", symbol)

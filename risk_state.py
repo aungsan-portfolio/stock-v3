@@ -58,3 +58,44 @@ def record_trade(day: str | None = None) -> int:
 def loss_breached(start_equity: float, current_equity: float) -> bool:
     """Return True when the configured daily loss limit has been exceeded."""
     return (float(start_equity) - float(current_equity)) >= float(config.MAX_DAILY_LOSS_USD)
+
+
+# ── Phase 3 (H1): start-of-day equity snapshot for the daily-loss kill-switch ──
+def snapshot_start_of_day_equity(equity: float, day: str | None = None) -> float:
+    """Persist the start-of-day NetLiquidation ONCE per date (restart-safe).
+
+    Idempotent: if a positive snapshot already exists for the day it is kept, so
+    a mid-day restart does not reset the baseline. A non-positive/invalid equity
+    is ignored (no snapshot written). Returns the stored value (0.0 if none).
+    """
+    day = day or _today()
+    state = _load()
+    rec = state.setdefault(day, {})
+    existing = float(rec.get("start_equity", 0.0) or 0.0)
+    if existing <= 0:
+        try:
+            val = float(equity)
+        except (TypeError, ValueError):
+            val = 0.0
+        if val > 0:
+            rec["start_equity"] = val
+            _save(state)
+    return float(state.get(day, {}).get("start_equity", 0.0) or 0.0)
+
+
+def start_of_day_equity(day: str | None = None) -> float:
+    """Return the persisted start-of-day equity for the day (0.0 if none)."""
+    day = day or _today()
+    return float(_load().get(day, {}).get("start_equity", 0.0) or 0.0)
+
+
+def daily_loss_blocked(current_equity: float, day: str | None = None) -> bool:
+    """True when today's loss vs the persisted start-of-day equity breaches the
+    cap (H1). Returns False when no valid snapshot exists yet -- the caller is
+    responsible for snapshotting at connect time; absent a baseline we cannot
+    claim a breach (fail-open for the *block* decision, never for protection).
+    """
+    start = start_of_day_equity(day)
+    if start <= 0:
+        return False
+    return loss_breached(start, current_equity)

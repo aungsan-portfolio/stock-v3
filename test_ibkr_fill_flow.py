@@ -17,8 +17,10 @@ Run with:
     python -m unittest test_ibkr_fill_flow -v
 """
 import asyncio
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 
@@ -73,6 +75,13 @@ class FakeTrade:
         self.orderStatus = status
 
 
+class FakePosition:
+    def __init__(self, symbol, position, avgCost=0.0):
+        self.contract = FakeContract(symbol)
+        self.position = position
+        self.avgCost = avgCost
+
+
 class _Client:
     def __init__(self):
         self._n = 9000
@@ -86,7 +95,7 @@ class FakeIB:
     """Minimal ib_insync.IB replacement. `on_wait(ib)` is invoked on every
     waitOnUpdate, letting a test evolve order state (simulate fills)."""
 
-    def __init__(self, on_wait=None, cancel_disabled=False):
+    def __init__(self, on_wait=None, cancel_disabled=False, reject_stops=False):
         self._all = []          # every FakeTrade placed
         self.cancelled = []
         self.bracket_calls = 0
@@ -95,6 +104,11 @@ class FakeIB:
         # (simulates a child that cannot be cancelled) so the safety gate must
         # fall back to an emergency flatten.
         self.cancel_disabled = cancel_disabled
+        # When True, protective STP/TRAIL orders are immediately Rejected (the
+        # broker refuses the stop) so protection cannot be established -> flatten.
+        self.reject_stops = reject_stops
+        self.account_values = []  # (tag, currency, value) for get_net_liquidation
+        self.positions_list = []  # FakePosition list for startup-scan tests
         self.client = _Client()
 
     # -- waiting --
@@ -109,7 +123,11 @@ class FakeIB:
     # -- orders --
     def placeOrder(self, contract, order):
         tot = float(getattr(order, "totalQuantity", 0) or 0)
-        st = FakeStatus(status="PreSubmitted", filled=0.0, remaining=tot)
+        otype = str(getattr(order, "orderType", "")).upper()
+        status = "PreSubmitted"
+        if self.reject_stops and otype in ("STP", "TRAIL"):
+            status = "Rejected"  # broker refuses the protective stop
+        st = FakeStatus(status=status, filled=0.0, remaining=tot)
         tr = FakeTrade(contract, order, st)
         self._all.append(tr)
         return tr
@@ -136,7 +154,11 @@ class FakeIB:
         return [t for t in self._all if t.orderStatus.status in ACTIVE]
 
     def positions(self):
-        return []
+        return list(self.positions_list)
+
+    def accountValues(self):
+        return [types.SimpleNamespace(tag=tag, currency=cur, value=str(val))
+                for (tag, cur, val) in self.account_values]
 
     def bracketOrder(self, action, quantity, limitPrice, takeProfitPrice, stopLossPrice):
         self.bracket_calls += 1
@@ -150,10 +172,13 @@ class FakeIB:
 
 # ── fill scripts (passed as FakeIB.on_wait) ──────────────────────────────────
 def _fill_parent(ib, qty=None, status="Filled", avg=100.0):
-    """Fill the open PARENT (the LMT order carrying a deterministic orderRef)."""
+    """Fill the open ENTRY parent (the BUY LMT carrying a deterministic orderRef).
+    Restricted to the BUY side so it never touches SELL protection orders that are
+    placed post-fill."""
     for t in ib.openTrades():
         o = t.order
-        if str(getattr(o, "orderType", "")) == "LMT" and getattr(o, "orderRef", ""):
+        if (str(getattr(o, "orderType", "")) == "LMT" and getattr(o, "orderRef", "")
+                and str(getattr(o, "action", "")).upper() == "BUY"):
             tot = float(getattr(o, "totalQuantity", 0) or 0)
             f = tot if qty is None else float(qty)
             t.orderStatus.status = status
@@ -188,7 +213,8 @@ def fill_market_only(ib):
 def reject_parent(ib):
     for t in ib.openTrades():
         o = t.order
-        if str(getattr(o, "orderType", "")) == "LMT" and getattr(o, "orderRef", ""):
+        if (str(getattr(o, "orderType", "")) == "LMT" and getattr(o, "orderRef", "")
+                and str(getattr(o, "action", "")).upper() == "BUY"):
             t.orderStatus.status = "Rejected"
             t.orderStatus.filled = 0.0
 
@@ -211,6 +237,12 @@ class _BridgeBase(unittest.TestCase):
         self._audit = mock.patch.object(order_audit, "log_event")
         self._audit.start()
         self.addCleanup(self._audit.stop)
+        # Isolate the file-backed daily risk state (start-of-day equity snapshot)
+        # so the Phase-3 entry gate is hermetic and never touches the real file.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        mock.patch.object(risk_state, "_STATE_PATH",
+                          Path(self._tmp.name) / "daily_risk_state.json").start()
         # Short, fast, deterministic await budget.
         for name, val in {"ORDER_FILL_TIMEOUT_SECONDS": 1.0, "ORDER_POLL_SECONDS": 0.25,
                           "CLOSE_MAX_ATTEMPTS": 3}.items():
@@ -272,10 +304,10 @@ class TestOpenBracket(_BridgeBase):
         self.assertEqual(res.outcome, ox.REJECTED)
         self.assertFalse(ox.should_record_trade(res))
 
-    def test_partial_fill_handles_both_stop_and_take_profit(self):
-        # GO/NO-GO: on a partial fill, NEITHER the protective stop NOR the
-        # take-profit limit child may exceed the actual filled qty (H6). The
-        # native bracket leaves an oversized STP *and* an oversized TP LMT.
+    def test_partial_fill_protection_sized_to_filled_qty(self):
+        # GO/NO-GO (Phase 2 invariant preserved under Phase 3): on a partial fill,
+        # protection is placed sized to the ACTUAL filled qty, so NO exit-side SELL
+        # (stop, hard-stop, OR take-profit) can exceed it -> no accidental short.
         mock.patch.object(config, "USE_TRAILING_EXIT", False).start()
         br = make_bridge(on_wait=partial_parent(30))
         res = br._place_open_bracket("AAPL", "BUY", 100, 100.0, 0.7)
@@ -283,27 +315,24 @@ class TestOpenBracket(_BridgeBase):
         self.assertEqual(res.filled, 30)
         self.assertTrue(res.protective_ok)
         self.assertFalse(res.aborted)
-        # A protective STP sized to exactly the 30 filled shares was placed.
-        stops = [o for o in placed_orders(br.ib)
-                 if str(getattr(o, "orderType", "")) == "STP"
-                 and float(getattr(o, "totalQuantity", 0)) == 30]
-        self.assertTrue(stops, "expected a resized protective STP of 30 shares")
-        # NO working SELL exit child may exceed the filled qty (no accidental short).
+        # Every working SELL exit is <= 30 (no oversell trap).
+        self.assertTrue(br.ib.working_exit_qtys("AAPL"))
         self.assertTrue(all(q <= 30 for q in br.ib.working_exit_qtys("AAPL")),
-                        f"oversized exit child survived: {br.ib.working_exit_qtys('AAPL')}")
-        # The original oversized take-profit LMT (100) was cancelled.
-        self.assertTrue(any(str(getattr(o, "orderType", "")) == "LMT"
-                            and str(getattr(o, "action", "")) == "SELL"
-                            and float(getattr(o, "totalQuantity", 0)) == 100
-                            for o in br.ib.cancelled),
-                        "expected the oversized take-profit LMT to be cancelled")
+                        f"oversized exit survived: {br.ib.working_exit_qtys('AAPL')}")
+        # A GTC protective stop sized to exactly the 30 filled shares exists.
+        gtc_stops = [o for o in placed_orders(br.ib)
+                     if str(getattr(o, "orderType", "")) in ("STP", "TRAIL")
+                     and str(getattr(o, "action", "")) == "SELL"
+                     and str(getattr(o, "tif", "")).upper() == "GTC"
+                     and float(getattr(o, "totalQuantity", 0)) == 30]
+        self.assertTrue(gtc_stops, "expected a GTC protective stop of 30 shares")
 
-    def test_partial_fill_cannot_cancel_children_is_flattened(self):
-        # If oversized exit children cannot be removed, the only safe action is to
-        # flatten and abort (never hold a position with an oversell trap).
+    def test_protection_placement_failure_is_flattened_and_aborted(self):
+        # If the broker refuses the protective stop, the only safe action is to
+        # emergency-flatten and abort (never hold an unprotected position).
         mock.patch.object(config, "USE_TRAILING_EXIT", False).start()
-        br = make_bridge(on_wait=partial_parent(30))
-        br.ib.cancel_disabled = True  # children refuse to cancel
+        br = make_bridge(on_wait=fill_parent_full)
+        br.ib.reject_stops = True  # every STP/TRAIL is Rejected
         with mock.patch.object(br, "_market_close_symbol") as flatten:
             res = br._place_open_bracket("AAPL", "BUY", 100, 100.0, 0.7)
         flatten.assert_called_once()
@@ -322,12 +351,12 @@ class TestOpenBracket(_BridgeBase):
 # ── 3. Missing protective stop after a fill -> emergency flatten (H7) ─────────
 class TestUnprotectedFlatten(_BridgeBase):
     def test_fill_without_confirmable_stop_is_flattened_and_aborted(self):
-        br = make_bridge()  # openTrades() will be empty -> no child found
+        br = make_bridge()  # openTrades() will be empty -> no protective stop
         result = ox.OrderResult(ox.FILLED, status="Filled", filled=100, remaining=0, avg_fill_price=100.0)
         parent = FakeOrder("BUY", "LMT", 100, "ref")
-        with mock.patch.object(br, "_place_protective_stop", return_value=False) as place, \
+        with mock.patch.object(br, "_place_protection", return_value=False) as place, \
              mock.patch.object(br, "_market_close_symbol") as flatten:
-            out = br._verify_or_protect("AAPL", parent, result, stop_price=96.0, exit_action="SELL")
+            out = br._verify_or_protect("AAPL", parent, result, 100.0, "SELL")
         self.assertTrue(place.called)
         flatten.assert_called_once()
         self.assertTrue(out.aborted)
@@ -402,7 +431,7 @@ class TestDuplicateGuard(_BridgeBase):
         ))
         self.assertTrue(br._duplicate_ref_working("AAPL", "BUY"))
 
-        # And execute_signal short-circuits without placing a new bracket.
+        # And execute_signal short-circuits without placing a new entry order.
         br.get_price = lambda *a, **k: 100.0          # type: ignore
         br.get_cash = lambda: 100000.0                # type: ignore
         br.get_position = lambda symbol: 0.0          # type: ignore
@@ -411,7 +440,7 @@ class TestDuplicateGuard(_BridgeBase):
         with mock.patch.object(risk_state, "record_trade") as rec:
             ok = br.execute_signal(types.SimpleNamespace(symbol="AAPL", action="BUY", confidence=0.7))
         self.assertFalse(ok)
-        self.assertEqual(br.ib.bracket_calls, 0)
+        self.assertEqual(len(br.ib._all), 1, "no new entry order may be placed")  # only the pre-seeded one
         self.assertEqual(rec.call_count, 0)
 
 

@@ -215,6 +215,21 @@ ORDER_POLL_SECONDS         = 0.25
 # to drive a close to remaining == 0 before giving up and alerting.
 CLOSE_MAX_ATTEMPTS         = 3
 
+# ── Phase 3: Server-side protection + risk engine (C2, H19, H1, H3) ──
+# Protective exits rest at the broker as GTC so they survive between the
+# one-shot bot's runs (and overnight). All exits for one position share an OCA
+# group so the first to fill auto-cancels the rest (no leftover resting SELL
+# that could open an accidental short). HARD_STOP_LOSS_PCT (above) is the
+# independent catastrophe stop, sized to the actual filled qty.
+PROTECTIVE_TIF             = "GTC"
+# Account circuit breakers (H3 GROUNDWORK only; conservative paper-test values).
+# Block NEW entries when equity falls this fraction below the start-of-day
+# snapshot. Closes / flatten / protective repair stay allowed.
+ACCOUNT_MAX_DRAWDOWN_PCT   = 0.10
+# Per-symbol exposure cap as a fraction of current equity (groundwork). A single
+# new position whose value exceeds this share of equity is refused.
+MAX_SYMBOL_EXPOSURE_PCT    = 0.10
+
 # ── Backtest Settings ────────────────────────────
 # Daily position-state simulation costs. These are conservative defaults.
 BACKTEST_TRANSACTION_COST_PCT = 0.0005  # 5 bps per order

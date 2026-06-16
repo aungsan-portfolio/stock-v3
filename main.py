@@ -258,6 +258,17 @@ def _place_paper_orders(signals) -> int:
         return 1
 
     try:
+        # Phase 3: snapshot start-of-day equity (daily-loss kill-switch baseline)
+        # and run the startup protection invariant before placing anything. An
+        # unprotected open long is repaired (GTC stop) or it halts NEW entries.
+        bridge.snapshot_start_of_day_equity()
+        protect = bridge.ensure_protective_stops()
+        if protect.get("repaired"):
+            print(f"ðŸ›¡ï¸  Repaired protective GTC stop(s) for: {protect['repaired']}")
+        if protect.get("failed"):
+            print(f"âš ï¸  Startup protection FAILED for {protect['failed']} "
+                  f"â€” NEW entries halted; closes/flatten still allowed.")
+
         result = bridge.execute_all(signals)
         print(f"\nâœ… Orders accepted : {result['placed']}")
         print(f"   Skipped         : {result['skipped']}")

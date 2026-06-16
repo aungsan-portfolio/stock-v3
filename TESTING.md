@@ -22,6 +22,8 @@ python -m unittest test_live_readiness -v    # Phase-0 live-readiness scaffoldin
 python -m unittest test_model_gate -v        # Phase-1 model gate + signal parity
 python -m unittest test_order_exec -v        # Phase-2 order-execution logic (H4-H9)
 python -m unittest test_ibkr_fill_flow -v    # Phase-2 fill-driven order path (fake IBKR)
+python -m unittest test_risk_engine -v       # Phase-3 risk engine + equity snapshot (H1, H3)
+python -m unittest test_phase3_protection -v # Phase-3 GTC/OCA + kill-switch + startup invariant
 python -m unittest discover -p "test_*.py"   # everything
 python test_logic.py                         # equivalent direct run
 ```
@@ -43,6 +45,7 @@ so they never overwrite real reports.
 | Imports | `main`, `backtest`, `predictor`, `ibkr_bridge`, engines import cleanly |
 | Live-readiness (Phase 0) | `unprotected_longs` / duplicate-ref invariants; `order_audit` JSONL never raises; Phase-3+ bridge capability flags `False` (Phase-2 flags now `True`); `live-readiness` scorecard reports NOT READY (`test_live_readiness.py`) |
 | Order execution (Phase 2) | fill-vs-accepted classification (`PreSubmitted` is not a fill); partial-fill exit-child reconciliation — **all** SELL children (protective stop, trailing stop, AND take-profit LMT) cancelled/resized to the actual filled qty so nothing can over-sell into a short; protective-child verify-or-flatten; robust close marketable-limit→market escalation; deterministic `orderRef` duplicate guard; emergency flatten cancels resting children first; capability flags (`test_order_exec.py`, `test_ibkr_fill_flow.py`) |
+| Server-side protection + risk (Phase 3) | GTC + OCA exit set placed **after** the confirmed fill, sized to the filled qty; independent hard −3% stop priced off the **actual** `avgFillPrice`; every exit `tif=GTC` and shares one non-empty OCA group; no exit qty exceeds the fill; placement/verify failure → flatten + abort; daily-loss kill-switch (start-of-day equity snapshot) blocks **new opens** but allows **closes**; account drawdown / per-symbol exposure groundwork; startup invariant repairs unprotected longs or halts new entries; capability flags (`test_order_exec.py`, `test_risk_engine.py`, `test_phase3_protection.py`) |
 | Model gate (Phase 1) | `evaluate_gate` decision table (missing / stale / below-floor / ok / disabled); per-symbol metrics persist + merge RF and LSTM and never raise; a pre-gate BUY is forced to `HOLD` when blocked; backtest/live signal-construction parity; P1 scorecard gates PASS while overall stays NOT READY; `signal-parity` command (`test_model_gate.py`) |
 
 > **Model gate & signal parity (Phase 1).** `test_model_gate.py` is offline and
@@ -77,6 +80,22 @@ so they never overwrite real reports.
 > `SUPPORTS_PARTIAL_FILL_HANDLING`, and `SUPPORTS_PROTECTIVE_CHILD_VERIFY` are
 > `True` only because the logic exists **and** is covered here; the Phase-3+ flags
 > remain `False`, so the `live-readiness` scorecard still reports NOT READY.
+
+> **Server-side protection + risk engine (Phase 3, C2/H19/H1/H3).** `test_risk_engine.py`
+> is pure (drawdown / exposure math + the file-backed start-of-day equity
+> snapshot, patched to a temp file); `test_phase3_protection.py` drives the real
+> bridge with the fake ib_insync objects from `test_ibkr_fill_flow.py`. They prove:
+> protection is placed **after** the confirmed fill, every exit is `tif=GTC` and
+> shares one OCA group, an independent hard −3% stop is sized to the filled qty
+> and priced off the **actual** `avgFillPrice` (not the signal price), no exit can
+> over-sell, a placement/verify failure flattens + aborts, the daily-loss
+> kill-switch blocks new opens while still allowing closes, and the startup
+> invariant repairs an unprotected long or halts new entries (avgCost missing →
+> halt, never guess). The "Unsafe GTC protection … emergency flatten",
+> "New entry blocked … (daily_loss/halt_flag)", and "Startup: …" lines in the
+> test output are **expected**. Flags `SUPPORTS_SERVER_SIDE_GTC_STOP` and
+> `SUPPORTS_DAILY_LOSS_KILLSWITCH` flip `True`; Phase-4–6 flags stay `False`, so
+> `live-readiness` still reports NOT READY.
 
 ## Continuous integration
 

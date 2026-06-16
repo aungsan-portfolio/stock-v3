@@ -327,6 +327,50 @@ def oversized_exit_children(symbol, exit_action, filled_qty_value, working_order
     ]
 
 
+# ── Server-side GTC / OCA protection (Phase 3: C2, H19) ──────────────────────
+def oca_group_id(day, symbol) -> str:
+    """Deterministic OCA group name for one position's exit set (H19).
+
+    The protective stop, the independent catastrophe hard-stop, and the
+    take-profit for a single entry all share this group so that when ONE fills
+    the broker auto-cancels the rest -- there is never a leftover resting SELL
+    that could open an accidental short.
+    """
+    return f"OCA:{str(day).strip()}:{_norm(symbol)}"
+
+
+def hard_stop_price(entry_price, hard_pct, action="BUY") -> float:
+    """Catastrophe hard-stop price (C2) computed from the ACTUAL entry/avg-fill
+    price -- never a stale signal price.
+
+    For a long (entry action BUY) it is entry*(1 - hard_pct); for a short it is
+    entry*(1 + hard_pct). Returns 0.0 for a non-positive/invalid entry price, and
+    the caller MUST treat 0.0 as "cannot price protection" (halt/flatten -- do
+    not guess).
+    """
+    e = _f(entry_price, 0.0)
+    if e <= 0:
+        return 0.0
+    pct = abs(_f(hard_pct, 0.0))
+    if _norm(action) == "BUY":
+        return round(e * (1.0 - pct), 2)
+    return round(e * (1.0 + pct), 2)
+
+
+def has_gtc_protective_stop(symbol, filled_qty_value, working_orders) -> bool:
+    """True when a GTC protective SELL stop (stop/trailing family) covers the
+    filled qty (Phase-3 startup invariant + post-fill verification).
+
+    A protective stop that is NOT GTC does not satisfy the invariant: between the
+    one-shot bot's runs only a resting GTC order protects the position.
+    """
+    filled = _f(filled_qty_value, 0.0)
+    for c in find_protective_children(symbol, working_orders):
+        if _norm(c.get("tif")) == "GTC" and _f(c.get("qty", 0.0)) + _EPS >= filled:
+            return True
+    return False
+
+
 # ── Close-order retry / escalation (H8) ──────────────────────────────────────
 def close_followup(result: OrderResult, attempt: int, max_attempts: int) -> str:
     """Decide what to do after a close attempt: 'done' / 'escalate' / 'giveup'.

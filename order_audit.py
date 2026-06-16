@@ -39,6 +39,9 @@ STAGE_STOP_PLACED = "stop_placed"  # protective child placed (Phase 3)
 STAGE_STOP_CONFIRMED = "stop_confirmed"  # protective child verified live (Phase 2/3)
 STAGE_TRADE_RECORDED = "trade_recorded"  # risk_state.record_trade() called
 STAGE_FLATTEN = "flatten"          # emergency/normal flatten action
+STAGE_PROTECT = "protect"          # GTC/OCA protective exit set placed + verified (Phase 3)
+STAGE_HALT = "halt"                # new-entry halt: daily-loss / drawdown / unprotected startup (Phase 3)
+STAGE_SNAPSHOT = "equity_snapshot" # start-of-day NetLiquidation snapshot (Phase 3)
 
 
 def log_event(stage: str, **fields) -> None:

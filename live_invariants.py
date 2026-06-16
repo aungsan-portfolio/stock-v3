@@ -133,6 +133,9 @@ def adapt_working_orders(ib_open_trades) -> list:
                 "parent_id": int(getattr(order, "parentId", 0) or 0),
                 "qty": float(getattr(order, "totalQuantity", 0) or 0),
                 "status": str(getattr(getattr(t, "orderStatus", None), "status", "") or "").strip(),
+                # tif lets Phase 3 confirm a protective stop is GTC (rests between
+                # the one-shot bot's runs), not a DAY order that expires.
+                "tif": str(getattr(order, "tif", "") or "").strip().upper(),
             })
         except Exception:
             continue

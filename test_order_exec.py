@@ -252,6 +252,43 @@ class TestExitChildren(unittest.TestCase):
         self.assertEqual(ox.oversized_exit_children("AAPL", "SELL", 100, working), [])
 
 
+# ── 7b. Phase 3: GTC / OCA / hard-stop pure helpers (C2, H19) ────────────────
+class TestOcaAndHardStop(unittest.TestCase):
+    def test_oca_group_is_deterministic_and_nonempty(self):
+        g = ox.oca_group_id("2026-06-16", "aapl")
+        self.assertTrue(g)
+        self.assertEqual(g, ox.oca_group_id("2026-06-16", "AAPL"))  # case-normalised
+        self.assertNotEqual(g, ox.oca_group_id("2026-06-16", "MSFT"))
+
+    def test_hard_stop_from_actual_basis_long(self):
+        # -3% off the ACTUAL avg-fill basis, not a stale signal price.
+        self.assertAlmostEqual(ox.hard_stop_price(100.0, 0.03, "BUY"), 97.0)
+        self.assertAlmostEqual(ox.hard_stop_price(50.0, 0.03, "BUY"), 48.50)
+
+    def test_hard_stop_invalid_basis_is_zero(self):
+        # 0.0 signals "cannot price protection" -> caller must halt/flatten.
+        self.assertEqual(ox.hard_stop_price(0.0, 0.03, "BUY"), 0.0)
+        self.assertEqual(ox.hard_stop_price(float("nan"), 0.03, "BUY"), 0.0)
+
+
+class TestHasGtcProtectiveStop(unittest.TestCase):
+    def _stop(self, qty, tif):
+        return {"symbol": "AAPL", "action": "SELL", "order_type": "STP", "qty": qty, "tif": tif}
+
+    def test_gtc_stop_covering_fill_passes(self):
+        self.assertTrue(ox.has_gtc_protective_stop("AAPL", 30, [self._stop(30, "GTC")]))
+
+    def test_day_stop_does_not_satisfy_invariant(self):
+        # A DAY stop expires; only a resting GTC stop protects between runs.
+        self.assertFalse(ox.has_gtc_protective_stop("AAPL", 30, [self._stop(30, "DAY")]))
+
+    def test_undersized_gtc_stop_does_not_cover(self):
+        self.assertFalse(ox.has_gtc_protective_stop("AAPL", 100, [self._stop(30, "GTC")]))
+
+    def test_no_stop_is_unprotected(self):
+        self.assertFalse(ox.has_gtc_protective_stop("AAPL", 30, []))
+
+
 # ── 8. close retry / escalation (H8) ─────────────────────────────────────────
 class TestCloseFollowup(unittest.TestCase):
     def test_full_fill_is_done(self):
