@@ -91,6 +91,7 @@ def save_rf_metrics(results: dict, trained_at: str | None = None) -> None:
         data = load_all()
         rf = data.setdefault("rf", {})
         for sym, m in (results or {}).items():
+            m = m or {}
             rf[str(sym).upper()] = {
                 "accuracy": _to_float(m.get("test_acc")),
                 "f1": _to_float(m.get("test_f1")),
@@ -115,6 +116,7 @@ def save_lstm_metrics(results: dict, trained_at: str | None = None) -> None:
         data = load_all()
         lstm = data.setdefault("lstm", {})
         for sym, m in (results or {}).items():
+            m = m or {}
             lstm[str(sym).upper()] = {
                 "best_val_loss": _to_float(m.get("best_val_loss")),
                 "n_train_seq": int(m.get("n_train_seq", 0) or 0),
