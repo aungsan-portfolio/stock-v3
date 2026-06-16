@@ -16,9 +16,10 @@ import logging
 import math
 from typing import List, Optional
 
-from ib_insync import IB, Stock, LimitOrder, Contract, Order
+from ib_insync import IB, Stock, LimitOrder, MarketOrder, Contract, Order
 
 import config
+import order_audit
 import risk_state
 from predictor import Signal
 
@@ -27,6 +28,22 @@ logger = logging.getLogger(__name__)
 ACCEPTED_ORDER_STATUSES = {"PendingSubmit", "PreSubmitted", "Submitted", "Filled", "ApiPending"}
 BAD_ORDER_STATUSES = {"Cancelled", "ApiCancelled", "Inactive", "Rejected"}
 WORKING_ORDER_STATUSES = {"PendingSubmit", "ApiPending", "PreSubmitted", "Submitted"}
+
+# ── Live-readiness capability flags ───────────────────────────────────────────
+# These advertise which live-trading safety capabilities are ACTUALLY IMPLEMENTED
+# in this bridge. They start False and each is flipped to True ONLY by the phase
+# that builds the backing logic (see reports/LIVE_TRADING_IMPLEMENTATION_PLAN_MM.md).
+# The `live-readiness` command reads them to produce an honest go-live scorecard.
+# Flipping one True without its implementation is a deliberate footgun — do not.
+SUPPORTS_FILL_VERIFICATION       = False   # Phase 2 (H4, H5): wait for real fill, not "accepted"
+SUPPORTS_PARTIAL_FILL_HANDLING   = False   # Phase 2 (H6): size children from actual filled qty
+SUPPORTS_PROTECTIVE_CHILD_VERIFY = False   # Phase 2 (H7): confirm stop child is live or flatten
+SUPPORTS_SERVER_SIDE_GTC_STOP    = False   # Phase 3 (C2, H19): resting GTC/OCA hard stop per entry
+SUPPORTS_DAILY_LOSS_KILLSWITCH   = False   # Phase 3 (H1): loss_breached() wired into the order gate
+SUPPORTS_REALTIME_DATA_GUARD     = False   # Phase 4 (H12, H13): require real-time, reject delayed
+SUPPORTS_MARKET_HOURS_GATE       = False   # Phase 4 (H15): refuse orders outside RTH/holidays
+SUPPORTS_STARTUP_RECONCILIATION  = False   # Phase 5 (H18): broker = source of truth on startup
+SUPPORTS_ACCOUNT_TYPE_ASSERTION  = False   # Phase 6: assert paper(DU)/live(U) account, not just port
 
 
 def _order_status_name(trade) -> str:
@@ -294,11 +311,22 @@ class IBKRBridge:
         contract = self._contract(symbol)
         limit_price = self._limit_price(action, price)
         order = LimitOrder(action, qty, limit_price)
+        order_audit.log_event(
+            order_audit.STAGE_SUBMIT, kind="limit", note=note,
+            symbol=symbol, action=action, qty=qty, limit_price=limit_price,
+        )
         trade = self.ib.placeOrder(contract, order)
         self.ib.sleep(1)
 
         status = _order_status_name(trade)
         accepted = _is_order_accepted(status)
+        # NOTE: `accepted` here means "broker acknowledged", NOT "filled" (H4).
+        # Phase 2 replaces this with fill-driven confirmation.
+        order_audit.log_event(
+            order_audit.STAGE_REJECTED if not accepted else order_audit.STAGE_ACK,
+            kind="limit", note=note, symbol=symbol, action=action, qty=qty,
+            limit_price=limit_price, status=status, accepted=accepted,
+        )
         logger.info(
             "%s | %s %s x%d limit=%.2f | status=%s accepted=%s",
             note, action, symbol, qty, limit_price, status, accepted,
@@ -336,6 +364,10 @@ class IBKRBridge:
         )
         trailing_stop.orderId = self.ib.client.getReqId()
 
+        order_audit.log_event(
+            order_audit.STAGE_SUBMIT, kind="open_trailing", symbol=symbol, action=action,
+            qty=qty, limit_price=limit_price, initial_stop=stop_price, trail_pct=trailing_pct,
+        )
         trades = [
             self.ib.placeOrder(contract, parent),
             self.ib.placeOrder(contract, trailing_stop),
@@ -343,6 +375,14 @@ class IBKRBridge:
         self.ib.sleep(1)
         statuses = [_order_status_name(t) for t in trades]
         accepted = all(_is_order_accepted(status) for status in statuses)
+        # The trailing child is placed but NOT verified live (H7); statuses here
+        # may be PreSubmitted, not Filled (H4/H5). Phase 2/3 harden this.
+        order_audit.log_event(
+            order_audit.STAGE_REJECTED if not accepted else order_audit.STAGE_ACK,
+            kind="open_trailing", symbol=symbol, action=action, qty=qty,
+            limit_price=limit_price, initial_stop=stop_price, trail_pct=trailing_pct,
+            statuses=statuses, accepted=accepted,
+        )
         logger.info(
             "Open trailing | %s %s x%d limit=%.2f | initial_stop=%.2f trail=%.4f%% | conf=%.2f | statuses=%s accepted=%s",
             action, symbol, qty, limit_price, stop_price, trailing_pct, confidence, statuses, accepted,
@@ -375,10 +415,20 @@ class IBKRBridge:
             stopLossPrice=stop_price,
         )
 
+        order_audit.log_event(
+            order_audit.STAGE_SUBMIT, kind="open_bracket", symbol=symbol, action=action,
+            qty=qty, limit_price=limit_price, stop_price=stop_price, profit_price=profit_price,
+        )
         trades = [self.ib.placeOrder(contract, order) for order in bracket]
         self.ib.sleep(1)
         statuses = [_order_status_name(t) for t in trades]
         accepted = all(_is_order_accepted(status) for status in statuses)
+        order_audit.log_event(
+            order_audit.STAGE_REJECTED if not accepted else order_audit.STAGE_ACK,
+            kind="open_bracket", symbol=symbol, action=action, qty=qty,
+            limit_price=limit_price, stop_price=stop_price, profit_price=profit_price,
+            statuses=statuses, accepted=accepted,
+        )
         logger.info(
             "Open bracket | %s %s x%d limit=%.2f | SL=%.2f TP=%.2f | conf=%.2f | statuses=%s accepted=%s",
             action, symbol, qty, limit_price, stop_price, profit_price, confidence, statuses, accepted,
@@ -434,6 +484,12 @@ class IBKRBridge:
             accepted = self._place_open_bracket(symbol, "BUY", qty, price, signal.confidence)
             if accepted:
                 trades = risk_state.record_trade()
+                # H4: recorded on "accepted", not a confirmed fill. Audited so
+                # Phase 2 can prove the move to fill-driven recording.
+                order_audit.log_event(
+                    order_audit.STAGE_TRADE_RECORDED, symbol=symbol, action="BUY",
+                    qty=qty, price=price, daily_trade_count=trades, on="accepted",
+                )
                 logger.info("Recorded daily trade #%d for %s", trades, symbol)
             return accepted
 
@@ -463,6 +519,10 @@ class IBKRBridge:
         accepted = self._place_open_bracket(symbol, "SELL", qty, price, signal.confidence)
         if accepted:
             trades = risk_state.record_trade()
+            order_audit.log_event(
+                order_audit.STAGE_TRADE_RECORDED, symbol=symbol, action="SELL",
+                qty=qty, price=price, daily_trade_count=trades, on="accepted",
+            )
             logger.info("Recorded daily trade #%d for %s", trades, symbol)
         return accepted
 
@@ -515,3 +575,100 @@ class IBKRBridge:
                 skipped += 1
 
         return {"placed": placed, "skipped": skipped, "total": len(signals)}
+
+    # ── Emergency flatten (kill-switch) ──────────────────────────────────────
+    def flatten_all(self, confirm: bool = False) -> dict:
+        """Emergency kill-switch: cancel every working order and market-close
+        every open position. PAPER-port-locked via connect() like all order
+        paths.
+
+        confirm=False (default) is a DRY-RUN: it reports exactly what it would
+        cancel/flatten and places nothing. confirm=True actually cancels orders
+        and submits MarketOrders to flatten. Returns a structured plan/result
+        dict so callers (the `panic-flatten` command, later graceful shutdown)
+        can print and verify it.
+
+        Uses market orders on purpose: in an emergency, certainty of exit beats
+        price. Handles longs (SELL to close) and any shorts (BUY to cover).
+        """
+        try:
+            self.ib.reqAllOpenOrders()
+            self.ib.sleep(1)
+        except Exception:
+            logger.warning("Could not refresh open orders before flatten", exc_info=True)
+
+        open_trades = list(self.ib.openTrades())
+        positions = [p for p in self.ib.positions() if float(p.position) != 0.0]
+
+        plan = {
+            "confirm": bool(confirm),
+            "orders_to_cancel": [
+                {
+                    "symbol": str(getattr(t.contract, "symbol", "")),
+                    "action": str(getattr(t.order, "action", "")),
+                    "order_type": str(getattr(t.order, "orderType", "")),
+                    "qty": float(getattr(t.order, "totalQuantity", 0) or 0),
+                    "order_id": int(getattr(t.order, "orderId", 0) or 0),
+                    "status": _order_status_name(t),
+                }
+                for t in open_trades
+                if _is_order_working(_order_status_name(t))
+            ],
+            "positions_to_flatten": [
+                {
+                    "symbol": str(p.contract.symbol),
+                    "qty": float(p.position),
+                    "action": "SELL" if float(p.position) > 0 else "BUY",
+                }
+                for p in positions
+            ],
+            "cancelled": 0,
+            "flattened": 0,
+            "flatten_results": [],
+        }
+
+        order_audit.log_event(
+            order_audit.STAGE_FLATTEN, phase="plan", confirm=bool(confirm),
+            n_orders=len(plan["orders_to_cancel"]), n_positions=len(plan["positions_to_flatten"]),
+        )
+
+        if not confirm:
+            return plan  # dry-run: nothing placed
+
+        # 1) Cancel all working orders (protective children included; they are
+        #    redundant once we market-close the underlying position).
+        for t in open_trades:
+            if not _is_order_working(_order_status_name(t)):
+                continue
+            try:
+                self.ib.cancelOrder(t.order)
+                plan["cancelled"] += 1
+            except Exception:
+                logger.warning("Failed to cancel order id=%s", getattr(t.order, "orderId", "?"), exc_info=True)
+        self.ib.sleep(1)
+
+        # 2) Market-close every open position.
+        for p in positions:
+            symbol = str(p.contract.symbol).upper().strip()
+            qty = int(abs(float(p.position)))
+            if qty <= 0:
+                continue
+            action = "SELL" if float(p.position) > 0 else "BUY"
+            try:
+                contract = self._contract(symbol)
+                trade = self.ib.placeOrder(contract, MarketOrder(action, qty))
+                self.ib.sleep(1)
+                status = _order_status_name(trade)
+                result = {
+                    "symbol": symbol, "action": action, "qty": qty, "status": status,
+                    "filled": float(getattr(trade.orderStatus, "filled", 0) or 0),
+                    "avg_fill": float(getattr(trade.orderStatus, "avgFillPrice", 0) or 0),
+                }
+                plan["flatten_results"].append(result)
+                plan["flattened"] += 1
+                order_audit.log_event(order_audit.STAGE_FLATTEN, phase="executed", **result)
+                logger.info("Flatten %s %s x%d -> status=%s", action, symbol, qty, status)
+            except Exception:
+                logger.warning("Failed to flatten %s", symbol, exc_info=True)
+        self.ib.sleep(1)
+        return plan

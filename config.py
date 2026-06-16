@@ -146,6 +146,25 @@ WEIGHT_TECHNICAL    = 0.25
 # 1 = at least one ML model (RF or LSTM) must be available; otherwise forced HOLD.
 MIN_ML_MODELS_FOR_SIGNAL = 1
 
+# ── Phase 1: Model performance / staleness gate (signal safety) ───
+# Per-symbol RF/LSTM metrics are persisted here at train time (see model_metrics.py)
+# and read by predictor.predict_all before issuing any BUY/SELL. A symbol whose
+# metrics are MISSING, STALE, or BELOW the floor is forced to HOLD with an
+# explanation. This is fail-closed by design: no trusted metric => no trade.
+MODEL_METRICS_FILE   = MODELS_DIR / "model_metrics.json"
+# Master switch for the gate. True = enforce (recommended). Tests may disable it
+# to isolate ensemble logic; do not ship it False.
+MODEL_GATE_ENABLED   = True
+# Minimum cross-validated RF accuracy required to trade a symbol. 0.50 = at least
+# coin-flip; a model at or below chance must not place orders. Raise to demand a
+# real edge once models clear this bar.
+MODEL_MIN_RF_ACCURACY = 0.50
+# Optional RF F1 floor. 0.0 = disabled; raise to also require balanced precision/recall.
+MODEL_MIN_RF_F1       = 0.0
+# Maximum model age (days since training) before a symbol is forced to HOLD.
+# Regime shifts make stale models dangerous; retrain to refresh the timestamp.
+MODEL_MAX_AGE_DAYS    = 30
+
 # ── Risk Management ──────────────────────────────
 # Small-basket mode: allow a few tiny positions instead of one large holding.
 MAX_POSITION_PCT    = 0.005

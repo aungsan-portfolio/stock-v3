@@ -40,6 +40,13 @@ Guided Daily Trading Coach (full-market scan; previews + multi-trade PAPER pract
   python main.py daily-coach --confirm --chart-checked --max-trades 3  # Up to 3 PAPER trades
   (PAPER ONLY. Live trading is hard-blocked. See README "Guided Daily Trading Coach".)
 
+Live-trading readiness (read-only scorecard + emergency kill-switch):
+  python main.py live-readiness           # Go-live scorecard (config + capability flags)
+  python main.py live-readiness --connect # Also check PAPER account for unprotected positions
+  python main.py panic-flatten            # DRY-RUN: show orders/positions it would flatten
+  python main.py panic-flatten --confirm  # Cancel all orders + market-close all PAPER positions
+  (See reports/LIVE_TRADING_IMPLEMENTATION_PLAN_MM.md. Still PAPER ONLY.)
+
 Exit codes:
   0  success
   1  IBKR connection failure
@@ -1355,6 +1362,281 @@ def cmd_backtest_summary(_args) -> int:
     return 0
 
 
+# -- Live-trading readiness self-check (read-only) ----------------------------
+def _load_bridge_module():
+    """Import ibkr_bridge after preparing the asyncio loop, or return None.
+
+    Reading the bridge's live-readiness capability flags does NOT require a
+    connection, but importing ib_insync (eventkit) touches the event loop at
+    import time, so prepare it first. Returns the module or None if ib_insync
+    is unavailable.
+    """
+    _ibkr_setup_asyncio()
+    try:
+        import ibkr_bridge
+        return ibkr_bridge
+    except Exception:
+        return None
+
+
+def _collect_readiness_gates(bridge_mod):
+    """Build the offline go-live scorecard from config + bridge capability flags.
+
+    Returns a list of gate dicts: {phase, title, status, detail}. status is one
+    of "PASS" / "FAIL" / "MANUAL". Read-only; never connects or places orders.
+    """
+    def cap(name):
+        # Capability flags default to False/absent => not implemented yet.
+        return bool(getattr(bridge_mod, name, False)) if bridge_mod else False
+
+    def gate(phase, title, ok, detail):
+        return {"phase": phase, "title": title, "status": "PASS" if ok else "FAIL", "detail": detail}
+
+    # -- Phase 1 automated gates (flip FAIL->PASS only because the logic exists) --
+    p1_gates = []
+    try:
+        import model_metrics
+        p1_gates.append(gate(
+            "P1", "Model performance gate (RF accuracy floor) implemented",
+            bool(getattr(model_metrics, "SUPPORTS_MODEL_PERFORMANCE_GATE", False)),
+            f"model_metrics.SUPPORTS_MODEL_PERFORMANCE_GATE; floor="
+            f"{getattr(config, 'MODEL_MIN_RF_ACCURACY', None)}"))
+        p1_gates.append(gate(
+            "P1", "Model staleness gate (max age) implemented",
+            bool(getattr(model_metrics, "SUPPORTS_MODEL_STALENESS_GATE", False)),
+            f"model_metrics.SUPPORTS_MODEL_STALENESS_GATE; max_age_days="
+            f"{getattr(config, 'MODEL_MAX_AGE_DAYS', None)}"))
+    except Exception as exc:
+        p1_gates.append(gate("P1", "Model performance/staleness gate implemented",
+                             False, f"model_metrics unavailable: {exc}"))
+    try:
+        import backtest
+        parity = backtest.check_signal_parity()
+        p1_gates.append(gate(
+            "P1", "Backtest/live signal-construction parity",
+            bool(parity.get("parity_ok")),
+            f"shared helpers={parity.get('shared_weighted_blend')}/"
+            f"{parity.get('shared_action_fn')}/{parity.get('shared_position_rule')}, "
+            f"numeric_match={parity.get('numeric_blend_match')}"))
+    except Exception as exc:
+        p1_gates.append(gate("P1", "Backtest/live signal-construction parity",
+                             False, f"parity check unavailable: {exc}"))
+
+    gates = p1_gates + [
+        gate("P2", "Fill-driven order confirmation (not 'accepted')",
+             cap("SUPPORTS_FILL_VERIFICATION"),
+             "ibkr_bridge.SUPPORTS_FILL_VERIFICATION"),
+        gate("P2", "Partial-fill handling (size children from filled qty)",
+             cap("SUPPORTS_PARTIAL_FILL_HANDLING"),
+             "ibkr_bridge.SUPPORTS_PARTIAL_FILL_HANDLING"),
+        gate("P2", "Protective-child verification (stop is live or flatten)",
+             cap("SUPPORTS_PROTECTIVE_CHILD_VERIFY"),
+             "ibkr_bridge.SUPPORTS_PROTECTIVE_CHILD_VERIFY"),
+        gate("P3", "Server-side GTC/OCA hard stop per entry",
+             cap("SUPPORTS_SERVER_SIDE_GTC_STOP"),
+             "ibkr_bridge.SUPPORTS_SERVER_SIDE_GTC_STOP"),
+        gate("P3", "Daily-loss kill-switch wired into order gate",
+             cap("SUPPORTS_DAILY_LOSS_KILLSWITCH"),
+             "ibkr_bridge.SUPPORTS_DAILY_LOSS_KILLSWITCH (risk_state.loss_breached)"),
+        gate("P4", "Real-time data guard (reject delayed for live)",
+             cap("SUPPORTS_REALTIME_DATA_GUARD"),
+             "ibkr_bridge.SUPPORTS_REALTIME_DATA_GUARD"),
+        gate("P4", "Real-time market-data type (IBKR_MARKET_DATA_TYPE==1)",
+             int(getattr(config, "IBKR_MARKET_DATA_TYPE", 3)) == 1,
+             f"config.IBKR_MARKET_DATA_TYPE={getattr(config, 'IBKR_MARKET_DATA_TYPE', None)} (3=delayed)"),
+        gate("P4", "Market-hours / holiday gate",
+             cap("SUPPORTS_MARKET_HOURS_GATE"),
+             "ibkr_bridge.SUPPORTS_MARKET_HOURS_GATE"),
+        gate("P4", "Historical-close pricing disabled for orders",
+             not bool(getattr(config, "ALLOW_HISTORICAL_PRICE_FOR_ORDERS", False)),
+             f"config.ALLOW_HISTORICAL_PRICE_FOR_ORDERS={getattr(config, 'ALLOW_HISTORICAL_PRICE_FOR_ORDERS', None)}"),
+        gate("P5", "Startup reconciliation (broker = source of truth)",
+             cap("SUPPORTS_STARTUP_RECONCILIATION"),
+             "ibkr_bridge.SUPPORTS_STARTUP_RECONCILIATION"),
+        gate("P6", "Account-type assertion (paper DU / live U)",
+             cap("SUPPORTS_ACCOUNT_TYPE_ASSERTION"),
+             "ibkr_bridge.SUPPORTS_ACCOUNT_TYPE_ASSERTION"),
+        gate("P6", "Explicit LIVE_ACCOUNT_ID configured",
+             bool(getattr(config, "LIVE_ACCOUNT_ID", None)),
+             f"config.LIVE_ACCOUNT_ID={getattr(config, 'LIVE_ACCOUNT_ID', None)}"),
+    ]
+
+    manual = [
+        {"phase": "P1", "title": "Backtest --include-lstm EDGE comparison vs live",
+         "status": "MANUAL", "detail": "run `backtest --include-lstm`; compare edge/frequency to live"},
+        {"phase": "P1", "title": "Forward PAPER test 1-3 months matches backtest",
+         "status": "MANUAL", "detail": "operator sign-off required"},
+        {"phase": "P3", "title": "TWS shows a resting GTC stop for every open long",
+         "status": "MANUAL", "detail": "visual check in TWS after an entry"},
+    ]
+    return gates + manual
+
+
+def _readiness_broker_gates():
+    """Optional --connect gates: inspect live PAPER broker state (read-only).
+
+    Reports any open long without a working protective SELL (unprotected_longs).
+    Connects via the paper-locked bridge and never places an order.
+    """
+    import live_invariants
+    bridge, code = _connect_bridge()
+    if bridge is None:
+        return [{"phase": "BRK", "title": "Connect to PAPER account", "status": "FAIL",
+                 "detail": f"could not connect (exit {code})"}]
+    try:
+        positions = live_invariants.adapt_positions(bridge.ib.positions())
+        bridge.ib.reqAllOpenOrders()
+        bridge.ib.sleep(1)
+        working = live_invariants.adapt_working_orders(bridge.ib.openTrades())
+        unprotected = live_invariants.unprotected_longs(positions, working)
+        n_long = sum(1 for p in positions if p["qty"] > 0)
+        return [{
+            "phase": "BRK",
+            "title": "Every open long has a working protective stop",
+            "status": "PASS" if not unprotected else "FAIL",
+            "detail": (f"{n_long} long position(s); unprotected: "
+                       + (", ".join(unprotected) if unprotected else "none")),
+        }]
+    finally:
+        bridge.disconnect()
+
+
+def cmd_live_readiness(args) -> int:
+    """Read-only go-live scorecard. Inspects config + bridge capability flags
+    (and, with --connect, the live PAPER broker state). NEVER places orders.
+
+    Exit code: 0 only when all AUTOMATED live-readiness gates PASS (manual gates
+    are listed separately for operator sign-off). Today this MUST report
+    NOT READY -- that is the correct Phase 0 baseline.
+    """
+    print("\n=== Live-Trading Readiness Self-Check (read-only) ===")
+    print("Plan: reports/LIVE_TRADING_IMPLEMENTATION_PLAN_MM.md")
+    print("This bot is PAPER-ONLY. This check does not enable live trading.\n")
+
+    bridge_mod = _load_bridge_module()
+    if bridge_mod is None:
+        print("[WARN] ib_insync/ibkr_bridge unavailable -- capability flags assumed not implemented.\n")
+
+    gates = _collect_readiness_gates(bridge_mod)
+    if bool(getattr(args, "connect", False)):
+        gates += _readiness_broker_gates()
+
+    icon = {"PASS": "[PASS]", "FAIL": "[FAIL]", "MANUAL": "[MANL]"}
+    print(f"{'Gate':<6} {'Status':<7} Title")
+    print("-" * 78)
+    for g in gates:
+        print(f"{g['phase']:<6} {icon.get(g['status'], g['status']):<7} {g['title']}")
+        print(f"{'':<14}-> {g['detail']}")
+
+    n_pass = sum(1 for g in gates if g["status"] == "PASS")
+    n_fail = sum(1 for g in gates if g["status"] == "FAIL")
+    n_manual = sum(1 for g in gates if g["status"] == "MANUAL")
+
+    print("\n-- Summary --")
+    print(f"  Automated PASS : {n_pass}")
+    print(f"  Automated FAIL : {n_fail}")
+    print(f"  Manual gates   : {n_manual}  (require operator sign-off)")
+
+    ready = n_fail == 0
+    if ready:
+        print("\n[OK] All automated gates pass. Complete the manual gates before going live.")
+    else:
+        print(f"\n[NOT READY] {n_fail} automated gate(s) still failing. Live trading must stay disabled.")
+    print("No IBKR orders were placed.")
+    return 0 if ready else 1
+
+
+# -- Emergency kill-switch: cancel orders + flatten positions (PAPER) ----------
+def cmd_panic_flatten(args) -> int:
+    """Emergency: cancel ALL working orders and market-close ALL positions on the
+    PAPER account. Dry-run by default; only with --confirm does it place orders.
+
+    Paper-port-locked through IBKRBridge.connect() like every other order path.
+    """
+    confirm = bool(getattr(args, "confirm", False))
+    print("\n=== PANIC FLATTEN (emergency kill-switch) ===")
+    print("Cancels ALL working orders and MARKET-CLOSES ALL positions (PAPER account).")
+    if not confirm:
+        print("DRY-RUN (default): nothing will be placed. Re-run with --confirm to execute.\n")
+    else:
+        print("--confirm set: orders WILL be cancelled and positions WILL be flattened.\n")
+
+    bridge, code = _connect_bridge()
+    if bridge is None:
+        return code
+    try:
+        plan = bridge.flatten_all(confirm=confirm)
+
+        orders = plan.get("orders_to_cancel", [])
+        positions = plan.get("positions_to_flatten", [])
+        print(f"Working orders to cancel : {len(orders)}")
+        for o in orders:
+            print(f"  - {o['action']} {o['symbol']} {o['order_type']} x{o['qty']:.0f} "
+                  f"(id={o['order_id']}, status={o['status']})")
+        print(f"Positions to flatten     : {len(positions)}")
+        for p in positions:
+            print(f"  - {p['action']} {p['symbol']} x{abs(p['qty']):.0f}")
+
+        if not confirm:
+            print("\nNo orders placed (dry-run). To execute:")
+            print("   python -X utf8 main.py panic-flatten --confirm")
+        else:
+            print(f"\nCancelled orders : {plan.get('cancelled', 0)}")
+            print(f"Flattened        : {plan.get('flattened', 0)}")
+            for r in plan.get("flatten_results", []):
+                print(f"  - {r['action']} {r['symbol']} x{r['qty']} -> status={r['status']} "
+                      f"filled={r['filled']:.0f} avg={r['avg_fill']:.2f}")
+            print("\nVerify in TWS that positions are flat and no working orders remain.")
+        return 0
+    finally:
+        bridge.disconnect()
+
+
+# -- Backtest/live signal parity + model-gate config (read-only) --------------
+def cmd_signal_parity(_args) -> int:
+    """Read-only: print backtest/live signal-construction parity and the model
+    performance/staleness gate configuration. No IBKR, no orders, no training.
+
+    Exit code: 0 if construction parity holds, 1 otherwise.
+    """
+    import backtest
+    import model_metrics
+
+    print("\n=== Backtest / Live Signal Parity (read-only) ===")
+    parity = backtest.check_signal_parity()
+    ok = bool(parity.get("parity_ok"))
+    print(f"  Shared weighted_blend        : {parity['shared_weighted_blend']}")
+    print(f"  Shared action_from_confidence: {parity['shared_action_fn']}")
+    print(f"  Shared position rule         : {parity['shared_position_rule']}")
+    print(f"  Numeric blend match          : {parity['numeric_blend_match']}")
+    print(f"  Ensemble weights             : {parity['weights']}")
+    print(f"  BUY/SELL thresholds          : {parity['buy_threshold']} / {parity['sell_threshold']}")
+    print(f"  MIN_ML_MODELS_FOR_SIGNAL     : {parity['min_ml_models_for_signal']}")
+    print(f"  Backtest include_lstm default: {parity['include_lstm_default']}")
+    print(f"  -> {parity['note']}")
+
+    print("\n=== Model Performance / Staleness Gate ===")
+    print(f"  Gate enabled        : {getattr(config, 'MODEL_GATE_ENABLED', True)}")
+    print(f"  Min RF accuracy     : {getattr(config, 'MODEL_MIN_RF_ACCURACY', None)}")
+    print(f"  Min RF F1 (0=off)   : {getattr(config, 'MODEL_MIN_RF_F1', None)}")
+    print(f"  Max model age (days): {getattr(config, 'MODEL_MAX_AGE_DAYS', None)}")
+    print(f"  Metrics file        : {getattr(config, 'MODEL_METRICS_FILE', None)}")
+    data = model_metrics.load_all()
+    n_rf = len(data.get("rf", {}) or {})
+    n_lstm = len(data.get("lstm", {}) or {})
+    print(f"  Persisted metrics   : RF={n_rf} symbol(s), LSTM={n_lstm} symbol(s)")
+    if n_rf == 0 and n_lstm == 0:
+        print("  [WARN] No persisted metrics yet -> every symbol is force-HOLD until you run `train`.")
+
+    if ok:
+        print("\n[OK] Backtest and live construct signals from the same source of truth.")
+        print("     For full EDGE parity also run: python -X utf8 main.py backtest --include-lstm")
+    else:
+        print("\n[MISMATCH] Backtest and live signal construction diverged -- investigate before trusting backtests.")
+    print("No IBKR connection was made and no orders were placed.")
+    return 0 if ok else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stock Prediction Engine â€” IBKR Paper Trading")
     sub = parser.add_subparsers(dest="command")
@@ -1495,6 +1777,35 @@ def main() -> int:
         help="Symbol-selection strategy for the full-market scan (default: config).",
     )
 
+    # -- Live-trading readiness self-check (read-only; never places orders) --
+    lr = sub.add_parser(
+        "live-readiness",
+        help="Read-only go-live scorecard (config + capability flags; no orders)",
+    )
+    lr.add_argument(
+        "--connect", action="store_true",
+        help="Also connect to the PAPER account (read-only) to check for "
+             "unprotected open positions",
+    )
+
+    # -- Emergency kill-switch (dry-run unless --confirm) --
+    pf = sub.add_parser(
+        "panic-flatten",
+        help="Emergency: cancel all working orders + market-close all positions "
+             "(PAPER; dry-run unless --confirm)",
+    )
+    pf.add_argument(
+        "--confirm", action="store_true",
+        help="Actually cancel orders and flatten positions (default is dry-run)",
+    )
+
+    # -- Backtest/live signal parity + model-gate config (read-only) --
+    sub.add_parser(
+        "signal-parity",
+        help="Show backtest/live signal-construction parity + model-gate config "
+             "(read-only, no IBKR, no orders)",
+    )
+
     args = parser.parse_args()
     if args.command == "train":
         return cmd_train(args)
@@ -1528,6 +1839,12 @@ def main() -> int:
         return cmd_model_refresh(args)
     if args.command == "daily-coach":
         return cmd_daily_coach(args)
+    if args.command == "live-readiness":
+        return cmd_live_readiness(args)
+    if args.command == "panic-flatten":
+        return cmd_panic_flatten(args)
+    if args.command == "signal-parity":
+        return cmd_signal_parity(args)
 
     parser.print_help()
     return 3

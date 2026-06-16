@@ -24,6 +24,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 import config
+import model_metrics
 from data_manager import (
     fetch_ohlcv,
     build_features,
@@ -327,6 +328,9 @@ class StockLSTMEngine:
         _atomic_npz_save(SCALERS_FILE, **npz_payload)
 
         logger.info("LSTM checkpoint saved → %s (n=%d)", config.LSTM_CKPT_FILE, len(new_models))
+        # Phase 1: persist per-symbol metrics + train date for the staleness gate.
+        # Wrapped internally so it never breaks training.
+        model_metrics.save_lstm_metrics({s: results[s] for s in new_models if s in results})
         return results
 
     def load(self) -> bool:

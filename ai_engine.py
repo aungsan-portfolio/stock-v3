@@ -23,6 +23,7 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 from sklearn.model_selection import TimeSeriesSplit
 
 import config
+import model_metrics
 from data_manager import (
     fetch_ohlcv,
     build_features,
@@ -189,6 +190,9 @@ class StockRFEngine:
         config.MODELS_DIR.mkdir(parents=True, exist_ok=True)
         _atomic_dump(self.models, config.ML_MODELS_FILE)
         logger.info("RF models saved → %s (n=%d)", config.ML_MODELS_FILE, len(new_models))
+        # Phase 1: persist per-symbol metrics + train date for the signal-safety
+        # gate (predictor.predict_all). Wrapped internally so it never breaks training.
+        model_metrics.save_rf_metrics({s: results[s] for s in new_models if s in results})
         return results
 
     def load(self) -> bool:

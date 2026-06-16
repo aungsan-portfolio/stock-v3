@@ -17,8 +17,11 @@ pip install -r requirements-dev.txt   # pulls in -r requirements.txt
 ## Running the unit tests
 
 ```bash
-python -m unittest test_logic -v      # verbose
-python test_logic.py                  # equivalent direct run
+python -m unittest test_logic -v             # core refactor logic
+python -m unittest test_live_readiness -v    # Phase-0 live-readiness scaffolding
+python -m unittest test_model_gate -v        # Phase-1 model gate + signal parity
+python -m unittest discover -p "test_*.py"   # everything
+python test_logic.py                         # equivalent direct run
 ```
 
 The tests are **deterministic and offline**: they feed synthetic OHLCV data and
@@ -36,6 +39,24 @@ so they never overwrite real reports.
 | Config | `MIN_HOLD_BARS == ML_HORIZON` |
 | Backtest I/O | empty-data → empty CSV + metrics JSON; populated → CSV rows + schema |
 | Imports | `main`, `backtest`, `predictor`, `ibkr_bridge`, engines import cleanly |
+| Live-readiness (Phase 0) | `unprotected_longs` / duplicate-ref invariants; `order_audit` JSONL never raises; bridge capability flags all `False`; `live-readiness` scorecard reports NOT READY (`test_live_readiness.py`) |
+| Model gate (Phase 1) | `evaluate_gate` decision table (missing / stale / below-floor / ok / disabled); per-symbol metrics persist + merge RF and LSTM and never raise; a pre-gate BUY is forced to `HOLD` when blocked; backtest/live signal-construction parity; P1 scorecard gates PASS while overall stays NOT READY; `signal-parity` command (`test_model_gate.py`) |
+
+> **Model gate & signal parity (Phase 1).** `test_model_gate.py` is offline and
+> patches `config.MODEL_METRICS_FILE` to a temp file, so it never reads or writes
+> the real `models/model_metrics.json`. The gate is **fail-closed**: a symbol
+> with missing, stale, or below-floor metrics is forced to `HOLD`. Two tests
+> deliberately exercise the corrupt-file / bad-input recovery paths, which log a
+> warning (with traceback) and return safe defaults — those tracebacks in the
+> test output are expected and the tests still pass. Capability flags
+> (`SUPPORTS_MODEL_PERFORMANCE_GATE`, `SUPPORTS_MODEL_STALENESS_GATE`) are `True`
+> only because the logic exists **and** is covered here.
+
+> **Live-readiness scaffolding (Phase 0).** `test_live_readiness.py` is offline.
+> The optional broker integration tests (paper TWS required) are skipped unless
+> you set `RUN_IBKR_INTEGRATION=1` with TWS running on port 7497. See
+> `reports/LIVE_TRADING_IMPLEMENTATION_PLAN_MM.md` for the phased plan; live
+> trading stays disabled until every automated `live-readiness` gate passes.
 
 ## Continuous integration
 
@@ -73,6 +94,15 @@ and the verification script:
   rather than returning a neutral `0.5`, so it can never silently count as an
   available model. Technical-only BUY/SELL trading stays disabled
   (`MIN_ML_MODELS_FOR_SIGNAL = 1`).
+
+- **Untrusted model → forced `HOLD` (Phase 1 signal-safety gate).**
+  Before any BUY/SELL is issued, `predictor.predict_all` consults
+  `model_metrics.evaluate_gate(symbol)`. A symbol whose persisted metrics are
+  **missing**, **stale** (older than `MODEL_MAX_AGE_DAYS`), or **below the floor**
+  (`MODEL_MIN_RF_ACCURACY`, optional `MODEL_MIN_RF_F1`) is forced to `HOLD` with
+  the reason appended to the signal. This is **fail-closed**: no trusted metric
+  means no trade. Metrics are written per symbol at train time and the gate can
+  be master-disabled with `MODEL_GATE_ENABLED` (tests only — ships `True`).
 
 - **`MIN_HOLD_BARS = ML_HORIZON`.**
   A position is held for at least `MIN_HOLD_BARS` bars before an opposite signal

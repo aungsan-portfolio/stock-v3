@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 
 import config
+import model_metrics
 from data_manager import fetch_ohlcv, build_features
 from ai_engine import StockRFEngine
 from lstm_engine import StockLSTMEngine
@@ -252,6 +253,15 @@ class Predictor:
                         f"LSTM={lstm_score:.2f}{'' if lstm_ok else '?'} "
                         f"Tech={tech_score:.2f} → ensemble={confidence:.2f}"
                     )
+
+                # Phase 1 signal-safety gate: never act on a model whose persisted
+                # metrics are missing, stale, or below the performance floor. A
+                # blocked symbol is forced to HOLD with the reason shown to the user.
+                if action != "HOLD":
+                    gate = model_metrics.evaluate_gate(symbol)
+                    if not gate.ok:
+                        action = "HOLD"
+                        reason = f"{reason} → BLOCKED[{gate.status}]: {gate.reason} → HOLD"
 
                 price = float(df["Close"].iloc[-1])
                 signals.append(Signal(

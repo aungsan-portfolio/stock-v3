@@ -37,6 +37,57 @@ logger = logging.getLogger(__name__)
 FEATURE_COLS = get_feature_columns()
 
 
+def check_signal_parity() -> dict:
+    """Confirm the backtest builds signals from the SAME source of truth as live.
+
+    Phase 1 (explicit backtest/live parity). Pure, offline, deterministic: it
+    verifies the blend / threshold / position helpers used here are the IDENTICAL
+    objects exported by predictor (not a divergent copy), and that a numeric blend
+    on sample scores matches between the two call sites. Returns a dict so the
+    result is both machine-checkable (live-readiness gate, tests) and human-
+    auditable (written into backtest_metrics.json as `signal_parity`).
+
+    parity_ok says the *construction* is identical. Full *edge* parity also needs
+    `backtest --include-lstm`, because LSTM is off by default in the backtest
+    while the live ensemble uses it -- surfaced here as include_lstm_default.
+    """
+    import predictor as _p
+
+    shared_blend = weighted_blend is _p.weighted_blend
+    shared_action = action_from_confidence is _p.action_from_confidence
+    shared_rule = apply_position_rule_with_hold is _p.apply_position_rule_with_hold
+
+    numeric_ok = True
+    for rf, lstm, tech in [(0.90, 0.80, 0.60), (0.30, 0.40, 0.50), (0.70, 0.20, 0.55)]:
+        live = _p.weighted_blend(rf, True, lstm, True, tech)
+        bt = weighted_blend(rf, True, lstm, True, tech)
+        if abs(live - bt) > 1e-12:
+            numeric_ok = False
+
+    parity_ok = bool(shared_blend and shared_action and shared_rule and numeric_ok)
+    return {
+        "parity_ok": parity_ok,
+        "shared_weighted_blend": bool(shared_blend),
+        "shared_action_fn": bool(shared_action),
+        "shared_position_rule": bool(shared_rule),
+        "numeric_blend_match": bool(numeric_ok),
+        "weights": {
+            "rf": float(config.WEIGHT_RF),
+            "lstm": float(config.WEIGHT_LSTM),
+            "tech": float(config.WEIGHT_TECHNICAL),
+        },
+        "buy_threshold": float(config.BUY_THRESHOLD),
+        "sell_threshold": float(config.SELL_THRESHOLD),
+        "min_ml_models_for_signal": int(config.MIN_ML_MODELS_FOR_SIGNAL),
+        "include_lstm_default": bool(config.BACKTEST_INCLUDE_LSTM),
+        "note": (
+            "Backtest and live share predictor.weighted_blend / action_from_confidence / "
+            "apply_position_rule_with_hold. For full edge parity also run "
+            "`backtest --include-lstm` (LSTM is off by default in the backtest)."
+        ),
+    }
+
+
 def _sharpe(daily_returns: np.ndarray, risk_free: float = 0.0) -> float:
     returns = np.asarray(daily_returns, dtype=float)
     returns = returns[np.isfinite(returns)]
@@ -387,6 +438,8 @@ def run_backtest(
     aggregate.update({
         "backtest_model": "RF_LSTM_TECHNICAL_WALK_FORWARD" if include_lstm else "RF_TECHNICAL_WALK_FORWARD",
         "include_lstm": bool(include_lstm),
+        # Phase 1: record explicit backtest/live signal-construction parity.
+        "signal_parity": check_signal_parity(),
         "allow_short": bool(allow_short),
         "min_hold_bars": int(min_hold),
         "hard_stop_pct": round(float(config.HARD_STOP_LOSS_PCT), 6),
