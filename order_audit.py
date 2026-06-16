@@ -42,6 +42,7 @@ STAGE_FLATTEN = "flatten"          # emergency/normal flatten action
 STAGE_PROTECT = "protect"          # GTC/OCA protective exit set placed + verified (Phase 3)
 STAGE_HALT = "halt"                # new-entry halt: daily-loss / drawdown / unprotected startup (Phase 3)
 STAGE_SNAPSHOT = "equity_snapshot" # start-of-day NetLiquidation snapshot (Phase 3)
+STAGE_QUOTE = "quote"              # order-price quote validated for data integrity (Phase 4)
 
 
 def log_event(stage: str, **fields) -> None:

@@ -20,6 +20,7 @@ from typing import List, Optional
 from ib_insync import IB, Stock, LimitOrder, MarketOrder, Contract, Order
 
 import config
+import data_integrity
 import live_invariants
 import order_audit
 import order_exec
@@ -46,8 +47,8 @@ SUPPORTS_PARTIAL_FILL_HANDLING   = True    # Phase 2 (H6): size children from ac
 SUPPORTS_PROTECTIVE_CHILD_VERIFY = True    # Phase 2 (H7): confirm stop child is live or flatten
 SUPPORTS_SERVER_SIDE_GTC_STOP    = True    # Phase 3 (C2, H19): resting GTC/OCA hard stop per entry
 SUPPORTS_DAILY_LOSS_KILLSWITCH   = True    # Phase 3 (H1): loss_breached() wired into the order gate
-SUPPORTS_REALTIME_DATA_GUARD     = False   # Phase 4 (H12, H13): require real-time, reject delayed
-SUPPORTS_MARKET_HOURS_GATE       = False   # Phase 4 (H15): refuse orders outside RTH/holidays
+SUPPORTS_REALTIME_DATA_GUARD     = True    # Phase 4 (H11-H13, H16): sane real-time/delayed quote, reject stale-close/crossed/wide
+SUPPORTS_MARKET_HOURS_GATE       = True     # Phase 4 (H15): refuse NEW entries outside RTH/holidays
 SUPPORTS_STARTUP_RECONCILIATION  = False   # Phase 5 (H18): broker = source of truth on startup
 SUPPORTS_ACCOUNT_TYPE_ASSERTION  = False   # Phase 6: assert paper(DU)/live(U) account, not just port
 
@@ -157,16 +158,46 @@ class IBKRBridge:
             return 0.0
         return cost if cost > 0 else 0.0
 
-    def _new_entries_blocked(self, symbol: str, intended_value: float = 0.0):
-        """Phase-3 entry gate for NEW opens ONLY (never closes/flatten/repair).
+    def _market_hours_ok(self) -> bool:
+        """True when a NEW entry is allowed by the US regular-hours gate (H15).
+
+        Reads the wall clock in US/Eastern and defers the calendar decision to
+        the pure data_integrity helper. Disabled (MARKET_HOURS_GATE_ENABLED
+        False) -> always True. Fails CLOSED (blocks) if the timezone cannot be
+        resolved, so a clock failure never lets an entry slip through at an
+        unknown time. Only ever consulted for NEW opens.
+        """
+        if not bool(getattr(config, "MARKET_HOURS_GATE_ENABLED", True)):
+            return True
+        try:
+            from zoneinfo import ZoneInfo
+            now_et = _dt.datetime.now(ZoneInfo("America/New_York"))
+        except Exception:
+            logger.error("Could not resolve US/Eastern time for market-hours gate "
+                         "-> blocking new entries", exc_info=True)
+            return False
+        return data_integrity.is_regular_hours(now_et)
+
+    def _new_entries_blocked(self, symbol: str, intended_value: float = 0.0,
+                             signal=None, order_price: Optional[float] = None):
+        """Entry gate for NEW opens ONLY (never closes/flatten/repair).
 
         Returns (blocked: bool, reason: str). Checks, in order: the sticky halt
-        flag (startup protection failure), the daily-loss kill-switch (H1), the
-        account drawdown halt (H3), and the per-symbol exposure cap (H3). Each is
-        conservative: a missing baseline never spuriously blocks.
+        flag (startup protection failure), the Phase-4 US market-hours gate
+        (H15), the Phase-4 decision-vs-order price agreement (H14), the
+        daily-loss kill-switch (H1), the account drawdown halt (H3), and the
+        per-symbol exposure cap (H3). Each is conservative: a missing baseline /
+        missing decision price never spuriously blocks.
         """
         if self._halt_new_entries:
             return True, "halt_flag"
+        if not self._market_hours_ok():
+            return True, "market_closed"
+        if signal is not None and order_price is not None:
+            if not data_integrity.decision_price_ok(
+                    getattr(signal, "price", None), order_price,
+                    getattr(config, "DECISION_PRICE_MAX_DEVIATION_PCT", 0.0)):
+                return True, "price_mismatch"
         equity = self.get_net_liquidation()
         if risk_state.daily_loss_blocked(equity):
             return True, "daily_loss"
@@ -239,67 +270,75 @@ class IBKRBridge:
         self._contract_cache[symbol] = qualified[0]
         return qualified[0]
 
-    def get_price(self, symbol: str, timeout: float = 5.0, allow_historical: bool = True) -> float:
+    def get_order_quote(self, symbol: str, timeout: float = 5.0) -> data_integrity.QuoteDecision:
+        """Fetch a snapshot quote and validate it for ORDER use (Phase 4,
+        H11-H13/H16). Returns a data_integrity.QuoteDecision: ``ok`` + ``price``
+        when a sane real-time (or, in paper, delayed) last/midpoint is available,
+        else ``ok=False`` with a reason (crossed/wide-spread/stale-close/
+        delayed-blocked/no-data). NEVER prices an order from the plain prior
+        daily ``close``. Read-only: places no order.
+        """
         contract = self._contract(symbol)
         ticker = self.ib.reqMktData(contract, "", True, False)
-
-        def _cancel_snapshot() -> None:
+        require_rt = bool(getattr(config, "REQUIRE_REALTIME_DATA_FOR_ORDERS", False))
+        max_spread = float(getattr(config, "MAX_QUOTE_SPREAD_PCT", 0.02))
+        decision = data_integrity.QuoteDecision(
+            False, 0.0, data_integrity.SOURCE_NONE, data_integrity.REASON_NO_DATA)
+        try:
+            # Wait for the snapshot to populate; re-evaluate each poll and stop
+            # as soon as a usable price appears (or the budget is exhausted).
+            for _ in range(max(1, int(timeout * 4))):
+                self.ib.sleep(0.25)
+                decision = data_integrity.evaluate_order_quote(
+                    last=getattr(ticker, "last", None),
+                    bid=getattr(ticker, "bid", None),
+                    ask=getattr(ticker, "ask", None),
+                    close=getattr(ticker, "close", None),
+                    delayed_last=getattr(ticker, "delayedLast", None),
+                    delayed_close=getattr(ticker, "delayedClose", None),
+                    delayed_bid=getattr(ticker, "delayedBid", None),
+                    delayed_ask=getattr(ticker, "delayedAsk", None),
+                    require_realtime=require_rt,
+                    max_spread_pct=max_spread,
+                )
+                if decision.ok:
+                    break
+        finally:
             try:
                 self.ib.cancelMktData(contract)
             except Exception:
                 pass
 
-        def _finite_positive(value) -> Optional[float]:
-            try:
-                fv = float(value)
-                if fv > 0 and not math.isnan(fv):
-                    return fv
-            except (TypeError, ValueError):
-                return None
-            return None
+        order_audit.log_event(
+            order_audit.STAGE_QUOTE, symbol=symbol, ok=decision.ok,
+            price=decision.price, source=decision.source, reason=decision.reason,
+            require_realtime=require_rt,
+        )
+        if not decision.ok:
+            logger.warning("Unusable order quote for %s -> %s", symbol, decision.reason)
+        return decision
 
-        # Wait for snapshot to populate; ib_insync.sleep yields to the event loop.
-        for _ in range(max(1, int(timeout * 4))):
-            self.ib.sleep(0.25)
+    def get_price(self, symbol: str, timeout: float = 5.0, allow_historical: bool = True) -> float:
+        """Validated order price (Phase 4). Returns the sane real-time/delayed
+        last or midpoint from get_order_quote, or 0.0 when no usable quote
+        exists. The historical (prior daily close) fallback is used ONLY when the
+        caller opts in (``allow_historical=True``) AND real-time is not required;
+        order callers pass ALLOW_HISTORICAL_PRICE_FOR_ORDERS (False) so a stale
+        close is never an order price."""
+        decision = self.get_order_quote(symbol, timeout=timeout)
+        if decision.ok and decision.price > 0:
+            return decision.price
 
-            for attr in ("last", "close", "delayedLast", "delayedClose"):
-                price = _finite_positive(getattr(ticker, attr, None))
-                if price is not None:
-                    _cancel_snapshot()
-                    return price
-            # In ib_insync marketPrice is a method, not a numeric attribute.
-            market_price_fn = getattr(ticker, "marketPrice", None)
-            if callable(market_price_fn):
-                try:
-                    price = _finite_positive(market_price_fn())
-                    if price is not None:
-                        _cancel_snapshot()
-                        return price
-                except Exception:
-                    pass
-
-            bid = _finite_positive(getattr(ticker, "bid", None)) \
-                or _finite_positive(getattr(ticker, "delayedBid", None))
-            ask = _finite_positive(getattr(ticker, "ask", None)) \
-                or _finite_positive(getattr(ticker, "delayedAsk", None))
-            if bid is not None and ask is not None:
-                _cancel_snapshot()
-                return (bid + ask) / 2.0
-
-        _cancel_snapshot()
-
-        if not allow_historical:
-            logger.warning("No live/delayed snapshot price for %s; historical fallback disabled", symbol)
+        require_rt = bool(getattr(config, "REQUIRE_REALTIME_DATA_FOR_ORDERS", False))
+        if (not allow_historical) or require_rt:
             return 0.0
 
-        # Fallback: last daily close from historical data. Works without a
-        # real-time subscription and when delayed snapshots fail to populate
-        # (e.g. outside regular trading hours). This should not be used for
-        # order placement unless config explicitly allows it.
-        hist_price = self._historical_close(contract)
+        # Fallback: last daily close from historical data. Defense-in-depth keeps
+        # this OFF for order placement (callers pass allow_historical=False); it
+        # only serves non-order callers that explicitly opt in.
+        hist_price = self._historical_close(self._contract(symbol))
         if hist_price is not None:
             return hist_price
-
         return 0.0
 
     def _historical_close(self, contract) -> Optional[float]:
@@ -842,7 +881,7 @@ class IBKRBridge:
             if qty == 0:
                 logger.warning("Qty=0 for BUY %s price=%.2f cash=%.2f", symbol, price, cash)
                 return False
-            blocked, reason = self._new_entries_blocked(symbol, qty * price)
+            blocked, reason = self._new_entries_blocked(symbol, qty * price, signal, price)
             if blocked:
                 order_audit.log_event(order_audit.STAGE_HALT, phase="entry_gate",
                                       symbol=symbol, action="BUY", reason=reason)
@@ -879,7 +918,7 @@ class IBKRBridge:
         if qty == 0:
             logger.warning("Qty=0 for short SELL %s price=%.2f cash=%.2f", symbol, price, cash)
             return False
-        blocked, reason = self._new_entries_blocked(symbol, qty * price)
+        blocked, reason = self._new_entries_blocked(symbol, qty * price, signal, price)
         if blocked:
             order_audit.log_event(order_audit.STAGE_HALT, phase="entry_gate",
                                   symbol=symbol, action="SELL", reason=reason)

@@ -230,6 +230,36 @@ ACCOUNT_MAX_DRAWDOWN_PCT   = 0.10
 # new position whose value exceeds this share of equity is refused.
 MAX_SYMBOL_EXPOSURE_PCT    = 0.10
 
+# ── Phase 4: Data integrity for order pricing (H11-H16) ──
+# Guards that the price an order is placed at is real-time-enough, internally
+# sane, and agrees with the price the decision was made on. PAPER-SAFE: these
+# only refuse a NEW entry on a bad/stale quote; they never enable live trading,
+# never touch closes/flatten/protective repair, and keep delayed-data paper
+# trading working (REQUIRE_REALTIME_DATA_FOR_ORDERS stays False until live).
+#
+# When True, an order may ONLY be priced from a real-time last/midpoint; delayed
+# and prior-close fields are refused. This MUST stay False for paper accounts on
+# the delayed (15-min) feed (IBKR_MARKET_DATA_TYPE=3) or no order would ever get
+# a price. It is flipped True only at live conversion (Phase 6), together with a
+# real-time market-data subscription. The crossed/wide-spread/stale-close sanity
+# checks run regardless of this flag.
+REQUIRE_REALTIME_DATA_FOR_ORDERS = False
+# Reject a quote whose bid/ask spread exceeds this fraction of the midpoint (an
+# illiquid / unreliable snapshot). 0 disables the check.
+MAX_QUOTE_SPREAD_PCT             = 0.02   # 2%
+# Refuse to act on a signal when the live order price has moved more than this
+# fraction from the price the decision was made on (a stale / gapped signal,
+# H14). In this bot the decision price is a daily close and the order price is
+# an intraday quote, so this is a LARGE-GAP guard; tighten it toward 0.005 only
+# once decisions are made on the live IBKR quote. 0 disables the check.
+DECISION_PRICE_MAX_DEVIATION_PCT = 0.05   # 5%
+# US regular-hours gate for NEW entries (H15). True = refuse to OPEN a new
+# position outside 09:30-16:00 ET on a trading day (closes, emergency flatten,
+# and protective repair are NEVER gated). Set False to practise paper entries
+# outside market hours. Uses an approximate computed US holiday/early-close
+# calendar (data_integrity.py) -- not the broker calendar.
+MARKET_HOURS_GATE_ENABLED        = True
+
 # ── Backtest Settings ────────────────────────────
 # Daily position-state simulation costs. These are conservative defaults.
 BACKTEST_TRANSACTION_COST_PCT = 0.0005  # 5 bps per order
