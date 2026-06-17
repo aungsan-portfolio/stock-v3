@@ -25,6 +25,7 @@ import live_invariants
 import order_audit
 import order_exec
 import reconciliation
+import reconnect_watchdog
 import risk_engine
 import risk_state
 from predictor import Signal
@@ -70,9 +71,20 @@ class IBKRBridge:
         # protection scan cannot protect an open long; closes/flatten/repair stay
         # allowed. Daily-loss + drawdown are checked dynamically, not via this flag.
         self._halt_new_entries = False
+        # Phase 5B-2: connection-health for the one-shot run. Defaults healthy
+        # ("presumed usable until we learn otherwise") so a bridge that has not
+        # connected behaves exactly as before; a mid-run disconnect flips it
+        # closed so _new_entries_blocked refuses NEW entries (fail-closed). The
+        # watchdog never places orders.
+        self._conn_health = reconnect_watchdog.ConnectionHealth()
+        self._intentional_disconnect = False
+        self._disconnect_handler_registered = False
 
     # ── Connection ───────────────────────────────────────────────
     def connect(self) -> bool:
+        # SAFETY GATE #1 (UNCHANGED, highest priority): paper-port lock. Enforced
+        # BEFORE any reconnect/backoff so a non-paper port is refused outright and
+        # the Phase-5B-2 watchdog can never retry it (or otherwise bypass it).
         if bool(getattr(config, "REQUIRE_PAPER_PORT", True)):
             paper_port = int(getattr(config, "PAPER_IBKR_PORT", 7497))
             if int(config.IBKR_PORT) != paper_port:
@@ -81,30 +93,109 @@ class IBKRBridge:
                     config.IBKR_PORT,
                     paper_port,
                 )
+                self._conn_health.mark_unhealthy(reconnect_watchdog.REASON_PAPER_PORT)
                 return False
 
+        # Phase 5B-2: bound the socket/request so a dead TWS cannot hang a
+        # one-shot run (flatten_vti.py / check_positions.py pattern).
+        timeout = reconnect_watchdog.request_timeout()
         try:
-            self.ib.connect(
-                host=config.IBKR_HOST,
-                port=config.IBKR_PORT,
-                clientId=getattr(config, "CLIENT_ID_BOT", config.IBKR_CLIENT_ID),
-            )
-            # Fall back to delayed (15-min) data when the account lacks a
-            # real-time market-data subscription. 3 = DELAYED, 4 = DELAYED_FROZEN.
-            try:
-                self.ib.reqMarketDataType(config.IBKR_MARKET_DATA_TYPE)
-            except Exception:
-                logger.warning("Could not set market data type", exc_info=True)
-            logger.info("Connected to IBKR | account=%s", self.ib.managedAccounts())
-            return True
+            if timeout and timeout > 0:
+                self.ib.RequestTimeout = timeout
         except Exception:
-            logger.exception("Failed to connect to IBKR TWS")
-            return False
+            logger.debug("Could not set ib.RequestTimeout", exc_info=True)
+
+        # Register the disconnect watchdog once (safe: it only marks health +
+        # audits, never places orders). Guarded so the offline fake-IB tests are
+        # unaffected.
+        self._register_disconnect_watchdog()
+        self._intentional_disconnect = False
+
+        timeout_kw = {"timeout": timeout} if timeout and timeout > 0 else {}
+
+        def _connect_once() -> bool:
+            try:
+                self.ib.connect(
+                    host=config.IBKR_HOST,
+                    port=config.IBKR_PORT,
+                    clientId=getattr(config, "CLIENT_ID_BOT", config.IBKR_CLIENT_ID),
+                    **timeout_kw,
+                )
+                # Fall back to delayed (15-min) data when the account lacks a
+                # real-time market-data subscription. 3 = DELAYED, 4 = DELAYED_FROZEN.
+                try:
+                    self.ib.reqMarketDataType(config.IBKR_MARKET_DATA_TYPE)
+                except Exception:
+                    logger.warning("Could not set market data type", exc_info=True)
+                logger.info("Connected to IBKR | account=%s", self.ib.managedAccounts())
+                return True
+            except Exception:
+                logger.exception("Failed to connect to IBKR TWS")
+                return False
+
+        # Phase 5B-2: bounded exponential-backoff retry of the INITIAL connect.
+        # Uses ib.sleep so the (cooperative) event loop keeps pumping between
+        # tries; bounded by IBKR_RECONNECT_MAX_ATTEMPTS — never a forever loop,
+        # never a daemon, never an order.
+        result = reconnect_watchdog.attempt_connect(_connect_once, sleep=self.ib.sleep)
+
+        if result.connected:
+            self._conn_health.mark_healthy(reconnect_watchdog.REASON_CONNECTED)
+            if result.attempts > 1:
+                logger.info("Connected to IBKR after %s attempt(s)", result.attempts)
+                reconnect_watchdog.audit_connection(
+                    reconnect_watchdog.REASON_CONNECTED, healthy=True,
+                    attempts=result.attempts, retried=True,
+                )
+            return True
+
+        # Gave up after the bounded retries (or a single try with reconnect off).
+        self._conn_health.mark_unhealthy(reconnect_watchdog.REASON_GAVE_UP)
+        reconnect_watchdog.audit_connection(
+            reconnect_watchdog.REASON_GAVE_UP, healthy=False,
+            attempts=result.attempts, enabled=result.enabled,
+        )
+        logger.error("IBKR connect failed after %s attempt(s) (reconnect enabled=%s)",
+                     result.attempts, result.enabled)
+        return False
 
     def disconnect(self) -> None:
+        # Flag the intentional close so the disconnect watchdog treats it as a
+        # clean shutdown (it must NOT mark the connection unhealthy / audit a
+        # mid-run drop for our own teardown).
+        self._intentional_disconnect = True
         if self.ib.isConnected():
             self.ib.disconnect()
             logger.info("Disconnected from IBKR")
+
+    def _register_disconnect_watchdog(self) -> None:
+        """Attach the Phase-5B-2 disconnect handler to ib.disconnectedEvent once.
+
+        The handler ONLY marks the connection unhealthy + audits; it NEVER places,
+        cancels, or modifies an order. Registration is fully guarded so the
+        offline fake-IB tests (whose stub IB has no disconnectedEvent) are
+        unaffected.
+        """
+        if self._disconnect_handler_registered:
+            return
+        event = getattr(self.ib, "disconnectedEvent", None)
+        if event is None:
+            return
+        try:
+            handler = reconnect_watchdog.make_disconnect_handler(
+                self._conn_health,
+                is_intentional=lambda: self._intentional_disconnect,
+            )
+            event += handler
+            self._disconnect_handler_registered = True
+        except Exception:
+            logger.debug("Could not register disconnect watchdog", exc_info=True)
+
+    def _connection_healthy(self) -> bool:
+        """True when the IBKR link is healthy for NEW entries. False after a
+        mid-run disconnect (fail-closed). Never raises."""
+        health = getattr(self, "_conn_health", None)
+        return bool(health is None or health.is_healthy)
 
     # ── Account state ────────────────────────────────────────────
     def get_cash(self) -> float:
@@ -184,7 +275,8 @@ class IBKRBridge:
         """Entry gate for NEW opens ONLY (never closes/flatten/repair).
 
         Returns (blocked: bool, reason: str). Checks, in order: the sticky halt
-        flag (startup protection failure), the Phase-4 US market-hours gate
+        flag (startup protection failure), the Phase-5B-2 connection-health gate
+        (mid-run disconnect -> fail closed), the Phase-4 US market-hours gate
         (H15), the Phase-4 decision-vs-order price agreement (H14), the
         daily-loss kill-switch (H1), the account drawdown halt (H3), and the
         per-symbol exposure cap (H3). Each is conservative: a missing baseline /
@@ -192,6 +284,12 @@ class IBKRBridge:
         """
         if self._halt_new_entries:
             return True, "halt_flag"
+        # Phase 5B-2: an unexpected mid-run disconnect marks the link unhealthy;
+        # refuse NEW entries until reconnected (closes/flatten/repair are never
+        # routed through this gate). Default health is healthy, so this never
+        # blocks a normally-connected run.
+        if not self._connection_healthy():
+            return True, "connection_unhealthy"
         if not self._market_hours_ok():
             return True, "market_closed"
         if signal is not None and order_price is not None:

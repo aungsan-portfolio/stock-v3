@@ -361,3 +361,35 @@ SCHEDULER_DRY_RUN_DEFAULT    = True
 # data_integrity calendar. Set False only to practise scheduled plan runs
 # outside market hours.
 SCHEDULER_REQUIRE_RTH        = True
+
+# ─── Phase 5B-2: Reconnect watchdog / connection resilience (Path A) ─────────
+# Connection hardening for the ONE-SHOT Path A bot (see reconnect_watchdog.py and
+# reports/LIVE_TRADING_IMPLEMENTATION_PLAN_MM.md task 5.3). This is NOT a daemon
+# and NOT a forever reconnect loop. It only:
+#   * wraps the INITIAL connect in a BOUNDED exponential-backoff retry, so a
+#     transient TWS hiccup at startup does not abort the whole one-shot run; and
+#   * registers an ib.disconnectedEvent handler that, on a mid-run drop, marks
+#     the connection UNHEALTHY and FAILS CLOSED (no new entries) — it never
+#     places, cancels, or modifies any order.
+# It adds NO new live-readiness capability flag and NEVER bypasses a safety gate:
+# the paper-port lock is enforced BEFORE any retry, and startup reconciliation,
+# the data-integrity gate, the market-hours gate, the daily-loss kill-switch, and
+# the model gate all still run unchanged. PAPER ONLY throughout.
+#
+# Master switch. False => connect() behaves exactly as before (a single attempt,
+# no retry). The disconnect handler still marks health, but no reconnect is tried.
+IBKR_RECONNECT_ENABLED            = True
+# Maximum TOTAL connect attempts for one one-shot run (the first try PLUS
+# retries). Bounded by design: the retry loop ALWAYS terminates after this many
+# tries — it never retries forever. Must be >= 1 (clamped up to 1 if set lower).
+IBKR_RECONNECT_MAX_ATTEMPTS       = 3
+# Exponential-backoff base delay (seconds) between failed connect attempts:
+#   delay(n) = min(MAX_DELAY, BASE_DELAY * 2**n)   for the n-th retry (0-indexed)
+IBKR_RECONNECT_BASE_DELAY_SECONDS = 2.0
+# Hard ceiling (seconds) on any single backoff delay, so the bounded retry can
+# never sleep for an unreasonable stretch (worst-case total stays small).
+IBKR_RECONNECT_MAX_DELAY_SECONDS  = 30.0
+# Socket/request timeout (seconds) handed to ib_insync (ib.RequestTimeout and the
+# connect() timeout), mirroring flatten_vti.py / check_positions.py. Keeps a dead
+# TWS from hanging a one-shot run indefinitely. 0 disables the explicit timeout.
+IBKR_REQUEST_TIMEOUT_SECONDS      = 30.0

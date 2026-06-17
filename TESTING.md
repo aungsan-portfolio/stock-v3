@@ -26,6 +26,7 @@ python -m unittest test_risk_engine -v       # Phase-3 risk engine + equity snap
 python -m unittest test_phase3_protection -v # Phase-3 GTC/OCA + kill-switch + startup invariant
 python -m unittest test_reconciliation -v    # Phase-5A startup reconciliation (broker = source of truth)
 python -m unittest test_scheduler_runner -v  # Phase-5B-1 supervised scheduler / market-hours runner
+python -m unittest test_reconnect_watchdog -v # Phase-5B-2 reconnect watchdog / connection resilience
 python -m unittest discover -p "test_*.py"   # everything
 python test_logic.py                         # equivalent direct run
 ```
@@ -49,6 +50,7 @@ so they never overwrite real reports.
 | Order execution (Phase 2) | fill-vs-accepted classification (`PreSubmitted` is not a fill); partial-fill exit-child reconciliation — **all** SELL children (protective stop, trailing stop, AND take-profit LMT) cancelled/resized to the actual filled qty so nothing can over-sell into a short; protective-child verify-or-flatten; robust close marketable-limit→market escalation; deterministic `orderRef` duplicate guard; emergency flatten cancels resting children first; capability flags (`test_order_exec.py`, `test_ibkr_fill_flow.py`) |
 | Server-side protection + risk (Phase 3) | GTC + OCA exit set placed **after** the confirmed fill, sized to the filled qty; independent hard −3% stop priced off the **actual** `avgFillPrice`; every exit `tif=GTC` and shares one non-empty OCA group; no exit qty exceeds the fill; placement/verify failure → flatten + abort; daily-loss kill-switch (start-of-day equity snapshot) blocks **new opens** but allows **closes**; account drawdown / per-symbol exposure groundwork; startup invariant repairs unprotected longs or halts new entries; capability flags (`test_order_exec.py`, `test_risk_engine.py`, `test_phase3_protection.py`) |
 | Startup reconciliation (Phase 5A) | `reconciliation.build_snapshot` broker-truth snapshot from plain broker state — protected vs. unprotected longs (GTC-aware: a DAY stop or take-profit LMT is not protection), duplicate `orderRef` detection, orphan exit orders (resting SELL with no covering long); `IBKRBridge.reconcile_startup_state()` driven through the real bridge with fake IBKR proves **broker = source of truth**, repairs an unprotected long via the existing Phase-3 path or halts new entries, audits the snapshot, and **never opens a new position** (`test_reconciliation.py`) |
+| Reconnect watchdog (Phase 5B-2) | `reconnect_watchdog` bounded-backoff + connection health for the ONE-SHOT bot (no daemon, no forever loop): `IBKRBridge.connect()` enforces the **paper-port lock first** (a non-paper port is refused **before any retry**, never bypassed), then retries the **initial** connect with **bounded** exponential backoff only when `IBKR_RECONNECT_ENABLED` (succeeds first try / retries then succeeds / **gives up** after `IBKR_RECONNECT_MAX_ATTEMPTS`); disabled ⇒ a single attempt; backoff is deterministic and **asserted without sleeping real time** (injected `sleep` recorder); an **unexpected** `disconnectedEvent` marks the link **unhealthy** so `_new_entries_blocked` returns `connection_unhealthy` (**fail closed**, no new positions) while an intentional `disconnect()` is a clean shutdown; the watchdog **never places an order**; every decision audited (`order_audit` stage `watchdog`); adds **no new capability flag** and live-readiness stays NOT READY (`test_reconnect_watchdog.py`) |
 | Supervised scheduler (Phase 5B-1) | `scheduler_runner.evaluate` pure decision (paper-safety → enabled → clock → US regular-hours gate, all fail-closed) blocks weekend/holiday/before-open/after-close and an unresolved clock, allows inside RTH, and **reports a paper-only-safety violation before anything else**; `run_scheduled` dispatches **at most once** (no loop), runs the existing `paper` command in **plan/dry-run by default placing no orders**, only forwards to the paper order path when `--execute` AND `SCHEDULER_DRY_RUN_DEFAULT=False`, audits every decision (`order_audit` stage `schedule`), adds **no new capability flag**, and live-readiness stays NOT READY (`test_scheduler_runner.py`) |
 | Model gate (Phase 1) | `evaluate_gate` decision table (missing / stale / below-floor / ok / disabled); per-symbol metrics persist + merge RF and LSTM and never raise; a pre-gate BUY is forced to `HOLD` when blocked; backtest/live signal-construction parity; P1 scorecard gates PASS while overall stays NOT READY; `signal-parity` command (`test_model_gate.py`) |
 
@@ -117,8 +119,8 @@ so they never overwrite real reports.
 > **expected**. `SUPPORTS_STARTUP_RECONCILIATION` flips `True` only because the
 > logic exists **and** is covered here; the Phase-6 flag
 > (`SUPPORTS_ACCOUNT_TYPE_ASSERTION`) stays `False`, so `live-readiness` still
-> reports NOT READY. Of Phase 5B, only **5B-1 (scheduler)** is built (below);
-> 5B-2 reconnect watchdog, 5B-3 graceful shutdown, and 5B-4 alerting are **not**.
+> reports NOT READY. Of Phase 5B, **5B-1 (scheduler)** and **5B-2 (reconnect
+> watchdog)** are built (below); 5B-3 graceful shutdown and 5B-4 alerting are **not**.
 
 > **Supervised scheduler / market-hours runner (Phase 5B-1, H17).** `scheduler_runner.py`
 > is the Path A answer to "`run_dryrun.bat` just dry-runs and crashes outside
@@ -143,6 +145,31 @@ so they never overwrite real reports.
 > NOT READY. For Windows Task Scheduler use `run_scheduled.bat`, which sets
 > `PYTHONUTF8=1` (and `python -X utf8`) so the emoji logs never raise
 > `UnicodeEncodeError` under a non-UTF-8 scheduled console.
+
+> **Reconnect watchdog / connection resilience (Phase 5B-2, H10).** `reconnect_watchdog.py`
+> hardens ONLY the one-shot connection — it is **not** a daemon and **not** a
+> forever reconnect loop. Its compute half is **pure and offline**: `backoff_delay`
+> / `backoff_schedule` are deterministic (no jitter, no clock) and `attempt_connect`
+> takes injected `connect_once` / `sleep` callables, so `test_reconnect_watchdog.py`
+> drives the **real** `IBKRBridge.connect()` retry path with a tiny `FakeIB` that
+> **records** each backoff delay instead of sleeping (no IBKR, no network, no real
+> time). The tests prove the contract: the **paper-port lock is enforced first**
+> (a non-paper port is refused **before any connect/retry** — the watchdog can
+> never bypass it), the **initial** connect retries with **bounded** exponential
+> backoff only when `IBKR_RECONNECT_ENABLED` and **gives up** after
+> `IBKR_RECONNECT_MAX_ATTEMPTS` (it never retries forever), reconnect-disabled is a
+> single attempt, the backoff schedule is bounded by `IBKR_RECONNECT_MAX_DELAY_SECONDS`,
+> an **unexpected** disconnect marks the link **unhealthy** so the entry gate
+> returns `connection_unhealthy` and **fails closed** (no new positions) while an
+> intentional `disconnect()` is a clean shutdown, and the watchdog **never places
+> an order**. Each connection event is audited (`order_audit` stage `watchdog`).
+> Per the plan, Phase 5B-2 adds **no new live-readiness capability flag**, so
+> `live-readiness` still reports NOT READY (the Phase-6
+> `SUPPORTS_ACCOUNT_TYPE_ASSERTION` gate stays `False`). The simulated
+> "Failed to connect to IBKR TWS" tracebacks and the "IBKR disconnected mid-run"
+> line in the test output are **expected**. Of Phase 5B, **5B-1 (scheduler)** and
+> **5B-2 (reconnect watchdog)** are built; 5B-3 graceful shutdown and 5B-4
+> alerting are **not**.
 
 ## Continuous integration
 
