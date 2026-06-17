@@ -25,6 +25,7 @@ python -m unittest test_ibkr_fill_flow -v    # Phase-2 fill-driven order path (f
 python -m unittest test_risk_engine -v       # Phase-3 risk engine + equity snapshot (H1, H3)
 python -m unittest test_phase3_protection -v # Phase-3 GTC/OCA + kill-switch + startup invariant
 python -m unittest test_reconciliation -v    # Phase-5A startup reconciliation (broker = source of truth)
+python -m unittest test_scheduler_runner -v  # Phase-5B-1 supervised scheduler / market-hours runner
 python -m unittest discover -p "test_*.py"   # everything
 python test_logic.py                         # equivalent direct run
 ```
@@ -48,6 +49,7 @@ so they never overwrite real reports.
 | Order execution (Phase 2) | fill-vs-accepted classification (`PreSubmitted` is not a fill); partial-fill exit-child reconciliation — **all** SELL children (protective stop, trailing stop, AND take-profit LMT) cancelled/resized to the actual filled qty so nothing can over-sell into a short; protective-child verify-or-flatten; robust close marketable-limit→market escalation; deterministic `orderRef` duplicate guard; emergency flatten cancels resting children first; capability flags (`test_order_exec.py`, `test_ibkr_fill_flow.py`) |
 | Server-side protection + risk (Phase 3) | GTC + OCA exit set placed **after** the confirmed fill, sized to the filled qty; independent hard −3% stop priced off the **actual** `avgFillPrice`; every exit `tif=GTC` and shares one non-empty OCA group; no exit qty exceeds the fill; placement/verify failure → flatten + abort; daily-loss kill-switch (start-of-day equity snapshot) blocks **new opens** but allows **closes**; account drawdown / per-symbol exposure groundwork; startup invariant repairs unprotected longs or halts new entries; capability flags (`test_order_exec.py`, `test_risk_engine.py`, `test_phase3_protection.py`) |
 | Startup reconciliation (Phase 5A) | `reconciliation.build_snapshot` broker-truth snapshot from plain broker state — protected vs. unprotected longs (GTC-aware: a DAY stop or take-profit LMT is not protection), duplicate `orderRef` detection, orphan exit orders (resting SELL with no covering long); `IBKRBridge.reconcile_startup_state()` driven through the real bridge with fake IBKR proves **broker = source of truth**, repairs an unprotected long via the existing Phase-3 path or halts new entries, audits the snapshot, and **never opens a new position** (`test_reconciliation.py`) |
+| Supervised scheduler (Phase 5B-1) | `scheduler_runner.evaluate` pure decision (paper-safety → enabled → clock → US regular-hours gate, all fail-closed) blocks weekend/holiday/before-open/after-close and an unresolved clock, allows inside RTH, and **reports a paper-only-safety violation before anything else**; `run_scheduled` dispatches **at most once** (no loop), runs the existing `paper` command in **plan/dry-run by default placing no orders**, only forwards to the paper order path when `--execute` AND `SCHEDULER_DRY_RUN_DEFAULT=False`, audits every decision (`order_audit` stage `schedule`), adds **no new capability flag**, and live-readiness stays NOT READY (`test_scheduler_runner.py`) |
 | Model gate (Phase 1) | `evaluate_gate` decision table (missing / stale / below-floor / ok / disabled); per-symbol metrics persist + merge RF and LSTM and never raise; a pre-gate BUY is forced to `HOLD` when blocked; backtest/live signal-construction parity; P1 scorecard gates PASS while overall stays NOT READY; `signal-parity` command (`test_model_gate.py`) |
 
 > **Model gate & signal parity (Phase 1).** `test_model_gate.py` is offline and
@@ -115,8 +117,32 @@ so they never overwrite real reports.
 > **expected**. `SUPPORTS_STARTUP_RECONCILIATION` flips `True` only because the
 > logic exists **and** is covered here; the Phase-6 flag
 > (`SUPPORTS_ACCOUNT_TYPE_ASSERTION`) stays `False`, so `live-readiness` still
-> reports NOT READY. Phase 5B (scheduler / reconnect watchdog / graceful
-> shutdown / alerting) is **not** included.
+> reports NOT READY. Of Phase 5B, only **5B-1 (scheduler)** is built (below);
+> 5B-2 reconnect watchdog, 5B-3 graceful shutdown, and 5B-4 alerting are **not**.
+
+> **Supervised scheduler / market-hours runner (Phase 5B-1, H17).** `scheduler_runner.py`
+> is the Path A answer to "`run_dryrun.bat` just dry-runs and crashes outside
+> hours". Its decision half is **pure and offline** like `data_integrity` /
+> `reconciliation`: `evaluate(now_et, ...)` takes a US/Eastern datetime and config
+> and returns a verdict; it never reads the clock itself, so `test_scheduler_runner.py`
+> is fully deterministic (fixed 2026-06-17 calendar anchors, an injected fake
+> dispatch — no IBKR, no network, no order path). The tests prove the contract:
+> a scheduled run is **blocked** outside US regular hours (weekend / holiday /
+> before-open / after-close) and when the clock can't be resolved (fail-closed),
+> **allowed** inside RTH on a trading day, gated by the `SCHEDULER_ENABLED`
+> master switch, and — highest priority — **refused on any paper-only-safety
+> violation** (live-trading flag, non-paper port, `REQUIRE_PAPER_PORT=False`,
+> short-selling, or historical-close pricing). `run_scheduled` dispatches **at
+> most once** (never a daemon loop), runs the existing `paper` command so every
+> downstream gate (model / data-integrity / market-hours / daily-loss / startup
+> reconciliation / paper-port lock) still applies, and ships in **plan/dry-run
+> placing no orders**: only `--execute` **and** a deliberate
+> `SCHEDULER_DRY_RUN_DEFAULT=False` reaches the (still paper-locked) order path.
+> Every decision is audited (`order_audit` stage `schedule`). Phase 5B-1 adds
+> **no new capability flag** (per the plan), so `live-readiness` still reports
+> NOT READY. For Windows Task Scheduler use `run_scheduled.bat`, which sets
+> `PYTHONUTF8=1` (and `python -X utf8`) so the emoji logs never raise
+> `UnicodeEncodeError` under a non-UTF-8 scheduled console.
 
 ## Continuous integration
 

@@ -333,3 +333,31 @@ COACH_DEFAULT_PREVIEW_CANDIDATES   = 3
 # stay False; daily-coach refuses to run if anything tries to flip it True or
 # tries to connect on a non-paper port while REQUIRE_PAPER_PORT is True.
 COACH_LIVE_TRADING_ENABLED         = False
+
+# ─── Phase 5B-1: Supervised Scheduler / Market-Hours Runner (Path A) ─────────
+# A THIN orchestration layer (`scheduler_runner.py`, command `run-scheduled`) for
+# the one-shot Path A bot. It only DECIDES whether a scheduled run is allowed and
+# then calls the EXISTING one-shot paper command. It adds NO trading logic, NO
+# daemon loop, and NO new capability flag. Every existing gate still applies
+# (model gate, data-integrity gate, market-hours gate, daily-loss kill-switch,
+# startup reconciliation, paper-port lock). PAPER ONLY: it never enables live
+# trading and ships in plan/dry-run mode.
+#
+# For Windows Task Scheduler use `run_scheduled.bat` and set PYTHONUTF8=1 (or
+# `python -X utf8`) so the emoji-bearing logs cannot raise UnicodeEncodeError in
+# a non-UTF-8 scheduled console (the H17 `scheduled_dryrun.log` fix).
+#
+# Master switch for the `run-scheduled` command. False => every scheduled run is
+# blocked (logged + audited) and nothing is dispatched.
+SCHEDULER_ENABLED            = True
+# Default execution mode. True (ship value) => even `run-scheduled --execute`
+# stays a dry-run/plan preview and places NO orders. Flip to False ONLY when you
+# deliberately want `--execute` to forward to the (paper) order path; the bot is
+# still paper-locked, so this can never place a live order.
+SCHEDULER_DRY_RUN_DEFAULT    = True
+# Require US regular trading hours (RTH) for a scheduled run. True (recommended)
+# => a run outside 09:30-16:00 ET on a trading day (weekend/holiday/early-close
+# aware) is blocked, mirroring the Phase-4 market-hours gate via the same
+# data_integrity calendar. Set False only to practise scheduled plan runs
+# outside market hours.
+SCHEDULER_REQUIRE_RTH        = True

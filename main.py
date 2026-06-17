@@ -47,6 +47,12 @@ Live-trading readiness (read-only scorecard + emergency kill-switch):
   python main.py panic-flatten --confirm  # Cancel all orders + market-close all PAPER positions
   (See reports/LIVE_TRADING_IMPLEMENTATION_PLAN_MM.md. Still PAPER ONLY.)
 
+Supervised scheduler (Path A; one-shot, market-hours gated; PAPER ONLY):
+  python -X utf8 main.py run-scheduled    # Run `paper` only inside US market hours (plan/dry-run)
+  python -X utf8 main.py run-scheduled --execute  # Forward to the paper order path (still gated;
+                                          # needs config.SCHEDULER_DRY_RUN_DEFAULT=False to place)
+  (Single-shot: never loops. Use Windows Task Scheduler + run_scheduled.bat to recur.)
+
 Exit codes:
   0  success
   1  IBKR connection failure
@@ -1660,6 +1666,43 @@ def cmd_signal_parity(_args) -> int:
     return 0 if ok else 1
 
 
+# -- Phase 5B-1: supervised scheduler / market-hours runner (Path A) ----------
+def cmd_run_scheduled(args) -> int:
+    """Supervised one-shot scheduler entry (PAPER ONLY). Decides whether a
+    scheduled run is allowed right now (paper-safety + SCHEDULER_ENABLED +
+    US regular-hours gate) and, if so, runs the EXISTING one-shot `paper` command.
+
+    It adds NO trading logic, NO daemon loop, and NO gate bypass -- every existing
+    safety control runs inside cmd_paper. Plan/dry-run by default: it places NO
+    orders unless an operator BOTH passes --execute AND has deliberately set
+    config.SCHEDULER_DRY_RUN_DEFAULT=False (and even then it is paper-locked).
+
+    Exit code: 0 for a cleanly blocked run (market closed / disabled is a normal
+    no-op), otherwise the underlying command's exit code.
+    """
+    import scheduler_runner
+
+    execute = bool(getattr(args, "execute", False))
+    print("\n=== Supervised Scheduler Run (Path A, PAPER ONLY) ===")
+    print("Decides if a scheduled run is allowed (paper-safety + enabled + market hours),")
+    print("then runs the existing one-shot `paper` command. Never loops; never places live orders.")
+
+    result = scheduler_runner.run_scheduled(execute=execute)
+    decision = result["decision"]
+    print("\n" + scheduler_runner.summary_line(decision))
+
+    if not result["ran"]:
+        print(f"[SKIP] Scheduled run blocked: {decision.reason} -- {decision.detail}")
+        print("No orders placed. No IBKR connection made.")
+        return result["exit_code"]
+
+    mode = "DRY-RUN / PLAN (no orders)" if result["dry_run"] else \
+        "EXECUTE (paper order path; still fully gated + paper-locked)"
+    print(f"[RUN] Scheduled run allowed -> {mode}")
+    print(f"Underlying `paper` command exit code: {result['exit_code']}")
+    return result["exit_code"]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stock Prediction Engine â€” IBKR Paper Trading")
     sub = parser.add_subparsers(dest="command")
@@ -1829,6 +1872,19 @@ def main() -> int:
              "(read-only, no IBKR, no orders)",
     )
 
+    # -- Phase 5B-1: supervised scheduler / market-hours runner (Path A) --
+    rs = sub.add_parser(
+        "run-scheduled",
+        help="Supervised one-shot scheduler: run the `paper` command only inside "
+             "US market hours (PAPER ONLY; plan/dry-run by default, never loops)",
+    )
+    rs.add_argument(
+        "--execute", action="store_true",
+        help="Forward to the (paper) order path instead of plan/dry-run. Still "
+             "requires config.SCHEDULER_DRY_RUN_DEFAULT=False to place orders, and "
+             "stays paper-port-locked. Never enables live trading.",
+    )
+
     args = parser.parse_args()
     if args.command == "train":
         return cmd_train(args)
@@ -1868,6 +1924,8 @@ def main() -> int:
         return cmd_panic_flatten(args)
     if args.command == "signal-parity":
         return cmd_signal_parity(args)
+    if args.command == "run-scheduled":
+        return cmd_run_scheduled(args)
 
     parser.print_help()
     return 3

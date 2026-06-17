@@ -44,6 +44,7 @@ STAGE_HALT = "halt"                # new-entry halt: daily-loss / drawdown / unp
 STAGE_SNAPSHOT = "equity_snapshot" # start-of-day NetLiquidation snapshot (Phase 3)
 STAGE_QUOTE = "quote"              # order-price quote validated for data integrity (Phase 4)
 STAGE_RECONCILE = "reconcile"      # startup broker-truth reconciliation snapshot (Phase 5A, H18)
+STAGE_SCHEDULE = "schedule"        # supervised scheduler run decision: allowed/blocked + dispatch (Phase 5B-1)
 
 
 def log_event(stage: str, **fields) -> None:
