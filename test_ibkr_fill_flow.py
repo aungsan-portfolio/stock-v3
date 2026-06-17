@@ -391,6 +391,15 @@ class TestRobustClose(_BridgeBase):
 
 # ── 5. execute_signal records a trade ONLY on a real fill (H4) ───────────────
 class TestExecuteSignalRecording(_BridgeBase):
+    def setUp(self):
+        super().setUp()
+        # Time-independence: these tests assert that a trade is recorded ONLY on a
+        # real fill -- not the Phase-4 market-hours gate. Outside US regular hours
+        # that gate would block the BUY open first and mask the record behavior.
+        # Disable it for THIS class only; restored by the base's mock.patch.stopall
+        # cleanup. Never disabled in production.
+        mock.patch.object(config, "MARKET_HOURS_GATE_ENABLED", False).start()
+
     def _wire(self, br):
         br.get_price = lambda *a, **k: 100.0          # type: ignore
         br.get_cash = lambda: 100000.0                # type: ignore

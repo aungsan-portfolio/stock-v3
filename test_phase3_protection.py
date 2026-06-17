@@ -73,6 +73,15 @@ class TestGtcOcaProtection(_BridgeBase):
 
 # ── 2. Daily-loss kill-switch (H1) ───────────────────────────────────────────
 class TestDailyLossKillSwitch(_BridgeBase):
+    def setUp(self):
+        super().setUp()
+        # Time-independence: these tests assert the daily-loss kill-switch's
+        # decision on a BUY open, NOT the Phase-4 market-hours gate. Outside US
+        # regular hours that gate would block the open first and mask the
+        # kill-switch behavior. Disable it for THIS class only; restored by the
+        # base's mock.patch.stopall cleanup. Never disabled in production.
+        mock.patch.object(config, "MARKET_HOURS_GATE_ENABLED", False).start()
+
     def _wire(self, br, equity):
         br.ib.account_values = [("NetLiquidation", "USD", equity)]
         br.get_price = lambda *a, **k: 100.0          # type: ignore

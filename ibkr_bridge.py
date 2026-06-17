@@ -24,6 +24,7 @@ import data_integrity
 import live_invariants
 import order_audit
 import order_exec
+import reconciliation
 import risk_engine
 import risk_state
 from predictor import Signal
@@ -49,7 +50,7 @@ SUPPORTS_SERVER_SIDE_GTC_STOP    = True    # Phase 3 (C2, H19): resting GTC/OCA 
 SUPPORTS_DAILY_LOSS_KILLSWITCH   = True    # Phase 3 (H1): loss_breached() wired into the order gate
 SUPPORTS_REALTIME_DATA_GUARD     = True    # Phase 4 (H11-H13, H16): sane real-time/delayed quote, reject stale-close/crossed/wide
 SUPPORTS_MARKET_HOURS_GATE       = True     # Phase 4 (H15): refuse NEW entries outside RTH/holidays
-SUPPORTS_STARTUP_RECONCILIATION  = False   # Phase 5 (H18): broker = source of truth on startup
+SUPPORTS_STARTUP_RECONCILIATION  = True    # Phase 5A (H18): broker = source of truth on startup
 SUPPORTS_ACCOUNT_TYPE_ASSERTION  = False   # Phase 6: assert paper(DU)/live(U) account, not just port
 
 
@@ -439,6 +440,16 @@ class IBKRBridge:
             logger.warning("Could not refresh open orders", exc_info=True)
         return live_invariants.adapt_working_orders(self.ib.openTrades())
 
+    def _open_positions_plain(self) -> list:
+        """Adapt broker positions() to the plain {"symbol","qty"} shape used by
+        the pure reconciliation / live-invariant checkers. Broker = source of
+        truth; read-only."""
+        try:
+            return live_invariants.adapt_positions(self.ib.positions())
+        except Exception:
+            logger.warning("Could not read positions for reconciliation", exc_info=True)
+            return []
+
     def _cancel_symbol_working_orders(self, symbol: str) -> int:
         """Cancel ALL working orders for `symbol` (any side / type). Used before
         an emergency flatten so no resting exit child can fire AFTER we go flat
@@ -683,6 +694,62 @@ class IBKRBridge:
                                       symbol=symbol, qty=qty)
                 logger.error("Startup: could not protect long %s -> HALT new entries", symbol)
         return report
+
+    def reconcile_startup_state(self) -> dict:
+        """Startup reconciliation (Phase 5A, H18): BROKER = source of truth.
+
+        Reads the broker's open positions and working orders, builds a pure
+        broker-truth snapshot (reconciliation.build_snapshot) describing protected
+        vs. unprotected longs, duplicate orderRefs, and orphan exit orders, and
+        writes the result to the audit log. Local files are NEVER treated as truth
+        over broker state.
+
+        Repair is delegated to the existing, already-tested Phase-3 path
+        (ensure_protective_stops): an unprotected long gets a GTC stop priced off
+        the broker avgCost, or new entries are halted. This method places NO new
+        entries and cancels nothing itself; it is safe to call on every startup.
+
+        Returns a report dict:
+          {"snapshot": <pure snapshot>, "protect": <ensure_protective_stops report>,
+           "halt_new_entries": bool, "clean": bool}
+        """
+        positions = self._open_positions_plain()
+        working = self._working_orders_plain()
+        snapshot = reconciliation.build_snapshot(positions, working)
+
+        order_audit.log_event(
+            order_audit.STAGE_RECONCILE, phase="startup",
+            source="broker", **reconciliation.audit_fields(snapshot),
+        )
+        logger.info("Startup reconciliation | %s", reconciliation.summary_line(snapshot))
+
+        # Repair unprotected longs ONLY through the existing protective-repair
+        # path. It scans broker positions itself (source of truth) and either
+        # places a GTC stop or halts NEW entries -- it never opens a position.
+        protect = {"checked": 0, "unprotected": [], "repaired": [], "failed": []}
+        if snapshot["unprotected_longs"]:
+            protect = self.ensure_protective_stops()
+
+        # Duplicate refs / orphan exits are surfaced + audited for operator action
+        # (and Phase 5B alerting). Phase 5A does NOT auto-cancel them: cancelling a
+        # resting order is a mutation we keep out of the minimal reconcile step.
+        if snapshot["duplicate_refs"]:
+            logger.warning("Startup reconciliation: duplicate orderRefs at broker: %s",
+                           snapshot["duplicate_refs"])
+        if snapshot["orphan_exits"]:
+            orphan_syms = sorted({str(o.get("symbol", "")).upper() for o in snapshot["orphan_exits"]})
+            logger.warning("Startup reconciliation: orphan exit order(s) with no covering long: %s",
+                           orphan_syms)
+
+        return {
+            "snapshot": snapshot,
+            "protect": protect,
+            "halt_new_entries": bool(self._halt_new_entries),
+            "clean": bool(snapshot["clean"]),
+        }
+
+    # Back-compat alias: the plan refers to this capability as startup_reconcile().
+    startup_reconcile = reconcile_startup_state
 
     def _finalize_open(self, symbol: str, action: str, parent_trade, result: order_exec.OrderResult,
                        intended_qty: int) -> order_exec.OrderResult:

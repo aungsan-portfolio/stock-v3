@@ -258,16 +258,28 @@ def _place_paper_orders(signals) -> int:
         return 1
 
     try:
-        # Phase 3: snapshot start-of-day equity (daily-loss kill-switch baseline)
-        # and run the startup protection invariant before placing anything. An
-        # unprotected open long is repaired (GTC stop) or it halts NEW entries.
+        # Phase 3: snapshot start-of-day equity (daily-loss kill-switch baseline).
         bridge.snapshot_start_of_day_equity()
-        protect = bridge.ensure_protective_stops()
+        # Phase 5A (H18): startup reconciliation -- BROKER is the source of truth.
+        # Rebuild state from broker positions + working orders, audit the
+        # broker-truth snapshot, and repair any unprotected long via the existing
+        # Phase-3 path (GTC stop) or halt NEW entries. Never opens a position.
+        recon = bridge.reconcile_startup_state()
+        snap = recon["snapshot"]
+        protect = recon["protect"]
+        print(f"ðŸ”Ž Startup reconciliation (broker = source of truth): "
+              f"{len(snap['open_positions'])} long(s), "
+              f"{snap['n_working_orders']} working order(s); clean={snap['clean']}")
         if protect.get("repaired"):
             print(f"ðŸ›¡ï¸  Repaired protective GTC stop(s) for: {protect['repaired']}")
         if protect.get("failed"):
             print(f"âš ï¸  Startup protection FAILED for {protect['failed']} "
                   f"â€” NEW entries halted; closes/flatten still allowed.")
+        if snap["duplicate_refs"]:
+            print(f"âš ï¸  Duplicate orderRef(s) at broker: {snap['duplicate_refs']}")
+        if snap["orphan_exits"]:
+            orphan_syms = sorted({o.get("symbol", "") for o in snap["orphan_exits"]})
+            print(f"âš ï¸  Orphan exit order(s) with no covering long: {orphan_syms}")
 
         result = bridge.execute_all(signals)
         print(f"\nâœ… Orders accepted : {result['placed']}")

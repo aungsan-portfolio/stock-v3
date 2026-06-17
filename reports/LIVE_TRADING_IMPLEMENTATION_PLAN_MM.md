@@ -185,7 +185,7 @@ order မချရ။
 | တာဝန် | ဘယ်မှာ | အသေးစိတ် |
 |------|--------|----------|
 | 5.1 Scheduler (Path A) | `run_dryrun.bat` အစား supervised runner | market-hours scheduled run; `PYTHONUTF8=1` env (`scheduled_dryrun.log` UnicodeEncodeError ပြင်); dry-run သီးသန့် မဟုတ် |
-| 5.2 Startup reconciliation (H18) | `main.py:899-931`, `risk_state.py` | startup တိုင်း `positions()` + `reqAllOpenOrders()` + `executions()` နဲ့ state rebuild; **broker = source of truth**; unprotected-position scan + alert |
+| 5.2 Startup reconciliation (H18) ✅ **(Phase 5A done)** | `reconciliation.py` (pure), `ibkr_bridge.py` `reconcile_startup_state()`, `main.py` startup | startup တိုင်း `positions()` + `reqAllOpenOrders()` နဲ့ broker-truth snapshot rebuild; **broker = source of truth** (local file truth မယူ); protected/unprotected long + duplicate `orderRef` + orphan exit scan; unprotected long ကို Phase-3 `ensure_protective_stops` နဲ့သာ repair (entry အသစ် **မဖွင့်**); audit log (`reconcile` stage); offline tests `test_reconciliation.py`; `SUPPORTS_STARTUP_RECONCILIATION=True`. **executions()-based fill reconcile + alert delivery က Phase 5B** |
 | 5.3 Reconnect/watchdog (H10) | `ibkr_bridge.py:53-85` | `ib.disconnectedEvent` handler + exponential backoff reconnect; `ib.RequestTimeout` set (`flatten_vti.py` ပုံစံ) |
 | 5.4 Graceful shutdown (M6) | `main.py` | SIGINT/SIGTERM/atexit handler; shutdown အချိန် resting GTC protection **ကျန်နေအောင်** သေချာစေ (naked position မဖြစ်စေ) |
 | 5.5 Alerting | အသစ် `alerts.py` | halt / disconnect / unprotected position / daily-loss breach / order reject / partial fill တို့မှာ email/SMS/push |

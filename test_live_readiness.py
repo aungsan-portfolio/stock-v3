@@ -143,10 +143,10 @@ class TestCapabilityFlagsBaseline(unittest.TestCase):
         "SUPPORTS_STARTUP_RECONCILIATION",
         "SUPPORTS_ACCOUNT_TYPE_ASSERTION",
     ]
-    # Phases 2, 3 and 4 are implemented AND covered (test_order_exec.py,
+    # Phases 2, 3, 4 and 5A are implemented AND covered (test_order_exec.py,
     # test_ibkr_fill_flow.py, test_risk_engine.py, test_phase3_protection.py,
-    # test_data_integrity.py), so these flip True -- the only honest way to flip a
-    # flag. See reports/LIVE_TRADING_IMPLEMENTATION_PLAN_MM.md.
+    # test_data_integrity.py, test_reconciliation.py), so these flip True -- the
+    # only honest way to flip a flag. See reports/LIVE_TRADING_IMPLEMENTATION_PLAN_MM.md.
     IMPLEMENTED_TRUE = [
         "SUPPORTS_FILL_VERIFICATION",        # Phase 2 (H4/H5)
         "SUPPORTS_PARTIAL_FILL_HANDLING",    # Phase 2 (H6)
@@ -155,10 +155,11 @@ class TestCapabilityFlagsBaseline(unittest.TestCase):
         "SUPPORTS_DAILY_LOSS_KILLSWITCH",    # Phase 3 (H1)
         "SUPPORTS_REALTIME_DATA_GUARD",      # Phase 4 (H11-H13/H16)
         "SUPPORTS_MARKET_HOURS_GATE",        # Phase 4 (H15)
+        "SUPPORTS_STARTUP_RECONCILIATION",   # Phase 5A (H18)
     ]
-    # Phases 5-6 are not built yet; their flags must stay False (fail-closed).
+    # Phase 6 is not built yet; its flag must stay False (fail-closed). Phase 5B
+    # (scheduler / watchdog / alerting) does not add a capability flag here.
     LATER_PHASE_FALSE = [
-        "SUPPORTS_STARTUP_RECONCILIATION",
         "SUPPORTS_ACCOUNT_TYPE_ASSERTION",
     ]
 

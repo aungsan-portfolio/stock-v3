@@ -24,6 +24,7 @@ python -m unittest test_order_exec -v        # Phase-2 order-execution logic (H4
 python -m unittest test_ibkr_fill_flow -v    # Phase-2 fill-driven order path (fake IBKR)
 python -m unittest test_risk_engine -v       # Phase-3 risk engine + equity snapshot (H1, H3)
 python -m unittest test_phase3_protection -v # Phase-3 GTC/OCA + kill-switch + startup invariant
+python -m unittest test_reconciliation -v    # Phase-5A startup reconciliation (broker = source of truth)
 python -m unittest discover -p "test_*.py"   # everything
 python test_logic.py                         # equivalent direct run
 ```
@@ -46,6 +47,7 @@ so they never overwrite real reports.
 | Live-readiness (Phase 0) | `unprotected_longs` / duplicate-ref invariants; `order_audit` JSONL never raises; Phase-3+ bridge capability flags `False` (Phase-2 flags now `True`); `live-readiness` scorecard reports NOT READY (`test_live_readiness.py`) |
 | Order execution (Phase 2) | fill-vs-accepted classification (`PreSubmitted` is not a fill); partial-fill exit-child reconciliation — **all** SELL children (protective stop, trailing stop, AND take-profit LMT) cancelled/resized to the actual filled qty so nothing can over-sell into a short; protective-child verify-or-flatten; robust close marketable-limit→market escalation; deterministic `orderRef` duplicate guard; emergency flatten cancels resting children first; capability flags (`test_order_exec.py`, `test_ibkr_fill_flow.py`) |
 | Server-side protection + risk (Phase 3) | GTC + OCA exit set placed **after** the confirmed fill, sized to the filled qty; independent hard −3% stop priced off the **actual** `avgFillPrice`; every exit `tif=GTC` and shares one non-empty OCA group; no exit qty exceeds the fill; placement/verify failure → flatten + abort; daily-loss kill-switch (start-of-day equity snapshot) blocks **new opens** but allows **closes**; account drawdown / per-symbol exposure groundwork; startup invariant repairs unprotected longs or halts new entries; capability flags (`test_order_exec.py`, `test_risk_engine.py`, `test_phase3_protection.py`) |
+| Startup reconciliation (Phase 5A) | `reconciliation.build_snapshot` broker-truth snapshot from plain broker state — protected vs. unprotected longs (GTC-aware: a DAY stop or take-profit LMT is not protection), duplicate `orderRef` detection, orphan exit orders (resting SELL with no covering long); `IBKRBridge.reconcile_startup_state()` driven through the real bridge with fake IBKR proves **broker = source of truth**, repairs an unprotected long via the existing Phase-3 path or halts new entries, audits the snapshot, and **never opens a new position** (`test_reconciliation.py`) |
 | Model gate (Phase 1) | `evaluate_gate` decision table (missing / stale / below-floor / ok / disabled); per-symbol metrics persist + merge RF and LSTM and never raise; a pre-gate BUY is forced to `HOLD` when blocked; backtest/live signal-construction parity; P1 scorecard gates PASS while overall stays NOT READY; `signal-parity` command (`test_model_gate.py`) |
 
 > **Model gate & signal parity (Phase 1).** `test_model_gate.py` is offline and
@@ -96,6 +98,25 @@ so they never overwrite real reports.
 > test output are **expected**. Flags `SUPPORTS_SERVER_SIDE_GTC_STOP` and
 > `SUPPORTS_DAILY_LOSS_KILLSWITCH` flip `True`; Phase-4–6 flags stay `False`, so
 > `live-readiness` still reports NOT READY.
+
+> **Startup reconciliation (Phase 5A, H18).** `reconciliation.py` is the **pure**
+> half (no ib_insync / network): it builds a broker-truth snapshot from plain
+> position / working-order dicts and never mutates anything. `test_reconciliation.py`
+> proves both halves: the snapshot classifies a long as protected only when a
+> resting **GTC** stop covers its qty (a DAY stop or take-profit LMT is *not*
+> downside protection), flags duplicate `orderRef`s and orphan exit orders, and
+> the bridge method `IBKRBridge.reconcile_startup_state()` (alias
+> `startup_reconcile`) treats the **broker as the source of truth** — never a
+> local file — audits the snapshot (`order_audit` stage `reconcile`), and repairs
+> an unprotected long **only** through the existing Phase-3 `ensure_protective_stops`
+> path (or halts new entries; avgCost missing → halt, never guess). The core
+> safety test asserts reconciliation **never places a BUY / opens a position**.
+> The "Startup reconciliation …" and "Startup: …" lines in the test output are
+> **expected**. `SUPPORTS_STARTUP_RECONCILIATION` flips `True` only because the
+> logic exists **and** is covered here; the Phase-6 flag
+> (`SUPPORTS_ACCOUNT_TYPE_ASSERTION`) stays `False`, so `live-readiness` still
+> reports NOT READY. Phase 5B (scheduler / reconnect watchdog / graceful
+> shutdown / alerting) is **not** included.
 
 ## Continuous integration
 
