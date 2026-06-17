@@ -37,6 +37,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
+import alerts
 import config
 import order_audit
 
@@ -254,6 +255,15 @@ def make_disconnect_handler(health: ConnectionHealth, *,
             if audit:
                 audit_connection(REASON_DISCONNECTED, healthy=False,
                                  disconnect_count=health.disconnect_count)
+            # Phase 5B-4: surface the mid-run drop to the operator. emit() is
+            # disabled/log-only by default, never raises, and never touches an
+            # order -- it only records/notifies, so it cannot affect the fail-
+            # closed posture above.
+            alerts.emit(alerts.EVENT_DISCONNECT,
+                        message="IBKR disconnected mid-run -> failing closed",
+                        reason=REASON_DISCONNECTED,
+                        disconnect_count=health.disconnect_count,
+                        intentional=False)
         except Exception:
             logger.debug("reconnect_watchdog: disconnect handler error", exc_info=True)
     return _on_disconnected

@@ -47,6 +47,7 @@ STAGE_RECONCILE = "reconcile"      # startup broker-truth reconciliation snapsho
 STAGE_SCHEDULE = "schedule"        # supervised scheduler run decision: allowed/blocked + dispatch (Phase 5B-1)
 STAGE_WATCHDOG = "watchdog"        # reconnect/connection-health event: connected/retried/disconnect/gave_up (Phase 5B-2)
 STAGE_SHUTDOWN = "shutdown"        # graceful one-shot shutdown: plan/clean-disconnect, unprotected-long scan (Phase 5B-3)
+STAGE_ALERT = "alert"              # operator alert emitted by alerts.py (Phase 5B-4); LOG/audit-only, never trades
 
 
 def log_event(stage: str, **fields) -> None:

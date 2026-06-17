@@ -33,6 +33,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
+import alerts
 import config
 import data_integrity
 import order_audit
@@ -172,6 +173,18 @@ def evaluate(now_et: Optional[_dt.datetime], *,
     return decision(True, REASON_ALLOWED, f"inside scheduled run window ({where})")
 
 
+def _block_severity(reason: str) -> str:
+    """Map a blocked-decision reason to an alert severity so a routine block (the
+    market is closed / scheduler disabled) is INFO -- below the default
+    ALERT_MIN_SEVERITY floor, so it never spams -- while a paper-safety violation
+    is CRITICAL and a clock failure is WARNING."""
+    if reason == REASON_PAPER_SAFETY:
+        return alerts.SEVERITY_CRITICAL
+    if reason == REASON_CLOCK_ERROR:
+        return alerts.SEVERITY_WARNING
+    return alerts.SEVERITY_INFO
+
+
 def summary_line(d: ScheduleDecision) -> str:
     """One-line human-readable summary of a decision for console / logs."""
     return (
@@ -260,6 +273,13 @@ def run_scheduled(*, now_et: Optional[_dt.datetime] = None,
 
     if not decision.allowed:
         logger.info("Scheduler: run BLOCKED (%s) - %s", decision.reason, decision.detail)
+        # Phase 5B-4: surface the block. A routine market-closed/disabled block is
+        # INFO (filtered out by the default severity floor); a paper-safety
+        # violation is CRITICAL. emit() never dispatches/places an order.
+        alerts.emit(alerts.EVENT_SCHEDULER_BLOCKED,
+                    severity=_block_severity(decision.reason),
+                    message=decision.detail, reason=decision.reason,
+                    now_et=decision.now_iso, paper_safe=decision.paper_safe)
         return {"ran": False, "exit_code": 0,
                 "dry_run": effective_dry_run, "decision": decision}
 
@@ -273,6 +293,10 @@ def run_scheduled(*, now_et: Optional[_dt.datetime] = None,
         logger.error("Scheduler: paper-only assertion failed at dispatch -> abort: %s", exc)
         order_audit.log_event(order_audit.STAGE_SCHEDULE,
                               decision="abort_paper_safety", error=str(exc))
+        alerts.emit(alerts.EVENT_SCHEDULER_BLOCKED,
+                    severity=alerts.SEVERITY_CRITICAL,
+                    message="paper-only assertion failed at dispatch -> abort",
+                    reason=REASON_PAPER_SAFETY, error=str(exc))
         return {"ran": False, "exit_code": 0,
                 "dry_run": effective_dry_run, "decision": decision}
 

@@ -27,6 +27,8 @@ python -m unittest test_phase3_protection -v # Phase-3 GTC/OCA + kill-switch + s
 python -m unittest test_reconciliation -v    # Phase-5A startup reconciliation (broker = source of truth)
 python -m unittest test_scheduler_runner -v  # Phase-5B-1 supervised scheduler / market-hours runner
 python -m unittest test_reconnect_watchdog -v # Phase-5B-2 reconnect watchdog / connection resilience
+python -m unittest test_shutdown_guard -v    # Phase-5B-3 graceful shutdown (preserve resting protection)
+python -m unittest test_alerts -v            # Phase-5B-4 alerting layer (disabled/log-only, never trades)
 python -m unittest discover -p "test_*.py"   # everything
 python test_logic.py                         # equivalent direct run
 ```
@@ -52,6 +54,8 @@ so they never overwrite real reports.
 | Startup reconciliation (Phase 5A) | `reconciliation.build_snapshot` broker-truth snapshot from plain broker state — protected vs. unprotected longs (GTC-aware: a DAY stop or take-profit LMT is not protection), duplicate `orderRef` detection, orphan exit orders (resting SELL with no covering long); `IBKRBridge.reconcile_startup_state()` driven through the real bridge with fake IBKR proves **broker = source of truth**, repairs an unprotected long via the existing Phase-3 path or halts new entries, audits the snapshot, and **never opens a new position** (`test_reconciliation.py`) |
 | Reconnect watchdog (Phase 5B-2) | `reconnect_watchdog` bounded-backoff + connection health for the ONE-SHOT bot (no daemon, no forever loop): `IBKRBridge.connect()` enforces the **paper-port lock first** (a non-paper port is refused **before any retry**, never bypassed), then retries the **initial** connect with **bounded** exponential backoff only when `IBKR_RECONNECT_ENABLED` (succeeds first try / retries then succeeds / **gives up** after `IBKR_RECONNECT_MAX_ATTEMPTS`); disabled ⇒ a single attempt; backoff is deterministic and **asserted without sleeping real time** (injected `sleep` recorder); an **unexpected** `disconnectedEvent` marks the link **unhealthy** so `_new_entries_blocked` returns `connection_unhealthy` (**fail closed**, no new positions) while an intentional `disconnect()` is a clean shutdown; the watchdog **never places an order**; every decision audited (`order_audit` stage `watchdog`); adds **no new capability flag** and live-readiness stays NOT READY (`test_reconnect_watchdog.py`) |
 | Supervised scheduler (Phase 5B-1) | `scheduler_runner.evaluate` pure decision (paper-safety → enabled → clock → US regular-hours gate, all fail-closed) blocks weekend/holiday/before-open/after-close and an unresolved clock, allows inside RTH, and **reports a paper-only-safety violation before anything else**; `run_scheduled` dispatches **at most once** (no loop), runs the existing `paper` command in **plan/dry-run by default placing no orders**, only forwards to the paper order path when `--execute` AND `SCHEDULER_DRY_RUN_DEFAULT=False`, audits every decision (`order_audit` stage `schedule`), adds **no new capability flag**, and live-readiness stays NOT READY (`test_scheduler_runner.py`) |
+| Graceful shutdown (Phase 5B-3) | `shutdown_guard.build_shutdown_plan` pure planner **preserves** every resting protective SELL stop (`orders_to_cancel` is always `[]`), opens no new entry, and only **detects** unprotected longs; `IBKRBridge.prepare_graceful_shutdown` is read-only and `graceful_shutdown` repairs an unprotected long **only** through the existing `ensure_protective_stops` path (fail-closed on a dropped link), marks the disconnect intentional so the 5B-2 watchdog reads it as a clean close, and never places/cancels an order (`test_shutdown_guard.py`) |
+| Alerting layer (Phase 5B-4) | `alerts.emit` is the single entry point and is **disabled by default** (`ALERTS_ENABLED=False`) and **log-only** when enabled (`ALERTS_LOG_ONLY=True`): a disabled emit is a **no-op** (no logging, no external action), an enabled one delivers ONLY to the logger + `order_audit` trail (`alert` stage) and is captured in `alerts.recent_alerts()`; **severity filtering** (`ALERT_MIN_SEVERITY`, default `warning`) suppresses routine INFO blocks; payloads are **JSON-safe** (non-serializable context coerced); `emit` **never raises** into the trading path, **never places an order**, **never enables live trading**, and **never blocks** a flatten/repair; the external email/SMS/Telegram/webhook channels are **inert disabled stubs** (send nothing). Lightly wired at safe points — watchdog disconnect / reconnect-failure, startup-reconcile unprotected/duplicate/orphan, scheduler block, graceful-shutdown unprotected long, partial fill / order reject, protective-child failure — and adds **no new capability flag**, so live-readiness stays NOT READY (`test_alerts.py`) |
 | Model gate (Phase 1) | `evaluate_gate` decision table (missing / stale / below-floor / ok / disabled); per-symbol metrics persist + merge RF and LSTM and never raise; a pre-gate BUY is forced to `HOLD` when blocked; backtest/live signal-construction parity; P1 scorecard gates PASS while overall stays NOT READY; `signal-parity` command (`test_model_gate.py`) |
 
 > **Model gate & signal parity (Phase 1).** `test_model_gate.py` is offline and
@@ -119,8 +123,9 @@ so they never overwrite real reports.
 > **expected**. `SUPPORTS_STARTUP_RECONCILIATION` flips `True` only because the
 > logic exists **and** is covered here; the Phase-6 flag
 > (`SUPPORTS_ACCOUNT_TYPE_ASSERTION`) stays `False`, so `live-readiness` still
-> reports NOT READY. Of Phase 5B, **5B-1 (scheduler)** and **5B-2 (reconnect
-> watchdog)** are built (below); 5B-3 graceful shutdown and 5B-4 alerting are **not**.
+> reports NOT READY. Of Phase 5B, **5B-1 (scheduler)**, **5B-2 (reconnect
+> watchdog)**, **5B-3 (graceful shutdown)** and **5B-4 (alerting)** are all built
+> (below).
 
 > **Supervised scheduler / market-hours runner (Phase 5B-1, H17).** `scheduler_runner.py`
 > is the Path A answer to "`run_dryrun.bat` just dry-runs and crashes outside
@@ -167,9 +172,39 @@ so they never overwrite real reports.
 > `live-readiness` still reports NOT READY (the Phase-6
 > `SUPPORTS_ACCOUNT_TYPE_ASSERTION` gate stays `False`). The simulated
 > "Failed to connect to IBKR TWS" tracebacks and the "IBKR disconnected mid-run"
-> line in the test output are **expected**. Of Phase 5B, **5B-1 (scheduler)** and
-> **5B-2 (reconnect watchdog)** are built; 5B-3 graceful shutdown and 5B-4
-> alerting are **not**.
+> line in the test output are **expected**. Of Phase 5B, **5B-1 (scheduler)**,
+> **5B-2 (reconnect watchdog)**, **5B-3 (graceful shutdown)** and **5B-4
+> (alerting)** are all built.
+
+> **Alerting layer (Phase 5B-4, M6).** `alerts.py` turns the safety events the bot
+> already detects into operator alerts and is **PURE and offline** (config read at
+> call time, deterministic severity filtering, an in-memory `recent_alerts()` ring
+> buffer), so `test_alerts.py` runs with no mail server, no socket, and no real
+> time. It is **INERT by default and cannot affect trading**: `ALERTS_ENABLED`
+> ships **False** (a disabled `emit()` is a pure no-op — no logging, no external
+> action), and even enabled it is **log-only** (`ALERTS_LOG_ONLY` True → the local
+> logger + the `order_audit` trail under stage `alert`; nothing leaves the box).
+> `emit()` **never raises** into the caller (the body is fully wrapped, so an alert
+> failure can never stop an emergency flatten or a protective repair), **never
+> places/cancels an order** (it imports no ib_insync), **never enables live
+> trading** (it never writes config), and **never blocks**. Severity filtering
+> (`ALERT_MIN_SEVERITY`, default `warning`) keeps routine INFO events — e.g. a
+> market-closed scheduled-run block — from spamming, while CRITICAL events
+> (disconnect, unprotected long, kill-switch) always pass; payloads are coerced
+> **JSON-safe**. Real email/SMS/Telegram/webhook delivery is **not** implemented
+> this phase — the external channel registry is empty and the `send_*` functions
+> are **inert disabled stubs** that send nothing. It is wired **lightly** at
+> already-audited safe points: the watchdog disconnect / reconnect-failure, the
+> startup-reconcile unprotected-long / duplicate-orderRef / orphan-exit findings,
+> a scheduler block, a graceful-shutdown unprotected long, and the order-path
+> partial-fill / rejection / protective-child-failure (emergency-flatten) outcomes
+> — each emit runs **after** the protective action so it can never delay or block
+> it. The tests prove a disabled emit does nothing, a log-only emit records the
+> expected payload, severity filtering and JSON-safety hold, `emit` never raises,
+> a watchdog disconnect alerts **without placing an order**, a blocked scheduled
+> run alerts **without dispatching**, and a graceful-shutdown warning alerts
+> **without cancelling a stop**. Phase 5B-4 adds **no new capability flag**, so
+> `live-readiness` still reports NOT READY (`test_alerts.py`).
 
 ## Continuous integration
 

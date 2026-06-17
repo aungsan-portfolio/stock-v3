@@ -19,6 +19,7 @@ from typing import List, Optional
 
 from ib_insync import IB, Stock, LimitOrder, MarketOrder, Contract, Order
 
+import alerts
 import config
 import data_integrity
 import live_invariants
@@ -156,6 +157,11 @@ class IBKRBridge:
             reconnect_watchdog.REASON_GAVE_UP, healthy=False,
             attempts=result.attempts, enabled=result.enabled,
         )
+        # Phase 5B-4: alert the operator that the (bounded) reconnect gave up.
+        # emit() is disabled/log-only by default and never places an order.
+        alerts.emit(alerts.EVENT_RECONNECT_FAILURE,
+                    message="IBKR connect gave up after bounded retries",
+                    attempts=result.attempts, enabled=result.enabled)
         logger.error("IBKR connect failed after %s attempt(s) (reconnect enabled=%s)",
                      result.attempts, result.enabled)
         return False
@@ -247,6 +253,17 @@ class IBKRBridge:
 
         report["halt_new_entries"] = bool(self._halt_new_entries)
         final_plan = report["plan"] or shutdown_guard.build_shutdown_plan([], [])
+        # Phase 5B-4: if a long is STILL unprotected at shutdown (repair off or
+        # could not repair), alert the operator. This runs AFTER the protective
+        # steps + disconnect and emit() never cancels/places an order, so it cannot
+        # strip a resting stop or block the teardown.
+        unprotected = list(final_plan.get("unprotected_longs", []) or [])
+        if unprotected:
+            alerts.emit(alerts.EVENT_SHUTDOWN_UNPROTECTED_LONG,
+                        message="unprotected long(s) remain at graceful shutdown",
+                        symbols=unprotected,
+                        repair_attempted=report["repair_attempted"],
+                        failed=report["failed"])
         order_audit.log_event(
             order_audit.STAGE_SHUTDOWN, phase="complete",
             repair_attempted=report["repair_attempted"],
@@ -822,6 +839,12 @@ class IBKRBridge:
             )
             logger.error("Unsafe GTC protection for filled %s (%s) -> emergency flatten", symbol, reason)
             self._market_close_symbol(symbol)
+            # Phase 5B-4: alert AFTER the flatten has been issued, so the alert can
+            # never delay or block the protective action. emit() places no order.
+            alerts.emit(alerts.EVENT_PROTECTIVE_CHILD_FAILURE, symbol=symbol,
+                        message="unsafe GTC protection -> emergency flatten",
+                        reason=reason, n_oversized=len(oversized),
+                        action="emergency_flatten")
             result.protective_ok = False
             result.aborted = True
             return result
@@ -910,6 +933,15 @@ class IBKRBridge:
         )
         logger.info("Startup reconciliation | %s", reconciliation.summary_line(snapshot))
 
+        # Phase 5B-4: surface the broker-truth discrepancies to the operator. These
+        # emit()s are disabled/log-only by default, never raise, and never place or
+        # cancel an order -- the actual repair below still goes ONLY through the
+        # existing Phase-3 ensure_protective_stops path.
+        if snapshot["unprotected_longs"]:
+            alerts.emit(alerts.EVENT_RECONCILE_UNPROTECTED_LONG,
+                        message="startup: long(s) with no resting GTC protective stop",
+                        symbols=list(snapshot["unprotected_longs"]))
+
         # Repair unprotected longs ONLY through the existing protective-repair
         # path. It scans broker positions itself (source of truth) and either
         # places a GTC stop or halts NEW entries -- it never opens a position.
@@ -923,10 +955,16 @@ class IBKRBridge:
         if snapshot["duplicate_refs"]:
             logger.warning("Startup reconciliation: duplicate orderRefs at broker: %s",
                            snapshot["duplicate_refs"])
+            alerts.emit(alerts.EVENT_DUPLICATE_ORDER_REF,
+                        message="startup: duplicate orderRef(s) at broker",
+                        refs=list(snapshot["duplicate_refs"]))
         if snapshot["orphan_exits"]:
             orphan_syms = sorted({str(o.get("symbol", "")).upper() for o in snapshot["orphan_exits"]})
             logger.warning("Startup reconciliation: orphan exit order(s) with no covering long: %s",
                            orphan_syms)
+            alerts.emit(alerts.EVENT_ORPHAN_EXIT_ORDER,
+                        message="startup: resting SELL order(s) with no covering long",
+                        symbols=orphan_syms)
 
         return {
             "snapshot": snapshot,
@@ -954,12 +992,20 @@ class IBKRBridge:
                 order_audit.STAGE_PARTIAL, symbol=symbol, action=action, filled=result.filled,
                 remaining=result.remaining, avg_fill_price=result.avg_fill_price, intended_qty=intended_qty,
             )
+            # Phase 5B-4: alert on a partial fill (log-only/disabled by default;
+            # never places an order). Protection sizing below is unaffected.
+            alerts.emit(alerts.EVENT_PARTIAL_FILL, symbol=symbol, action=action,
+                        filled=result.filled, remaining=result.remaining,
+                        intended_qty=intended_qty)
         else:
             order_audit.log_event(
                 order_audit.STAGE_REJECTED if result.outcome == order_exec.REJECTED else order_audit.STAGE_ACK,
                 symbol=symbol, action=action, outcome=result.outcome, status=result.status,
                 intended_qty=intended_qty,
             )
+            if result.outcome == order_exec.REJECTED:
+                alerts.emit(alerts.EVENT_ORDER_REJECTED, symbol=symbol, action=action,
+                            status=result.status, intended_qty=intended_qty)
             logger.info("Open %s %s x%d -> %s (no fill)", action, symbol, intended_qty, result.outcome)
             return result
 

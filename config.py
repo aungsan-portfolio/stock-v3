@@ -393,3 +393,29 @@ IBKR_RECONNECT_MAX_DELAY_SECONDS  = 30.0
 # connect() timeout), mirroring flatten_vti.py / check_positions.py. Keeps a dead
 # TWS from hanging a one-shot run indefinitely. 0 disables the explicit timeout.
 IBKR_REQUEST_TIMEOUT_SECONDS      = 30.0
+
+# ─── Phase 5B-4: Alerting layer (Path A) ─────────────────────────────────────
+# A SAFE, offline-testable alerting layer (`alerts.py`) that turns the safety
+# EVENTS the bot already detects -- a mid-run disconnect / reconnect failure, an
+# unprotected long at startup or shutdown, a duplicate orderRef, an orphan exit
+# order, a daily-loss kill-switch trip, an order rejection, a partial fill, a
+# protective-child failure / emergency flatten, a blocked scheduled run -- into
+# operator ALERTS. It is INERT by default and CANNOT affect trading: it never
+# places, cancels, or modifies an order, never enables live trading, and never
+# blocks (an alert failure can never stop an emergency flatten / protective
+# repair). NO real email/SMS/Telegram/webhook is sent in this phase -- the
+# external channels are disabled, inert stubs that send nothing off-box.
+#
+# Master switch. Ships False => alerts.emit() is a no-op (no logging, no external
+# action). Turn on ONLY to surface alerts; this never enables live trading and
+# never relaxes any paper-only gate.
+ALERTS_ENABLED        = False
+# Log-only mode. Ships True => alerts go ONLY to the standard logger + the
+# order_audit trail; no external channel is ever consulted. Leave True until a
+# later, deliberately-configured phase wires a real (still optional) channel.
+ALERTS_LOG_ONLY       = True
+# Minimum severity that is actually delivered: "info" | "warning" | "critical".
+# Ships "warning" so routine INFO events (e.g. a market-closed scheduled-run
+# block) are not noisy, while CRITICAL events (disconnect, unprotected long,
+# kill-switch) always pass. An unrecognised value falls back to "warning".
+ALERT_MIN_SEVERITY    = "warning"
