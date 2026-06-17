@@ -28,6 +28,7 @@ import reconciliation
 import reconnect_watchdog
 import risk_engine
 import risk_state
+import shutdown_guard
 from predictor import Signal
 
 logger = logging.getLogger(__name__)
@@ -167,6 +168,94 @@ class IBKRBridge:
         if self.ib.isConnected():
             self.ib.disconnect()
             logger.info("Disconnected from IBKR")
+
+    # ── Phase 5B-3: graceful shutdown ────────────────────────────
+    def prepare_graceful_shutdown(self) -> dict:
+        """Build the READ-ONLY graceful-shutdown plan (Phase 5B-3).
+
+        Reads broker truth (positions + working orders), delegates to the PURE
+        shutdown_guard.build_shutdown_plan, and audits the plan. Places NOTHING
+        and cancels NOTHING: the plan's only verbs are PRESERVE every resting
+        protective stop and DETECT any unprotected long. Safe to call any time;
+        never raises.
+        """
+        try:
+            positions = self._open_positions_plain()
+            working = self._working_orders_plain()
+            plan = shutdown_guard.build_shutdown_plan(positions, working)
+        except Exception:
+            logger.warning("Could not build graceful-shutdown plan", exc_info=True)
+            plan = shutdown_guard.build_shutdown_plan([], [])
+        order_audit.log_event(
+            order_audit.STAGE_SHUTDOWN, phase="plan",
+            **shutdown_guard.audit_fields(plan),
+        )
+        logger.info("Graceful shutdown | %s", shutdown_guard.summary_line(plan))
+        return plan
+
+    def graceful_shutdown(self, repair: bool = True) -> dict:
+        """Tear the one-shot connection down SAFELY (Phase 5B-3).
+
+        Steps, in order:
+          1. Build the read-only plan (preserve all resting protective stops;
+             detect unprotected longs). Opens NO new entry, cancels NO order.
+          2. If a long is unprotected AND ``repair`` is on AND the link is still
+             healthy/connected, repair ONLY through the existing, already-tested
+             ensure_protective_stops() -- it places a GTC stop priced off the
+             broker avgCost or HALTS new entries; it never opens a position and
+             never guesses avgCost (a missing basis -> halt, not a guess). A
+             resting GTC protective stop is NEVER cancelled.
+          3. Mark the disconnect intentional (so the Phase-5B-2 watchdog reads it
+             as a clean close, not an unexpected mid-run drop) and disconnect.
+          4. Audit the final shutdown state.
+
+        Never raises (it is meant for a ``finally:`` teardown). Returns a report
+        dict.
+        """
+        report = {
+            "plan": None, "repair_attempted": False,
+            "repaired": [], "failed": [],
+            "halt_new_entries": bool(self._halt_new_entries),
+            "disconnected": False,
+        }
+        try:
+            plan = self.prepare_graceful_shutdown()
+            report["plan"] = plan
+
+            # Repair unprotected longs ONLY via the existing Phase-3 path, and
+            # only while the link is usable (fail-closed: never place orders on a
+            # dropped/unhealthy connection). ensure_protective_stops never opens a
+            # position and never guesses avgCost.
+            if (repair and shutdown_guard.needs_protection_repair(plan)
+                    and self._connection_healthy() and self.ib.isConnected()):
+                report["repair_attempted"] = True
+                protect = self.ensure_protective_stops()
+                report["repaired"] = protect.get("repaired", [])
+                report["failed"] = protect.get("failed", [])
+                # Re-plan so the audited final state reflects the repair.
+                plan = self.prepare_graceful_shutdown()
+                report["plan"] = plan
+        except Exception:
+            logger.warning("Graceful-shutdown pre-disconnect step failed", exc_info=True)
+
+        # Always tear the connection down cleanly, even if the steps above raised.
+        try:
+            self.disconnect()
+            report["disconnected"] = True
+        except Exception:
+            logger.warning("Graceful-shutdown disconnect failed", exc_info=True)
+
+        report["halt_new_entries"] = bool(self._halt_new_entries)
+        final_plan = report["plan"] or shutdown_guard.build_shutdown_plan([], [])
+        order_audit.log_event(
+            order_audit.STAGE_SHUTDOWN, phase="complete",
+            repair_attempted=report["repair_attempted"],
+            repaired=report["repaired"], failed=report["failed"],
+            halt_new_entries=report["halt_new_entries"],
+            disconnected=report["disconnected"],
+            **shutdown_guard.audit_fields(final_plan),
+        )
+        return report
 
     def _register_disconnect_watchdog(self) -> None:
         """Attach the Phase-5B-2 disconnect handler to ib.disconnectedEvent once.

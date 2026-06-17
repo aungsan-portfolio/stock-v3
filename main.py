@@ -292,7 +292,11 @@ def _place_paper_orders(signals) -> int:
         print(f"   Skipped         : {result['skipped']}")
         print(f"   Total signals   : {result['total']}")
     finally:
-        bridge.disconnect()
+        # Phase 5B-3: graceful shutdown -- preserve every resting GTC protective
+        # stop, repair any unprotected long via the existing Phase-3 path (or
+        # halt), and mark the disconnect intentional so the watchdog reads it as
+        # a clean close. Never opens a new entry; never cancels a protective stop.
+        bridge.graceful_shutdown()
     return 0
 
 
