@@ -450,3 +450,51 @@ EXPECTED_PAPER_ACCOUNT_ID = None
 # `live-readiness` scorecard's "Explicit LIVE_ACCOUNT_ID configured" gate FAILS,
 # keeping the bot NOT READY for live trading.
 LIVE_ACCOUNT_ID           = None
+
+# ─── Minervini / SEPA paper overlay (ADDITIVE, default-OFF) ──────────────────
+# A beginner-safe overlay (minervini.py) on top of the RF+LSTM+Technical ensemble:
+# a Stage-2 trend-template filter, a VCP-like contraction approximation, a
+# pocket-pivot signal, 1R sizing off a dedicated setup stop, expectancy metrics,
+# and a beginner/Burmese coach. It is strictly ADDITIVE: it may only BLOCK a NEW
+# BUY (never a SELL / close / flatten / protective exit) and may only SHRINK
+# position size (never bypass MAX_POSITION_PCT / MAX_TRADE_VALUE / exposure /
+# MAX_OPEN_POSITIONS / MAX_DAILY_TRADES). It does NOT replace the model gate, does
+# NOT add a new ML feature column or a SUPPORTS_* capability flag, and is PAPER
+# ONLY. Every switch below ships False, so the overlay is a complete no-op until
+# explicitly enabled and tested in paper.
+#
+# Master kill-switch. False => the entire overlay is inert (no block, no sizing
+# change, no coach output) regardless of the sub-switches below.
+MINERVINI_OVERLAY_ENABLED        = False
+# Hard-block a NEW BUY when the Stage-2 trend template fails (adds a
+# 'stage2_filter' reason in the existing entry gate; wired in a later milestone).
+MINERVINI_STAGE2_BLOCK_ENABLED   = False
+# Enable 1R position sizing: qty = min(notional_qty, risk_qty). Only ever shrinks.
+MINERVINI_SIZING_ENABLED         = False
+# Show beginner "why blocked / why this setup" coaching + preview math.
+MINERVINI_COACH_ENABLED          = False
+# Milestone B ONLY (deferred): place the dedicated setup stop as a live GTC/OCA
+# leg. MUST stay False in this branch; the dedicated stop is sizing/preview only.
+MINERVINI_LIVE_STOP_ENABLED      = False
+
+# Stage-2 trend-template thresholds.
+MINERVINI_NEAR_52W_HIGH_PCT      = 0.25   # price must be within 25% of the 52-week high
+MINERVINI_OFF_52W_LOW_PCT        = 0.30   # price must be >= 30% above the 52-week low
+MINERVINI_RS_RANK_MIN            = 70.0   # min relative-strength percentile; None-tolerant (skip if no benchmark)
+MINERVINI_MA_200_RISING_LOOKBACK = 20     # bars used to confirm the 200-day SMA slope is up
+
+# VCP-like contraction (a coarse APPROXIMATION, not a true manual VCP).
+MINERVINI_VCP_MIN_CONTRACTIONS   = 2      # min successive tightening segments to call it "VCP-like"
+MINERVINI_VCP_MAX_BASE_DEPTH_PCT = 0.35   # reject bases deeper than 35%
+MINERVINI_VCP_PIVOT_LOOKBACK     = 15     # bars per contraction segment / final pivot-low window
+
+# Pocket pivot.
+MINERVINI_POCKET_VOL_LOOKBACK    = 10     # up-day volume must exceed max down-day vol over N prior bars
+
+# 1R risk sizing — DEDICATED Minervini stop (NOT STOP_LOSS_PCT / HARD_STOP_LOSS_PCT).
+MINERVINI_RISK_PER_TRADE_USD     = 25.0   # max $ risk per trade = (entry - mini_stop) * risk_qty
+MINERVINI_STOP_BUFFER_PCT        = 0.005  # place the dedicated stop this far below the VCP pivot low
+MINERVINI_MAX_STOP_DISTANCE_PCT  = 0.10   # cap stop distance; a far pivot blanks risk-sizing (never enlarges)
+
+# Coach localization. "en" | "my" (Burmese). English is always the fallback.
+MINERVINI_COACH_LANGUAGE         = "en"
