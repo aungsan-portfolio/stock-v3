@@ -137,6 +137,123 @@ def _format_money(x: Optional[float]) -> str:
         return "n/a"
 
 
+# ─── Minervini / SEPA overlay view (READ-ONLY, default-OFF) ──────────────────
+# A purely educational, additive layer that explains a symbol's Minervini/SEPA
+# setup ("why blocked / why this setup") next to the existing lesson/preview.
+# It is gated behind BOTH config switches and is a complete no-op unless both are
+# True. It NEVER places, sizes, or blocks an order in this milestone (M1): the
+# advisory 1R stop here is for explanation only and is clearly marked as such.
+def minervini_coach_enabled() -> bool:
+    """True only when BOTH the master overlay switch and the coach switch are on."""
+    return bool(getattr(config, "MINERVINI_OVERLAY_ENABLED", False)) and bool(
+        getattr(config, "MINERVINI_COACH_ENABLED", False)
+    )
+
+
+def build_minervini_view(
+    signal,
+    ohlcv=None,
+    benchmark_df=None,
+) -> Optional[Dict[str, Any]]:
+    """Build a read-only Minervini/SEPA explanation dict for one signal.
+
+    Returns None when the overlay/coach switches are off (so callers add nothing
+    to their output) — this is the default. When enabled, it evaluates the symbol
+    via the M0 ``minervini`` module on the last CLOSED bar (no lookahead) and
+    returns a beginner-readable dict. NEVER raises into the caller: any data /
+    compute failure degrades to an "unavailable" view, mirroring
+    ``assess_chart_status``. This milestone is explanation-only — nothing here
+    blocks a BUY or changes position size.
+
+    Args:
+        signal:        a predictor.Signal-like object (needs .symbol).
+        ohlcv:         optional pre-fetched OHLCV DataFrame; fetched lazily if None.
+        benchmark_df:  optional benchmark (e.g. SPY) OHLCV for relative strength.
+
+    Returns:
+        None, or a dict with keys: available, symbol, stage2_ok, reasons,
+        reason_text, vcp_like, pocket_pivot, rs_rank, pivot_low,
+        advisory_stop_price, setup_summary, note.
+    """
+    if not minervini_coach_enabled():
+        return None
+
+    symbol = str(getattr(signal, "symbol", "")).upper().strip()
+    note = (
+        "Educational overlay only. The Stage-2 trend template, VCP-like "
+        "approximation, and pocket pivot are extra context; they do NOT place, "
+        "size, or block any order in this view."
+    )
+
+    try:
+        import minervini
+
+        df = ohlcv
+        if df is None:
+            from data_manager import fetch_ohlcv
+            df = fetch_ohlcv(symbol)
+        verdict = minervini.evaluate_entry(df, benchmark_df=benchmark_df)
+        advisory_stop = minervini.minervini_stop_price(verdict.pivot_low)
+    except Exception:
+        logger.debug("Minervini coach view unavailable for %s", symbol, exc_info=True)
+        return {
+            "available": False,
+            "symbol": symbol,
+            "reason_text": "Could not evaluate the Minervini/SEPA setup for this symbol.",
+            "note": note,
+        }
+
+    reason_text = (
+        "Passes the Stage-2 trend template."
+        if verdict.stage2_ok
+        else "Not a Stage-2 setup: " + (", ".join(verdict.reasons) or "trend template not met")
+    )
+
+    setup_bits: List[str] = []
+    setup_bits.append("Stage-2 uptrend: " + ("YES" if verdict.stage2_ok else "no"))
+    setup_bits.append("VCP-like (approximation): " + ("YES" if verdict.vcp_like else "no"))
+    setup_bits.append("Pocket pivot: " + ("YES" if verdict.pocket_pivot else "no"))
+    if verdict.rs_rank is not None:
+        setup_bits.append(f"RS rank ~{verdict.rs_rank:.0f}/100 (SPY-relative)")
+
+    return {
+        "available": True,
+        "symbol": symbol,
+        "stage2_ok": bool(verdict.stage2_ok),
+        "reasons": list(verdict.reasons),
+        "reason_text": reason_text,
+        "vcp_like": bool(verdict.vcp_like),
+        "pocket_pivot": bool(verdict.pocket_pivot),
+        "rs_rank": verdict.rs_rank,
+        "pivot_low": verdict.pivot_low,
+        "advisory_stop_price": advisory_stop,
+        "setup_summary": " | ".join(setup_bits),
+        "note": note,
+    }
+
+
+def print_minervini_view(view: Optional[Dict[str, Any]]) -> None:
+    """Print the Minervini/SEPA coach view (ASCII, Windows-safe). No-op on None."""
+    if not view:
+        return
+    print("\n── Minervini / SEPA setup (educational, no order) ────────────")
+    print(f"  Symbol              : {view.get('symbol', '')}")
+    if not view.get("available", False):
+        print(f"  Setup               : unavailable ({view.get('reason_text', '')})")
+        print("───────────────────────────────────────────────────────────────")
+        return
+    print(f"  Stage-2 uptrend     : {'YES' if view.get('stage2_ok') else 'NO'}")
+    print(f"  Setup summary       : {view.get('setup_summary', '')}")
+    print(f"  Why / Why not       : {view.get('reason_text', '')}")
+    if view.get("advisory_stop_price") is not None:
+        print(
+            f"  Advisory 1R stop    : {_format_money(view.get('advisory_stop_price'))} "
+            f"(below VCP-like pivot {_format_money(view.get('pivot_low'))}; explanation only)"
+        )
+    print(f"  Note                : {view.get('note', '')}")
+    print("───────────────────────────────────────────────────────────────")
+
+
 # ─── Lesson builder (educational summary, no order sizing) ──────────────────
 def build_trade_lesson(
     signal,
@@ -245,6 +362,9 @@ def build_trade_lesson(
             "that run `paper-coach --confirm --chart-checked` if you still want to trade."
         ),
         "chart_check_required": bool(getattr(config, "COACH_REQUIRE_CHART_CHECK", True)),
+        # Read-only Minervini/SEPA setup explanation (None unless the overlay +
+        # coach switches are both on; never affects trading).
+        "minervini": build_minervini_view(signal),
     }
 
 
@@ -351,6 +471,10 @@ def build_trade_preview(
         "trade_cap_usd": float(getattr(config, "MAX_TRADE_VALUE", 0.0)) if getattr(config, "MAX_TRADE_VALUE", None) is not None else None,
         "confidence": confidence,
         "min_confidence_required": min_conf,
+        # Read-only Minervini/SEPA setup explanation for this entry candidate
+        # (None unless the overlay + coach switches are both on; never sizes or
+        # blocks the order).
+        "minervini": build_minervini_view(signal),
     }
 
 
@@ -758,6 +882,7 @@ def print_trade_lesson(lesson: Dict[str, Any]) -> None:
     if lesson["chart_check_required"]:
         print("  ⚠ Chart check is REQUIRED before any execution.")
     print("───────────────────────────────────────────────────────────────")
+    print_minervini_view(lesson.get("minervini"))
 
 
 def print_trade_preview(preview: Dict[str, Any]) -> None:
@@ -780,6 +905,7 @@ def print_trade_preview(preview: Dict[str, Any]) -> None:
     print("\n  Question: Do you understand this trade? (yes/no)")
     print("  No order placed.")
     print("───────────────────────────────────────────────────────────────")
+    print_minervini_view(preview.get("minervini"))
 
 
 # ─── Markdown report writer ──────────────────────────────────────────────────
