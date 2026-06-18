@@ -332,8 +332,10 @@ class TestStillNotReady(_WatchdogBase):
         present = {a for a in dir(ibkr_bridge) if a.startswith("SUPPORTS_")}
         self.assertEqual(present, self.EXPECTED_CAPABILITY_FLAGS,
                          "Phase 5B-2 must not add a live-readiness capability flag")
-        # The Phase-6 gate stays False (fail-closed).
-        self.assertFalse(ibkr_bridge.SUPPORTS_ACCOUNT_TYPE_ASSERTION)
+        # Phase 6.1 ships the account-type assertion (built + fail-closed tested),
+        # so its capability flag is honestly True. Live-readiness stays NOT READY
+        # via the config-only gates (see test_live_readiness_reports_not_ready).
+        self.assertTrue(ibkr_bridge.SUPPORTS_ACCOUNT_TYPE_ASSERTION)
 
     def test_live_readiness_reports_not_ready(self):
         import main

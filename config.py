@@ -419,3 +419,34 @@ ALERTS_LOG_ONLY       = True
 # block) are not noisy, while CRITICAL events (disconnect, unprotected long,
 # kill-switch) always pass. An unrecognised value falls back to "warning".
 ALERT_MIN_SEVERITY    = "warning"
+
+# ─── Phase 6.1: Account-type assertion (paper DU / live U) ───────────────────
+# The paper-port lock (IBKR_PORT/PAPER_IBKR_PORT/REQUIRE_PAPER_PORT above) guards
+# the PORT (7497). It does NOT guard WHICH account is logged into TWS/Gateway on
+# that port -- a live ("U...") account on 7497 would otherwise pass every guard
+# and could place a real-money order. `account_guard.assert_account` closes that
+# gap: on every connect it reads `ib.managedAccounts()` and FAILS CLOSED unless
+# the account matches the expected ENVIRONMENT prefix (paper -> "DU", live -> "U"
+# + explicit LIVE_ACCOUNT_ID), refusing empty / malformed / ambiguous lists too.
+#
+# PAPER ONLY this phase: live mode stays INERT. COACH_LIVE_TRADING_ENABLED is
+# False and LIVE_ACCOUNT_ID is None, so `account_guard.live_mode_enabled()` is
+# False and the bridge ALWAYS asserts a "DU..." paper account. The guard is built
+# and fail-closed tested, so its live-readiness capability flag
+# (SUPPORTS_ACCOUNT_TYPE_ASSERTION) is honestly True; live trading stays disabled
+# because the SEPARATE IBKR_MARKET_DATA_TYPE and LIVE_ACCOUNT_ID scorecard gates
+# still FAIL, keeping `live-readiness` NOT READY.
+#
+# Master switch. Ships True => the assertion runs on every connect (fail-closed).
+# A documented escape hatch only; leave True for paper safety.
+ASSERT_ACCOUNT_TYPE       = True
+# Optional explicit paper account id. None => accept any single "DU..." paper
+# account (the normal case). Set to a specific "DU..." id to REQUIRE that exact
+# paper account; it also becomes MANDATORY when TWS exposes multiple accounts
+# (the guard never silently chooses one).
+EXPECTED_PAPER_ACCOUNT_ID = None
+# Explicit LIVE account id (must be a "U..." id). MUST stay None until live
+# conversion (Phase 6.2-6.4). While None, live mode can never be selected and the
+# `live-readiness` scorecard's "Explicit LIVE_ACCOUNT_ID configured" gate FAILS,
+# keeping the bot NOT READY for live trading.
+LIVE_ACCOUNT_ID           = None
