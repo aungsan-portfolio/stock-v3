@@ -143,10 +143,11 @@ class TestCapabilityFlagsBaseline(unittest.TestCase):
         "SUPPORTS_STARTUP_RECONCILIATION",
         "SUPPORTS_ACCOUNT_TYPE_ASSERTION",
     ]
-    # Phases 2, 3, 4 and 5A are implemented AND covered (test_order_exec.py,
+    # Phases 2, 3, 4, 5A and 6.1 are implemented AND covered (test_order_exec.py,
     # test_ibkr_fill_flow.py, test_risk_engine.py, test_phase3_protection.py,
-    # test_data_integrity.py, test_reconciliation.py), so these flip True -- the
-    # only honest way to flip a flag. See reports/LIVE_TRADING_IMPLEMENTATION_PLAN_MM.md.
+    # test_data_integrity.py, test_reconciliation.py, test_account_guard.py), so
+    # these flip True -- the only honest way to flip a flag.
+    # See reports/LIVE_TRADING_IMPLEMENTATION_PLAN_MM.md.
     IMPLEMENTED_TRUE = [
         "SUPPORTS_FILL_VERIFICATION",        # Phase 2 (H4/H5)
         "SUPPORTS_PARTIAL_FILL_HANDLING",    # Phase 2 (H6)
@@ -156,12 +157,12 @@ class TestCapabilityFlagsBaseline(unittest.TestCase):
         "SUPPORTS_REALTIME_DATA_GUARD",      # Phase 4 (H11-H13/H16)
         "SUPPORTS_MARKET_HOURS_GATE",        # Phase 4 (H15)
         "SUPPORTS_STARTUP_RECONCILIATION",   # Phase 5A (H18)
+        "SUPPORTS_ACCOUNT_TYPE_ASSERTION",   # Phase 6.1 (account_guard.assert_account)
     ]
-    # Phase 6 is not built yet; its flag must stay False (fail-closed). Phase 5B
-    # (scheduler / watchdog / alerting) does not add a capability flag here.
-    LATER_PHASE_FALSE = [
-        "SUPPORTS_ACCOUNT_TYPE_ASSERTION",
-    ]
+    # Phase 6.1 ships the account-type assertion (built + fail-closed tested), so no
+    # capability flag remains False. Live trading still stays disabled via the
+    # config-only gates (IBKR_MARKET_DATA_TYPE, LIVE_ACCOUNT_ID), not via a flag.
+    LATER_PHASE_FALSE = []
 
     def test_all_capability_flags_present(self):
         br = _import_bridge()
@@ -249,6 +250,58 @@ class TestPaperIntegration(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             rc = main.cmd_panic_flatten(args)
         self.assertEqual(rc, 0)
+
+
+# -- 8. Phase 6.1 account-type assertion: built, but live-readiness STILL NOT
+#       READY (LIVE_ACCOUNT_ID is None and IBKR_MARKET_DATA_TYPE is still 3) -----
+class TestPhase61AccountTypeReadiness(unittest.TestCase):
+    def test_account_guard_module_imports(self):
+        import account_guard
+        self.assertTrue(hasattr(account_guard, "assert_account"))
+        self.assertTrue(hasattr(account_guard, "live_mode_enabled"))
+
+    def test_live_mode_is_inert_for_shipped_config(self):
+        import account_guard
+        # The shipped paper config must never resolve to live mode.
+        self.assertFalse(account_guard.live_mode_enabled(config))
+        self.assertIsNone(getattr(config, "LIVE_ACCOUNT_ID", None))
+
+    def _gate(self, title_fragment):
+        import main
+        # config-only gates (market-data type, LIVE_ACCOUNT_ID) do not depend on
+        # the bridge module, so None keeps this deterministic + offline.
+        gates = main._collect_readiness_gates(None)
+        matches = [g for g in gates if title_fragment in g["title"]]
+        self.assertEqual(len(matches), 1, f"expected exactly one gate for {title_fragment!r}")
+        return matches[0]
+
+    def test_live_account_id_gate_fails_because_none(self):
+        g = self._gate("Explicit LIVE_ACCOUNT_ID configured")
+        self.assertEqual(g["status"], "FAIL")
+
+    def test_market_data_type_gate_fails_because_delayed(self):
+        # IBKR_MARKET_DATA_TYPE is still 3 (delayed) -> the live real-time gate fails.
+        self.assertEqual(int(getattr(config, "IBKR_MARKET_DATA_TYPE", 3)), 3)
+        g = self._gate("Real-time market-data type")
+        self.assertEqual(g["status"], "FAIL")
+
+    def test_live_readiness_still_not_ready(self):
+        import main
+        args = mock.Mock(connect=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = main.cmd_live_readiness(args)
+        self.assertEqual(rc, 1, "live-readiness must STILL report NOT READY after Phase 6.1")
+
+    def test_account_type_capability_flag_true_but_still_not_ready(self):
+        # Phase 6.1 ships the account-type assertion (wired into connect() as
+        # SAFETY GATE #2, fail-closed tested), so the capability flag is honestly
+        # True. live-readiness is STILL NOT READY -- see test_live_readiness_still_
+        # not_ready -- because the config-only gates (market-data type,
+        # LIVE_ACCOUNT_ID) still FAIL, NOT because of this flag.
+        br = _import_bridge()
+        if br is None:
+            self.skipTest("ib_insync/ibkr_bridge unavailable")
+        self.assertTrue(br.SUPPORTS_ACCOUNT_TYPE_ASSERTION)
 
 
 if __name__ == "__main__":

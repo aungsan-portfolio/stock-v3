@@ -29,6 +29,7 @@ python -m unittest test_scheduler_runner -v  # Phase-5B-1 supervised scheduler /
 python -m unittest test_reconnect_watchdog -v # Phase-5B-2 reconnect watchdog / connection resilience
 python -m unittest test_shutdown_guard -v    # Phase-5B-3 graceful shutdown (preserve resting protection)
 python -m unittest test_alerts -v            # Phase-5B-4 alerting layer (disabled/log-only, never trades)
+python -m unittest test_account_guard -v     # Phase-6.1 account-type assertion (paper DU / live U, fail-closed)
 python -m unittest discover -p "test_*.py"   # everything
 python test_logic.py                         # equivalent direct run
 ```
@@ -55,6 +56,7 @@ so they never overwrite real reports.
 | Reconnect watchdog (Phase 5B-2) | `reconnect_watchdog` bounded-backoff + connection health for the ONE-SHOT bot (no daemon, no forever loop): `IBKRBridge.connect()` enforces the **paper-port lock first** (a non-paper port is refused **before any retry**, never bypassed), then retries the **initial** connect with **bounded** exponential backoff only when `IBKR_RECONNECT_ENABLED` (succeeds first try / retries then succeeds / **gives up** after `IBKR_RECONNECT_MAX_ATTEMPTS`); disabled ⇒ a single attempt; backoff is deterministic and **asserted without sleeping real time** (injected `sleep` recorder); an **unexpected** `disconnectedEvent` marks the link **unhealthy** so `_new_entries_blocked` returns `connection_unhealthy` (**fail closed**, no new positions) while an intentional `disconnect()` is a clean shutdown; the watchdog **never places an order**; every decision audited (`order_audit` stage `watchdog`); adds **no new capability flag** and live-readiness stays NOT READY (`test_reconnect_watchdog.py`) |
 | Supervised scheduler (Phase 5B-1) | `scheduler_runner.evaluate` pure decision (paper-safety → enabled → clock → US regular-hours gate, all fail-closed) blocks weekend/holiday/before-open/after-close and an unresolved clock, allows inside RTH, and **reports a paper-only-safety violation before anything else**; `run_scheduled` dispatches **at most once** (no loop), runs the existing `paper` command in **plan/dry-run by default placing no orders**, only forwards to the paper order path when `--execute` AND `SCHEDULER_DRY_RUN_DEFAULT=False`, audits every decision (`order_audit` stage `schedule`), adds **no new capability flag**, and live-readiness stays NOT READY (`test_scheduler_runner.py`) |
 | Graceful shutdown (Phase 5B-3) | `shutdown_guard.build_shutdown_plan` pure planner **preserves** every resting protective SELL stop (`orders_to_cancel` is always `[]`), opens no new entry, and only **detects** unprotected longs; `IBKRBridge.prepare_graceful_shutdown` is read-only and `graceful_shutdown` repairs an unprotected long **only** through the existing `ensure_protective_stops` path (fail-closed on a dropped link), marks the disconnect intentional so the 5B-2 watchdog reads it as a clean close, and never places/cancels an order (`test_shutdown_guard.py`) |
+| Account-type assertion (Phase 6.1) | `account_guard.assert_account` is the **pure, offline** decision (no ib_insync / network / clock / orders) that closes the gap the paper-port lock leaves open: the port lock guards the **port** (7497), this guards the **account** logged into it. It **FAILS CLOSED** on an empty / malformed / ambiguous (`>1` account, no explicit expected) list and on the wrong environment prefix — a live **`U...`** account on the paper port is refused, and it **never silently chooses** an account (so a live account in a multi-account list can never be auto-selected). Paper requires a `DU...` account (or an explicit `EXPECTED_PAPER_ACCOUNT_ID`); the **live** `U...` + explicit `LIVE_ACCOUNT_ID` branch is implemented and tested but **INERT** (`live_mode_enabled` is False for the shipped paper config, so the bridge always asserts paper). `IBKRBridge.connect()` runs it **after** a successful connect and **before** marking the link healthy, so a wrong account fails the connection, marks the link unhealthy, disconnects, and audits (`order_audit` stage `account_assertion`); it **places no order** and **does not enable live trading**. The capability flag `SUPPORTS_ACCOUNT_TYPE_ASSERTION` is honestly **True** (the guard is built **and** fail-closed tested), while `live-readiness` stays **NOT READY** via the **separate** config-only gates — `LIVE_ACCOUNT_ID` is None and `IBKR_MARKET_DATA_TYPE` is still 3 — and the full Phase 6 live conversion (6.2 live port wiring, 6.3 `live_safety_preflight`, 6.4 config flip) remains unbuilt (`test_account_guard.py`, `test_live_readiness.py`) |
 | Alerting layer (Phase 5B-4) | `alerts.emit` is the single entry point and is **disabled by default** (`ALERTS_ENABLED=False`) and **log-only** when enabled (`ALERTS_LOG_ONLY=True`): a disabled emit is a **no-op** (no logging, no external action), an enabled one delivers ONLY to the logger + `order_audit` trail (`alert` stage) and is captured in `alerts.recent_alerts()`; **severity filtering** (`ALERT_MIN_SEVERITY`, default `warning`) suppresses routine INFO blocks; payloads are **JSON-safe** (non-serializable context coerced); `emit` **never raises** into the trading path, **never places an order**, **never enables live trading**, and **never blocks** a flatten/repair; the external email/SMS/Telegram/webhook channels are **inert disabled stubs** (send nothing). Lightly wired at safe points — watchdog disconnect / reconnect-failure, startup-reconcile unprotected/duplicate/orphan, scheduler block, graceful-shutdown unprotected long, partial fill / order reject, protective-child failure — and adds **no new capability flag**, so live-readiness stays NOT READY (`test_alerts.py`) |
 | Model gate (Phase 1) | `evaluate_gate` decision table (missing / stale / below-floor / ok / disabled); per-symbol metrics persist + merge RF and LSTM and never raise; a pre-gate BUY is forced to `HOLD` when blocked; backtest/live signal-construction parity; P1 scorecard gates PASS while overall stays NOT READY; `signal-parity` command (`test_model_gate.py`) |
 
@@ -121,9 +123,10 @@ so they never overwrite real reports.
 > safety test asserts reconciliation **never places a BUY / opens a position**.
 > The "Startup reconciliation …" and "Startup: …" lines in the test output are
 > **expected**. `SUPPORTS_STARTUP_RECONCILIATION` flips `True` only because the
-> logic exists **and** is covered here; the Phase-6 flag
-> (`SUPPORTS_ACCOUNT_TYPE_ASSERTION`) stays `False`, so `live-readiness` still
-> reports NOT READY. Of Phase 5B, **5B-1 (scheduler)**, **5B-2 (reconnect
+> logic exists **and** is covered here; the Phase-6.1 flag
+> (`SUPPORTS_ACCOUNT_TYPE_ASSERTION`) is likewise `True` (built + fail-closed
+> tested), yet `live-readiness` still reports NOT READY via the config-only gates
+> (`LIVE_ACCOUNT_ID` None, `IBKR_MARKET_DATA_TYPE` 3). Of Phase 5B, **5B-1 (scheduler)**, **5B-2 (reconnect
 > watchdog)**, **5B-3 (graceful shutdown)** and **5B-4 (alerting)** are all built
 > (below).
 
@@ -205,6 +208,38 @@ so they never overwrite real reports.
 > run alerts **without dispatching**, and a graceful-shutdown warning alerts
 > **without cancelling a stop**. Phase 5B-4 adds **no new capability flag**, so
 > `live-readiness` still reports NOT READY (`test_alerts.py`).
+
+> **Account-type assertion (Phase 6.1).** `account_guard.py` is **PURE and
+> offline** (like `data_integrity` / `reconciliation` / `shutdown_guard`): it
+> imports no ib_insync, opens no socket, reads no clock, and places no order, so
+> `test_account_guard.py` runs deterministically with no TWS. It closes the one
+> guard gap the paper-port lock cannot: the port lock guards the **port** (7497);
+> `account_guard.assert_account` guards the **account** actually logged into that
+> port. The decision is **fail-closed** — empty `managedAccounts()`, any malformed
+> id, an ambiguous multi-account list with no explicit expected account, an
+> explicit expected account that is absent, and the wrong environment prefix all
+> return a hard reject — and it **never silently selects** an account, so a live
+> `U...` account can never be auto-chosen. Paper requires a `DU...` account; the
+> **live** (`U...` + explicit `LIVE_ACCOUNT_ID`) branch is implemented and unit
+> tested but **INERT** this phase: `live_mode_enabled` is False for the shipped
+> paper config (`COACH_LIVE_TRADING_ENABLED` False, `REQUIRE_PAPER_PORT` True,
+> `LIVE_ACCOUNT_ID` None), so the bridge **always** asserts a paper account.
+> `test_account_guard.py` also drives the **real** `IBKRBridge.connect()` with a
+> tiny `FakeIB`: a `DU...` account connects, while a live `U...` account on the
+> paper port, an empty list, a malformed id, and an ambiguous list are all
+> **refused** (connection marked unhealthy, disconnected, audited under
+> `order_audit` stage `account_assertion`) and **no order is ever placed**. The
+> "Account-type assertion FAILED … fail closed" and "Failed to connect to IBKR
+> TWS" lines in the test output are the **expected** logs from those fail-closed
+> tests. The guard does **not** enable live trading. Because the guard is built
+> **and** fail-closed tested, its live-readiness capability flag
+> `SUPPORTS_ACCOUNT_TYPE_ASSERTION` is honestly **True**; `live-readiness` still
+> reports **NOT READY** because the **separate** config-only gates fail —
+> `LIVE_ACCOUNT_ID` is None and `IBKR_MARKET_DATA_TYPE` is still 3 — and the full
+> Phase 6 live conversion (6.2 live port wiring **+** 6.3 `live_safety_preflight`
+> **+** 6.4 config flip) is not built (`test_account_guard.py`,
+> `test_live_readiness.py`). **❗ 6.2–6.4 remain blocked — no live port, no
+> live-safety preflight, no config flip; PAPER ONLY.**
 
 ## Continuous integration
 

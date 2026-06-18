@@ -19,6 +19,7 @@ from typing import List, Optional
 
 from ib_insync import IB, Stock, LimitOrder, MarketOrder, Contract, Order
 
+import account_guard
 import alerts
 import config
 import data_integrity
@@ -54,7 +55,16 @@ SUPPORTS_DAILY_LOSS_KILLSWITCH   = True    # Phase 3 (H1): loss_breached() wired
 SUPPORTS_REALTIME_DATA_GUARD     = True    # Phase 4 (H11-H13, H16): sane real-time/delayed quote, reject stale-close/crossed/wide
 SUPPORTS_MARKET_HOURS_GATE       = True     # Phase 4 (H15): refuse NEW entries outside RTH/holidays
 SUPPORTS_STARTUP_RECONCILIATION  = True    # Phase 5A (H18): broker = source of truth on startup
-SUPPORTS_ACCOUNT_TYPE_ASSERTION  = False   # Phase 6: assert paper(DU)/live(U) account, not just port
+# Phase 6.1 BUILDS the account-type assertion (account_guard.assert_account, wired
+# into connect() below as SAFETY GATE #2 and covered fail-closed by
+# test_account_guard.py): a live "U..." account on the paper port now fails closed.
+# This flag advertises ONLY that capability -- the guard is implemented and tested --
+# so it is honestly True. It does NOT advertise that the bot is ready for live
+# trading: the live conversion (6.2 live-port wiring + 6.3 live_safety_preflight +
+# 6.4 config flip) is NOT built, and the SEPARATE scorecard gates for
+# IBKR_MARKET_DATA_TYPE==1 and an explicit LIVE_ACCOUNT_ID still FAIL, so
+# live-readiness stays NOT READY. PAPER ONLY.
+SUPPORTS_ACCOUNT_TYPE_ASSERTION  = True    # Phase 6.1: assert paper(DU)/live(U) account, not just port
 
 
 def _order_status_name(trade) -> str:
@@ -142,6 +152,19 @@ class IBKRBridge:
         result = reconnect_watchdog.attempt_connect(_connect_once, sleep=self.ib.sleep)
 
         if result.connected:
+            # SAFETY GATE #2 (Phase 6.1): account-type assertion. The paper-port
+            # lock above guarded the PORT; this guards the ACCOUNT actually logged
+            # into that port -- a live ("U...") account on the paper port FAILS
+            # CLOSED here. Read-only: it only reads managedAccounts() and places
+            # NO order. Run BEFORE marking the link healthy so a wrong account can
+            # never present as a usable connection.
+            if not self._assert_account_type():
+                self._conn_health.mark_unhealthy(account_guard.HEALTH_REASON)
+                # Do not stay connected to an unverified (possibly live) account.
+                self.disconnect()
+                logger.error("Refusing connection: account-type assertion failed "
+                             "(fail closed).")
+                return False
             self._conn_health.mark_healthy(reconnect_watchdog.REASON_CONNECTED)
             if result.attempts > 1:
                 logger.info("Connected to IBKR after %s attempt(s)", result.attempts)
@@ -174,6 +197,62 @@ class IBKRBridge:
         if self.ib.isConnected():
             self.ib.disconnect()
             logger.info("Disconnected from IBKR")
+
+    # ── Phase 6.1: account-type assertion ────────────────────────
+    def _assert_account_type(self) -> bool:
+        """Assert the connected broker account matches the expected ENVIRONMENT.
+
+        Read-only safety guard (Phase 6.1). The paper-port lock guards the PORT;
+        this guards the ACCOUNT logged into that port. Reads ib.managedAccounts()
+        and delegates the decision to the PURE account_guard.assert_account, which
+        FAILS CLOSED on an empty / malformed / ambiguous account list or the wrong
+        environment prefix:
+
+          * paper mode (default, and the ONLY mode used this phase): require a
+            single "DU..." paper account, or an explicitly-configured
+            EXPECTED_PAPER_ACCOUNT_ID when TWS exposes several;
+          * live mode (INERT -- account_guard.live_mode_enabled() is False for the
+            shipped paper config): require a "U..." account matching the explicit
+            LIVE_ACCOUNT_ID.
+
+        Returns True only on a verified account. Places NO order and NEVER enables
+        live trading. Both the pass and the fail are audited (order_audit stage
+        ``account_assertion``) and logged; a fail is logged at ERROR level (req 11).
+        Never raises (a managedAccounts() error is treated as empty -> fail closed).
+        """
+        # Documented escape hatch; ships True so the default behaviour is the
+        # fail-closed assertion. Leaving it on is the paper-safe default.
+        if not bool(getattr(config, "ASSERT_ACCOUNT_TYPE", True)):
+            logger.warning("ASSERT_ACCOUNT_TYPE is disabled -- skipping account-type "
+                           "assertion (NOT recommended).")
+            return True
+
+        live_mode = account_guard.live_mode_enabled(config)
+        if live_mode:
+            expected = getattr(config, "LIVE_ACCOUNT_ID", None)
+        else:
+            expected = getattr(config, "EXPECTED_PAPER_ACCOUNT_ID", None)
+
+        try:
+            managed = self.ib.managedAccounts()
+        except Exception:
+            logger.error("Could not read managedAccounts() for the account-type "
+                         "assertion -> failing closed", exc_info=True)
+            managed = []
+
+        result = account_guard.assert_account(
+            managed, live_mode=live_mode, expected_account=expected)
+
+        order_audit.log_event(account_guard.AUDIT_STAGE,
+                              **account_guard.audit_fields(result))
+        if result.ok:
+            logger.info("Account-type assertion passed | %s",
+                        account_guard.summary_line(result))
+            return True
+
+        logger.error("Account-type assertion FAILED -> refusing connection (fail "
+                     "closed) | %s", account_guard.summary_line(result))
+        return False
 
     # ── Phase 5B-3: graceful shutdown ────────────────────────────
     def prepare_graceful_shutdown(self) -> dict:

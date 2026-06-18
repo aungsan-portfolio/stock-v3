@@ -202,20 +202,33 @@ order မချရ။
 
 **⚠️ Phase 1–5 အကုန် go-gate အောင်ပြီးမှသာ ဒီ phase ကို ဝင်ရ။**
 
+> **STATUS (2026-06-18):** **6.1 ✅ IMPLEMENTED — paper-side account-type guard only.**
+> `account_guard.assert_account` ဆောက်ပြီး၊ `IBKRBridge.connect()` ထဲ wire လုပ်ပြီး၊
+> `test_account_guard.py` + `test_live_readiness.py` (offline, deterministic) ဖြင့်
+> cover ပြီး။ wrong/empty/malformed/ambiguous account ⇒ **fail closed** (live `U...`
+> account on paper port ကို ယခု refuse)。 **6.2 / 6.3 / 6.4 / 6.5 ⛔ BLOCKED — NOT
+> STARTED.** live port wiring မရှိ၊ `live_safety_preflight()` မရှိ၊ config flag
+> မပြောင်း။ **PAPER ONLY** ဆက်ထား — `IBKR_PORT=7497`, `REQUIRE_PAPER_PORT=True`,
+> `IBKR_MARKET_DATA_TYPE=3`, `LIVE_ACCOUNT_ID=None`, `COACH_LIVE_TRADING_ENABLED=False`,
+> `ALLOW_HISTORICAL_PRICE_FOR_ORDERS=False` **ဘာမှ မပြောင်းရသေး**။ live-readiness
+> capability flag `SUPPORTS_ACCOUNT_TYPE_ASSERTION` က full Phase 6 (6.1–6.4)
+> မပြီးမချင်း **False** အတိုင်း ⇒ `live-readiness` **NOT READY** (`LIVE_ACCOUNT_ID=None`
+> + `IBKR_MARKET_DATA_TYPE=3` ကြောင့်)。
+
 | တာဝန် | ဘယ်မှာ | အသေးစိတ် |
 |------|--------|----------|
-| 6.1 Account-type assertion **(အရေးအကြီးဆုံး guard gap)** | `ibkr_bridge.py:53-85`, `trade_coach.py:56-87` | connect ပြီး `managedAccounts()` ဖတ်; paper=`DU` prefix, live=`U` + explicit `LIVE_ACCOUNT_ID` match စစ်。 **Port lock က port ကိုသာ ကာ — wrong account ကို မကာ**; Gateway က 7497 မှာ live account login ထားရင် guard အကုန် ဖြတ်ပြီး real-money order ချနိုင်တယ် |
-| 6.2 Live port wiring | `config.py`, `ibkr_bridge.py` | 7496 + client-id + account config **အသစ်ဆောက်** (flag ပြောင်းရုံ မဟုတ်) |
-| 6.3 `live_safety_preflight()` | `main.py` | live order မချခင် invariant အကုန် (real-time data, market-hours, GTC stop capability, account-type, loss-limit snapshot) စစ်; တစ်ခုမှ fail ရင် refuse |
-| 6.4 Config flag ပြောင်း | `config.py:175,184,202,258` | `COACH_LIVE_TRADING_ENABLED`, `REQUIRE_PAPER_PORT`, port — **အပေါ်အဆင့်အားလုံး ✅ ပြီးမှသာ** |
-| 6.5 Minimal-capital rollout | — | share ၁ ခု/အသေးငယ်ဆုံး size, symbol ၁ ခု, supervised; ရက်အနည်းငယ် စောင့်ကြည့်ပြီးမှ တစ်ဆင့်ချင်း scale |
+| 6.1 Account-type assertion ✅ **IMPLEMENTED (paper-side guard only — 2026-06-18)** **(အရေးအကြီးဆုံး guard gap)** | `account_guard.py` (pure), `ibkr_bridge.py` `_assert_account_type()`+`connect()`, `config.py` `ASSERT_ACCOUNT_TYPE`/`EXPECTED_PAPER_ACCOUNT_ID`/`LIVE_ACCOUNT_ID`, `test_account_guard.py` | **✅ BUILT (fail-closed, order မချ, live မဖွင့်):** `account_guard.assert_account` (PURE/offline) က connect success ပြီး `managedAccounts()` ဖတ်; paper=`DU` prefix, live=`U` + explicit `LIVE_ACCOUNT_ID` match စစ်。 **Port lock က port ကိုသာ ကာ — wrong account ကို မကာ**; Gateway က 7497 မှာ live account login ထားရင် guard အကုန် ဖြတ်ပြီး real-money order ချနိုင်တယ် |
+| 6.2 Live port wiring ⛔ **BLOCKED — NOT STARTED (PAPER ONLY)** | `config.py`, `ibkr_bridge.py` | 7496 + client-id + account config **အသစ်ဆောက်** (flag ပြောင်းရုံ မဟုတ်) |
+| 6.3 `live_safety_preflight()` ⛔ **BLOCKED — NOT STARTED** | `main.py` | live order မချခင် invariant အကုန် (real-time data, market-hours, GTC stop capability, account-type, loss-limit snapshot) စစ်; တစ်ခုမှ fail ရင် refuse |
+| 6.4 Config flag ပြောင်း | `config.py:175,184,202,258` (⛔ **BLOCKED — do NOT change these this phase**) | `COACH_LIVE_TRADING_ENABLED`, `REQUIRE_PAPER_PORT`, port — **အပေါ်အဆင့်အားလုံး ✅ ပြီးမှသာ** |
+| 6.5 Minimal-capital rollout ⛔ **BLOCKED** | — | share ၁ ခု/အသေးငယ်ဆုံး size, symbol ၁ ခု, supervised; ရက်အနည်းငယ် စောင့်ကြည့်ပြီးမှ တစ်ဆင့်ချင်း scale |
 
 **🚦 Final Go-Live checklist:**
 - [ ] `live-readiness` command ✅ (invariant အကုန်)
 - [ ] Forward paper-test ၁–၃ လ, backtest expectation နဲ့ ကိုက်
 - [ ] open position တိုင်း server-side GTC stop ရှိ (TWS မျက်မြင်)
 - [ ] daily-loss kill-switch + drawdown halt တကယ် fire (paper မှာ စစ်ပြီး)
-- [ ] account-type assertion ✅
+- [ ] account-type assertion ✅ *(6.1 paper-side guard ✅ built + tested; full Phase 6 live wiring still pending)*
 - [ ] `panic-flatten` command ✅
 - [ ] alerting ✅
 - [ ] minimal capital + supervised
@@ -235,7 +248,7 @@ order မချရ။
 ## အကျဉ်းချုပ် — gate sequence
 
 ```
-Phase 0 ✅ → (Phase 1 ✅ ∥ Phase 2 ✅) → Phase 3 ✅ → Phase 4 ✅ → Phase 5 ✅ → Phase 6 ✅ → LIVE (minimal capital)
+Phase 0 ✅ → (Phase 1 ✅ ∥ Phase 2 ✅) → Phase 3 ✅ → Phase 4 ✅ → Phase 5 ✅ → Phase 6 ◐ (6.1 ✅ guard / 6.2–6.4 ⛔ blocked) → LIVE (minimal capital)
 ```
 
 တစ်ဆင့်စီ၏ go/no-go gate မအောင်ဘဲ နောက်တစ်ဆင့် **မသွားရ**။ ဒီ plan တစ်ခုလုံးကို **paper account**

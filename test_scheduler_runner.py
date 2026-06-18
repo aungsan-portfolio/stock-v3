@@ -273,8 +273,10 @@ class TestLiveReadinessStillNotReady(unittest.TestCase):
             import ibkr_bridge
         except Exception:
             self.skipTest("ib_insync/ibkr_bridge unavailable")
-        # Phase 6 gate stays False; Phase 5A reconciliation flag stays True.
-        self.assertFalse(ibkr_bridge.SUPPORTS_ACCOUNT_TYPE_ASSERTION)
+        # Phase 6.1 ships the account-type assertion (built + fail-closed tested),
+        # so its flag is True; Phase 5A reconciliation flag stays True. Live trading
+        # stays disabled via the config-only gates, not via these flags.
+        self.assertTrue(ibkr_bridge.SUPPORTS_ACCOUNT_TYPE_ASSERTION)
         self.assertTrue(ibkr_bridge.SUPPORTS_STARTUP_RECONCILIATION)
 
 

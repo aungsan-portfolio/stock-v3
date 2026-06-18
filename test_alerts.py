@@ -470,8 +470,10 @@ class TestStillNotReady(_AlertsBase):
     def test_no_new_capability_flag_on_bridge(self):
         present = {a for a in dir(ibkr_bridge) if a.startswith("SUPPORTS_")}
         self.assertEqual(present, self.EXPECTED_CAPABILITY_FLAGS)
-        self.assertFalse(ibkr_bridge.SUPPORTS_ACCOUNT_TYPE_ASSERTION,
-                         "Phase 6 gate stays False (fail-closed)")
+        # Phase 6.1 ships the account-type assertion (built + fail-closed tested),
+        # so its capability flag is honestly True; Phase 5B-4 adds no flag.
+        self.assertTrue(ibkr_bridge.SUPPORTS_ACCOUNT_TYPE_ASSERTION,
+                        "Phase 6.1 account-type assertion is built + tested")
 
     def test_live_readiness_reports_not_ready(self):
         import main
