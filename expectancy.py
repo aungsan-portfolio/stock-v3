@@ -215,14 +215,23 @@ def _excluded_trade(symbol: str, fold: str, row: dict, side: str, reason: str) -
 def reconstruct_closed_trades(rows: List[dict]) -> List[ClosedTrade]:
     """Reconstruct LONG round-trips from the per-bar ledger.
 
-    Grouped by ``(symbol, fold_start)`` and paired in file order: an executed
-    ``old_position==0 -> new_position==1`` row opens a long, the next executed
-    ``1 -> 0`` row closes it. Anything that does not fit is EXCLUDED with a
-    reason (never silently dropped):
-      * leftover entries  -> ``open_at_period_end``
-      * leftover exits    -> ``orphan_exit``
-      * short opens       -> ``short_unsupported`` (M4-core is long-only)
-      * other executed moves -> ``unmodeled_transition``
+    Grouped by ``(symbol, fold_start)`` and paired by a CHRONOLOGICAL state
+    machine over each group's executed rows in file/date order (the ledger is
+    already date-ordered; we never reorder). A single ``pending_entry`` tracks
+    the currently-open long: an executed ``old_position==0 -> new_position==1``
+    row opens it, and the next executed ``1 -> 0`` row closes THAT entry only.
+
+    This guarantees an entry is never paired with an EARLIER exit. In particular
+    a position carried in from a previous fold shows up as a ``1 -> 0`` exit at
+    the top of the group with no pending entry; it is classified as an orphan
+    exit instead of being mis-paired backwards with a later entry (the bug in the
+    prior index-based ``long_entries[i] / long_exits[i]`` pairing).
+
+    Anything that does not fit is EXCLUDED with a reason (never silently dropped):
+      * unclosed entry at end of group -> ``open_at_period_end``
+      * exit with no pending entry      -> ``orphan_exit`` (e.g. carried-in position)
+      * short opens                     -> ``short_unsupported`` (M4-core is long-only)
+      * other executed moves            -> ``unmodeled_transition``
     """
     trades: List[ClosedTrade] = []
     groups: "OrderedDict[tuple, List[dict]]" = OrderedDict()
@@ -231,17 +240,33 @@ def reconstruct_closed_trades(rows: List[dict]) -> List[ClosedTrade]:
         groups.setdefault(key, []).append(r)
 
     for (symbol, fold), grp in groups.items():
-        long_entries: List[dict] = []
-        long_exits: List[dict] = []
+        # `pending_entry` is the currently-open long entry row (None when flat).
+        # Processing in arrival order means a 1->0 exit can only ever close an
+        # entry that was opened BEFORE it within this same (symbol, fold) group.
+        pending_entry: Optional[dict] = None
         for r in grp:
             if not _is_true(r.get("order_executed")):
                 continue
             old = _int(r.get("old_position"))
             new = _int(r.get("new_position"))
             if old == 0 and new == 1:
-                long_entries.append(r)
+                # Open a long. A still-pending entry here means the prior open
+                # never closed inside this group -> flush it as open_at_period_end
+                # before starting the new one (defensive; valid long-only data
+                # never re-opens while already long).
+                if pending_entry is not None:
+                    trades.append(_excluded_trade(symbol, fold, pending_entry, "long",
+                                                  REASON_OPEN_AT_PERIOD_END))
+                pending_entry = r
             elif old == 1 and new == 0:
-                long_exits.append(r)
+                if pending_entry is not None:
+                    trades.append(_build_long_trade(symbol, fold, pending_entry, r))
+                    pending_entry = None
+                else:
+                    # Exit before any pending entry: the position was carried in
+                    # from a previous fold (or the ledger is inconsistent). It is
+                    # NEVER paired backwards with a later entry.
+                    trades.append(_excluded_trade(symbol, fold, r, "long", REASON_ORPHAN_EXIT))
             elif new is not None and new < 0:
                 # Opening (or flipping into) a short: not modeled in M4-core.
                 trades.append(_excluded_trade(symbol, fold, r, "short", REASON_SHORT_UNSUPPORTED))
@@ -251,13 +276,10 @@ def reconstruct_closed_trades(rows: List[dict]) -> List[ClosedTrade]:
             else:
                 trades.append(_excluded_trade(symbol, fold, r, "unknown", REASON_UNMODELED_TRANSITION))
 
-        n_pairs = min(len(long_entries), len(long_exits))
-        for i in range(n_pairs):
-            trades.append(_build_long_trade(symbol, fold, long_entries[i], long_exits[i]))
-        for entry in long_entries[n_pairs:]:
-            trades.append(_excluded_trade(symbol, fold, entry, "long", REASON_OPEN_AT_PERIOD_END))
-        for exit_ in long_exits[n_pairs:]:
-            trades.append(_excluded_trade(symbol, fold, exit_, "long", REASON_ORPHAN_EXIT))
+        # An entry still open at the end of the group never closed in-period.
+        if pending_entry is not None:
+            trades.append(_excluded_trade(symbol, fold, pending_entry, "long",
+                                          REASON_OPEN_AT_PERIOD_END))
 
     return trades
 
