@@ -77,6 +77,7 @@ import hot_scanner
 from hot_scanner import scan_hot_stocks
 import model_doctor
 import expectancy
+import coach_i18n  # M5A: DISPLAY-ONLY language layer (no order path, no decisions)
 from trade_coach import (
     build_trade_lesson, build_trade_preview, print_trade_lesson, print_trade_preview,
     write_trade_note, select_coach_candidates,
@@ -525,10 +526,13 @@ def cmd_threshold_report(args) -> int:
 
 
 # â”€â”€ Guided Paper Trading Coach (read-mostly, beginner-friendly) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-def _print_coach_intro() -> None:
-    print("\n=== Guided Paper Trading Coach ===")
-    print("A learning tool: it explains signals and previews PAPER trades.")
-    print("It never auto-buys. A paper order needs BOTH --confirm AND --chart-checked.")
+def _print_coach_intro(lang=None) -> None:
+    """Print the coach banner. ``lang`` is DISPLAY-ONLY (M5A): the critical safety
+    line stays BILINGUAL (English + Burmese) and keeps the literal CLI tokens."""
+    lang = coach_i18n.resolve_language(lang)
+    print("\n=== " + coach_i18n.t("coach_intro_title", lang) + " ===")
+    print(coach_i18n.t("coach_intro_learn", lang))
+    print(coach_i18n.t("coach_intro_safety", lang))
 
 
 def _read_hot_candidate_symbols():
@@ -548,9 +552,10 @@ def _read_hot_candidate_symbols():
     return symbols
 
 
-def cmd_coach(_args) -> int:
+def cmd_coach(args) -> int:
     """Beginner lessons on the WATCHLIST. No IBKR connection, no orders."""
-    _print_coach_intro()
+    lang = coach_i18n.resolve_language(getattr(args, "language", None))
+    _print_coach_intro(lang)
     signals = Predictor().predict_all()  # defaults to config.WATCHLIST
     if not signals:
         print("\nNo signals produced â€” check trained models / data source.")
@@ -577,14 +582,15 @@ def cmd_coach(_args) -> int:
             print_trade_preview(preview)
             write_trade_note(build_trade_lesson(c), action_taken="preview_only", preview=preview)
 
-    print("\nNo IBKR connection was made and no orders were placed.")
+    print("\n" + coach_i18n.t("no_ibkr_no_orders", lang))
     print("Next step: python -X utf8 main.py paper-coach")
     return 0
 
 
-def cmd_coach_hot(_args) -> int:
+def cmd_coach_hot(args) -> int:
     """Beginner lessons on the latest hot_candidates.csv. No IBKR, no orders."""
-    _print_coach_intro()
+    lang = coach_i18n.resolve_language(getattr(args, "language", None))
+    _print_coach_intro(lang)
     symbols = _read_hot_candidate_symbols()
     if symbols is None:
         print(f"\nNo hot candidates file at {config.HOT_CANDIDATES_FILE}.")
@@ -618,7 +624,7 @@ def cmd_coach_hot(_args) -> int:
         print_trade_preview(preview)
         write_trade_note(build_trade_lesson(c), action_taken="preview_only", preview=preview)
 
-    print("\nNo IBKR connection was made and no orders were placed.")
+    print("\n" + coach_i18n.t("no_ibkr_no_orders", lang))
     return 0
 
 
@@ -1408,6 +1414,7 @@ def cmd_expectancy_report(args) -> int:
     metrics (reason `unavailable_risk`). Pass --proxy-risk for a clearly-labeled
     hard-stop PROXY R (never presented as true Minervini R).
     """
+    lang = coach_i18n.resolve_language(getattr(args, "language", None))
     trades_path = getattr(config, "EXPECTANCY_BACKTEST_TRADES",
                           config.REPORTS_DIR / "backtest_trades.csv")
     json_path = getattr(config, "EXPECTANCY_REPORT_JSON",
@@ -1422,31 +1429,36 @@ def cmd_expectancy_report(args) -> int:
         print("Run `python main.py backtest` first to generate reports/backtest_trades.csv.")
 
     report = expectancy.generate_report(trades_path, enable_proxy_risk=enable_proxy)
-    jp, mp = expectancy.write_report(report, json_path=json_path, md_path=md_path)
+    jp, mp = expectancy.write_report(report, json_path=json_path, md_path=md_path, lang=lang)
 
+    # DISPLAY-ONLY localization (M5A): labels are translated; numbers, file paths,
+    # reason codes, and risk mode keys are passed through verbatim.
     m = report["metrics"]
     r = m["r"]
-    print("\nExpectancy / R-Multiple Report (read-only)")
-    print(f"Source: {report['source_file']}")
-    print(f"Rows read: {report['n_rows_read']}")
-    print(f"Risk mode: {report['risk_mode']}"
-          + (f" (proxy_pct={report['proxy_pct']})" if report["risk_mode"] != "none" else ""))
-    print(f"Closed trades included / excluded: {m['n_trades_included']} / {m['n_trades_excluded']}")
-    print(f"Total realized PnL (return units): {m['total_realized_pnl']}")
-    print(f"Wins / Losses / Scratch: {m['wins']} / {m['losses']} / {m['scratch']}")
+    risk_suffix = (f" (proxy_pct={report['proxy_pct']})" if report["risk_mode"] != "none" else "")
+    print("\n" + coach_i18n.t("cli_exp_header", lang))
+    print(coach_i18n.t("cli_exp_source", lang, path=report["source_file"]))
+    print(coach_i18n.t("cli_exp_rows", lang, n=report["n_rows_read"]))
+    print(coach_i18n.t("cli_exp_risk_mode", lang, mode=report["risk_mode"], suffix=risk_suffix))
+    print(coach_i18n.t("cli_exp_trades", lang,
+                       inc=m["n_trades_included"], exc=m["n_trades_excluded"]))
+    print(coach_i18n.t("cli_exp_total_pnl", lang, v=m["total_realized_pnl"]))
+    print(coach_i18n.t("cli_exp_wls", lang, w=m["wins"], l=m["losses"], s=m["scratch"]))
     wr = m["win_rate"]
-    print(f"Win rate: {wr * 100:.1f}%" if wr is not None else "Win rate: n/a")
-    print(f"Profit factor: {m['profit_factor_display']}")
+    wr_str = f"{wr * 100:.1f}%" if wr is not None else "n/a"
+    print(coach_i18n.t("cli_exp_win_rate", lang, v=wr_str))
+    print(coach_i18n.t("cli_exp_profit_factor", lang, v=m["profit_factor_display"]))
     if r["expectancy_R"] is None:
-        print("Expectancy (R): n/a (no valid initial risk; use --proxy-risk for a labeled proxy)")
+        print(coach_i18n.t("cli_exp_expectancy_na", lang))
     else:
-        print(f"Expectancy (R): {r['expectancy_R']:.4f} over {r['n_r_included']} trades")
+        print(coach_i18n.t("cli_exp_expectancy_val", lang,
+                           v=f"{r['expectancy_R']:.4f}", n=r["n_r_included"]))
     if m["excluded_by_reason"]:
-        print("Excluded by reason: "
-              + ", ".join(f"{k}={v}" for k, v in sorted(m["excluded_by_reason"].items())))
-    print(f"\nReports written -> {jp}")
+        pairs = ", ".join(f"{k}={v}" for k, v in sorted(m["excluded_by_reason"].items()))
+        print(coach_i18n.t("cli_exp_excluded", lang, pairs=pairs))
+    print("\n" + coach_i18n.t("cli_exp_reports_written", lang, jp=jp))
     print(f"                   {mp}")
-    print("No IBKR connection was made and no orders were placed.")
+    print(coach_i18n.t("no_ibkr_no_orders", lang))
     return 0
 
 
@@ -1766,6 +1778,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Stock Prediction Engine â€” IBKR Paper Trading")
     sub = parser.add_subparsers(dest="command")
 
+    # M5A: DISPLAY-ONLY language flag for safe, read-only coach/report commands.
+    # It localizes labels/headings only - never metrics, decisions, sizing, the
+    # order path, JSON keys, numbers, or file paths. Intentionally NOT added to
+    # any order-capable command (paper / paper-coach / daily-coach / paper-hot).
+    def _add_language_flag(p) -> None:
+        p.add_argument(
+            "--language", choices=["en", "my"], default=None,
+            help="Display language (en=English default, my=Burmese). DISPLAY ONLY: "
+                 "never affects metrics, decisions, sizing, orders, JSON keys, "
+                 "numbers, or file paths. Falls back to "
+                 "config.MINERVINI_COACH_LANGUAGE, then English.",
+        )
+
     sub.add_parser("train", help="Train RF + LSTM models")
     sub.add_parser("predict", help="Show today's signals")
 
@@ -1791,6 +1816,7 @@ def main() -> int:
              "(default off). This is NOT true Minervini 1R; backtest trades have "
              "no real setup stop.",
     )
+    _add_language_flag(er)  # display-only; JSON/metrics/paths unchanged
 
     pp = sub.add_parser("paper", help="Execute signals on IBKR paper")
     pp.add_argument("--dry-run", action="store_true", help="Preview signals without placing orders")
@@ -1833,8 +1859,12 @@ def main() -> int:
     _add_hot_flags(sub.add_parser("threshold-report", help="Sweep BUY thresholds (read-only, no orders)"))
 
     # â”€â”€ Guided Paper Trading Coach subcommands â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    sub.add_parser("coach", help="Beginner lessons on WATCHLIST signals (no IBKR, no orders)")
-    sub.add_parser("coach-hot", help="Beginner lessons on hot_candidates.csv (no IBKR, no orders)")
+    _add_language_flag(
+        sub.add_parser("coach", help="Beginner lessons on WATCHLIST signals (no IBKR, no orders)")
+    )
+    _add_language_flag(
+        sub.add_parser("coach-hot", help="Beginner lessons on hot_candidates.csv (no IBKR, no orders)")
+    )
     pc = sub.add_parser(
         "paper-coach",
         help="Paper preview; place ONE order only with --confirm AND --chart-checked",
