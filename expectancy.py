@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import config
+import coach_i18n  # M5A: DISPLAY-ONLY i18n (config + stdlib only; no order path)
 
 logger = logging.getLogger(__name__)
 
@@ -417,15 +418,21 @@ def _r(x) -> str:
     return "n/a" if x is None else f"{x:.4f}R"
 
 
-def report_to_markdown(report: dict) -> str:
-    """Render a human-readable Markdown report. Pure string builder."""
+def report_to_markdown(report: dict, lang: Optional[str] = None) -> str:
+    """Render a human-readable Markdown report. Pure string builder.
+
+    ``lang`` (M5A) selects the DISPLAY language for headings / notes /
+    disclaimers ONLY - default English (and ``None`` -> config default, then
+    English). Numbers, file paths, reason codes, risk_source counts, and the
+    JSON schema are NEVER localized. Safety / disclaimer text is kept BILINGUAL
+    (English + Burmese) so the English warning is never lost.
+    """
     m = report["metrics"]
     r = m["r"]
     lines = [
-        "# Expectancy / R-Multiple Report",
+        "# " + coach_i18n.t("md_title", lang),
         "",
-        "_Read-only M4 report. No backtest was run, no models trained, no IBKR "
-        "connection, no orders placed. Source is the offline backtest ledger._",
+        "_" + coach_i18n.t("md_readonly_note", lang) + "_",
         "",
         f"- **Source:** `{report['source_file']}`",
         f"- **Rows read:** {report['n_rows_read']}",
@@ -434,7 +441,7 @@ def report_to_markdown(report: dict) -> str:
         "- **Risk mode:** " + report["risk_mode"]
         + (f" (proxy_pct={report['proxy_pct']})" if report["risk_mode"] != "none" else ""),
         "",
-        "## Realized performance (PnL-based)",
+        "## " + coach_i18n.t("md_h_realized", lang),
         "",
         f"- **Closed trades included:** {m['n_trades_included']}",
         f"- **Excluded trades:** {m['n_trades_excluded']}",
@@ -445,23 +452,17 @@ def report_to_markdown(report: dict) -> str:
         f"- **Profit factor:** {m['profit_factor_display']}",
         f"- **Average win / Average loss:** {m['avg_win']} / {m['avg_loss']}",
         "",
-        "## R-multiple / expectancy",
+        "## " + coach_i18n.t("md_h_rmultiple", lang),
         "",
     ]
     if report["risk_mode"] == "none":
         lines += [
-            "> **R-multiple and expectancy are NOT computed.** The backtest ledger "
-            "carries no true Minervini 1R initial risk, so every trade is tagged "
-            "`risk_source=unavailable` and excluded from R metrics. Pass "
-            "`--proxy-risk` for a clearly-labeled hard-stop *proxy* (never true "
-            "Minervini R).",
+            "> " + coach_i18n.t("md_disclaimer_none", lang),
             "",
         ]
     else:
         lines += [
-            "> **PROXY R - not true Minervini R.** initial_risk is a fixed hard-stop "
-            f"fraction (proxy_pct={report['proxy_pct']}), NOT a real VCP setup stop. "
-            "Treat these R values as a rough proxy only.",
+            "> " + coach_i18n.t("md_disclaimer_proxy", lang, proxy_pct=report["proxy_pct"]),
             "",
         ]
     lines += [
@@ -471,26 +472,31 @@ def report_to_markdown(report: dict) -> str:
         f"- **Risk-source counts:** {r['risk_source_counts']}",
         f"- **R excluded by reason:** {r['r_excluded_by_reason']}",
         "",
-        "## Excluded trades by reason",
+        "## " + coach_i18n.t("md_h_excluded", lang),
         "",
     ]
     if m["excluded_by_reason"]:
         for reason, n in sorted(m["excluded_by_reason"].items()):
             lines.append(f"- `{reason}`: {n}")
     else:
-        lines.append("- none")
-    lines += ["", "## Notes", ""]
+        lines.append("- " + coach_i18n.t("md_none", lang))
+    lines += ["", "## " + coach_i18n.t("md_h_notes", lang), ""]
     lines += [f"- {n}" for n in report["notes"]]
     lines += [""]
     return "\n".join(lines)
 
 
-def write_report(report: dict, *, json_path, md_path):
-    """Write the JSON + Markdown artifacts. The ONLY side effect of this module."""
+def write_report(report: dict, *, json_path, md_path, lang: Optional[str] = None):
+    """Write the JSON + Markdown artifacts. The ONLY side effect of this module.
+
+    ``lang`` (M5A) localizes the Markdown DISPLAY only. The JSON artifact is
+    NEVER localized - identical bytes regardless of language - so the machine
+    schema stays stable.
+    """
     json_path = Path(json_path)
     md_path = Path(md_path)
     json_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     md_path.parent.mkdir(parents=True, exist_ok=True)
-    md_path.write_text(report_to_markdown(report), encoding="utf-8")
+    md_path.write_text(report_to_markdown(report, lang=lang), encoding="utf-8")
     return json_path, md_path
