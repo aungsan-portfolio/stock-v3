@@ -1,3 +1,17 @@
+> ## ⚠️ SUPERSEDED — ဒီ document က သမိုင်းမှတ်တမ်း (2026-06-16 baseline audit) သာ ဖြစ်သည်
+> ဒီ readiness report က Phase 1–6 safety work **မလုပ်ရသေးခင်** ရေးထားတာ ဖြစ်လို့၊ အောက်ဖော်ပြ
+> finding အများစုက **ယခု ပြင်ပြီးသွားပြီ** (2026-06-19 code audit + 484 tests pass ဖြင့် အတည်ပြုပြီး):
+> - 🔴 **C2 hard stop (-3%)** — ယခု entry တိုင်းမှာ **server-side GTC STP** အဖြစ် ချပြီး (OCA group မျှ) ✅
+> - ⚠️ **H1 daily-loss kill-switch** — ယခု `_new_entries_blocked` gate ထဲ **တကယ် wire ဖြစ်ပြီ** ✅
+> - **H4–H9 order execution** (accepted≠filled, partial-fill, idempotency) ✅ · **H18 reconciliation** (broker-truth) ✅
+> - **H15 market-hours gate** ✅ · **H19 GTC/OCA** ✅ · **account-type assertion** (Phase 6.1) ✅
+>
+> **လက်ရှိ source-of-truth = `reports/PAPER_GATE_VALIDATION_CHECKLIST.md`** (shipped Phase 0–5B+6.1 state)။
+> ကျန်နေသေးတာ: Phase-1 forward paper-test (၁–၃ လ) + Phase 6.2/6.3 live wiring (PAPER ONLY ဆက်ထား)။
+> အောက်က ၅၆-agent analysis ကို **roadmap/အကြောင်းရင်း မှတ်တမ်း** အဖြစ်သာ ဖတ်ပါ — current state အဖြစ် မဖတ်ပါနှင့်။
+
+---
+
 # Live Trading Bot ဖြစ်အောင် — အသေးစိတ် သုံးသပ်ချက် (မြန်မာ)
 
 > Agent ၅၆ ခုနဲ့ codebase တစ်ခုလုံးကို subsystem ၆ ခု ခွဲဖတ် → dimension ၆ ခု audit →
