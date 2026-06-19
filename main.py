@@ -1220,6 +1220,30 @@ def _bt_parse_date(s: str):
         return None
 
 
+def _reconstruct_backtest_trades(rows):
+    """Canonical closed-trade reconstruction shared with the expectancy report.
+
+    Delegates to ``expectancy.reconstruct_closed_trades`` + ``compute_metrics`` so
+    ``backtest-summary`` and ``expectancy-report`` reconcile on the SAME ledger:
+    round-trips are paired WITHIN each ``(symbol, fold_start)`` group (never across
+    symbols or walk-forward folds). Positions that span a fold/period boundary are
+    excluded with a reason (``open_at_period_end`` / ``orphan_exit``) instead of being
+    mis-paired by a global ``zip`` (the old behavior, which paired one symbol's entry
+    with an unrelated symbol's exit and inflated the trade count / profit factor).
+
+    Read-only and pure. R-multiple / proxy risk is NOT applied here (backtest-summary
+    reports PnL only); the R metrics live in ``expectancy-report``.
+
+    Returns ``(included_trades, metrics)`` where ``included_trades`` is the list of
+    PnL-included ``ClosedTrade`` round-trips and ``metrics`` is the
+    ``expectancy.compute_metrics`` dict.
+    """
+    trades = expectancy.reconstruct_closed_trades(rows)
+    metrics = expectancy.compute_metrics(trades)
+    included = [t for t in trades if t.pnl_included]
+    return included, metrics
+
+
 def cmd_backtest_summary(_args) -> int:
     """Read-only summary of the most recent backtest artifacts.
 
@@ -1263,42 +1287,34 @@ def cmd_backtest_summary(_args) -> int:
     exits = [r for r in executed if r.get("old_position") == "1" and r.get("new_position") == "0"]
     open_positions_left = len(entries) - len(exits)
 
-    # ---- Pair entries and exits in order -----------------------------------
+    # ---- Reconstruct closed trades (canonical, shared with expectancy-report)
+    # Round-trips are paired WITHIN each (symbol, fold_start) group, NOT with a
+    # global zip across the whole file. This reconciles backtest-summary with
+    # expectancy-report: the same ledger yields the same closed-trade count,
+    # win/loss split, and profit factor in both reports. Positions that span a
+    # fold/period boundary are excluded with a reason rather than mis-paired.
+    included, metrics = _reconstruct_backtest_trades(rows)
     closed_trades = []
-    for entry, exit_ in zip(entries, exits):
-        try:
-            entry_eq = float(entry.get("equity"))
-            exit_eq = float(exit_.get("equity"))
-            ret = (exit_eq / entry_eq) - 1.0 if entry_eq else None
-        except (TypeError, ValueError, ZeroDivisionError):
-            ret = None
-        if ret is None:
-            continue
-        ed = _bt_parse_date(entry.get("date"))
-        xd = _bt_parse_date(exit_.get("date"))
-        hold_days = (xd - ed).days if (ed and xd) else None
+    for t in included:
+        ed = _bt_parse_date(t.entry_date)
+        xd = _bt_parse_date(t.exit_date)
         closed_trades.append({
-            "entry_date": entry.get("date"),
-            "exit_date": exit_.get("date"),
-            "return": ret,
-            "hold_days": hold_days,
+            "entry_date": t.entry_date,
+            "exit_date": t.exit_date,
+            "return": t.realized_pnl,
+            "hold_days": (xd - ed).days if (ed and xd) else None,
         })
 
-    wins = [t for t in closed_trades if t["return"] > 0]
-    losses = [t for t in closed_trades if t["return"] <= 0]
-    n_closed = len(closed_trades)
-    win_rate = (len(wins) / n_closed) if n_closed else None
-    avg_win = (sum(t["return"] for t in wins) / len(wins)) if wins else None
-    avg_loss = (sum(t["return"] for t in losses) / len(losses)) if losses else None
-
-    gross_win = sum(t["return"] for t in wins)
-    gross_loss = sum(-t["return"] for t in losses)  # positive magnitude
-    if gross_loss > 0:
-        profit_factor = gross_win / gross_loss
-    elif gross_win > 0:
-        profit_factor = float("inf")
-    else:
-        profit_factor = None
+    n_closed = metrics["n_trades_included"]
+    wins_n = metrics["wins"]
+    losses_n = metrics["losses"]
+    scratch_n = metrics["scratch"]
+    win_rate = metrics["win_rate"]
+    avg_win = metrics["avg_win"]
+    avg_loss = metrics["avg_loss"]
+    pf_display = metrics["profit_factor_display"]
+    total_pnl = metrics["total_realized_pnl"]
+    excluded_by_reason = metrics["excluded_by_reason"]
 
     best = max(closed_trades, key=lambda t: t["return"]) if closed_trades else None
     worst = min(closed_trades, key=lambda t: t["return"]) if closed_trades else None
@@ -1336,16 +1352,14 @@ def cmd_backtest_summary(_args) -> int:
     print(f"Exits: {len(exits)}")
     print(f"Open positions left: {open_positions_left}")
     print(f"Closed trades: {n_closed}")
-    print(f"Wins / Losses: {len(wins)} / {len(losses)}")
+    if excluded_by_reason:
+        ex = ", ".join(f"{k}={v}" for k, v in sorted(excluded_by_reason.items()))
+        print(f"Excluded (not a clean round-trip within symbol/fold): {ex}")
+    print(f"Wins / Losses / Scratch: {wins_n} / {losses_n} / {scratch_n}")
     print(f"Win rate: {win_rate * 100:.1f}%" if win_rate is not None else "Win rate: n/a")
     print(f"Average win: {_bt_summary_pct(avg_win)}")
     print(f"Average loss: {_bt_summary_pct(avg_loss)}")
-    if profit_factor is None:
-        print("Profit factor (approx): n/a")
-    elif profit_factor == float("inf"):
-        print("Profit factor (approx): inf (no losing trades)")
-    else:
-        print(f"Profit factor (approx): {profit_factor:.2f}")
+    print(f"Profit factor (approx): {pf_display}")
     print(f"Best trade: {fmt_trade(best)}")
     print(f"Worst trade: {fmt_trade(worst)}")
     print(f"Max drawdown: {_bt_summary_pct(max_drawdown)}")
@@ -1361,15 +1375,20 @@ def cmd_backtest_summary(_args) -> int:
     def md_trade(t):
         return fmt_trade(t)
 
-    pf_str = (
-        "n/a" if profit_factor is None
-        else ("inf (no losing trades)" if profit_factor == float("inf") else f"{profit_factor:.2f}")
+    pf_str = pf_display
+    excluded_str = (
+        ", ".join(f"`{k}`={v}" for k, v in sorted(excluded_by_reason.items()))
+        if excluded_by_reason else "none"
     )
     lines = [
         "# Backtest Summary",
         "",
         "_Read-only summary of existing backtest artifacts. No backtest was run, "
         "no models trained, no IBKR connection, no orders placed._",
+        "",
+        "_Closed trades are reconstructed as long round-trips paired WITHIN each "
+        "`(symbol, fold_start)` group — the same canonical logic as "
+        "`expectancy-report`, so the two reports reconcile._",
         "",
         f"- **Symbols tested:** {symbols_tested if symbols_tested is not None else 'unknown'}",
         f"- **Model:** {model_name}",
@@ -1379,8 +1398,10 @@ def cmd_backtest_summary(_args) -> int:
         f"- **Exits:** {len(exits)}",
         f"- **Open positions left:** {open_positions_left}",
         f"- **Closed trades:** {n_closed}",
-        f"- **Wins / Losses:** {len(wins)} / {len(losses)}",
+        f"- **Excluded (not a clean round-trip within symbol/fold):** {excluded_str}",
+        f"- **Wins / Losses / Scratch:** {wins_n} / {losses_n} / {scratch_n}",
         f"- **Win rate:** {win_rate * 100:.1f}%" if win_rate is not None else "- **Win rate:** n/a",
+        f"- **Total realized PnL (return units):** {total_pnl}",
         f"- **Average win:** {_bt_summary_pct(avg_win)}",
         f"- **Average loss:** {_bt_summary_pct(avg_loss)}",
         f"- **Profit factor (approx):** {pf_str}",
