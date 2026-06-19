@@ -127,6 +127,68 @@ class TestReconstruct(unittest.TestCase):
         self.assertAlmostEqual(by_symbol["SPY"].realized_pnl, 0.05)
         self.assertAlmostEqual(by_symbol["AAPL"].realized_pnl, -0.03)
 
+    def test_exit_before_entry_does_not_pair_backwards(self):
+        # A position carried in from a prior fold appears as a 1->0 exit at the
+        # TOP of the group (no pending entry), FOLLOWED by a real entry and its
+        # own later exit. The carried-in exit must be an orphan_exit; the real
+        # entry must pair with its OWN later exit, never backwards with the
+        # earlier carried-in exit (the temporal/state-machine bug being fixed).
+        rows = [
+            _row("SPY", "2022-01-05", "252", True, 1, 0, 110.0, 1.10),  # carry-in exit
+            _row("SPY", "2022-02-01", "252", True, 0, 1, 100.0, 1.00),  # real entry
+            _row("SPY", "2022-02-20", "252", True, 1, 0, 108.0, 1.08),  # real exit
+        ]
+        trades = expectancy.reconstruct_closed_trades(rows)
+        included = [t for t in trades if t.pnl_included]
+        excluded = [t for t in trades if not t.pnl_included]
+        self.assertEqual(len(included), 1)
+        self.assertEqual(len(excluded), 1)
+        rt = included[0]
+        # Paired with the LATER exit (eq 1.08 -> +8%), NOT the earlier carried-in
+        # exit (eq 1.10 -> +10%, which the old index-pairing produced).
+        self.assertAlmostEqual(rt.realized_pnl, 0.08)
+        self.assertEqual(rt.entry_date, "2022-02-01")
+        self.assertEqual(rt.exit_date, "2022-02-20")
+        self.assertLess(rt.entry_date, rt.exit_date)  # chronologically valid
+        self.assertEqual(excluded[0].exclusion_reason, expectancy.REASON_ORPHAN_EXIT)
+
+    def test_cross_fold_carry_not_mispaired(self):
+        # Same SYMBOL, two folds: fold 100 opens a long that never closes in-fold
+        # (carried out), fold 200 begins with the carried-in exit. The fold-100
+        # entry must NOT pair across the boundary with the fold-200 exit; each is
+        # excluded with its own reason instead.
+        rows = [
+            _row("SPY", "2022-01-03", "100", True, 0, 1, 100.0, 1.00),  # fold 100 entry
+            _row("SPY", "2022-02-01", "200", True, 1, 0, 110.0, 1.10),  # fold 200 carry-in exit
+        ]
+        trades = expectancy.reconstruct_closed_trades(rows)
+        self.assertEqual([t for t in trades if t.pnl_included], [])  # nothing paired
+        reasons = sorted(t.exclusion_reason for t in trades)
+        self.assertEqual(
+            reasons,
+            sorted([expectancy.REASON_OPEN_AT_PERIOD_END, expectancy.REASON_ORPHAN_EXIT]),
+        )
+
+    def test_round_trip_then_leftover_entry_open_at_period_end(self):
+        # A clean round-trip followed by a re-entry that never closes in-group:
+        # the round-trip is included; the dangling LATEST entry (not the closed
+        # one) is the open_at_period_end leftover.
+        rows = [
+            _row("SPY", "2022-01-03", "252", True, 0, 1, 100.0, 1.00),
+            _row("SPY", "2022-01-20", "252", True, 1, 0, 106.0, 1.06),  # closes #1
+            _row("SPY", "2022-02-01", "252", True, 0, 1, 108.0, 1.06),  # re-entry, never closes
+        ]
+        trades = expectancy.reconstruct_closed_trades(rows)
+        included = [t for t in trades if t.pnl_included]
+        excluded = [t for t in trades if not t.pnl_included]
+        self.assertEqual(len(included), 1)
+        self.assertAlmostEqual(included[0].realized_pnl, 0.06)
+        self.assertEqual(included[0].entry_date, "2022-01-03")
+        self.assertEqual(included[0].exit_date, "2022-01-20")
+        self.assertEqual(len(excluded), 1)
+        self.assertEqual(excluded[0].exclusion_reason, expectancy.REASON_OPEN_AT_PERIOD_END)
+        self.assertEqual(excluded[0].entry_date, "2022-02-01")
+
     def test_non_executed_rows_are_ignored(self):
         # A SELL signal that never executes (long-only "skip-sell") must not pair.
         rows = [_row("SPY", "2022-01-03", "252", False, 0, 0, 100.0, 1.0)]
