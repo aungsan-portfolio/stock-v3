@@ -540,6 +540,106 @@ class IBKRBridge:
                          symbol, exc_info=True)
             return False
 
+    def _minervini_risk_sized_qty(self, symbol: str, signal=None,
+                                  entry_price: float = 0.0,
+                                  notional_qty: int = 0) -> int:
+        """Minervini M3 paper-only 1R risk sizing for a NEW BUY entry ONLY.
+
+        SHRINKS (never grows) the already-capped notional share quantity so the
+        dollar risk down to the dedicated Minervini setup stop is capped at
+        ``MINERVINI_RISK_PER_TRADE_USD``:
+
+            stop           = minervini.minervini_stop_price(verdict.pivot_low)
+            risk_per_share = entry_price - stop
+            risk_qty       = floor(MINERVINI_RISK_PER_TRADE_USD / risk_per_share)
+            return           min(notional_qty, risk_qty)
+
+        SHRINK-ONLY: the result is NEVER greater than ``notional_qty`` (which the
+        caller already capped via MAX_POSITION_PCT / MAX_TRADE_VALUE in
+        _calc_quantity). It never raises a cap, never sizes a SELL/close, and never
+        sends the stop to the broker -- the advisory stop is a sizing INPUT only
+        (MINERVINI_LIVE_STOP_ENABLED stays False; no OCA/GTC leg is created here).
+
+        FAIL OPEN by design -- returns ``notional_qty`` UNCHANGED (no shrink) when:
+            * the master overlay switch or the sizing sub-switch is off, OR
+            * the action is not exactly "BUY", OR
+            * notional_qty <= 0, OR
+            * entry_price is not a positive finite number, OR
+            * no VCP-like pivot / dedicated stop can be computed, OR
+            * the stop is not a positive finite number, OR
+            * the stop is not strictly below entry (stop >= entry / invalid), OR
+            * the stop is farther than MINERVINI_MAX_STOP_DISTANCE_PCT below entry
+              (a far pivot "blanks" risk-sizing instead of sizing off a tiny base), OR
+            * the risk-per-share or the risk budget is non-positive / non-finite, OR
+            * the data fetch / evaluation raises for ANY reason.
+        A data hiccup or an unusable stop therefore can never spuriously refuse or
+        mis-size an entry.
+
+        The ONLY case that returns a SMALLER number is a fully valid setup; the
+        ONLY case that returns 0 is a valid stop whose per-share risk is so wide
+        that not even one share fits the risk budget. The caller treats 0 as "skip
+        this BUY" (it must never place a zero-qty order); 0 is still a shrink, never
+        an increase.
+        """
+        if not isinstance(notional_qty, int):
+            try:
+                notional_qty = int(notional_qty)
+            except (TypeError, ValueError):
+                return notional_qty
+        if notional_qty <= 0:
+            return notional_qty
+        # Double kill-switch: BOTH the master overlay AND the sizing sub-switch must
+        # be ON. Either off => return the notional size unchanged (no data fetch).
+        if not bool(getattr(config, "MINERVINI_OVERLAY_ENABLED", False)):
+            return notional_qty
+        if not bool(getattr(config, "MINERVINI_SIZING_ENABLED", False)):
+            return notional_qty
+        # Guard on action == "BUY" exactly (NOT action != "HOLD"): sizing must never
+        # touch a SELL / short / close (those never reach this helper anyway).
+        action = str(getattr(signal, "action", "")).upper().strip()
+        if action != "BUY":
+            return notional_qty
+        try:
+            entry = float(entry_price)
+            if not math.isfinite(entry) or entry <= 0:
+                return notional_qty
+
+            import minervini
+            from data_manager import fetch_ohlcv
+
+            df = fetch_ohlcv(symbol)
+            verdict = minervini.evaluate_entry(df)
+            stop = minervini.minervini_stop_price(getattr(verdict, "pivot_low", None))
+            if stop is None:
+                return notional_qty
+            stop = float(stop)
+            if not math.isfinite(stop) or stop <= 0:
+                return notional_qty
+            # The dedicated stop must sit strictly BELOW the entry for a long (a
+            # valid 1R risk). stop >= entry is invalid -> fail open (no shrink).
+            if stop >= entry:
+                return notional_qty
+            risk_per_share = entry - stop
+            if not math.isfinite(risk_per_share) or risk_per_share <= 0:
+                return notional_qty
+            # A far pivot "blanks" risk-sizing: refuse to size off a stop more than
+            # MINERVINI_MAX_STOP_DISTANCE_PCT below entry (it would never enlarge,
+            # but a distant/unreliable pivot should not drive the size at all).
+            max_dist_pct = float(getattr(config, "MINERVINI_MAX_STOP_DISTANCE_PCT", 0.10))
+            if max_dist_pct > 0 and risk_per_share > entry * max_dist_pct:
+                return notional_qty
+            risk_budget = float(getattr(config, "MINERVINI_RISK_PER_TRADE_USD", 0.0))
+            if not math.isfinite(risk_budget) or risk_budget <= 0:
+                return notional_qty
+            risk_qty = int(risk_budget / risk_per_share)  # floor; may legitimately be 0
+            # SHRINK-ONLY: never exceed the notional size, never go negative.
+            return max(0, min(notional_qty, risk_qty))
+        except Exception:
+            # Fail open: an unusable stop / data hiccup must never block or mis-size.
+            logger.debug("Minervini 1R sizing unavailable for %s -> fail open (no shrink)",
+                         symbol, exc_info=True)
+            return notional_qty
+
     def working_order_symbols(self) -> set:
         """Symbols with working orders, across all visible client ids."""
         try:
@@ -1308,6 +1408,23 @@ class IBKRBridge:
             if qty == 0:
                 logger.warning("Qty=0 for BUY %s price=%.2f cash=%.2f", symbol, price, cash)
                 return False
+            # Minervini M3 (paper-only, default-OFF): 1R risk sizing may only SHRINK
+            # the notional qty just computed -- never raise it past MAX_POSITION_PCT /
+            # MAX_TRADE_VALUE. Fail-open: any unusable stop / data returns the
+            # notional qty unchanged. A valid stop whose per-share risk is too wide
+            # for even one share returns 0 -> skip this BUY (never a qty=0 order).
+            sized_qty = self._minervini_risk_sized_qty(symbol, signal, price, qty)
+            if sized_qty <= 0:
+                order_audit.log_event(
+                    order_audit.STAGE_HALT, phase="risk_sizing", symbol=symbol,
+                    action="BUY", reason="minervini_risk_qty_zero",
+                    notional_qty=qty, price=price,
+                )
+                logger.info("BUY %s skipped: Minervini 1R risk too wide for >=1 share "
+                            "(notional_qty=%d, price=%.2f) -> no order placed",
+                            symbol, qty, price)
+                return False
+            qty = sized_qty
             blocked, reason = self._new_entries_blocked(symbol, qty * price, signal, price)
             if blocked:
                 order_audit.log_event(order_audit.STAGE_HALT, phase="entry_gate",
