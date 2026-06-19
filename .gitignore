@@ -15,7 +15,6 @@ models/
 .vscode/
 
 data/
-reports/
 models_backup_before_train_hot/
 
 # Local backup / checkpoint artifacts
