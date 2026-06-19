@@ -463,9 +463,10 @@ class IBKRBridge:
         flag (startup protection failure), the Phase-5B-2 connection-health gate
         (mid-run disconnect -> fail closed), the Phase-4 US market-hours gate
         (H15), the Phase-4 decision-vs-order price agreement (H14), the
-        daily-loss kill-switch (H1), the account drawdown halt (H3), and the
-        per-symbol exposure cap (H3). Each is conservative: a missing baseline /
-        missing decision price never spuriously blocks.
+        daily-loss kill-switch (H1), the account drawdown halt (H3), the
+        per-symbol exposure cap (H3), and finally the Minervini M2 Stage-2 filter
+        (NEW BUY only, default-OFF, fail-open). Each is conservative: a missing
+        baseline / missing decision price never spuriously blocks.
         """
         if self._halt_new_entries:
             return True, "halt_flag"
@@ -490,7 +491,54 @@ class IBKRBridge:
             return True, "drawdown_halt"
         if risk_engine.symbol_exposure_exceeded(intended_value, 0.0, equity):
             return True, "symbol_exposure"
+        if self._minervini_stage2_blocks(symbol, signal):
+            return True, "stage2_filter"
         return False, ""
+
+    def _minervini_stage2_blocks(self, symbol: str, signal=None) -> bool:
+        """Minervini M2 Stage-2 hard block for a NEW BUY entry ONLY.
+
+        Returns True (block) ONLY when ALL hold:
+            * config.MINERVINI_OVERLAY_ENABLED is True (master kill-switch), AND
+            * config.MINERVINI_STAGE2_BLOCK_ENABLED is True, AND
+            * the signal's action is exactly "BUY" (never HOLD; SELL/close/flatten
+              never reach this gate), AND
+            * the M0 minervini verdict has stage2_ok == False.
+
+        FAIL OPEN by design: if either switch is off, the action is not a BUY, or
+        the data fetch / evaluation raises for ANY reason, this returns False (do
+        NOT block) so a data hiccup can never spuriously refuse an entry. This
+        only ever BLOCKS a NEW BUY — it can never block, weaken, or alter a SELL,
+        a close/flatten, a protective stop, sizing, or any OCA leg.
+        """
+        if not bool(getattr(config, "MINERVINI_OVERLAY_ENABLED", False)):
+            return False
+        if not bool(getattr(config, "MINERVINI_STAGE2_BLOCK_ENABLED", False)):
+            return False
+        # Guard on action == "BUY" exactly (NOT action != "HOLD"): a SELL must
+        # never be filtered by this overlay.
+        action = str(getattr(signal, "action", "")).upper().strip()
+        if action != "BUY":
+            return False
+        try:
+            import minervini
+            from data_manager import fetch_ohlcv
+
+            df = fetch_ohlcv(symbol)
+            verdict = minervini.evaluate_entry(df)
+            # Read the verdict INSIDE the try so a malformed/missing/None
+            # stage2_ok fails open instead of propagating (M2 fail-open contract).
+            # A missing attribute defaults to True (= "ok", do not block); an
+            # explicit None is treated the same.
+            stage2_ok = getattr(verdict, "stage2_ok", True)
+            if stage2_ok is None:
+                return False
+            return not bool(stage2_ok)
+        except Exception:
+            # Fail open: never let a fetch/eval/verdict failure block a trade.
+            logger.debug("Minervini Stage-2 filter unavailable for %s -> fail open",
+                         symbol, exc_info=True)
+            return False
 
     def working_order_symbols(self) -> set:
         """Symbols with working orders, across all visible client ids."""
