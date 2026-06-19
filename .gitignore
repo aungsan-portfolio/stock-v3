@@ -17,3 +17,8 @@ models/
 data/
 reports/
 models_backup_before_train_hot/
+
+# Local backup / checkpoint artifacts
+*.bak
+phase1_incomplete_checkpoint.diff
+models_backup_before_fullmarket_training/
