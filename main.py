@@ -76,6 +76,7 @@ from backtest import run_backtest
 import hot_scanner
 from hot_scanner import scan_hot_stocks
 import model_doctor
+import expectancy
 from trade_coach import (
     build_trade_lesson, build_trade_preview, print_trade_lesson, print_trade_preview,
     write_trade_note, select_coach_candidates,
@@ -1395,6 +1396,60 @@ def cmd_backtest_summary(_args) -> int:
     return 0
 
 
+def cmd_expectancy_report(args) -> int:
+    """Read-only expectancy / R-multiple report from the backtest ledger (M4-core).
+
+    Reads reports/backtest_trades.csv (the offline walk-forward simulation
+    ledger). Does NOT run a backtest, train models, connect to IBKR, or place
+    orders. Writes reports/expectancy_metrics.json + reports/expectancy_report.md.
+
+    R-multiple and expectancy_R are NOT computed by default: the backtest ledger
+    has no true Minervini 1R initial risk, so every trade is excluded from the R
+    metrics (reason `unavailable_risk`). Pass --proxy-risk for a clearly-labeled
+    hard-stop PROXY R (never presented as true Minervini R).
+    """
+    trades_path = getattr(config, "EXPECTANCY_BACKTEST_TRADES",
+                          config.REPORTS_DIR / "backtest_trades.csv")
+    json_path = getattr(config, "EXPECTANCY_REPORT_JSON",
+                        config.REPORTS_DIR / "expectancy_metrics.json")
+    md_path = getattr(config, "EXPECTANCY_REPORT_MD",
+                      config.REPORTS_DIR / "expectancy_report.md")
+    enable_proxy = bool(getattr(args, "proxy_risk", False)) or \
+        bool(getattr(config, "EXPECTANCY_ENABLE_PROXY_RISK", False))
+
+    if not trades_path.exists():
+        print(f"No backtest ledger found at {trades_path} (continuing with an empty report).")
+        print("Run `python main.py backtest` first to generate reports/backtest_trades.csv.")
+
+    report = expectancy.generate_report(trades_path, enable_proxy_risk=enable_proxy)
+    jp, mp = expectancy.write_report(report, json_path=json_path, md_path=md_path)
+
+    m = report["metrics"]
+    r = m["r"]
+    print("\nExpectancy / R-Multiple Report (read-only)")
+    print(f"Source: {report['source_file']}")
+    print(f"Rows read: {report['n_rows_read']}")
+    print(f"Risk mode: {report['risk_mode']}"
+          + (f" (proxy_pct={report['proxy_pct']})" if report["risk_mode"] != "none" else ""))
+    print(f"Closed trades included / excluded: {m['n_trades_included']} / {m['n_trades_excluded']}")
+    print(f"Total realized PnL (return units): {m['total_realized_pnl']}")
+    print(f"Wins / Losses / Scratch: {m['wins']} / {m['losses']} / {m['scratch']}")
+    wr = m["win_rate"]
+    print(f"Win rate: {wr * 100:.1f}%" if wr is not None else "Win rate: n/a")
+    print(f"Profit factor: {m['profit_factor_display']}")
+    if r["expectancy_R"] is None:
+        print("Expectancy (R): n/a (no valid initial risk; use --proxy-risk for a labeled proxy)")
+    else:
+        print(f"Expectancy (R): {r['expectancy_R']:.4f} over {r['n_r_included']} trades")
+    if m["excluded_by_reason"]:
+        print("Excluded by reason: "
+              + ", ".join(f"{k}={v}" for k, v in sorted(m["excluded_by_reason"].items())))
+    print(f"\nReports written -> {jp}")
+    print(f"                   {mp}")
+    print("No IBKR connection was made and no orders were placed.")
+    return 0
+
+
 # -- Live-trading readiness self-check (read-only) ----------------------------
 def _load_bridge_module():
     """Import ibkr_bridge after preparing the asyncio loop, or return None.
@@ -1724,6 +1779,19 @@ def main() -> int:
         help="Read-only summary of reports/backtest_* (no backtest, no IBKR, no orders)",
     )
 
+    # -- M4-core: read-only expectancy / R-multiple report (no IBKR, no orders) --
+    er = sub.add_parser(
+        "expectancy-report",
+        help="Read-only expectancy / R-multiple report from reports/backtest_trades.csv "
+             "(no backtest, no IBKR, no orders)",
+    )
+    er.add_argument(
+        "--proxy-risk", action="store_true",
+        help="Compute a clearly-LABELED hard-stop PROXY R-multiple/expectancy "
+             "(default off). This is NOT true Minervini 1R; backtest trades have "
+             "no real setup stop.",
+    )
+
     pp = sub.add_parser("paper", help="Execute signals on IBKR paper")
     pp.add_argument("--dry-run", action="store_true", help="Preview signals without placing orders")
 
@@ -1898,6 +1966,8 @@ def main() -> int:
         return cmd_backtest(args)
     if args.command == "backtest-summary":
         return cmd_backtest_summary(args)
+    if args.command == "expectancy-report":
+        return cmd_expectancy_report(args)
     if args.command == "paper":
         return cmd_paper(args)
     if args.command == "scan-hot":

@@ -498,3 +498,16 @@ MINERVINI_MAX_STOP_DISTANCE_PCT  = 0.10   # cap stop distance; a far pivot blank
 
 # Coach localization. "en" | "my" (Burmese). English is always the fallback.
 MINERVINI_COACH_LANGUAGE         = "en"
+
+# ── M4-core: expectancy / R-multiple OFFLINE reporting (READ-ONLY) ───────────
+# Output paths + flags for the read-only `expectancy-report` CLI command. These
+# are report artifacts only: NO trading behavior, NO order path, NO broker
+# connection, NO live switch. Safe to change freely.
+EXPECTANCY_BACKTEST_TRADES   = REPORTS_DIR / "backtest_trades.csv"      # input ledger (read-only)
+EXPECTANCY_REPORT_JSON       = REPORTS_DIR / "expectancy_metrics.json"  # machine-readable output
+EXPECTANCY_REPORT_MD         = REPORTS_DIR / "expectancy_report.md"     # human-readable output
+# Proxy-risk mode is OFF by default. The backtest ledger has NO true Minervini
+# 1R stop, so R-multiple / expectancy are NOT computed unless a proxy is
+# explicitly requested (CLI --proxy-risk or this flag), and the proxy is always
+# clearly labeled as a hard-stop proxy - never presented as true Minervini R.
+EXPECTANCY_ENABLE_PROXY_RISK = False
