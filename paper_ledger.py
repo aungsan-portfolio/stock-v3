@@ -217,6 +217,14 @@ def exit_dedupe_key(*, symbol, side, qty, price, ts, order_ref) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
+def _exec_id_value(exec_id) -> Optional[str]:
+    """Normalize broker execution id: None/blank both mean unavailable."""
+    if exec_id is None:
+        return None
+    s = str(exec_id).strip()
+    return s or None
+
+
 def record_exit(symbol, *, exit_kind, exit_avg_price=None, qty=None, result=None,
                 side="SELL", session=None, order_ref=None, exec_id=None, ts=None,
                 decision=None) -> None:
@@ -234,10 +242,12 @@ def record_exit(symbol, *, exit_kind, exit_avg_price=None, qty=None, result=None
             qty = getattr(result, "filled", None)
         if exit_avg_price is None:
             exit_avg_price = getattr(result, "avg_fill_price", None)
-    ts_final = str(ts) if ts else _now()
-    dedupe_id = (str(exec_id) if exec_id is not None
+    event_ts = str(ts) if ts else _now()
+    dedupe_ts = str(ts) if ts else ""
+    exec_id_clean = _exec_id_value(exec_id)
+    dedupe_id = (exec_id_clean if exec_id_clean is not None
                  else exit_dedupe_key(symbol=symbol, side=side, qty=qty,
-                                      price=exit_avg_price, ts=ts_final,
+                                      price=exit_avg_price, ts=dedupe_ts,
                                       order_ref=order_ref))
     _append({
         "event": EVENT_EXIT,
@@ -248,10 +258,10 @@ def record_exit(symbol, *, exit_kind, exit_avg_price=None, qty=None, result=None
         "exit_avg_price": _num(exit_avg_price),
         "exit_kind": exit_kind,
         "order_ref": order_ref,
-        "exec_id": (str(exec_id) if exec_id is not None else None),
+        "exec_id": exec_id_clean,
         "dedupe_id": dedupe_id,
         "decision": decision,
-    }, ts=ts_final)
+    }, ts=event_ts)
 
 
 # ── Pure classification (testable; used by the broker-executions sweep) ───────

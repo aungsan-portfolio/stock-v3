@@ -121,6 +121,19 @@ class TestWriter(unittest.TestCase):
                                ts="2026-06-05T15:01:00",
                                order_ref="2026-06-05:MSFT:SELL_STOP"))
 
+    def test_record_exit_blank_exec_id_uses_stable_fallback(self):
+        pl.record_exit("AAPL", exit_kind=pl.EXIT_PROTECTIVE_STOP, qty=2,
+                       exit_avg_price=94.0, order_ref="2026-06-05:AAPL:SELL_STOP",
+                       exec_id="", ts=None)
+        evs = self._events()
+        self.assertEqual(len(evs), 1)
+        self.assertIsNone(evs[0]["exec_id"])
+        self.assertEqual(
+            evs[0]["dedupe_id"],
+            pl.exit_dedupe_key(symbol="AAPL", side="SELL", qty=2, price=94.0,
+                               ts="", order_ref="2026-06-05:AAPL:SELL_STOP"))
+        self.assertIn(evs[0]["dedupe_id"], pl.recorded_exit_keys(self.journal))
+
     def test_writer_never_raises_on_junk(self):
         # Bad objects must never propagate an exception into the order path.
         pl.record_entry(None, None)

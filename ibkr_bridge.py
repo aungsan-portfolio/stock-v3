@@ -1281,7 +1281,7 @@ class IBKRBridge:
                 symbol = str(getattr(contract, "symbol", "") or "").upper()
                 if not symbol or remaining_open.get(symbol, 0.0) <= 1e-9:
                     continue  # unmatched SELL (no tracked open long) -> ignore
-                exec_id = getattr(exe, "execId", None)
+                exec_id = paper_ledger._exec_id_value(getattr(exe, "execId", None))
                 order_ref = getattr(exe, "orderRef", None)
                 try:
                     qty = float(getattr(exe, "shares", None))
@@ -1292,7 +1292,7 @@ class IBKRBridge:
                 exit_price = avg if isinstance(avg, (int, float)) and avg else price
                 ts = getattr(exe, "time", None)
                 ts_str = str(ts) if ts else ""
-                key = (str(exec_id) if exec_id else
+                key = (exec_id if exec_id is not None else
                        paper_ledger.exit_dedupe_key(
                            symbol=symbol, side="SELL", qty=qty, price=exit_price,
                            ts=ts_str, order_ref=order_ref))
