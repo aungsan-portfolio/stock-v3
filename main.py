@@ -77,6 +77,7 @@ import hot_scanner
 from hot_scanner import scan_hot_stocks
 import model_doctor
 import expectancy
+import forward_test  # read-only forward paper-test report (no order path, no IBKR)
 import coach_i18n  # M5A: DISPLAY-ONLY language layer (no order path, no decisions)
 from trade_coach import (
     build_trade_lesson, build_trade_preview, print_trade_lesson, print_trade_preview,
@@ -228,6 +229,35 @@ def _connect_bridge():
     return bridge, 0
 
 
+def _run_paper_startup_checks(bridge) -> dict:
+    """Shared PAPER startup checks before connected paper commands use orders.
+
+    The reconciliation path is broker-truth, may repair unprotected longs through
+    the existing protective-stop repair, and runs the read-only forward-test exit
+    sweep inside reconcile_startup_state(). It never opens a position.
+    """
+    bridge.snapshot_start_of_day_equity()
+    return bridge.reconcile_startup_state()
+
+
+def _print_startup_reconciliation(recon: dict) -> None:
+    snap = recon["snapshot"]
+    protect = recon["protect"]
+    print(f"Startup reconciliation (broker = source of truth): "
+          f"{len(snap['open_positions'])} long(s), "
+          f"{snap['n_working_orders']} working order(s); clean={snap['clean']}")
+    if protect.get("repaired"):
+        print(f"Repaired protective GTC stop(s) for: {protect['repaired']}")
+    if protect.get("failed"):
+        print(f"Startup protection FAILED for {protect['failed']} "
+              f"- NEW entries halted; closes/flatten still allowed.")
+    if snap["duplicate_refs"]:
+        print(f"Duplicate orderRef(s) at broker: {snap['duplicate_refs']}")
+    if snap["orphan_exits"]:
+        orphan_syms = sorted({o.get("symbol", "") for o in snap["orphan_exits"]})
+        print(f"Orphan exit order(s) with no covering long: {orphan_syms}")
+
+
 def _place_paper_orders(signals) -> int:
     """Place signals on the IBKR PAPER account via the existing IBKRBridge.
 
@@ -266,28 +296,8 @@ def _place_paper_orders(signals) -> int:
         return 1
 
     try:
-        # Phase 3: snapshot start-of-day equity (daily-loss kill-switch baseline).
-        bridge.snapshot_start_of_day_equity()
-        # Phase 5A (H18): startup reconciliation -- BROKER is the source of truth.
-        # Rebuild state from broker positions + working orders, audit the
-        # broker-truth snapshot, and repair any unprotected long via the existing
-        # Phase-3 path (GTC stop) or halt NEW entries. Never opens a position.
-        recon = bridge.reconcile_startup_state()
-        snap = recon["snapshot"]
-        protect = recon["protect"]
-        print(f"ðŸ”Ž Startup reconciliation (broker = source of truth): "
-              f"{len(snap['open_positions'])} long(s), "
-              f"{snap['n_working_orders']} working order(s); clean={snap['clean']}")
-        if protect.get("repaired"):
-            print(f"ðŸ›¡ï¸  Repaired protective GTC stop(s) for: {protect['repaired']}")
-        if protect.get("failed"):
-            print(f"âš ï¸  Startup protection FAILED for {protect['failed']} "
-                  f"â€” NEW entries halted; closes/flatten still allowed.")
-        if snap["duplicate_refs"]:
-            print(f"âš ï¸  Duplicate orderRef(s) at broker: {snap['duplicate_refs']}")
-        if snap["orphan_exits"]:
-            orphan_syms = sorted({o.get("symbol", "") for o in snap["orphan_exits"]})
-            print(f"âš ï¸  Orphan exit order(s) with no covering long: {orphan_syms}")
+        recon = _run_paper_startup_checks(bridge)
+        _print_startup_reconciliation(recon)
 
         result = bridge.execute_all(signals)
         print(f"\nâœ… Orders accepted : {result['placed']}")
@@ -753,6 +763,7 @@ def cmd_paper_coach(args) -> int:
                 print(f"  - {r}")
             return 0
 
+        _print_startup_reconciliation(_run_paper_startup_checks(bridge))
         print(
             f"\nPlacing at most 1 PAPER order for {sym} through the existing "
             "IBKRBridge (all risk controls apply)..."
@@ -965,6 +976,7 @@ def _daily_coach_execute(candidates, n_candidates: int) -> int:
         return code
 
     try:
+        _print_startup_reconciliation(_run_paper_startup_checks(bridge))
         cash = bridge.get_cash()
         positions = {
             p.contract.symbol.upper(): float(p.position)
@@ -1483,6 +1495,67 @@ def cmd_expectancy_report(args) -> int:
     return 0
 
 
+def cmd_forward_test_report(args) -> int:
+    """Read-only forward PAPER-TEST report from the paper-fill journal.
+
+    Reads reports/paper_trades.jsonl (the append-only journal of REAL paper fills
+    written during `python main.py paper`). Does NOT connect to IBKR, train
+    models, or place orders. Writes reports/forward_test_metrics.json +
+    reports/forward_test_report.md.
+
+    PnL is in US dollars; R-multiple uses BROKER PROTECTIVE-STOP risk (entry vs.
+    the real resting stop), never a Minervini setup R. Win rate / expectancy_R /
+    profit factor share expectancy.compute_metrics with the backtest report.
+    """
+    journal_path = getattr(config, "FORWARD_TEST_JOURNAL",
+                           config.REPORTS_DIR / "paper_trades.jsonl")
+    json_path = getattr(config, "FORWARD_TEST_REPORT_JSON",
+                        config.REPORTS_DIR / "forward_test_metrics.json")
+    md_path = getattr(config, "FORWARD_TEST_REPORT_MD",
+                      config.REPORTS_DIR / "forward_test_report.md")
+    session = getattr(args, "session", None)
+    since = getattr(args, "since", None)
+
+    if not journal_path.exists():
+        print(f"No paper-fill journal found at {journal_path} (continuing with an empty report).")
+        print("Run `python main.py paper` to generate reports/paper_trades.jsonl.")
+
+    report = forward_test.generate_report(journal_path, session=session, since=since)
+    jp, mp = forward_test.write_report(report, json_path=json_path, md_path=md_path)
+
+    m = report["metrics"]
+    r = m["r"]
+    dd = report["drawdown"]
+    wr = m["win_rate"]
+    wr_str = f"{wr * 100:.1f}%" if wr is not None else "n/a"
+    ddp = dd["max_drawdown_pct"]
+    ddp_str = "n/a" if ddp is None else f"{ddp * 100:.1f}%"
+
+    print("\n── Forward Paper-Test Report ──")
+    print(f"Source:            {report['source_file']}")
+    print(f"Events read:       {report['n_events_read']}")
+    print(f"Session / Since:   {report['session_filter'] or 'all'} / {report['since_filter'] or 'all'}")
+    print(f"Closed / Excluded: {m['n_trades_included']} / {m['n_trades_excluded']}")
+    print(f"Total realized $:  {m['total_realized_pnl']}")
+    print(f"Win / Loss / Scr:  {m['wins']} / {m['losses']} / {m['scratch']}")
+    print(f"Win rate:          {wr_str}")
+    print(f"Profit factor:     {m['profit_factor_display']}")
+    if r["expectancy_R"] is None:
+        print("Expectancy (R):    n/a (no trade had a valid broker protective-stop risk)")
+    else:
+        print(f"Expectancy (R):    {r['expectancy_R']:.4f}R "
+              f"(n={r['n_r_included']}, broker protective-stop risk)")
+    print(f"Max drawdown:      {dd['max_drawdown_usd']} ({ddp_str})")
+    print(f"Sharpe (daily):    {report['sharpe']}")
+    breaches = [d["date"] for d in report["daily"] if d["daily_loss_breach"]]
+    if breaches:
+        print(f"Daily-loss breaches: {', '.join(breaches)}")
+    print(f"\nReports written:   {jp}")
+    print(f"                   {mp}")
+    print("(read-only — no IBKR, no orders)")
+    return 0
+
+
 # -- Live-trading readiness self-check (read-only) ----------------------------
 def _load_bridge_module():
     """Import ibkr_bridge after preparing the asyncio loop, or return None.
@@ -1839,6 +1912,22 @@ def main() -> int:
     )
     _add_language_flag(er)  # display-only; JSON/metrics/paths unchanged
 
+    # -- Forward paper-test report (read-only; reads reports/paper_trades.jsonl) --
+    ftr = sub.add_parser(
+        "forward-test-report",
+        help="Read-only forward paper-test report from reports/paper_trades.jsonl "
+             "(no IBKR, no orders)",
+    )
+    ftr.add_argument(
+        "--session", default=None,
+        help="Only include journal events stamped with this session label",
+    )
+    ftr.add_argument(
+        "--since", default=None,
+        help="Only include trades whose exit (or entry, for open positions) is "
+             "on/after this date (YYYY-MM-DD)",
+    )
+
     pp = sub.add_parser("paper", help="Execute signals on IBKR paper")
     pp.add_argument("--dry-run", action="store_true", help="Preview signals without placing orders")
 
@@ -2019,6 +2108,8 @@ def main() -> int:
         return cmd_backtest_summary(args)
     if args.command == "expectancy-report":
         return cmd_expectancy_report(args)
+    if args.command == "forward-test-report":
+        return cmd_forward_test_report(args)
     if args.command == "paper":
         return cmd_paper(args)
     if args.command == "scan-hot":
@@ -2058,4 +2149,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
