@@ -26,6 +26,7 @@ import data_integrity
 import live_invariants
 import order_audit
 import order_exec
+import paper_ledger
 import reconciliation
 import reconnect_watchdog
 import risk_engine
@@ -953,7 +954,8 @@ class IBKRBridge:
         return cancelled
 
     def _place_protection(self, symbol: str, filled: float, entry_basis: float,
-                          exit_action: str = "SELL") -> bool:
+                          exit_action: str = "SELL", *,
+                          journal_stop: bool = False) -> bool:
         """Place SERVER-SIDE GTC protective exits for a long, sized to the ACTUAL
         filled qty and sharing ONE OCA group (C2 + H19):
 
@@ -1021,6 +1023,16 @@ class IBKRBridge:
             oca_group=oca, tif=tif, hard_stop=hard_px, gtc_ok=gtc_ok,
             n_oversized=len(oversized), ok=ok,
         )
+        if ok and journal_stop:
+            # Forward paper-test journal (append-only, never-raise): record the
+            # PRIMARY protective stop as the R denominator, plus the catastrophe
+            # hard stop for reference. This is broker protective-stop risk, not a
+            # Minervini setup R.
+            paper_ledger.record_stop(
+                symbol, target_qty, self._initial_stop_price("BUY", basis),
+                hard_stop=hard_px, entry_basis=basis,
+                order_ref=order_exec.deterministic_order_ref(self._today(), symbol, "BUY"),
+            )
         return ok
 
     def _verify_or_protect(self, symbol: str, parent_order, result: order_exec.OrderResult,
@@ -1050,7 +1062,8 @@ class IBKRBridge:
         self._cancel_oversized_exit_children(symbol, exit_action, filled)
 
         # 3) Place server-side GTC/OCA protection sized to the actual filled qty.
-        placed_ok = self._place_protection(symbol, filled, entry_basis, exit_action)
+        placed_ok = self._place_protection(
+            symbol, filled, entry_basis, exit_action, journal_stop=True)
 
         # 4) Safety gate: a covering GTC stop exists AND no exit child oversells.
         working = self._working_orders_plain()
@@ -1193,6 +1206,12 @@ class IBKRBridge:
                         message="startup: resting SELL order(s) with no covering long",
                         symbols=orphan_syms)
 
+        # Forward paper-test journal: READ-ONLY sweep of broker SELL executions to
+        # capture exits (esp. server-side stop-outs that fill between one-shot
+        # runs). Places NO order, never raises, deduped by execId. Runs last so it
+        # can never affect reconciliation/repair above.
+        self._sweep_paper_exits()
+
         return {
             "snapshot": snapshot,
             "protect": protect,
@@ -1202,6 +1221,91 @@ class IBKRBridge:
 
     # Back-compat alias: the plan refers to this capability as startup_reconcile().
     startup_reconcile = reconcile_startup_state
+
+    def _recent_fills(self) -> list:
+        """READ-ONLY recent executions/fills from the broker (places no order).
+
+        Prefers a fresh ``reqExecutions()`` pull (today's executions, incl. any
+        server-side stop-out that filled while we were offline); falls back to the
+        cached ``fills()``. Never raises.
+        """
+        ib = getattr(self, "ib", None)
+        if ib is None:
+            return []
+        try:
+            fills = ib.reqExecutions()
+            if fills:
+                return list(fills)
+        except Exception:
+            pass
+        try:
+            return list(ib.fills())
+        except Exception:
+            return []
+
+    def _sweep_paper_exits(self) -> None:
+        """READ-ONLY: journal SELL executions (broker truth) for the forward
+        paper-test ledger. Places NO order; never raises.
+
+        Only an execution that can close an ALREADY-JOURNALED open long is
+        recorded; a SELL for an untracked symbol (or beyond the tracked open qty)
+        is ignored, never a phantom round-trip. Deduped by execId/dedupe_id so
+        repeated startups never double-count.
+        """
+        try:
+            fills = self._recent_fills()
+            if not fills:
+                return
+            seen = paper_ledger.recorded_exit_keys()
+            remaining_open = dict(paper_ledger.open_long_qty())
+        except Exception:
+            return
+
+        def _fill_time(f):
+            exe = getattr(f, "execution", None)
+            return str(getattr(exe, "time", "") or "")
+
+        try:
+            fills = sorted(fills, key=_fill_time)  # oldest-first: close oldest lot
+        except Exception:
+            pass
+
+        for fill in fills:
+            try:
+                exe = getattr(fill, "execution", None)
+                contract = getattr(fill, "contract", None)
+                if exe is None or contract is None:
+                    continue
+                if str(getattr(exe, "side", "") or "").upper() not in ("SLD", "SELL"):
+                    continue  # long-only book: only SELLs are exits
+                symbol = str(getattr(contract, "symbol", "") or "").upper()
+                if not symbol or remaining_open.get(symbol, 0.0) <= 1e-9:
+                    continue  # unmatched SELL (no tracked open long) -> ignore
+                exec_id = paper_ledger._exec_id_value(getattr(exe, "execId", None))
+                order_ref = getattr(exe, "orderRef", None)
+                try:
+                    qty = float(getattr(exe, "shares", None))
+                except (TypeError, ValueError):
+                    qty = 0.0
+                avg = getattr(exe, "avgPrice", None)
+                price = getattr(exe, "price", None)
+                exit_price = avg if isinstance(avg, (int, float)) and avg else price
+                ts = getattr(exe, "time", None)
+                ts_str = str(ts) if ts else ""
+                key = (exec_id if exec_id is not None else
+                       paper_ledger.exit_dedupe_key(
+                           symbol=symbol, side="SELL", qty=qty, price=exit_price,
+                           ts=ts_str, order_ref=order_ref))
+                if key in seen:
+                    continue
+                seen.add(key)
+                paper_ledger.record_exit(
+                    symbol, exit_kind=paper_ledger.classify_exit_kind(order_ref),
+                    exit_avg_price=exit_price, qty=qty, side="SELL",
+                    order_ref=order_ref, exec_id=exec_id, ts=(ts_str or None))
+                remaining_open[symbol] = max(0.0, remaining_open[symbol] - (qty or 0.0))
+            except Exception:
+                continue
 
     def _finalize_open(self, symbol: str, action: str, parent_trade, result: order_exec.OrderResult,
                        intended_qty: int) -> order_exec.OrderResult:
@@ -1436,6 +1540,12 @@ class IBKRBridge:
                 return False
             result = self._place_open_bracket(symbol, "BUY", qty, price, signal.confidence)
             self._record_if_filled(symbol, "BUY", result)
+            # Forward paper-test journal (append-only, never-raise; same safety
+            # class as order_audit). Captures the entry + the Signal model reason.
+            paper_ledger.record_entry(
+                signal, result,
+                order_ref=order_exec.deterministic_order_ref(self._today(), symbol, "BUY"),
+            )
             return result.occupies_slot
 
         # action == "SELL"

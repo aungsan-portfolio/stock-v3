@@ -511,3 +511,19 @@ EXPECTANCY_REPORT_MD         = REPORTS_DIR / "expectancy_report.md"     # human-
 # explicitly requested (CLI --proxy-risk or this flag), and the proxy is always
 # clearly labeled as a hard-stop proxy - never presented as true Minervini R.
 EXPECTANCY_ENABLE_PROXY_RISK = False
+
+# ── Forward paper-test tracking (READ-ONLY report; PAPER-ONLY capture) ───────
+# Output paths for the read-only `forward-test-report` CLI command and the
+# append-only journal of REAL paper fills (reports/paper_trades.jsonl). Like the
+# expectancy block above, these are report/journal artifacts only: NO trading
+# behavior, NO order path change, NO broker connection from the report command,
+# NO live switch. The journal is written from inside the already-paper-locked
+# `paper` run via append-only, never-raise hooks (same safety class as
+# order_audit). Safe to change freely.
+FORWARD_TEST_JOURNAL     = REPORTS_DIR / "paper_trades.jsonl"        # append-only fill journal
+FORWARD_TEST_REPORT_JSON = REPORTS_DIR / "forward_test_metrics.json"  # machine-readable output
+FORWARD_TEST_REPORT_MD   = REPORTS_DIR / "forward_test_report.md"     # human-readable output
+# Optional label stamped on each journal event to delimit a forward-test window
+# (e.g. "2026-Q2-paper"). None -> unlabeled; the report aggregates all events and
+# supports an optional --session / --since filter. Never affects trading.
+FORWARD_TEST_SESSION     = None

@@ -34,6 +34,7 @@ except RuntimeError:
 import config              # noqa: E402
 import order_audit         # noqa: E402
 import order_exec as ox    # noqa: E402
+import paper_ledger        # noqa: E402
 import risk_state          # noqa: E402
 import ibkr_bridge         # noqa: E402
 from ib_insync import LimitOrder, MarketOrder, Order  # noqa: E402  (real order objects)
@@ -82,6 +83,24 @@ class FakePosition:
         self.avgCost = avgCost
 
 
+class FakeExecution:
+    def __init__(self, side="SLD", shares=0.0, avgPrice=0.0, price=0.0,
+                 execId=None, orderRef=None, time=None):
+        self.side = side
+        self.shares = shares
+        self.avgPrice = avgPrice
+        self.price = price
+        self.execId = execId
+        self.orderRef = orderRef
+        self.time = time
+
+
+class FakeFill:
+    def __init__(self, symbol, execution):
+        self.contract = FakeContract(symbol)
+        self.execution = execution
+
+
 class _Client:
     def __init__(self):
         self._n = 9000
@@ -109,6 +128,7 @@ class FakeIB:
         self.reject_stops = reject_stops
         self.account_values = []  # (tag, currency, value) for get_net_liquidation
         self.positions_list = []  # FakePosition list for startup-scan tests
+        self.fills_list = []      # FakeFill list for read-only execution sweeps
         self.client = _Client()
 
     # -- waiting --
@@ -155,6 +175,12 @@ class FakeIB:
 
     def positions(self):
         return list(self.positions_list)
+
+    def reqExecutions(self):
+        return list(self.fills_list)
+
+    def fills(self):
+        return list(self.fills_list)
 
     def accountValues(self):
         return [types.SimpleNamespace(tag=tag, currency=cur, value=str(val))
@@ -387,6 +413,62 @@ class TestRobustClose(_BridgeBase):
         self.assertGreaterEqual(len(orders), 2, "should retry after the limit did not fill")
         self.assertEqual(str(getattr(orders[-1], "orderType", "")), "MKT",
                          "final escalation must be a market order")
+
+
+# ── 4b. Forward paper-test execution sweep (read-only, deduped) ──────────────
+class TestPaperExitSweep(_BridgeBase):
+    def setUp(self):
+        super().setUp()
+        self._journal_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._journal_tmp.cleanup)
+        mock.patch.object(config, "FORWARD_TEST_JOURNAL",
+                          Path(self._journal_tmp.name) / "paper_trades.jsonl").start()
+
+    def _seed_open_entry(self, qty=10.0):
+        paper_ledger.record_entry(
+            types.SimpleNamespace(symbol="AAPL", action="BUY", confidence=0.7),
+            ox.OrderResult(outcome=ox.FILLED, filled=qty, remaining=0.0,
+                           avg_fill_price=100.0),
+            order_ref="2026-06-20:AAPL:BUY")
+
+    def _events(self):
+        return paper_ledger.load_journal(config.FORWARD_TEST_JOURNAL)
+
+    def test_sweep_blank_exec_id_no_time_is_stably_deduped(self):
+        self._seed_open_entry(qty=10.0)
+        br = make_bridge()
+        br.ib.fills_list = [
+            FakeFill("AAPL", FakeExecution(
+                side="SLD", shares=4.0, avgPrice=95.0, execId="", time=None,
+                orderRef="2026-06-20:AAPL:SELL_STOP")),
+        ]
+
+        br._sweep_paper_exits()
+        br._sweep_paper_exits()
+
+        exits = [e for e in self._events() if e.get("event") == paper_ledger.EVENT_EXIT]
+        self.assertEqual(len(exits), 1)
+        self.assertIsNone(exits[0]["exec_id"])
+        self.assertEqual(
+            exits[0]["dedupe_id"],
+            paper_ledger.exit_dedupe_key(
+                symbol="AAPL", side="SELL", qty=4.0, price=95.0, ts="",
+                order_ref="2026-06-20:AAPL:SELL_STOP"))
+        # Partial exit leaves remaining open qty, so a bad dedupe would duplicate.
+        self.assertEqual(paper_ledger.open_long_qty(config.FORWARD_TEST_JOURNAL),
+                         {"AAPL": 6.0})
+
+    def test_sweep_ignores_unmatched_sell(self):
+        br = make_bridge()
+        br.ib.fills_list = [
+            FakeFill("AAPL", FakeExecution(
+                side="SLD", shares=4.0, avgPrice=95.0, execId="E1",
+                orderRef="2026-06-20:AAPL:SELL_STOP")),
+        ]
+
+        br._sweep_paper_exits()
+
+        self.assertEqual(self._events(), [])
 
 
 # ── 5. execute_signal records a trade ONLY on a real fill (H4) ───────────────
