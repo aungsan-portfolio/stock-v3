@@ -269,8 +269,9 @@ class TestEnsembleModelAvailability(unittest.TestCase):
 
     def test_one_present_is_enough_with_default_threshold(self):
         self.assertEqual(config.MIN_ML_MODELS_FOR_SIGNAL, 1)
+        # A single AVAILABLE, positively-weighted model is enough. RF qualifies;
+        # a zero-weighted LSTM does not — see the Item-6b voter tests below.
         self.assertTrue(self.enough(True, False))
-        self.assertTrue(self.enough(False, True))
 
     def test_safe_score_marks_missing_model_as_not_ok(self):
         def raises():
@@ -288,6 +289,79 @@ class TestEnsembleModelAvailability(unittest.TestCase):
         # With both ML missing the result must equal the technical score.
         result = self.blend(0.95, False, 0.95, False, 0.20)
         self.assertAlmostEqual(result, 0.20, places=6)
+
+    # --- Item 6b: WEIGHT_LSTM = 0 (LSTM val AUC sub-chance) ---
+    def _expected_rf_tech(self, rf, tech):
+        # weighted_blend renormalizes over the present weights; with LSTM at 0
+        # only RF + technical survive, so the blend is their ratio-weighted mean.
+        wr, wt = config.WEIGHT_RF, config.WEIGHT_TECHNICAL
+        return (rf * wr + tech * wt) / (wr + wt)
+
+    def test_lstm_weight_is_zero(self):
+        # Pins the Item 6b decision: LSTM contributes no weight to the ensemble.
+        self.assertEqual(config.WEIGHT_LSTM, 0.0)
+
+    def test_blend_drops_lstm_even_when_present(self):
+        # Even with lstm_ok=True, a zero LSTM weight must remove it from the math:
+        # the blend is identical regardless of the LSTM score, and equals the
+        # RF+technical renormalized mean. (RF and technical paths stay intact.)
+        expected = self._expected_rf_tech(0.80, 0.40)
+        low_lstm = self.blend(0.80, True, 0.00, True, 0.40)
+        high_lstm = self.blend(0.80, True, 1.00, True, 0.40)
+        self.assertAlmostEqual(low_lstm, high_lstm, places=6)
+        self.assertAlmostEqual(low_lstm, expected, places=6)
+
+    def test_blend_rf_and_technical_renormalize(self):
+        # RF present, LSTM absent: confidence is the RF:technical renormalized
+        # mean (weights need not sum to 1.0). Explicit numeric guard.
+        result = self.blend(0.80, True, 0.99, False, 0.40)
+        self.assertAlmostEqual(result, (0.80 * 0.40 + 0.40 * 0.25) / 0.65, places=6)
+
+    # Item-6b safety tighten: a zero-weighted model is NOT an availability voter.
+    def test_lstm_only_not_enough_when_lstm_weight_zero(self):
+        # LSTM-only (RF missing) with WEIGHT_LSTM=0 must FAIL MIN_ML_MODELS_FOR_SIGNAL
+        # — a zero-weight model adds nothing to the blend, so letting it satisfy the
+        # voter would amount to trading on the technical score alone.
+        self.assertEqual(config.WEIGHT_LSTM, 0.0)
+        self.assertEqual(config.MIN_ML_MODELS_FOR_SIGNAL, 1)
+        self.assertEqual(self.count(False, True), 0)
+        self.assertFalse(self.enough(False, True))
+
+    def test_rf_only_is_enough_via_positive_weight(self):
+        # RF carries a positive weight, so an RF-only symbol still trades.
+        self.assertGreater(config.WEIGHT_RF, 0)
+        self.assertEqual(self.count(True, False), 1)
+        self.assertTrue(self.enough(True, False))
+
+    def test_both_missing_still_not_enough(self):
+        self.assertEqual(self.count(False, False), 0)
+        self.assertFalse(self.enough(False, False))
+
+    def test_rf_and_lstm_enough_through_rf_weight(self):
+        # Both available: RF's nonzero weight satisfies the voter on its own; the
+        # zero-weighted LSTM is not counted, so the count is 1 (RF only).
+        self.assertEqual(self.count(True, True), 1)
+        self.assertTrue(self.enough(True, True))
+
+    def test_predict_all_forces_hold_when_only_zero_weight_lstm_available(self):
+        # Integration: RF missing, LSTM available but zero-weighted → not enough ML
+        # models → forced HOLD (never reaches the blend / gate). Guards the tighten
+        # end-to-end through predict_all.
+        from predictor import Predictor
+        with mock.patch("predictor.fetch_ohlcv", return_value=make_ohlcv()):
+            p = Predictor()
+            mock.patch.object(
+                p.rf, "predict",
+                side_effect=ModelNotAvailableError("no rf"),
+            ).start()
+            mock.patch.object(p.lstm, "predict", return_value=0.9).start()
+            signals = p.predict_all(symbols=["TEST"])
+
+        self.assertEqual(len(signals), 1)
+        sig = signals[0]
+        self.assertEqual(sig.action, "HOLD")
+        self.assertEqual(sig.confidence, 0.5)
+        self.assertIn("forced HOLD", sig.reason)
 
     # --- 4. integration: both ML models missing → forced HOLD ---
     def test_predict_all_forces_hold_when_both_models_missing(self):

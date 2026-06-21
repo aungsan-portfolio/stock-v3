@@ -165,8 +165,18 @@ SELL_THRESHOLD      = 0.40
 MIN_HOLD_BARS       = ML_HORIZON
 
 # ── Ensemble Weights ─────────────────────────────
+# weighted_blend (predictor.py) renormalizes over whichever weights are present,
+# so these need NOT sum to 1.0 — only the RF:technical ratio matters now that LSTM
+# is zeroed. Renormalization keeps RF and the technical path behaving exactly as
+# before (their relative influence is unchanged).
 WEIGHT_RF           = 0.40
-WEIGHT_LSTM         = 0.35
+# LSTM disabled — Item 6b (edge-recovery roadmap), 2026-06-21. Per-symbol LSTM
+# validation AUC is sub-chance: 5/8 watchlist symbols score < 0.50 (e.g. NVDA 0.396,
+# QQQ 0.391, VTI 0.425), so blending the LSTM in only injected noise. A weight of 0.0
+# removes it from the score math entirely. NOTE: the LSTM may still load, but
+# predictor.ml_model_count only counts available models with positive weights, so a
+# zero-weight LSTM no longer satisfies MIN_ML_MODELS_FOR_SIGNAL by itself.
+WEIGHT_LSTM         = 0.0
 WEIGHT_TECHNICAL    = 0.25
 
 # Trading safety: do not allow technical-only BUY/SELL signals.

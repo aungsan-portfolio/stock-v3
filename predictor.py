@@ -100,7 +100,18 @@ def _safe_score(fn, *args, **kwargs) -> Tuple[float, bool]:
 
 
 def ml_model_count(rf_ok: bool, lstm_ok: bool) -> int:
-    return int(bool(rf_ok)) + int(bool(lstm_ok))
+    """Count ML models that can actually influence the ensemble confidence.
+
+    A sub-model is an availability voter only when it is BOTH available AND carries
+    a positive ensemble weight. A zero-weighted model contributes nothing to the
+    blend (Item 6b zeroes WEIGHT_LSTM because LSTM validation AUC is sub-chance), so
+    counting it would let an otherwise model-less symbol clear
+    MIN_ML_MODELS_FOR_SIGNAL and trade on the technical score alone — technical-only
+    trading by the back door, which this gate exists to prevent.
+    """
+    rf_counts = bool(rf_ok) and config.WEIGHT_RF > 0
+    lstm_counts = bool(lstm_ok) and config.WEIGHT_LSTM > 0
+    return int(rf_counts) + int(lstm_counts)
 
 
 def enough_ml_models(rf_ok: bool, lstm_ok: bool) -> bool:
