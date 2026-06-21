@@ -96,6 +96,14 @@ def save_rf_metrics(results: dict, trained_at: str | None = None) -> None:
                 "accuracy": _to_float(m.get("test_acc")),
                 "f1": _to_float(m.get("test_f1")),
                 "oob": _to_float(m.get("oob_score")),
+                # Edge-detection metrics (None when undefined; additive — older
+                # readers ignore them, the gate only consults them when its floor
+                # is enabled). See eval_metrics.py / ai_engine.StockRFEngine.train.
+                "auc": _opt_float(m.get("auc")),
+                "pr_auc": _opt_float(m.get("pr_auc")),
+                "brier": _opt_float(m.get("brier")),
+                "precision_at_buy": _opt_float(m.get("precision_at_buy")),
+                "holdout_auc": _opt_float(m.get("holdout_auc")),
                 "n_samples": int(m.get("n_samples", 0) or 0),
                 "trained_at": trained_at,
             }
@@ -119,6 +127,7 @@ def save_lstm_metrics(results: dict, trained_at: str | None = None) -> None:
             m = m or {}
             lstm[str(sym).upper()] = {
                 "best_val_loss": _to_float(m.get("best_val_loss")),
+                "best_val_auc": _opt_float(m.get("best_val_auc")),
                 "n_train_seq": int(m.get("n_train_seq", 0) or 0),
                 "trained_at": trained_at,
             }
@@ -191,6 +200,17 @@ def evaluate_gate(symbol: str, now: "_dt.date | None" = None) -> GateResult:
                     False, f"{sym} RF F1 {f1} < floor {f1_floor:.3f}", "below_threshold"
                 )
 
+        # Optional ROC-AUC floor (default 0.0 = disabled). AUC matches how the bot
+        # acts (it trades the confident tail), so this is the right knob to demand
+        # real ranking skill once models clear it. Fail-closed: missing => block.
+        auc_floor = float(getattr(config, "MODEL_MIN_RF_AUC", 0.0))
+        if auc_floor > 0:
+            auc = rf.get("auc")
+            if auc is None or (isinstance(auc, float) and math.isnan(auc)) or float(auc) < auc_floor:
+                return GateResult(
+                    False, f"{sym} RF AUC {auc} < floor {auc_floor:.3f}", "below_threshold"
+                )
+
     return GateResult(True, "ok", "ok")
 
 
@@ -199,6 +219,17 @@ def _to_float(value):
         return float(value)
     except (TypeError, ValueError):
         return float("nan")
+
+
+def _opt_float(value):
+    """Like _to_float but preserves None as None (so 'metric not computed' stays
+    distinct from a real value and from NaN in the persisted JSON)."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_date(value) -> "_dt.date | None":

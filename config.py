@@ -164,6 +164,25 @@ MODEL_MIN_RF_F1       = 0.0
 # Maximum model age (days since training) before a symbol is forced to HOLD.
 # Regime shifts make stale models dangerous; retrain to refresh the timestamp.
 MODEL_MAX_AGE_DAYS    = 30
+# Optional ROC-AUC floor. 0.0 = disabled (default; preserves current behavior).
+# AUC matches how the bot trades (it ranks/acts on the confident tail) far better
+# than 0.5-threshold accuracy. Raise (e.g. 0.55) to demand real ranking skill.
+# Computed at train time from pooled out-of-sample fold predictions (eval_metrics).
+MODEL_MIN_RF_AUC      = 0.0
+# Tail fraction held out at train time to produce an HONEST pre-refit walk-forward
+# estimate of the production model RECIPE (reported as holdout_auc). The shipped
+# final model is still refit on ALL rows afterwards — this number grades the
+# recipe on unseen forward bars, not the literal served object.
+MODEL_HOLDOUT_RATIO   = 0.15
+
+# ── Permutation / shuffled-label null test (read-only research) ───
+# Decisive check of whether a symbol's real CV-AUC beats its own shuffled-label
+# null distribution, with multiple-testing controlled via Benjamini-Hochberg.
+# Pure offline analysis; never connects to IBKR and never trades. Defaults stay
+# SMALL so a run is minutes, not hours.
+PERMUTATION_N_SHUFFLES     = 50    # null draws per symbol
+PERMUTATION_SAMPLE_SYMBOLS = 20    # symbols tested by default (0 = all; CLI --all overrides)
+PERMUTATION_FDR_Q          = 0.05  # Benjamini-Hochberg false-discovery rate
 
 # ── Risk Management ──────────────────────────────
 # Small-basket mode: allow a few tiny positions instead of one large holding.
@@ -180,6 +199,24 @@ TAKE_PROFIT_PCT     = 0.015   # fallback fixed-bracket TP when trailing is disab
 # Minimum forward return required for a BUY label. Set above broker fee + slippage
 # round trip so the model learns to cover costs, not microscopic moves.
 MIN_PROFIT_MARGIN   = 0.003
+
+# ── Labeling mode (target the model is trained on) ───
+# "binary"        : current fixed-horizon endpoint label — 1.0 if
+#                   Close[t+ML_HORIZON]/Close[t]-1 > MIN_PROFIT_MARGIN, else 0.0,
+#                   NaN where the future is unknown. Path-blind. DEFAULT (unchanged).
+# "triple_barrier": path-aware label — 1.0 if the +LABEL_TP_PCT barrier is touched
+#                   BEFORE the -LABEL_STOP_PCT barrier within ML_HORIZON bars (using
+#                   intrabar High/Low), else 0.0; NaN if the future window is
+#                   incomplete. Same-bar ties resolve pessimistically to the stop.
+# CAVEAT: triple_barrier simulates a FIXED TP/SL bracket, so it is a faithful proxy
+# ONLY for the fixed-bracket exit (USE_TRAILING_EXIT=False). With
+# USE_TRAILING_EXIT=True (current default) live exits use a TRAILING stop and no
+# fixed TP (see ibkr_bridge.py), so this label approximates — does not exactly
+# match — live P&L. Stays binary {0.0, 1.0, NaN} either way (no ensemble changes).
+LABEL_MODE          = "binary"
+LABEL_TP_PCT        = 0.015   # upper (take-profit) barrier; mirrors TAKE_PROFIT_PCT
+LABEL_STOP_PCT      = 0.004   # lower (stop) barrier; mirrors STOP_LOSS_PCT
+
 # Absolute backstop exit. A hard stop that overrides trailing logic to cap the
 # worst-case loss on any single position regardless of other exit settings.
 HARD_STOP_LOSS_PCT  = 0.03

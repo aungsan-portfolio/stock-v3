@@ -23,6 +23,7 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 from sklearn.model_selection import TimeSeriesSplit
 
 import config
+import eval_metrics
 import model_metrics
 from data_manager import (
     fetch_ohlcv,
@@ -76,6 +77,43 @@ def build_rf(oob_score: bool = False) -> RandomForestClassifier:
     )
 
 
+def cv_pooled_auc(X, y, horizon: Optional[int] = None, n_splits: int = 5) -> Optional[float]:
+    """Pooled out-of-sample ROC-AUC from a walk-forward TimeSeriesSplit, using the
+    canonical RF recipe (``build_rf`` + ML_HORIZON train-row striding + class-1
+    ``predict_proba``). This is the SAME machinery StockRFEngine.train uses for its
+    per-symbol ``auc``, factored out so the permutation null test scores real and
+    shuffled labels with an identical metric (single source of truth).
+
+    Returns None when the data is too short, every fold is single-class, or the
+    pooled labels are single-class (AUC undefined) — never raises.
+    """
+    horizon = int(horizon or config.ML_HORIZON)
+    X = np.asarray(X)
+    y = np.asarray(y).astype(int)
+    if len(X) < n_splits + 1:
+        return None
+
+    pooled_y: list = []
+    pooled_p: list = []
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    for tr_idx, te_idx in tscv.split(X):
+        sub = _subsample_train_indices(len(tr_idx), horizon)
+        X_tr, y_tr = X[tr_idx[sub]], y[tr_idx[sub]]
+        X_te, y_te = X[te_idx], y[te_idx]
+        if len(X_tr) == 0 or len(np.unique(y_tr)) < 2 or len(X_te) == 0:
+            continue
+        clf = build_rf()
+        clf.fit(X_tr, y_tr)
+        pp = eval_metrics.proba_pos(clf, X_te)
+        if pp is not None:
+            pooled_y.append(y_te)
+            pooled_p.append(pp)
+
+    if not pooled_y:
+        return None
+    return eval_metrics.safe_auc(np.concatenate(pooled_y), np.concatenate(pooled_p))
+
+
 class StockRFEngine:
     def __init__(self) -> None:
         self.models: Dict[str, RandomForestClassifier] = {}
@@ -118,6 +156,13 @@ class StockRFEngine:
                     logger.warning("Not enough rows for CV on %s (n=%d)", symbol, len(X))
                     continue
 
+                # Pooled out-of-sample predictions across folds. Pooling (vs
+                # macro-averaging per-fold) gives one honest AUC / precision-at-
+                # threshold over every test bar — the metric that matches how the
+                # bot actually trades (it acts on the confident tail, not at 0.5).
+                pooled_y: list = []
+                pooled_p: list = []
+
                 tscv = TimeSeriesSplit(n_splits=n_splits)
                 for tr_idx, te_idx in tscv.split(X):
                     sub = _subsample_train_indices(len(tr_idx), horizon)
@@ -139,9 +184,48 @@ class StockRFEngine:
                     n_train_eval += len(X_tr)
                     n_test_eval += len(X_te)
 
+                    pp = eval_metrics.proba_pos(fold_clf, X_te)
+                    if pp is not None:
+                        pooled_y.append(y_te)
+                        pooled_p.append(pp)
+
                 if not fold_acc:
                     logger.warning("No usable CV folds for %s — skipping", symbol)
                     continue
+
+                # Edge-detection metrics over the pooled OOS predictions.
+                if pooled_y:
+                    pooled = eval_metrics.pooled_classification_metrics(
+                        np.concatenate(pooled_y), np.concatenate(pooled_p)
+                    )
+                else:
+                    pooled = {"auc": None, "pr_auc": None, "brier": None,
+                              "precision_at_buy": None, "n_at_buy": 0}
+
+                # Pre-refit walk-forward holdout estimate: grade the production
+                # RECIPE (same build_rf + ML_HORIZON striding) on a final unseen
+                # tail. The shipped final_clf below is still refit on ALL rows;
+                # this number grades the recipe on forward bars, not that object.
+                holdout = {"holdout_auc": None, "holdout_precision_at_buy": None,
+                           "n_holdout": 0}
+                ratio = float(getattr(config, "MODEL_HOLDOUT_RATIO", 0.0) or 0.0)
+                if 0.0 < ratio < 1.0:
+                    cut = int(len(X) * (1.0 - ratio))
+                    if cut >= 50 and (len(X) - cut) >= 20:
+                        h_sub = _subsample_train_indices(cut, horizon)
+                        X_h, y_h = X[:cut][h_sub], y[:cut][h_sub]
+                        X_ho, y_ho = X[cut:], y[cut:]
+                        if len(np.unique(y_h)) >= 2:
+                            graded = build_rf()
+                            graded.fit(X_h, y_h)
+                            pp_ho = eval_metrics.proba_pos(graded, X_ho)
+                            if pp_ho is not None:
+                                hm = eval_metrics.pooled_classification_metrics(y_ho, pp_ho)
+                                holdout = {
+                                    "holdout_auc": hm["auc"],
+                                    "holdout_precision_at_buy": hm["precision_at_buy"],
+                                    "n_holdout": int(len(y_ho)),
+                                }
 
                 # Refit the saved production model after evaluation. Train on the
                 # same ML_HORIZON-strided rows the CV folds used so the production
@@ -161,6 +245,16 @@ class StockRFEngine:
                     "test_precision": round(float(np.mean(fold_prec)), 4),
                     "test_recall": round(float(np.mean(fold_rec)), 4),
                     "test_f1": round(float(np.mean(fold_f1)), 4),
+                    # Pooled OOS edge-detection metrics (None when undefined).
+                    "auc": eval_metrics.round4(pooled["auc"]),
+                    "pr_auc": eval_metrics.round4(pooled["pr_auc"]),
+                    "brier": eval_metrics.round4(pooled["brier"]),
+                    "precision_at_buy": eval_metrics.round4(pooled["precision_at_buy"]),
+                    "n_at_buy": int(pooled["n_at_buy"]),
+                    # Pre-refit walk-forward holdout estimate (grades the recipe).
+                    "holdout_auc": eval_metrics.round4(holdout["holdout_auc"]),
+                    "holdout_precision_at_buy": eval_metrics.round4(holdout["holdout_precision_at_buy"]),
+                    "n_holdout": int(holdout["n_holdout"]),
                     "cv_folds": int(len(fold_acc)),
                     "n_train_eval": int(n_train_eval),
                     "n_test_eval": int(n_test_eval),
@@ -169,11 +263,13 @@ class StockRFEngine:
                     "positive_rate": round(float(np.mean(y)), 4),
                 }
                 if verbose:
+                    auc = results[symbol]["auc"]
                     logger.info(
-                        "%-6s acc=%.3f f1=%.3f oob=%.3f n=%d",
+                        "%-6s acc=%.3f f1=%.3f auc=%s oob=%.3f n=%d",
                         symbol,
                         results[symbol]["test_acc"],
                         results[symbol]["test_f1"],
+                        f"{auc:.3f}" if auc is not None else "n/a",
                         results[symbol]["oob_score"],
                         len(X),
                     )

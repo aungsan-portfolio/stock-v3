@@ -127,20 +127,32 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def make_labels(
-    df: pd.DataFrame, horizon: int = None, min_profit_margin: float = None
+    df: pd.DataFrame,
+    horizon: int = None,
+    min_profit_margin: float = None,
+    mode: str = None,
+    tp_pct: float = None,
+    stop_pct: float = None,
 ) -> pd.Series:
     """
-    Create binary labels for future direction.
+    Create binary direction labels for the next ``horizon`` bars.
 
-    A row is labeled 1.0 only when the forward return clears
-    ``min_profit_margin`` (default ``config.MIN_PROFIT_MARGIN``), so the models
-    learn to predict moves big enough to cover round-trip costs, not microscopic
-    noise that nets a loss after fees + slippage.
+    Two modes (selected by ``mode`` or, when None, ``config.LABEL_MODE``):
 
-    Returns:
+    * ``"binary"`` (default, unchanged): label 1.0 when the endpoint forward
+      return clears ``min_profit_margin`` (default ``config.MIN_PROFIT_MARGIN``).
+      Path-blind — it only looks at Close[t+horizon].
         1.0 if Close[t+horizon] / Close[t] - 1 > min_profit_margin
         0.0 otherwise (move too small, flat, or negative)
         NaN for rows where the future close is unknown
+
+    * ``"triple_barrier"``: path-aware (see ``_triple_barrier_labels``). 1.0 if a
+      +tp_pct take-profit barrier is touched BEFORE a -stop_pct stop barrier
+      within the horizon, else 0.0; NaN when the window is incomplete.
+
+    Both modes return strictly {0.0, 1.0, NaN}, so every downstream class check,
+    ``pos_weight``, ``class_weight="balanced"`` and ``predict_proba`` path is
+    unaffected by the choice.
 
     Important: do NOT cast `(future_return > margin)` directly to int over the
     whole series, because NaN > margin becomes False and silently creates fake
@@ -151,15 +163,84 @@ def make_labels(
         raise ValueError("horizon must be a positive integer")
     if "Close" not in df.columns:
         raise ValueError("make_labels() requires a 'Close' column")
-    if min_profit_margin is None:
-        min_profit_margin = config.MIN_PROFIT_MARGIN
 
-    future_return = df["Close"].shift(-horizon) / df["Close"] - 1.0
-    labels = pd.Series(index=df.index, dtype="float64")
+    mode = (mode or getattr(config, "LABEL_MODE", "binary")).lower()
 
-    valid = future_return.notna()
-    labels.loc[valid] = (future_return.loc[valid] > min_profit_margin).astype(float)
-    return labels
+    if mode == "binary":
+        if min_profit_margin is None:
+            min_profit_margin = config.MIN_PROFIT_MARGIN
+        future_return = df["Close"].shift(-horizon) / df["Close"] - 1.0
+        labels = pd.Series(index=df.index, dtype="float64")
+        valid = future_return.notna()
+        labels.loc[valid] = (future_return.loc[valid] > min_profit_margin).astype(float)
+        return labels
+
+    if mode == "triple_barrier":
+        return _triple_barrier_labels(df, horizon, tp_pct=tp_pct, stop_pct=stop_pct)
+
+    raise ValueError(
+        f"unknown LABEL_MODE: {mode!r} (expected 'binary' or 'triple_barrier')"
+    )
+
+
+def _triple_barrier_labels(
+    df: pd.DataFrame, horizon: int, tp_pct: float = None, stop_pct: float = None
+) -> pd.Series:
+    """Path-aware binary labels using intrabar High/Low.
+
+    For each row t, scan ahead bars t+1 … t+horizon with entry = Close[t]:
+        1.0  if High >= entry*(1+tp_pct) on a bar STRICTLY BEFORE any bar where
+             Low <= entry*(1-stop_pct)  (take-profit reached first)
+        0.0  otherwise — stop reached first, both barriers on the SAME bar
+             (pessimistic tie-break = stop), or neither touched within horizon
+        NaN  when fewer than ``horizon`` future bars exist (incomplete window —
+             same valid-row set as the binary label, no fake 0s at the tail)
+
+    Requires High and Low columns (present on build_features() output, which
+    preserves OHLCV). Defaults: tp_pct=config.LABEL_TP_PCT, stop_pct=
+    config.LABEL_STOP_PCT.
+
+    Caveat: this simulates a FIXED TP/SL bracket. It is a faithful proxy only for
+    the fixed-bracket exit; with config.USE_TRAILING_EXIT=True (default) the live
+    exit is a trailing stop with no fixed TP, so this label approximates — does
+    not exactly reproduce — live P&L.
+    """
+    for col in ("Close", "High", "Low"):
+        if col not in df.columns:
+            raise ValueError(
+                f"triple_barrier labels require a {col!r} column "
+                "(call make_labels on build_features() output, which keeps OHLCV)"
+            )
+    if tp_pct is None:
+        tp_pct = float(getattr(config, "LABEL_TP_PCT", config.TAKE_PROFIT_PCT))
+    if stop_pct is None:
+        stop_pct = float(getattr(config, "LABEL_STOP_PCT", config.STOP_LOSS_PCT))
+
+    close = df["Close"].to_numpy(dtype=float)
+    high = df["High"].to_numpy(dtype=float)
+    low = df["Low"].to_numpy(dtype=float)
+    n = len(close)
+    labels = np.full(n, np.nan, dtype="float64")
+
+    for t in range(n - horizon):
+        entry = close[t]
+        if entry <= 0:
+            continue
+        upper = entry * (1.0 + tp_pct)
+        lower = entry * (1.0 - stop_pct)
+        outcome = 0.0  # neither barrier touched within horizon -> 0.0
+        for k in range(t + 1, t + horizon + 1):
+            hit_stop = low[k] <= lower
+            hit_tp = high[k] >= upper
+            if hit_tp and not hit_stop:
+                outcome = 1.0
+                break
+            if hit_stop:  # stop alone, or same-bar tie -> pessimistic stop
+                outcome = 0.0
+                break
+        labels[t] = outcome
+
+    return pd.Series(labels, index=df.index, dtype="float64")
 
 
 def get_feature_columns() -> list:

@@ -24,6 +24,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 import config
+import eval_metrics
 import model_metrics
 from data_manager import (
     fetch_ohlcv,
@@ -283,21 +284,39 @@ class StockLSTMEngine:
                     raise RuntimeError("LSTM training produced no best_state")
 
                 model.load_state_dict(best_state)
+
+                # Edge-detection metrics on the validation set — AUC + precision at
+                # the BUY threshold match how the bot trades far better than BCE
+                # val_loss alone. Computed while the model/val tensors are still on
+                # DEVICE; guarded for the single-class case (returns None).
+                model.eval()
+                with torch.no_grad():
+                    val_scores = torch.sigmoid(model(X_val_t)).detach().cpu().numpy()
+                val_metrics = eval_metrics.pooled_classification_metrics(
+                    y_val_t.detach().cpu().numpy(), val_scores
+                )
+
                 model.cpu().eval()
 
                 new_models[symbol] = model
                 new_scalers[symbol] = (mean.astype(np.float32), std.astype(np.float32))
                 results[symbol] = {
                     "best_val_loss": round(float(best_val_loss), 4),
+                    "best_val_auc": eval_metrics.round4(val_metrics["auc"]),
+                    "val_precision_at_buy": eval_metrics.round4(val_metrics["precision_at_buy"]),
+                    "n_val_at_buy": int(val_metrics["n_at_buy"]),
                     "n_train_seq": int(len(X_tr)),
                     "n_train_seq_full": int(n_train_seq_full),
                     "n_val_seq": int(len(X_val)),
                     "train_subsample_horizon": int(max(1, int(config.ML_HORIZON))),
                 }
                 if verbose:
+                    v_auc = results[symbol]["best_val_auc"]
                     logger.info(
-                        "%s LSTM val_loss=%.4f train_seq=%d/%d (stride=%d) val_seq=%d",
-                        symbol, best_val_loss, len(X_tr), n_train_seq_full,
+                        "%s LSTM val_loss=%.4f val_auc=%s train_seq=%d/%d (stride=%d) val_seq=%d",
+                        symbol, best_val_loss,
+                        f"{v_auc:.3f}" if v_auc is not None else "n/a",
+                        len(X_tr), n_train_seq_full,
                         max(1, int(config.ML_HORIZON)), len(X_val),
                     )
 

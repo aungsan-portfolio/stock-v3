@@ -487,6 +487,90 @@ class TestMakeLabelsThreshold(unittest.TestCase):
         )
 
 
+# ── 6d. make_labels triple-barrier (path-aware) mode ─────────────────
+class TestTripleBarrierLabels(unittest.TestCase):
+    """Opt-in path-aware label. entry=Close[t]; tp_pct=0.015 -> upper=101.5,
+    stop_pct=0.004 -> lower=99.6 when entry=100. Stays binary {0,1,NaN}."""
+
+    def setUp(self):
+        from data_manager import make_labels
+        self.make_labels = make_labels
+
+    def _df(self, bars):
+        # bars: list of (high, low, close); Open mirrors Close (unused by labels).
+        idx = pd.bdate_range("2021-01-01", periods=len(bars))
+        close = [b[2] for b in bars]
+        return pd.DataFrame(
+            {
+                "Open": close,
+                "High": [b[0] for b in bars],
+                "Low": [b[1] for b in bars],
+                "Close": close,
+                "Volume": [1_000_000.0] * len(bars),
+            },
+            index=idx,
+        )
+
+    def _labels(self, bars, horizon=2):
+        return self.make_labels(
+            self._df(bars), horizon=horizon, mode="triple_barrier",
+            tp_pct=0.015, stop_pct=0.004,
+        )
+
+    def test_tp_before_stop_is_one(self):
+        # bar1 High 102 >= 101.5 (TP) and Low 100 > 99.6 (no stop) -> 1.0
+        labels = self._labels([(100, 100, 100), (102.0, 100.0, 101.0), (101, 100, 100.5)])
+        self.assertEqual(labels.iloc[0], 1.0)
+
+    def test_stop_before_tp_is_zero(self):
+        # bar1 Low 99 <= 99.6 (stop) and High 100.5 < 101.5 (no TP) -> 0.0
+        labels = self._labels([(100, 100, 100), (100.5, 99.0, 99.5), (101, 100, 100.5)])
+        self.assertEqual(labels.iloc[0], 0.0)
+
+    def test_same_bar_tie_resolves_to_stop(self):
+        # bar1 hits BOTH barriers -> pessimistic stop -> 0.0
+        labels = self._labels([(100, 100, 100), (102.0, 99.0, 100.0), (101, 100, 100.5)])
+        self.assertEqual(labels.iloc[0], 0.0)
+
+    def test_neither_barrier_within_horizon_is_zero(self):
+        labels = self._labels([(100, 100, 100), (101.0, 99.8, 100.2), (101.0, 99.8, 100.3)])
+        self.assertEqual(labels.iloc[0], 0.0)
+
+    def test_future_unknown_rows_are_nan(self):
+        labels = self._labels([(100, 100, 100), (102, 100, 101), (101, 100, 100.5)])
+        self.assertTrue(np.isnan(labels.iloc[-1]))
+        self.assertTrue(np.isnan(labels.iloc[-2]))
+
+    def test_only_binary_values_and_nan(self):
+        df = make_ohlcv(n=120, seed=3)
+        labels = self.make_labels(df, horizon=5, mode="triple_barrier")
+        valid = labels.dropna().unique()
+        self.assertTrue(set(valid).issubset({0.0, 1.0}),
+                        f"triple-barrier must stay binary, got {valid}")
+
+    def test_requires_high_low_columns(self):
+        df = pd.DataFrame(
+            {"Close": [100.0, 101.0, 102.0]},
+            index=pd.bdate_range("2021-01-01", periods=3),
+        )
+        with self.assertRaises(ValueError):
+            self.make_labels(df, horizon=1, mode="triple_barrier")
+
+    def test_default_mode_stays_binary(self):
+        # With LABEL_MODE default 'binary', a +1% endpoint move over horizon=1 is 1.0
+        # even though High/Low are present (binary path ignores them).
+        labels = self.make_labels(
+            self._df([(100, 100, 100), (101.0, 100.0, 101.0), (101, 100, 101)]),
+            horizon=1,
+        )
+        self.assertEqual(labels.iloc[0], 1.0)
+
+    def test_unknown_mode_raises(self):
+        with self.assertRaises(ValueError):
+            self.make_labels(self._df([(100, 100, 100), (101, 100, 101)]),
+                             horizon=1, mode="nonsense")
+
+
 # ── 7. config.MIN_HOLD_BARS = ML_HORIZON ─────────────────────────────
 class TestConfigMinHold(unittest.TestCase):
     def test_min_hold_bars_equals_ml_horizon(self):

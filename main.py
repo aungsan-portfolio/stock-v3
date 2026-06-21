@@ -76,6 +76,7 @@ from backtest import run_backtest
 import hot_scanner
 from hot_scanner import scan_hot_stocks
 import model_doctor
+import permutation_test
 import expectancy
 import forward_test  # read-only forward paper-test report (no order path, no IBKR)
 import coach_i18n  # M5A: DISPLAY-ONLY language layer (no order path, no decisions)
@@ -645,6 +646,23 @@ def cmd_model_doctor(args) -> int:
     Read-only: no IBKR connection, no orders. Writes reports/model_doctor_report.md.
     """
     return model_doctor.run_doctor(top_n=getattr(args, "top_n", None))
+
+
+def cmd_permutation_test(args) -> int:
+    """Shuffled-label null test: does any symbol's real CV-AUC beat luck?
+
+    Read-only research: no IBKR connection, no orders, no models saved. Writes
+    reports/permutation_test_report.md (+ .json).
+    """
+    symbols = None
+    raw = getattr(args, "symbols", None)
+    if raw:
+        symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    return permutation_test.run_permutation_test(
+        symbols=symbols,
+        n_shuffles=getattr(args, "n_shuffles", None),
+        sample=0 if getattr(args, "all", False) else None,
+    )
 
 
 def cmd_model_refresh(args) -> int:
@@ -2084,6 +2102,22 @@ def main() -> int:
              "(read-only, no IBKR, no orders)",
     )
 
+    # -- Shuffled-label permutation null test (read-only research) --
+    pt = sub.add_parser(
+        "permutation-test",
+        help="Shuffled-label null test: does any symbol's real CV-AUC beat luck? "
+             "(read-only, no IBKR, no orders, no models saved)",
+    )
+    pt.add_argument(
+        "--all", action="store_true",
+        help="Test the full universe (ignore PERMUTATION_SAMPLE_SYMBOLS)",
+    )
+    pt.add_argument(
+        "--symbols", type=str, default=None,
+        help="Comma-separated symbols to test (overrides the watchlist)",
+    )
+    pt.add_argument("--n-shuffles", type=int, default=None, help="Null draws per symbol")
+
     # -- Phase 5B-1: supervised scheduler / market-hours runner (Path A) --
     rs = sub.add_parser(
         "run-scheduled",
@@ -2140,6 +2174,8 @@ def main() -> int:
         return cmd_panic_flatten(args)
     if args.command == "signal-parity":
         return cmd_signal_parity(args)
+    if args.command == "permutation-test":
+        return cmd_permutation_test(args)
     if args.command == "run-scheduled":
         return cmd_run_scheduled(args)
 
