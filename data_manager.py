@@ -8,7 +8,7 @@ Priority-1 production fixes:
 """
 import logging
 import time
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -20,6 +20,28 @@ logger = logging.getLogger(__name__)
 
 # key = (symbol, period, interval), value = (timestamp, dataframe)
 _cache: Dict[Tuple[str, str, str], Tuple[float, pd.DataFrame]] = {}
+
+# ── Item 3: gated regime / relative-strength feature columns ─────────
+# These are appended to the model feature set ONLY when the matching config
+# flag is on (see get_feature_columns / build_features). Default-off keeps the
+# frozen 14-feature list and the existing on-disk models intact.
+_REGIME_FEATURE_COLS = [
+    "realized_vol",   # short-window realized volatility (std of daily returns)
+    "vol_regime",     # short-vol / long-vol ratio (vol expansion vs contraction)
+    "mom_short",      # ~3-month time-series momentum (price % change)
+    "mom_long",       # ~6-month time-series momentum
+    "ts_rank",        # time-series percentile rank of close in a trailing window (0, 1]
+    "dist_high",      # distance below the trailing high, <= 0 (drawdown/strength regime)
+]
+_MARKET_REL_FEATURE_COLS = [
+    "rel_ret_short",  # symbol minus benchmark return over the short window
+    "rel_ret_long",   # symbol minus benchmark return over the long window
+    "rs_slope",       # momentum of the relative-strength (close / benchmark) line
+    "mkt_trend",      # benchmark trend regime (benchmark vs its SMA), broadcast to the row
+]
+
+# One-shot warning latch so an unwired market_df does not spam the logs.
+_MARKET_DF_WARNED = False
 
 
 def fetch_ohlcv(
@@ -65,7 +87,15 @@ def fetch_ohlcv(
     return df.copy()
 
 
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
+def build_features(df: pd.DataFrame, market_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Engineer the model feature matrix from a single symbol's OHLCV.
+
+    ``market_df`` is an optional benchmark (e.g. SPY) OHLCV frame used only by the
+    relative-strength features, and only when ``config.USE_MARKET_RELATIVE_FEATURES``
+    is on. It is backward compatible: every existing caller passes ``df`` alone and
+    is unaffected. When both Item-3 flags are off (the default) the output is
+    byte-identical to the original 14-feature frame.
+    """
     f = df.copy()
     close, high, low, volume = f["Close"], f["High"], f["Low"], f["Volume"]
 
@@ -122,8 +152,83 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     f["dist_sma20"] = (close - f["sma_short"]) / close
     f["dist_sma50"] = (close - f["sma_long"]) / close
 
+    # ── Item 3 (default OFF): regime / relative-strength feature set ──
+    # Only computed when the matching flag is on, so the default path adds no
+    # columns and the final dropna() drops the same warmup rows as before.
+    if config.USE_REGIME_FEATURES:
+        _add_regime_features(f, close)
+    if config.USE_MARKET_RELATIVE_FEATURES:
+        _add_market_relative_features(f, close, market_df)
+
     f.dropna(inplace=True)
     return f
+
+
+def _add_regime_features(f: pd.DataFrame, close: pd.Series) -> None:
+    """Single-symbol volatility / momentum / trend-regime features (Item 3).
+
+    All values are stationary and price-level independent (returns, ratios,
+    normalized distances) so they are comparable across symbols. Mutates ``f``
+    in place; computed only when ``config.USE_REGIME_FEATURES`` is on.
+    """
+    ret1 = close.pct_change(1)
+    vol_short = ret1.rolling(config.REGIME_VOL_SHORT).std()
+    vol_long = ret1.rolling(config.REGIME_VOL_LONG).std()
+    f["realized_vol"] = vol_short
+    # Vol regime: >1 expanding vol, <1 contracting. Guard divide-by-zero.
+    f["vol_regime"] = vol_short / vol_long.replace(0, np.nan)
+    f["mom_short"] = close.pct_change(config.REGIME_MOM_SHORT)
+    f["mom_long"] = close.pct_change(config.REGIME_MOM_LONG)
+    # Time-series percentile rank of the latest close within a trailing window,
+    # in (0, 1]. A per-symbol, offline "where does today sit vs its own recent
+    # history" strength proxy — NOT a cross-sectional rank across symbols.
+    win = int(config.REGIME_RANK_WINDOW)
+    f["ts_rank"] = close.rolling(win).apply(
+        lambda a: float((a <= a[-1]).mean()), raw=True
+    )
+    # Distance below the trailing high (<= 0): 0 at a fresh high, negative in a
+    # drawdown. Captures the strength/regime of the symbol's own trend.
+    roll_high = close.rolling(config.REGIME_HIGH_WINDOW).max()
+    f["dist_high"] = close / roll_high.replace(0, np.nan) - 1.0
+
+
+def _add_market_relative_features(
+    f: pd.DataFrame, close: pd.Series, market_df: Optional[pd.DataFrame]
+) -> None:
+    """SPY/benchmark relative-strength features (Item 3).
+
+    Requires a benchmark close series aligned to the symbol's dates. When
+    ``market_df`` is None the columns are emitted as neutral 0.0 (with a one-shot
+    warning) so no FEATURE_COLS consumer crashes before the engines are wired to
+    pass ``market_df``. Mutates ``f`` in place; computed only when
+    ``config.USE_MARKET_RELATIVE_FEATURES`` is on.
+    """
+    if market_df is None or "Close" not in getattr(market_df, "columns", []):
+        global _MARKET_DF_WARNED
+        if not _MARKET_DF_WARNED:
+            logger.warning(
+                "USE_MARKET_RELATIVE_FEATURES is on but no market_df was passed to "
+                "build_features() — emitting NEUTRAL (0.0) relative-strength features. "
+                "Wire market_df (data_manager.fetch_market_benchmark) through the "
+                "engines before trusting these features in training."
+            )
+            _MARKET_DF_WARNED = True
+        for col in _MARKET_REL_FEATURE_COLS:
+            f[col] = 0.0
+        return
+
+    # Align the benchmark to the symbol's trading dates; forward-fill any gaps.
+    mkt_close = market_df["Close"].reindex(f.index).ffill()
+    s_short = int(config.REL_RET_SHORT)
+    s_long = int(config.REL_RET_LONG)
+    f["rel_ret_short"] = close.pct_change(s_short) - mkt_close.pct_change(s_short)
+    f["rel_ret_long"] = close.pct_change(s_long) - mkt_close.pct_change(s_long)
+    # Relative-strength line = symbol / benchmark; its slope is RS momentum.
+    rs_line = close / mkt_close.replace(0, np.nan)
+    f["rs_slope"] = rs_line.pct_change(config.RS_SLOPE_WINDOW)
+    # Broadcast market-regime feature: benchmark vs its own trend SMA.
+    mkt_sma = mkt_close.rolling(config.MKT_TREND_SMA).mean()
+    f["mkt_trend"] = mkt_close / mkt_sma.replace(0, np.nan) - 1.0
 
 
 def make_labels(
@@ -243,8 +348,31 @@ def _triple_barrier_labels(
     return pd.Series(labels, index=df.index, dtype="float64")
 
 
+def fetch_market_benchmark(
+    period: str = None, interval: str = None, force_refresh: bool = False
+) -> pd.DataFrame:
+    """Fetch the benchmark (config.MARKET_BENCHMARK_SYMBOL, e.g. SPY) OHLCV for the
+    relative-strength features. Thin wrapper over fetch_ohlcv so engines can pass
+    the result as ``build_features(df, market_df=...)``.
+
+    This performs a network fetch and is intended to be called by the engines
+    ONLY when ``config.USE_MARKET_RELATIVE_FEATURES`` is on. build_features()
+    itself never calls it — feature engineering stays pure/offline/testable.
+    """
+    return fetch_ohlcv(
+        config.MARKET_BENCHMARK_SYMBOL,
+        period=period,
+        interval=interval,
+        force_refresh=force_refresh,
+    )
+
+
 def get_feature_columns() -> list:
-    return [
+    """Model feature columns. The frozen base-14 set is returned unless an Item-3
+    flag is on, in which case the matching gated columns are APPENDED (order
+    preserved) — which changes the feature-vector width and requires retraining.
+    """
+    cols = [
         "sma_cross",
         "dist_ema",
         "rsi",
@@ -260,3 +388,8 @@ def get_feature_columns() -> list:
         "dist_sma20",
         "dist_sma50",
     ]
+    if getattr(config, "USE_REGIME_FEATURES", False):
+        cols = cols + _REGIME_FEATURE_COLS
+    if getattr(config, "USE_MARKET_RELATIVE_FEATURES", False):
+        cols = cols + _MARKET_REL_FEATURE_COLS
+    return cols

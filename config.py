@@ -109,6 +109,33 @@ BOLLINGER_STD       = 2
 ATR_PERIOD          = 14
 VOLUME_MA_PERIOD    = 20
 
+# ── Item 3: Regime / relative-strength feature set (default OFF) ──────
+# Extra engineered features for edge recovery (cross-sectional/RS + regime).
+# BOTH flags default to False, so get_feature_columns() returns the frozen
+# 14-feature ML set UNCHANGED and the on-disk RF/LSTM models keep loading.
+# Enabling either flag WIDENS the feature vector, which REQUIRES retraining
+# the models before live use (the old models expect 14 inputs). FEATURE_COLS is
+# captured at import time in the engines, so toggling a flag needs a process
+# restart, not a hot reload.
+USE_REGIME_FEATURES          = False  # single-symbol volatility / momentum / trend regime
+USE_MARKET_RELATIVE_FEATURES = False  # SPY-relative strength (needs market_df wired into engines)
+MARKET_BENCHMARK_SYMBOL      = "SPY"  # benchmark used for the relative-strength features
+
+# Regime-feature lookback windows (bars). All offline-computable from OHLCV.
+REGIME_VOL_SHORT             = 20     # short realized-vol window
+REGIME_VOL_LONG              = 60     # long realized-vol window (vol-regime denominator)
+REGIME_MOM_SHORT             = 63     # ~3-month time-series momentum
+REGIME_MOM_LONG              = 126    # ~6-month time-series momentum
+REGIME_RANK_WINDOW           = 126    # trailing window for time-series price rank in (0, 1]
+REGIME_HIGH_WINDOW           = 252    # ~52-week high window for distance-below-high
+
+# Market-relative feature windows (bars). Used only when a market_df is supplied
+# to build_features(); otherwise these features are emitted as neutral 0.0.
+REL_RET_SHORT                = 20     # short relative-return window vs benchmark
+REL_RET_LONG                 = 63     # long relative-return window vs benchmark
+RS_SLOPE_WINDOW              = 20     # momentum of the relative-strength (price-ratio) line
+MKT_TREND_SMA                = 50     # benchmark trend SMA for the broadcast market-regime feature
+
 # ── ML Settings ─────────────────────────────────
 ML_WINDOW           = 20
 ML_HORIZON          = 5
