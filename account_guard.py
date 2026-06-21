@@ -52,7 +52,7 @@ import config
 logger = logging.getLogger(__name__)
 
 # ── Environment prefixes ─────────────────────────────────────────────────────
-PAPER_PREFIX = "DU"   # IBKR paper accounts: DU + digits
+PAPER_PREFIX = "DU"   # IBKR paper accounts: DU + alphanumeric id
 LIVE_PREFIX = "U"     # IBKR live accounts:  U  + digits
 
 MODE_PAPER = "paper"
@@ -75,10 +75,11 @@ REASON_WRONG_PREFIX = "wrong_account_prefix"
 # A well-formed IBKR account id: 1-4 leading uppercase letters then >=3 digits
 # (e.g. DU1234567, U1234567). Anything else is treated as malformed -> fail closed.
 _ACCOUNT_RE = re.compile(r"^[A-Z]{1,4}[0-9]{3,}$")
-# Environment-prefix tests require the prefix to be IMMEDIATELY followed by a
-# digit, so a paper "DU..." can never satisfy the live "U" prefix and a stray id
-# like "UABC123" can never masquerade as a live account.
-_PAPER_PREFIX_RE = re.compile(r"^DU[0-9]")
+# Environment-prefix tests require the prefix to be IMMEDIATELY followed by an
+# account-id character. Paper accounts may include a letter after DU (for example
+# DUQ710212), while live accounts remain U + digit so "UABC123" cannot masquerade
+# as a live account.
+_PAPER_PREFIX_RE = re.compile(r"^DU[A-Z0-9]")
 _LIVE_PREFIX_RE = re.compile(r"^U[0-9]")
 
 
@@ -145,9 +146,9 @@ def is_well_formed(account) -> bool:
 def has_environment_prefix(account, *, live: bool) -> bool:
     """True when ``account`` carries the expected environment prefix.
 
-    paper -> ``^DU[0-9]``   live -> ``^U[0-9]``. The trailing-digit requirement
-    means a paper "DU..." account can never match the live "U" prefix (and vice
-    versa)."""
+    paper -> ``^DU[A-Z0-9]``   live -> ``^U[0-9]``. Paper accounts may include
+    a letter after ``DU``; live accounts still require ``U`` followed by a digit
+    so stray ids like "UABC123" never pass live mode."""
     acct = normalize_account(account)
     if not acct:
         return False
