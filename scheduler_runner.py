@@ -85,15 +85,16 @@ def paper_safety_violations() -> List[str]:
     """Return a list of reasons the current config is NOT unambiguously paper-only
     (empty list == safe). Mirrors trade_coach.assert_paper_trading_only so the
     scheduler refuses BEFORE doing anything if a live-trading config slipped in.
-    This is a pre-gate; IBKRBridge.connect() still enforces the paper-port lock."""
+    This is a pre-gate; AlpacaBridge.connect() still enforces the paper URL lock."""
     v: List[str] = []
     if bool(getattr(config, "COACH_LIVE_TRADING_ENABLED", False)):
         v.append("COACH_LIVE_TRADING_ENABLED is True")
-    if not bool(getattr(config, "REQUIRE_PAPER_PORT", True)):
-        v.append("REQUIRE_PAPER_PORT is False")
-    paper_port = int(getattr(config, "PAPER_IBKR_PORT", 7497))
-    if int(getattr(config, "IBKR_PORT", paper_port)) != paper_port:
-        v.append(f"IBKR_PORT {getattr(config, 'IBKR_PORT', None)} != paper port {paper_port}")
+    
+    import os
+    endpoint = os.environ.get("APCA_API_BASE_URL", getattr(config, "ALPACA_PAPER_BASE_URL", "")).rstrip("/")
+    if endpoint != "https://paper-api.alpaca.markets":
+        v.append(f"Alpaca base URL is not paper: {endpoint}")
+
     if bool(getattr(config, "ALLOW_SHORT", False)):
         v.append("ALLOW_SHORT is True")
     if bool(getattr(config, "ALLOW_HISTORICAL_PRICE_FOR_ORDERS", False)):

@@ -39,10 +39,63 @@ _MARKET_REL_FEATURE_COLS = [
     "rs_slope",       # momentum of the relative-strength (close / benchmark) line
     "mkt_trend",      # benchmark trend regime (benchmark vs its SMA), broadcast to the row
 ]
+# ── Item 6B: Advanced market micro-structure features (LSTM edge recovery) ──
+# Computed entirely from OHLCV — no order-book data required. Enabled via
+# config.USE_MICRO_FEATURES. All columns are stationary and comparable across
+# symbols: returns, log-ratios, normalized spreads.
+_MICRO_FEATURE_COLS = [
+    "close_loc",          # log close / VWAP proxy: close / (hlc3/typical) — deviation from mean print
+    "volume_imbalance",   # directional volume pressure: (up_vol - down_vol) / total_vol
+    "intraday_volatility",# high-low / close as a % — daily range efficiency
+    "gap_pct",            # overnight gap: (Open - prev Close) / prev Close
+    "rolling_efficiency", # 10-bar efficiency ratio: |close - close[-10]| / sum(|ret_i|)
+    "atr_slope",          # 5-bar change in ATR — volatility expansion/contraction
+    "volume_shock",       # volume ratio z-score: (vol_ratio - 1) / vol_ratio_rolling_std
+    "close_rank_20",      # where close ranks in the trailing 20 bars, (0,1]
+    "high_low_spread_pct",# HL / close — normalized daily range
+]
+_CANDLESTICK_FEATURE_COLS = [
+    "doji",               # open approx = close (indecision)
+    "dragonfly_doji",     # doji with long lower shadow (bullish reversal)
+    "gravestone_doji",    # doji with long upper shadow (bearish reversal)
+    "white_marubozu",     # strong bullish with no shadows (continuation)
+    "black_marubozu",     # strong bearish with no shadows (continuation)
+    "hammer",             # long lower shadow, small body in downtrend (reversal)
+    "hanging_man",        # long lower shadow, small body in uptrend (reversal)
+    "shooting_star",      # long upper shadow, small body in uptrend (reversal)
+    "bullish_engulfing",  # white body engulfs prior black body (reversal)
+    "bearish_engulfing",  # black body engulfs prior white body (reversal)
+    "bullish_harami",     # white body inside prior black body (weakening)
+    "bearish_harami",     # black body inside prior white body (weakening)
+    "piercing_line",      # white closes above prior black midpoint (reversal)
+    "dark_cloud_cover",   # black closes below prior white midpoint (reversal)
+    "morning_star",       # 3-bar: black, doji gap down, white gap up (major reversal)
+    "evening_star",       # 3-bar: white, doji gap up, black gap down (major reversal)
+]
+
 
 # One-shot warning latch so an unwired market_df does not spam the logs.
 _MARKET_DF_WARNED = False
 
+
+# Singleton MultiSourceDataProvider shared across the module. Callers that pass
+# an explicit IBKRBridge to data_manager at init time can set this once at startup;
+# otherwise it defaults to yfinance-only, matching the old behavior exactly.
+_PROVIDER = None
+
+def set_data_provider(provider=None):
+    """Replace the global data provider (e.g. with a MultiSourceDataProvider wired
+    to your IBKRBridge). Passing None resets to the default yfinance-only provider.
+    Call once at startup (e.g. in main.py) so the module import order does not
+    matter."""
+    global _PROVIDER
+    _PROVIDER = provider
+
+def _get_or_create_provider():
+    if _PROVIDER is not None:
+        return _PROVIDER
+    from data_providers import MultiSourceDataProvider
+    return MultiSourceDataProvider()
 
 def fetch_ohlcv(
     symbol: str,
@@ -50,7 +103,14 @@ def fetch_ohlcv(
     interval: str = None,
     force_refresh: bool = False,
 ) -> pd.DataFrame:
-    """Fetch OHLCV data from yfinance with a small in-memory TTL cache."""
+    """Fetch OHLCV data via the configured MultiSourceDataProvider (default:
+    yfinance) with an in-memory TTL cache overlay for frequently-accessed
+    symbols during a single run.
+
+    When a data_provider is set via ``set_data_provider(provider)`` the
+    provider's multi-source fallback and disk cache are used; otherwise the
+    legacy yfinance-only path applies (unchanged behaviour).
+    """
     symbol = symbol.upper().strip()
     period = period or config.PRICE_PERIOD
     interval = interval or config.PRICE_INTERVAL
@@ -62,6 +122,16 @@ def fetch_ohlcv(
         if time.time() - ts < config.CACHE_TTL_SECONDS:
             return cached_df.copy()
 
+    # If a provider was explicitly set, delegate to its multi-source fetch
+    # (which includes its own disk cache, fallback, and corporate-action checks).
+    if _PROVIDER is not None:
+        df = _get_or_create_provider().fetch(
+            symbol, period=period, interval=interval, force_refresh=force_refresh
+        )
+        _cache[cache_key] = (time.time(), df.copy())
+        return df.copy()
+
+    # Default: legacy yfinance-only path (byte-identical to original behaviour).
     ticker = yf.Ticker(symbol)
     df = ticker.history(period=period, interval=interval, auto_adjust=True)
     if df.empty:
@@ -87,7 +157,7 @@ def fetch_ohlcv(
     return df.copy()
 
 
-def build_features(df: pd.DataFrame, market_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+def build_features(df: pd.DataFrame, market_df: Optional[pd.DataFrame] = None, cfg=None) -> pd.DataFrame:
     """Engineer the model feature matrix from a single symbol's OHLCV.
 
     ``market_df`` is an optional benchmark (e.g. SPY) OHLCV frame used only by the
@@ -96,37 +166,38 @@ def build_features(df: pd.DataFrame, market_df: Optional[pd.DataFrame] = None) -
     is unaffected. When both Item-3 flags are off (the default) the output is
     byte-identical to the original 14-feature frame.
     """
+    cfg = cfg or config
     f = df.copy()
     close, high, low, volume = f["Close"], f["High"], f["Low"], f["Volume"]
 
-    f["sma_short"] = close.rolling(config.SMA_SHORT).mean()
-    f["sma_long"] = close.rolling(config.SMA_LONG).mean()
-    f["ema"] = close.ewm(span=config.EMA_PERIOD, adjust=False).mean()
+    f["sma_short"] = close.rolling(cfg.SMA_SHORT).mean()
+    f["sma_long"] = close.rolling(cfg.SMA_LONG).mean()
+    f["ema"] = close.ewm(span=cfg.EMA_PERIOD, adjust=False).mean()
     # Close-normalized so the feature is comparable across price levels/symbols
     # instead of carrying raw dollar magnitude.
     f["sma_cross"] = (f["sma_short"] - f["sma_long"]) / close
     f["dist_ema"] = (close - f["ema"]) / close
 
     delta = close.diff()
-    gain = delta.clip(lower=0).rolling(config.RSI_PERIOD).mean()
-    loss = (-delta.clip(upper=0)).rolling(config.RSI_PERIOD).mean()
+    gain = delta.clip(lower=0).rolling(cfg.RSI_PERIOD).mean()
+    loss = (-delta.clip(upper=0)).rolling(cfg.RSI_PERIOD).mean()
     rs = gain / loss.replace(0, np.nan)
     f["rsi"] = 100 - (100 / (1 + rs))
 
-    ema_fast = close.ewm(span=config.MACD_FAST, adjust=False).mean()
-    ema_slow = close.ewm(span=config.MACD_SLOW, adjust=False).mean()
+    ema_fast = close.ewm(span=cfg.MACD_FAST, adjust=False).mean()
+    ema_slow = close.ewm(span=cfg.MACD_SLOW, adjust=False).mean()
     macd = ema_fast - ema_slow
-    macd_sig = macd.ewm(span=config.MACD_SIGNAL, adjust=False).mean()
+    macd_sig = macd.ewm(span=cfg.MACD_SIGNAL, adjust=False).mean()
     macd_hist = macd - macd_sig
     # Close-normalized MACD family so magnitudes are price-level independent.
     f["macd"] = macd / close
     f["macd_sig"] = macd_sig / close
     f["macd_hist"] = macd_hist / close
 
-    bb_mid = close.rolling(config.BOLLINGER_PERIOD).mean()
-    bb_std = close.rolling(config.BOLLINGER_PERIOD).std()
-    f["bb_upper"] = bb_mid + config.BOLLINGER_STD * bb_std
-    f["bb_lower"] = bb_mid - config.BOLLINGER_STD * bb_std
+    bb_mid = close.rolling(cfg.BOLLINGER_PERIOD).mean()
+    bb_std = close.rolling(cfg.BOLLINGER_PERIOD).std()
+    f["bb_upper"] = bb_mid + cfg.BOLLINGER_STD * bb_std
+    f["bb_lower"] = bb_mid - cfg.BOLLINGER_STD * bb_std
     f["bb_pct"] = (close - f["bb_lower"]) / (
         f["bb_upper"] - f["bb_lower"]
     ).replace(0, np.nan)
@@ -139,10 +210,10 @@ def build_features(df: pd.DataFrame, market_df: Optional[pd.DataFrame] = None) -
         ],
         axis=1,
     ).max(axis=1)
-    f["atr"] = tr.rolling(config.ATR_PERIOD).mean()
+    f["atr"] = tr.rolling(cfg.ATR_PERIOD).mean()
     f["atr_pct"] = f["atr"] / close
 
-    f["vol_ma"] = volume.rolling(config.VOLUME_MA_PERIOD).mean()
+    f["vol_ma"] = volume.rolling(cfg.VOLUME_MA_PERIOD).mean()
     f["vol_ratio"] = volume / f["vol_ma"].replace(0, np.nan)
 
     f["ret_1d"] = close.pct_change(1)
@@ -155,45 +226,50 @@ def build_features(df: pd.DataFrame, market_df: Optional[pd.DataFrame] = None) -
     # ── Item 3 (default OFF): regime / relative-strength feature set ──
     # Only computed when the matching flag is on, so the default path adds no
     # columns and the final dropna() drops the same warmup rows as before.
-    if config.USE_REGIME_FEATURES:
-        _add_regime_features(f, close)
-    if config.USE_MARKET_RELATIVE_FEATURES:
-        _add_market_relative_features(f, close, market_df)
+    if getattr(cfg, "USE_REGIME_FEATURES", False):
+        _add_regime_features(f, close, cfg)
+    if getattr(cfg, "USE_MARKET_RELATIVE_FEATURES", False):
+        _add_market_relative_features(f, close, market_df, cfg)
+    if getattr(cfg, "USE_CANDLESTICK_FEATURES", False):
+        _add_candlestick_features(f, close, high, low, f["Open"], cfg)
+    if getattr(cfg, "USE_MICRO_FEATURES", False):
+        _add_micro_features(f, close, high, low, f["Open"], f["Volume"], cfg)
 
     f.dropna(inplace=True)
     return f
 
 
-def _add_regime_features(f: pd.DataFrame, close: pd.Series) -> None:
+def _add_regime_features(f: pd.DataFrame, close: pd.Series, cfg=None) -> None:
     """Single-symbol volatility / momentum / trend-regime features (Item 3).
 
     All values are stationary and price-level independent (returns, ratios,
     normalized distances) so they are comparable across symbols. Mutates ``f``
     in place; computed only when ``config.USE_REGIME_FEATURES`` is on.
     """
+    cfg = cfg or config
     ret1 = close.pct_change(1)
-    vol_short = ret1.rolling(config.REGIME_VOL_SHORT).std()
-    vol_long = ret1.rolling(config.REGIME_VOL_LONG).std()
+    vol_short = ret1.rolling(cfg.REGIME_VOL_SHORT).std()
+    vol_long = ret1.rolling(cfg.REGIME_VOL_LONG).std()
     f["realized_vol"] = vol_short
     # Vol regime: >1 expanding vol, <1 contracting. Guard divide-by-zero.
     f["vol_regime"] = vol_short / vol_long.replace(0, np.nan)
-    f["mom_short"] = close.pct_change(config.REGIME_MOM_SHORT)
-    f["mom_long"] = close.pct_change(config.REGIME_MOM_LONG)
+    f["mom_short"] = close.pct_change(cfg.REGIME_MOM_SHORT)
+    f["mom_long"] = close.pct_change(cfg.REGIME_MOM_LONG)
     # Time-series percentile rank of the latest close within a trailing window,
     # in (0, 1]. A per-symbol, offline "where does today sit vs its own recent
     # history" strength proxy — NOT a cross-sectional rank across symbols.
-    win = int(config.REGIME_RANK_WINDOW)
+    win = int(cfg.REGIME_RANK_WINDOW)
     f["ts_rank"] = close.rolling(win).apply(
         lambda a: float((a <= a[-1]).mean()), raw=True
     )
     # Distance below the trailing high (<= 0): 0 at a fresh high, negative in a
     # drawdown. Captures the strength/regime of the symbol's own trend.
-    roll_high = close.rolling(config.REGIME_HIGH_WINDOW).max()
+    roll_high = close.rolling(cfg.REGIME_HIGH_WINDOW).max()
     f["dist_high"] = close / roll_high.replace(0, np.nan) - 1.0
 
 
 def _add_market_relative_features(
-    f: pd.DataFrame, close: pd.Series, market_df: Optional[pd.DataFrame]
+    f: pd.DataFrame, close: pd.Series, market_df: Optional[pd.DataFrame], cfg=None
 ) -> None:
     """SPY/benchmark relative-strength features (Item 3).
 
@@ -203,6 +279,7 @@ def _add_market_relative_features(
     pass ``market_df``. Mutates ``f`` in place; computed only when
     ``config.USE_MARKET_RELATIVE_FEATURES`` is on.
     """
+    cfg = cfg or config
     if market_df is None or "Close" not in getattr(market_df, "columns", []):
         global _MARKET_DF_WARNED
         if not _MARKET_DF_WARNED:
@@ -219,15 +296,15 @@ def _add_market_relative_features(
 
     # Align the benchmark to the symbol's trading dates; forward-fill any gaps.
     mkt_close = market_df["Close"].reindex(f.index).ffill()
-    s_short = int(config.REL_RET_SHORT)
-    s_long = int(config.REL_RET_LONG)
+    s_short = int(cfg.REL_RET_SHORT)
+    s_long = int(cfg.REL_RET_LONG)
     f["rel_ret_short"] = close.pct_change(s_short) - mkt_close.pct_change(s_short)
     f["rel_ret_long"] = close.pct_change(s_long) - mkt_close.pct_change(s_long)
     # Relative-strength line = symbol / benchmark; its slope is RS momentum.
     rs_line = close / mkt_close.replace(0, np.nan)
-    f["rs_slope"] = rs_line.pct_change(config.RS_SLOPE_WINDOW)
+    f["rs_slope"] = rs_line.pct_change(cfg.RS_SLOPE_WINDOW)
     # Broadcast market-regime feature: benchmark vs its own trend SMA.
-    mkt_sma = mkt_close.rolling(config.MKT_TREND_SMA).mean()
+    mkt_sma = mkt_close.rolling(cfg.MKT_TREND_SMA).mean()
     f["mkt_trend"] = mkt_close / mkt_sma.replace(0, np.nan) - 1.0
 
 
@@ -367,11 +444,182 @@ def fetch_market_benchmark(
     )
 
 
-def get_feature_columns() -> list:
-    """Model feature columns. The frozen base-14 set is returned unless an Item-3
-    flag is on, in which case the matching gated columns are APPENDED (order
-    preserved) — which changes the feature-vector width and requires retraining.
+
+def _add_candlestick_features(f: pd.DataFrame, close: pd.Series, high: pd.Series,
+                               low: pd.Series, open_: pd.Series, cfg=None) -> None:
+    """Candlestick pattern boolean flags from Steve Nison's Japanese Candlestick
+    Charting Techniques. Each pattern returns {0, 1}. Mutates f in place;
+    computed only when config.USE_CANDLESTICK_FEATURES is on.
     """
+    cfg = cfg or config
+    body = (close - open_).abs()
+    total_range = high - low
+    avg_body = body.rolling(20).mean().replace(0, np.nan)
+    body_pct = body / total_range.replace(0, np.nan)
+    upper_shadow = high - close.where(close >= open_, open_)
+    lower_shadow = open_.where(close >= open_, close) - low
+
+    doji_th = float(getattr(cfg, "CANDLESTICK_DOJI_THRESHOLD", 0.10))
+    long_shadow_mult = float(getattr(cfg, "CANDLESTICK_LONGSHADOW_MULTIPLIER", 2.0))
+    long_body_th = float(getattr(cfg, "CANDLESTICK_LONGBODY_THRESHOLD", 0.60))
+    short_body_mult = float(getattr(cfg, "CANDLESTICK_SHORT_BODY_MULTIPLIER", 0.5))
+
+    # -- Single-candle patterns --
+    is_doji = body_pct < doji_th
+    dragonfly = is_doji & (lower_shadow > long_shadow_mult * body) & (upper_shadow < body)
+    gravestone = is_doji & (upper_shadow > long_shadow_mult * body) & (lower_shadow < body)
+    f["doji"] = is_doji.astype(float)
+    f["dragonfly_doji"] = dragonfly.astype(float)
+    f["gravestone_doji"] = gravestone.astype(float)
+
+    white = close >= open_
+    black = close < open_
+    strong_body = body / total_range.replace(0, np.nan) > long_body_th
+    no_upper = upper_shadow < body * 0.1
+    no_lower = lower_shadow < body * 0.1
+    f["white_marubozu"] = (white & strong_body & no_upper & no_lower).astype(float)
+    f["black_marubozu"] = (black & strong_body & no_upper & no_lower).astype(float)
+
+    small_body = body < avg_body * short_body_mult
+    long_lower = lower_shadow > long_shadow_mult * body
+    long_upper = upper_shadow > long_shadow_mult * body
+
+    # Hammer/Hanging Man: differentiated by short-term trend context
+    ret_5d_col = close.pct_change(5)
+    downtrend = ret_5d_col < 0
+    uptrend = ret_5d_col >= 0
+    hammer_shape = white & small_body & long_lower & (upper_shadow < body)
+    f["hammer"] = (hammer_shape & downtrend).astype(float)
+    f["hanging_man"] = (hammer_shape & uptrend).astype(float)
+
+    # Shooting Star
+    shooting_shape = black & small_body & long_upper & (lower_shadow < body)
+    f["shooting_star"] = (shooting_shape & uptrend).astype(float)
+
+    # -- Two-candle patterns --
+    prev_open = open_.shift(1)
+    prev_close = close.shift(1)
+    prev_high = high.shift(1)
+    prev_low = low.shift(1)
+    prev_white = prev_close >= prev_open
+    prev_black = prev_close < prev_open
+
+    f["bullish_engulfing"] = (
+        prev_black & white &
+        (open_ < prev_close) & (close > prev_open)
+    ).astype(float)
+    f["bearish_engulfing"] = (
+        prev_white & black &
+        (open_ > prev_close) & (close < prev_open)
+    ).astype(float)
+    f["bullish_harami"] = (
+        prev_black & white &
+        (open_ > prev_close) & (close < prev_open)
+    ).astype(float)
+    f["bearish_harami"] = (
+        prev_white & black &
+        (open_ < prev_close) & (close > prev_open)
+    ).astype(float)
+
+    prev_mid = (prev_open + prev_close) / 2.0
+    f["piercing_line"] = (
+        prev_black & white &
+        (open_ < prev_low) & (close > prev_mid)
+    ).astype(float)
+    f["dark_cloud_cover"] = (
+        prev_white & black &
+        (open_ > prev_high) & (close < prev_mid)
+    ).astype(float)
+
+    # -- Three-candle patterns --
+    prev2_open = open_.shift(2)
+    prev2_close = close.shift(2)
+    prev2_high = high.shift(2)
+    prev2_low = low.shift(2)
+    prev2_white = prev2_close >= prev2_open
+    prev2_black = prev2_close < prev2_open
+    prev2_mid = (prev2_open + prev2_close) / 2.0
+
+    prev1_body = (prev_close - prev_open).abs()
+    prev1_small = prev1_body < avg_body.shift(1) * short_body_mult
+
+    f["morning_star"] = (
+        prev2_black & prev1_small &
+        (prev_high < prev2_low) &  # gap down to star
+        white & (low > prev_high) &  # gap up from star
+        (close > prev2_mid)
+    ).astype(float)
+    f["evening_star"] = (
+        prev2_white & prev1_small &
+        (prev_low > prev2_high) &  # gap up to star
+        black & (high < prev_low) &  # gap down from star
+        (close < prev2_mid)
+    ).astype(float)
+def _add_micro_features(f: pd.DataFrame, close: pd.Series, high: pd.Series, low: pd.Series,
+                         open_: pd.Series, volume: pd.Series, cfg=None) -> None:
+    """Micro-structure / market quality features computed from daily OHLCV.
+    No order-book data required. All values stationary & price-level independent.
+    Gated by config.USE_MICRO_FEATURES (default OFF).
+
+    Features added:
+      * close_loc — log(close / hlc3): mean-reversion proxy
+      * volume_imbalance — (up_day_vol - down_day_vol) / total_rolling_vol
+      * intraday_volatility — log range / close: daily efficiency
+      * gap_pct — overnight gap
+      * rolling_efficiency — 10-day efficiency ratio
+      * atr_slope — ATR rate of change
+      * volume_shock — z-score of volume ratio
+      * close_rank_20 — percentile rank of close in trailing 20 bars
+      * high_low_spread_pct — HL normalized by close
+    """
+    cfg = cfg or config
+    hlc3 = (high + low + close) / 3.0
+    f["close_loc"] = np.log(close / hlc3.replace(0, np.nan))
+
+    # Volume imbalance: directional volume pressure
+    up_day = close >= open_
+    down_day = close < open_
+    up_vol = volume.where(up_day, 0.0)
+    down_vol = volume.where(down_day, 0.0)
+    vol_total = volume.rolling(20).sum().replace(0, np.nan)
+    f["volume_imbalance"] = (up_vol.rolling(20).sum() - down_vol.rolling(20).sum()) / vol_total
+
+    f["intraday_volatility"] = (high - low) / close
+
+    # Overnight gap
+    f["gap_pct"] = open_ / close.shift(1) - 1.0
+
+    # Rolling efficiency ratio: net move / total path
+    ret = close.pct_change(1).abs()
+    eff_num = (close - close.shift(10)).abs()
+    eff_den = ret.rolling(10).sum().replace(0, np.nan)
+    f["rolling_efficiency"] = eff_num / eff_den
+
+    # ATR slope (5-bar change in ATR%)
+    atr = (high - low + (high - close.shift(1)).abs() + (low - close.shift(1)).abs()).rolling(14).mean()
+    atr_pct = atr / close
+    f["atr_slope"] = atr_pct.pct_change(5)
+
+    # Volume shock z-score: how unusual is today's volume ratio
+    vr = volume / volume.rolling(20).mean().replace(0, np.nan)
+    vr_std = vr.rolling(40).std().replace(0, np.nan)
+    f["volume_shock"] = (vr - vr.mean()) / vr_std
+
+    # Close rank in trailing 20 bars
+    f["close_rank_20"] = close.rolling(20).apply(
+        lambda a: float((a <= a[-1]).mean()), raw=True
+    )
+
+    # Normalized daily range
+    f["high_low_spread_pct"] = (high - low) / close
+
+
+def get_feature_columns(cfg=None) -> list:
+    """Model feature columns. The frozen base-14 set is returned unless an Item-3
+    or Item-6B flag is on, in which case the matching gated columns are APPENDED
+    (order preserved) — which changes the feature-vector width and requires retraining.
+    """
+    cfg = cfg or config
     cols = [
         "sma_cross",
         "dist_ema",
@@ -388,8 +636,12 @@ def get_feature_columns() -> list:
         "dist_sma20",
         "dist_sma50",
     ]
-    if getattr(config, "USE_REGIME_FEATURES", False):
+    if getattr(cfg, "USE_REGIME_FEATURES", False):
         cols = cols + _REGIME_FEATURE_COLS
-    if getattr(config, "USE_MARKET_RELATIVE_FEATURES", False):
+    if getattr(cfg, "USE_MARKET_RELATIVE_FEATURES", False):
         cols = cols + _MARKET_REL_FEATURE_COLS
+    if getattr(cfg, "USE_CANDLESTICK_FEATURES", False):
+        cols = cols + _CANDLESTICK_FEATURE_COLS
+    if getattr(cfg, "USE_MICRO_FEATURES", False):
+        cols = cols + _MICRO_FEATURE_COLS
     return cols

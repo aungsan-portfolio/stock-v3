@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stock Engine Pro V3</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0b0e14;--bg2:#131720;--bg3:#1c2130;--bg4:#252b3d;--border:#2a3148;--text:#e2e6f0;--text2:#8891a8;--accent:#6c5ce7;--accent2:#a29bfe;--green:#00b894;--green-bg:rgba(0,184,148,0.15);--red:#e17055;--red-bg:rgba(225,112,85,0.15);--yellow:#fdcb6e;--yellow-bg:rgba(253,203,110,0.15);--radius:8px}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);overflow-x:hidden}
+.header{background:var(--bg2);border-bottom:1px solid var(--border);padding:10px 16px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
+.header h1{font-size:16px;font-weight:700;background:linear-gradient(135deg,var(--accent2),var(--accent));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.header .info{display:flex;align-items:center;gap:10px;font-size:11px;color:var(--text2)}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--green);display:inline-block}
+.layout{display:grid;grid-template-columns:200px 1fr;min-height:calc(100vh-44px)}
+.sidebar{background:var(--bg2);border-right:1px solid var(--border);padding:8px;overflow-y:auto}
+.sidebar button{display:block;width:100%;padding:7px 10px;background:transparent;border:none;color:var(--text);font-family:inherit;font-size:11px;text-align:left;border-radius:6px;cursor:pointer}
+.sidebar button:hover{background:var(--bg3)}
+.sidebar button.active{background:var(--accent);color:#fff;font-weight:500}
+.sidebar .label{display:block;font-size:9px;color:var(--text2);padding:8px 10px 3px;font-weight:600;text-transform:uppercase}
+.main{display:flex;flex-direction:column;overflow:hidden}
+.tab{display:none;padding:12px;overflow-y:auto;max-height:calc(100vh-44px)}
+.tab.active{display:block}
+.card-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:10px}
+.card{background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);padding:12px}
+.card .l{font-size:10px;color:var(--text2);font-weight:600;text-transform:uppercase}
+.card .v{font-size:18px;font-weight:700;margin-top:2px}
+table{width:100%;border-collapse:collapse;font-size:11px}
+th{text-align:left;padding:6px 8px;background:var(--bg2);color:var(--text2);font-weight:500;border-bottom:1px solid var(--border);white-space:nowrap;position:sticky;top:0}
+td{padding:5px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
+tr:hover{background:var(--bg4)}
+.num{text-align:right;font-family:'SF Mono','JetBrains Mono',monospace;font-size:11px}
+.pos{color:var(--green);font-weight:600}
+.neg{color:var(--red);font-weight:600}
+.wrap{overflow-x:auto;border:1px solid var(--border);border-radius:var(--radius);margin-bottom:10px}
+.btn-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.btn,.btn-sm{padding:7px 14px;border:none;border-radius:6px;font-family:inherit;font-weight:600;font-size:11px;cursor:pointer}
+.btn:hover{transform:translateY(-1px)}
+.btn:disabled{opacity:0.4;cursor:not-allowed}
+.btn-p{background:var(--accent);color:#fff}
+.btn-g{background:var(--green);color:#fff}
+.btn-r{background:var(--red);color:#fff}
+.btn-o{background:transparent;border:1px solid var(--border);color:var(--text)}
+.badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:9px;font-weight:600}
+.badge-buy{background:var(--green-bg);color:var(--green)}
+.badge-sell{background:var(--red-bg);color:var(--red)}
+.console{background:#080b12;border:1px solid var(--border);border-radius:var(--radius);padding:10px;font-family:'SF Mono','JetBrains Mono',monospace;font-size:11px;line-height:1.5;max-height:300px;overflow-y:auto;white-space:pre-wrap}
+.console .err{color:var(--red)}
+.console .ok{color:var(--green)}
+.console .info{color:var(--accent2)}
+.loading{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(11,14,20,.7);z-index:999;align-items:center;justify-content:center}
+.loading.show{display:flex}
+.spinner{width:30px;height:30px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:s .6s linear infinite}
+@keyframes s{to{transform:rotate(360deg)}}
+.toast{position:fixed;bottom:16px;right:16px;padding:8px 14px;border-radius:6px;font-size:11px;font-weight:500;z-index:2000;opacity:0;transition:.3s}
+.toast.show{opacity:1}
+.toast.ok{background:var(--green-bg);color:var(--green);border:1px solid var(--green)}
+.toast.err{background:var(--red-bg);color:var(--red);border:1px solid var(--red)}
+input,select{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:5px;font-family:inherit;font-size:12px;outline:0}
+input:focus,select:focus{border-color:var(--accent)}
+.buy-box{background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);padding:12px;margin-bottom:10px}
+.buy-box h3{font-size:13px;font-weight:600;margin-bottom:8px}
+.buy-row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+@media(max-width:700px){.layout{grid-template-columns:1fr}.sidebar{display:none}}
+</style>
+</head>
+<body>
+
+<div class="loading" id="loading"><div class="spinner"></div></div>
+
+<div class="header">
+  <h1>Stock Engine Pro V3</h1>
+  <div class="info">
+    <span class="dot"></span>
+    <span id="clock"></span>
+    <button class="btn btn-o" style="padding:3px 8px;font-size:10px" onclick="document.getElementById('s').classList.toggle('show')">Menu</button>
+  </div>
+</div>
+
+<div class="layout">
+  <div class="sidebar" id="s">
+    <div class="label">Trading</div>
+    <button class="active" onclick="switchTab('buy')">Buy / Sell</button>
+    <button onclick="switchTab('portfolio')">Portfolio</button>
+    <div class="label">Scanner</div>
+    <button onclick="switchTab('hot')">Hot Candidates</button>
+    <button onclick="switchTab('coach')">Daily Coach</button>
+    <div class="label">Analysis</div>
+    <button onclick="switchTab('backtest')">Backtest</button>
+    <button onclick="switchTab('reports')">Reports</button>
+    <div class="label">System</div>
+    <button onclick="switchTab('models')">Models</button>
+    <button onclick="switchTab('console')">Console</button>
+  </div>
+
+  <div class="main">
+    <div class="tab active" id="t-buy">
+      <div class="buy-box">
+        <h3>Place Paper Order</h3>
+        <div class="buy-row">
+          <input type="text" id="sym" placeholder="Symbol" value="SPCX" style="width:80px;text-transform:uppercase">
+          <select id="side"><option value="BUY">BUY</option><option value="SELL">SELL</option></select>
+          <input type="number" id="qty" placeholder="Qty" value="5" style="width:60px" min="1">
+          <input type="text" id="price" placeholder="Price" value="" style="width:80px">
+          <select id="tif"><option value="DAY">DAY</option><option value="GTC">GTC</option></select>
+          <button class="btn btn-g" onclick="doBuy()">Place Order</button>
+        </div>
+        <div style="margin-top:6px;font-size:10px;color:var(--text2)">Leave Price blank = Market Order</div>
+      </div>
+      <div class="card-row">
+        <div class="card"><div class="l">Cash</div><div class="v" id="bcash">--</div></div>
+        <div class="card"><div class="l">Unrealized P&L</div><div class="v" id="bpnl">--</div></div>
+        <div class="card"><div class="l">Positions</div><div class="v" id="bpos">--</div></div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-sm btn-p" onclick="run('scan-hot',['--full-market'])">Scan Hot</button>
+        <button class="btn btn-sm btn-o" onclick="refreshPortfolio()">Refresh</button>
+      </div>
+      <h3 style="font-size:12px;font-weight:600;margin-bottom:6px">Hot Candidates</h3>
+      <div class="wrap"><table><thead><tr id="hth"></tr></thead><tbody id="htb"></tbody></table></div>
+      <div id="orderResult" style="display:none"></div>
+    </div>
+
+    <div class="tab" id="t-portfolio">
+      <div class="btn-row">
+        <button class="btn btn-sm btn-p" onclick="refreshPortfolio()">Refresh</button>
+        <span style="font-size:10px;color:var(--text2);display:flex;align-items:center" id="lastUpd"></span>
+      </div>
+      <div class="card-row">
+        <div class="card"><div class="l">Cash</div><div class="v" id="pcash">--</div></div>
+        <div class="card"><div class="l">Net Liq</div><div class="v" id="pnlv">--</div></div>
+        <div class="card"><div class="l">Unrealized P&L</div><div class="v" id="ppnl">--</div></div>
+      </div>
+      <h3 style="font-size:12px;font-weight:600;margin:0 0 6px">Positions</h3>
+      <div class="wrap"><table><thead><tr><th>Symbol</th><th>Qty</th><th>Avg Cost</th><th>Mkt Value</th><th>Unrealized P&L</th><th>P&L%</th></tr></thead><tbody id="ptb"><tr><td colspan="6" style="text-align:center;color:var(--text2);padding:16px">Loading...</td></tr></tbody></table></div>
+      <h3 style="font-size:12px;font-weight:600;margin:10px 0 6px">Working Orders</h3>
+      <div class="wrap"><table><thead><tr><th>Symbol</th><th>Action</th><th>Qty</th><th>Type</th><th>Price</th><th>Status</th></tr></thead><tbody id="otb"><tr><td colspan="6" style="text-align:center;padding:12px;color:var(--text2)">None</td></tr></tbody></table></div>
+      <button class="btn btn-sm btn-r" onclick="if(confirm('Cancel all?'))fetch('/api/cancel').then(r=>r.json()).then(d=>output(d))">Cancel Orders</button>
+    </div>
+
+    <div class="tab" id="t-hot">
+      <div class="btn-row">
+        <button class="btn btn-sm btn-g" onclick="run('scan-hot',['--full-market'])">Full Scan</button>
+        <button class="btn btn-sm btn-p" onclick="run('predict-hot',['--full-market','--top-n','30'])">Predict</button>
+        <button class="btn btn-sm btn-o" onclick="run('model-doctor')">Doctor</button>
+        <button class="btn btn-sm btn-o" onclick="run('model-refresh',['--from-report','--top-n','30'])">Refresh Models</button>
+      </div>
+      <div class="wrap"><table><thead><tr id="hth2"></tr></thead><tbody id="htb2"></tbody></table></div>
+      <div class="console" id="hotCon"><div class="info">Output here</div></div>
+    </div>
+
+    <div class="tab" id="t-coach">
+      <div class="btn-row">
+        <button class="btn btn-sm btn-g" onclick="run('daily-coach',['--max-trades','1'])">Run Daily Coach</button>
+        <button class="btn btn-sm btn-p" onclick="run('daily-coach',['--confirm','--chart-checked','--max-trades','1'])">Coach + Trade</button>
+      </div>
+      <div class="console" id="coachCon"><div class="info">Output here</div></div>
+    </div>
+
+    <div class="tab" id="t-backtest">
+      <div class="btn-row">
+        <button class="btn btn-sm btn-p" onclick="run('backtest',['--train-min','252','--step','21'])">Run Backtest</button>
+        <button class="btn btn-sm btn-g" onclick="run('backtest',['--train-min','252','--step','21','--include-lstm'])">+LSTM</button>
+        <button class="btn btn-sm btn-o" onclick="run('backtest-summary')">Summary</button>
+        <button class="btn btn-sm btn-o" onclick="run('expectancy-report')">Expectancy</button>
+        <button class="btn btn-sm btn-o" onclick="run('forward-test-report')">Forward Test</button>
+      </div>
+      <div class="console" id="btCon"><div class="info">Output here</div></div>
+    </div>
+
+    <div class="tab" id="t-reports">
+      <button class="btn btn-sm btn-p" onclick="loadReports()">Refresh</button>
+      <div class="wrap" style="margin-top:8px"><table><thead><tr><th>File</th><th>Size</th><th>Date</th><th></th></tr></thead><tbody id="rtb"></tbody></table></div>
+    </div>
+
+    <div class="tab" id="t-models">
+      <div class="card-row">
+        <div class="card"><div class="l">RF Models</div><div class="v" id="mrf">--</div></div>
+        <div class="card"><div class="l">LSTM Models</div><div class="v" id="mlstm">--</div></div>
+        <div class="card"><div class="l">Buy Threshold</div><div class="v" id="mthr">--</div></div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-sm btn-p" onclick="run('model-refresh',['--from-report','--top-n','30'])">Refresh Models</button>
+        <button class="btn btn-sm btn-g" onclick="run('train')">Train All</button>
+        <button class="btn btn-sm btn-o" onclick="run('model-doctor')">Doctor</button>
+        <button class="btn btn-sm btn-o" onclick="run('predict')">Predict</button>
+      </div>
+      <div class="console" id="modelCon"><div class="info">Output here</div></div>
+    </div>
+
+    <div class="tab" id="t-console">
+      <div class="buy-box">
+        <div class="buy-row">
+          <select id="cmdSel" style="flex:1;min-width:160px">
+            <option value="live-readiness">Live Readiness</option>
+            <option value="scan-hot --full-market">Scan Hot</option>
+            <option value="predict-hot --full-market --top-n 30">Predict Hot</option>
+            <option value="train-hot --full-market --top-n 30">Train Hot</option>
+            <option value="daily-coach --max-trades 1">Daily Coach</option>
+            <option value="daily-coach --confirm --chart-checked --max-trades 1">Coach + Trade</option>
+            <option value="paper-coach">Paper Coach</option>
+            <option value="backtest --train-min 252 --step 21">Backtest</option>
+            <option value="backtest-summary">Summary</option>
+            <option value="expectancy-report">Expectancy</option>
+            <option value="forward-test-report">Forward Test</option>
+            <option value="model-refresh --from-report --top-n 30">Model Refresh</option>
+            <option value="train">Train Models</option>
+            <option value="predict">Predict</option>
+            <option value="model-doctor">Model Doctor</option>
+            <option value="paper">Paper Trade</option>
+            <option value="panic-flatten --confirm">Panic Flatten</option>
+            <option value="run-scheduled">Run Scheduled</option>
+          </select>
+          <button class="btn btn-sm btn-p" onclick="runConsole()">Run</button>
+          <button class="btn btn-sm btn-o" onclick="document.getElementById('ccon').innerHTML=''">Clear</button>
+        </div>
+      </div>
+      <div class="console" id="ccon" style="max-height:400px;min-height:150px"><div class="info">Select command, click Run</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// Tab switching
+function switchTab(tab) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('t-' + tab).classList.add('active');
+  document.querySelectorAll('.sidebar button').forEach(b => b.classList.remove('active'));
+  const btns = document.querySelectorAll('.sidebar button');
+  const map = {buy:0,portfolio:1,hot:2,coach:3,backtest:4,reports:5,models:6,console:7};
+  if (btns[map[tab]]) btns[map[tab]].classList.add('active');
+  if (tab === 'portfolio') refreshPortfolio();
+  if (tab === 'buy') { refreshPortfolio(); loadHot(); }
+  if (tab === 'hot') loadHot();
+  if (tab === 'reports') loadReports();
+  if (tab === 'models') loadModels();
+}
+
+// Clock
+function clock() {
+  document.getElementById('clock').textContent = new Date().toLocaleTimeString('en-US', {hour12:false});
+}
+setInterval(clock, 1000); clock();
+
+// Toast
+function toast(msg, type) {
+  const t = document.getElementById('toast') || (() => {
+    const e = document.createElement('div');
+    e.id = 'toast'; e.className = 'toast';
+    document.body.appendChild(e); return e;
+  })();
+  t.textContent = msg;
+  t.className = 'toast ' + type + ' show';
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+// Loading
+function load(show) {
+  document.getElementById('loading').classList.toggle('show', show);
+}
+
+// Run command (async)
+function run(cmd, args) {
+  const cons = document.querySelector('.tab.active .console');
+  if (cons) cons.innerHTML = '<div class="info">Running ' + cmd + '...</div>';
+  load(true);
+  const url = '/api/run/' + cmd + (args && args.length ? '/' + args.join('/') : '');
+  fetch(url).then(r => r.json()).then(d => {
+    load(false);
+    if (cons) {
+      cons.innerHTML = '';
+      const lines = (d.output || '').split('\n');
+      lines.forEach(l => {
+        const div = document.createElement('div');
+        if (l.includes('ERROR') || l.includes('Error') || l.includes('Traceback')) div.className = 'err';
+        else if (l.includes('✅') || l.includes('✓')) div.className = 'ok';
+        div.textContent = l;
+        cons.appendChild(div);
+      });
+    }
+    if (d.exit === 0) toast('Done', 'ok');
+    else if (d.exit !== 0) toast('Failed', 'err');
+    loadHot();
+    loadModels();
+  }).catch(e => { load(false); toast(e.message, 'err'); });
+}
+
+function runConsole() {
+  const val = document.getElementById('cmdSel').value;
+  const parts = val.split(' ');
+  const cmd = parts[0];
+  const args = parts.slice(1);
+  const con = document.getElementById('ccon');
+  con.innerHTML = '<div class="info">Running ' + val + '...</div>';
+  load(true);
+  const url = '/api/run/' + cmd + (args.length ? '/' + args.join('/') : '');
+  fetch(url).then(r => r.json()).then(d => {
+    load(false);
+    con.innerHTML = '';
+    const lines = (d.output || '').split('\n');
+    lines.forEach(l => {
+      const div = document.createElement('div');
+      if (l.includes('ERROR') || l.includes('Error') || l.includes('Traceback')) div.className = 'err';
+      else if (l.includes('✅') || l.includes('✓')) div.className = 'ok';
+      div.textContent = l;
+      con.appendChild(div);
+    });
+  });
+}
+
+// Portfolio
+async function refreshPortfolio() {
+  try {
+    const r = await fetch('/api/portfolio');
+    const d = await r.json();
+    document.getElementById('lastUpd').textContent = 'Updated: ' + new Date().toLocaleTimeString('en-US', {hour12:false});
+
+    const cash = Number(d.cash) || 0;
+    const nlv = Number(d.net_liquidation) || 0;
+    let upnl = 0;
+    d.positions.forEach(p => upnl += Number(p.unrealized_pnl || 0));
+
+    const fmt = (n) => '$' + Number(n).toLocaleString('en-US', {minimumFractionDigits:2});
+    const pnlHtml = (n) => '<span class="' + (n >= 0 ? 'pos' : 'neg') + '">' + (n >= 0 ? '+' : '') + fmt(Math.abs(n)) + '</span>';
+
+    document.getElementById('pcash').textContent = fmt(cash);
+    document.getElementById('pnlv').textContent = fmt(nlv);
+    document.getElementById('ppnl').innerHTML = pnlHtml(upnl);
+
+    document.getElementById('bcash').textContent = fmt(cash);
+    document.getElementById('bpnl').innerHTML = pnlHtml(upnl);
+    document.getElementById('bpos').textContent = d.positions.length || 0;
+
+    const ptb = document.getElementById('ptb');
+    if (d.positions.length) {
+      ptb.innerHTML = d.positions.map(p => {
+        const up = Number(p.unrealized_pnl || 0);
+        const cost = Number(p.avg_cost || 0);
+        const mkt = Number(p.market_value || 0);
+        const pct = cost ? (up / (mkt - up)) * 100 : 0;
+        return '<tr><td><b>' + p.symbol + '</b></td><td class="num">' + p.qty + '</td><td class="num">' + fmt(cost) + '</td><td class="num">' + fmt(mkt) + '</td><td class="num ' + (up >= 0 ? 'pos' : 'neg') + '">' + (up >= 0 ? '+' : '') + fmt(Math.abs(up)) + '</td><td class="num ' + (up >= 0 ? 'pos' : 'neg') + '">' + (up >= 0 ? '+' : '') + pct.toFixed(1) + '%</td></tr>';
+      }).join('');
+    } else {
+      ptb.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:16px;color:var(--text2)">No positions</td></tr>';
+    }
+
+    const otb = document.getElementById('otb');
+    if (d.orders && d.orders.length) {
+      otb.innerHTML = d.orders.map(o => {
+        const badge = o.action === 'BUY' ? 'badge-buy' : 'badge-sell';
+        return '<tr><td><b>' + o.symbol + '</b></td><td><span class="badge ' + badge + '">' + o.action + '</span></td><td class="num">' + o.qty + '</td><td>' + o.type + '</td><td class="num">' + (o.limit_price || 'MKT') + '</td><td>' + o.status + '</td></tr>';
+      }).join('');
+    } else {
+      otb.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:12px;color:var(--text2)">No working orders</td></tr>';
+    }
+  } catch(e) {}
+}
+
+// Hot candidates
+async function loadHot() {
+  try {
+    const r = await fetch('/api/hot');
+    const d = await r.json();
+    const cols = d.rows || [];
+    ['hth','hth2'].forEach(hid => {
+      const h = document.getElementById(hid);
+      if (h) h.innerHTML = '<th>#</th><th>Symbol</th><th>Price</th><th>5d%</th><th>20d%</th><th>Score</th><th>ATR</th>';
+    });
+    ['htb','htb2'].forEach((bid, i) => {
+      const b = document.getElementById(bid);
+      if (!b) return;
+      const max = bid === 'htb' ? 15 : 30;
+      if (!cols.length) {
+        b.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:16px;color:var(--text2)">No data - run a scan first</td></tr>';
+        return;
+      }
+      b.innerHTML = cols.slice(0, max).map((row, ri) => {
+        const sym = row[0] || '?';
+        const price = parseFloat(row[4]).toFixed(2);
+        const r5 = parseFloat(row[6]);
+        const r20 = parseFloat(row[7]);
+        const score = parseFloat(row[10]).toFixed(1);
+        const atr = (parseFloat(row[9]) * 100).toFixed(1);
+        return '<tr onclick="fillBuy(\'' + sym + '\')" style="cursor:pointer">' +
+          '<td>' + (ri + 1) + '</td>' +
+          '<td><b>' + sym + '</b></td>' +
+          '<td class="num">$' + price + '</td>' +
+          '<td class="num ' + (r5 > 0 ? 'pos' : 'neg') + '">' + (r5 > 0 ? '+' : '') + (r5 * 100).toFixed(1) + '%</td>' +
+          '<td class="num ' + (r20 > 0 ? 'pos' : 'neg') + '">' + (r20 > 0 ? '+' : '') + (r20 * 100).toFixed(1) + '%</td>' +
+          '<td class="num">' + score + '</td>' +
+          '<td class="num">' + atr + '%</td></tr>';
+      }).join('');
+    });
+  } catch(e) {}
+}
+
+function fillBuy(sym) {
+  document.getElementById('sym').value = sym;
+  switchTab('buy');
+  toast('Symbol ' + sym + ' ready', 'ok');
+}
+
+// Buy
+async function doBuy() {
+  const sym = document.getElementById('sym').value.trim().toUpperCase();
+  const side = document.getElementById('side').value;
+  const qty = parseInt(document.getElementById('qty').value);
+  const price = document.getElementById('price').value.trim();
+  if (!sym || !qty || qty < 1) { toast('Enter symbol and qty', 'err'); return; }
+  const btn = document.querySelector('.btn-g');
+  btn.disabled = true;
+  btn.textContent = 'Placing...';
+  load(true);
+  try {
+    const r = await fetch('/api/run/paper-hot/--symbols/' + sym + '/--top-n/1/--execute');
+    const d = await r.json();
+    document.getElementById('orderResult').style.display = 'block';
+    document.getElementById('orderResult').innerHTML = '<div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);padding:10px;margin-top:8px"><pre style="font-size:11px;color:var(--text2);white-space:pre-wrap">' + (d.output || 'Order sent') + '</pre></div>';
+    toast('Order placed: ' + sym, 'ok');
+    setTimeout(() => refreshPortfolio(), 2000);
+  } catch(e) { toast(e.message, 'err'); }
+  finally {
+    btn.disabled = false;
+    btn.textContent = 'Place Order';
+    load(false);
+  }
+}
+
+// Reports
+async function loadReports() {
+  try {
+    const r = await fetch('/api/reports');
+    const files = await r.json();
+    const tbody = document.getElementById('rtb');
+    if (!files.length) {
+      tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:16px;color:var(--text2)">No reports</td></tr>';
+      return;
+    }
+    tbody.innerHTML = files.map(f =>
+      '<tr><td><b>' + f.name + '</b></td><td>' + f.size + '</td><td>' + f.modified + '</td><td><button class="btn btn-sm btn-o" style="padding:2px 8px;font-size:10px" onclick="window.open(\'/report/' + encodeURIComponent(f.name) + '\',\'_blank\')">Open</button></td></tr>'
+    ).join('');
+  } catch(e) {}
+}
+
+// Models
+async function loadModels() {
+  try {
+    const r = await fetch('/api/models');
+    const d = await r.json();
+    document.getElementById('mrf').textContent = d.rf || '?';
+    document.getElementById('mlstm').textContent = d.lstm || '?';
+    document.getElementById('mthr').textContent = d.threshold || '?';
+  } catch(e) {}
+}
+
+// Load initial data
+document.addEventListener('DOMContentLoaded', () => {
+  loadHot();
+  loadReports();
+  loadModels();
+  refreshPortfolio();
+});
+</script>
+</body>
+</html>

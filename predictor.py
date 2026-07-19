@@ -22,6 +22,7 @@ import model_metrics
 from data_manager import fetch_ohlcv, build_features
 from ai_engine import StockRFEngine
 from lstm_engine import StockLSTMEngine
+from alternative_models import StockXGBEngine, StockTransformerEngine
 from errors import ModelNotAvailableError
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,8 @@ class Signal:
     confidence: float
     rf_score: float
     lstm_score: float
+    xgb_score: float
+    trans_score: float
     tech_score: float
     price: float
     reason: str
@@ -71,21 +74,15 @@ def technical_score_from_feature_row(row: pd.Series) -> float:
     return float(np.clip(score, 0.0, 1.0))
 
 
-def _technical_score(df: pd.DataFrame) -> float:
-    feat = build_features(df)
+def _technical_score(df: pd.DataFrame, cfg=None) -> float:
+    feat = build_features(df, cfg=cfg)
     if feat.empty:
         return 0.5
     return technical_score_from_feature_row(feat.iloc[-1])
 
 
 def _safe_score(fn, *args, **kwargs) -> Tuple[float, bool]:
-    """Returns (score, ok). ok=False means the score should be treated as missing.
-
-    A missing per-symbol model is an expected, benign condition, so it is logged
-    at debug level. Any other failure is unexpected and logged with a traceback.
-    Both cases yield ok=False so the ensemble does not count them as an available
-    ML model.
-    """
+    """Returns (score, ok). ok=False means the score should be treated as missing."""
     try:
         score = float(fn(*args, **kwargs))
         if not np.isfinite(score):
@@ -99,23 +96,19 @@ def _safe_score(fn, *args, **kwargs) -> Tuple[float, bool]:
         return 0.5, False
 
 
-def ml_model_count(rf_ok: bool, lstm_ok: bool) -> int:
-    """Count ML models that can actually influence the ensemble confidence.
-
-    A sub-model is an availability voter only when it is BOTH available AND carries
-    a positive ensemble weight. A zero-weighted model contributes nothing to the
-    blend (Item 6b zeroes WEIGHT_LSTM because LSTM validation AUC is sub-chance), so
-    counting it would let an otherwise model-less symbol clear
-    MIN_ML_MODELS_FOR_SIGNAL and trade on the technical score alone — technical-only
-    trading by the back door, which this gate exists to prevent.
-    """
-    rf_counts = bool(rf_ok) and config.WEIGHT_RF > 0
-    lstm_counts = bool(lstm_ok) and config.WEIGHT_LSTM > 0
-    return int(rf_counts) + int(lstm_counts)
+def ml_model_count(rf_ok: bool, lstm_ok: bool, xgb_ok: bool = False, trans_ok: bool = False, cfg=None) -> int:
+    """Count ML models that can actually influence the ensemble confidence."""
+    cfg = cfg or config.get_settings()
+    rf_counts = bool(rf_ok) and cfg.WEIGHT_RF > 0
+    lstm_counts = bool(lstm_ok) and cfg.WEIGHT_LSTM > 0
+    xgb_counts = bool(xgb_ok) and getattr(cfg, "WEIGHT_XGB", 0) > 0
+    trans_counts = bool(trans_ok) and getattr(cfg, "WEIGHT_TRANSFORMER", 0) > 0
+    return int(rf_counts) + int(lstm_counts) + int(xgb_counts) + int(trans_counts)
 
 
-def enough_ml_models(rf_ok: bool, lstm_ok: bool) -> bool:
-    return ml_model_count(rf_ok, lstm_ok) >= config.MIN_ML_MODELS_FOR_SIGNAL
+def enough_ml_models(rf_ok: bool, lstm_ok: bool, xgb_ok: bool = False, trans_ok: bool = False, cfg=None) -> bool:
+    cfg = cfg or config.get_settings()
+    return ml_model_count(rf_ok, lstm_ok, xgb_ok, trans_ok, cfg) >= cfg.MIN_ML_MODELS_FOR_SIGNAL
 
 
 def weighted_blend(
@@ -124,12 +117,20 @@ def weighted_blend(
     lstm_score: float,
     lstm_ok: bool,
     tech_score: float,
+    xgb_score: float = 0.5,
+    xgb_ok: bool = False,
+    trans_score: float = 0.5,
+    trans_ok: bool = False,
+    cfg=None,
 ) -> float:
     """Blend available scores while respecting missing model flags."""
+    cfg = cfg or config.get_settings()
     pairs = [
-        (rf_score, config.WEIGHT_RF if rf_ok else 0.0),
-        (lstm_score, config.WEIGHT_LSTM if lstm_ok else 0.0),
-        (tech_score, config.WEIGHT_TECHNICAL),
+        (rf_score, cfg.WEIGHT_RF if rf_ok else 0.0),
+        (lstm_score, cfg.WEIGHT_LSTM if lstm_ok else 0.0),
+        (xgb_score, getattr(cfg, "WEIGHT_XGB", 0.20) if xgb_ok else 0.0),
+        (trans_score, getattr(cfg, "WEIGHT_TRANSFORMER", 0.15) if trans_ok else 0.0),
+        (tech_score, cfg.WEIGHT_TECHNICAL),
     ]
     total_w = sum(w for _, w in pairs)
     if total_w <= 0:
@@ -137,10 +138,11 @@ def weighted_blend(
     return float(np.clip(sum(s * w for s, w in pairs) / total_w, 0.0, 1.0))
 
 
-def action_from_confidence(confidence: float) -> str:
-    if confidence >= config.BUY_THRESHOLD:
+def action_from_confidence(confidence: float, cfg=None) -> str:
+    cfg = cfg or config.get_settings()
+    if confidence >= cfg.BUY_THRESHOLD:
         return "BUY"
-    if confidence <= config.SELL_THRESHOLD:
+    if confidence <= cfg.SELL_THRESHOLD:
         return "SELL"
     return "HOLD"
 
@@ -155,36 +157,7 @@ def apply_position_rule_with_hold(
     current_price: Optional[float] = None,
     hard_stop_pct: Optional[float] = None,
 ) -> Tuple[int, bool, str, int]:
-    """Advance a unit position by one bar according to a broker-like rule.
-
-    This is the single source of truth shared by the backtest and (conceptually)
-    the live IBKR bridge so both treat BUY/SELL/HOLD identically:
-
-    - Long-only by default. A SELL while flat opens a short only if ``allow_short``.
-    - An opposite signal closes the open position only after it has been held for
-      at least ``min_hold`` bars (aligned with ``ML_HORIZON``); earlier opposite
-      signals are ignored and the position is kept.
-    - BUY/SELL never flip the position in a single bar; they close to flat first
-      (mirrors ``IBKRBridge.execute_signal``).
-    - Hard-stop backstop: a long position whose current return has fallen below
-      ``-hard_stop_pct`` is closed immediately, BYPASSING the ``min_hold`` guard
-      and whatever signal arrived this bar. This is the worst-case loss cap and
-      applies to LONGS ONLY (shorts are intentionally not bypassed here).
-
-    Args:
-        position:      current unit position, one of -1, 0, +1.
-        signal:        "BUY", "SELL" or "HOLD".
-        allow_short:   whether a flat SELL may open a short.
-        bars_held:     bars the current position has been open (0 when flat).
-        min_hold:      minimum bars before an opposite signal may close.
-        entry_price:   fill price of the open long (required for the hard stop).
-        current_price: latest price used to evaluate the hard stop.
-        hard_stop_pct: positive fraction; long closes when current return
-                       < -hard_stop_pct. Pass None to disable the hard stop.
-
-    Returns:
-        (new_position, executed, note, new_bars_held)
-    """
+    """Advance a unit position by one bar according to a broker-like rule."""
     signal = signal.upper()
     min_hold = max(1, int(min_hold))
 
@@ -227,15 +200,21 @@ def apply_position_rule_with_hold(
 
 
 class Predictor:
-    def __init__(self) -> None:
-        self.rf = StockRFEngine()
-        self.lstm = StockLSTMEngine()
+    def __init__(self, settings=None) -> None:
+        self.cfg = settings or config.get_settings()
+        self.rf = StockRFEngine(settings=self.cfg)
+        self.lstm = StockLSTMEngine(settings=self.cfg)
+        self.xgb = StockXGBEngine(settings=self.cfg)
+        self.trans = StockTransformerEngine(settings=self.cfg)
+
         # Best-effort load up-front so each predict_all call doesn't pay the cost.
         self.rf.load()
         self.lstm.load()
+        self.xgb.load()
+        self.trans.load()
 
     def predict_all(self, symbols: Optional[List[str]] = None) -> List[Signal]:
-        symbols = symbols or config.WATCHLIST
+        symbols = symbols or self.cfg.WATCHLIST
         signals: List[Signal] = []
 
         for symbol in symbols:
@@ -244,24 +223,31 @@ class Predictor:
 
                 rf_score, rf_ok = _safe_score(self.rf.predict, symbol, df)
                 lstm_score, lstm_ok = _safe_score(self.lstm.predict, symbol, df)
-                tech_score = _technical_score(df)
+                xgb_score, xgb_ok = _safe_score(self.xgb.predict, symbol, df)
+                trans_score, trans_ok = _safe_score(self.trans.predict, symbol, df)
+                tech_score = _technical_score(df, self.cfg)
 
-                if not enough_ml_models(rf_ok, lstm_ok):
+                if not enough_ml_models(rf_ok, lstm_ok, xgb_ok, trans_ok, self.cfg):
                     confidence = 0.5
                     action = "HOLD"
                     reason = (
                         f"RF={rf_score:.2f}{'' if rf_ok else '?'} "
                         f"LSTM={lstm_score:.2f}{'' if lstm_ok else '?'} "
+                        f"XGB={xgb_score:.2f}{'' if xgb_ok else '?'} "
+                        f"TRANS={trans_score:.2f}{'' if trans_ok else '?'} "
                         f"Tech={tech_score:.2f} → ML models missing, forced HOLD"
                     )
                 else:
                     confidence = weighted_blend(
-                        rf_score, rf_ok, lstm_score, lstm_ok, tech_score
+                        rf_score, rf_ok, lstm_score, lstm_ok, tech_score,
+                        xgb_score, xgb_ok, trans_score, trans_ok, self.cfg
                     )
-                    action = action_from_confidence(confidence)
+                    action = action_from_confidence(confidence, self.cfg)
                     reason = (
                         f"RF={rf_score:.2f}{'' if rf_ok else '?'} "
                         f"LSTM={lstm_score:.2f}{'' if lstm_ok else '?'} "
+                        f"XGB={xgb_score:.2f}{'' if xgb_ok else '?'} "
+                        f"TRANS={trans_score:.2f}{'' if trans_ok else '?'} "
                         f"Tech={tech_score:.2f} → ensemble={confidence:.2f}"
                     )
 
@@ -281,6 +267,8 @@ class Predictor:
                     confidence=round(float(confidence), 4),
                     rf_score=round(rf_score, 4),
                     lstm_score=round(lstm_score, 4),
+                    xgb_score=round(xgb_score, 4),
+                    trans_score=round(trans_score, 4),
                     tech_score=round(tech_score, 4),
                     price=round(price, 2),
                     reason=reason,

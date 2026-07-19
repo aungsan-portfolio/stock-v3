@@ -138,7 +138,12 @@ class TestConnectedPaperCommandCoverage(unittest.TestCase):
                                "clean": True, "duplicate_refs": [], "orphan_exits": []},
                   "protect": {"repaired": [], "failed": []},
               }) as startup, \
-             mock.patch.object(main, "build_trade_preview", return_value={"tradeable": True}), \
+             mock.patch.object(main, "build_trade_preview", return_value={
+                 "tradeable": True,
+                 "rr_2r": 2.0,
+                 "risk_per_share": 1.0,
+                 "suggested_shares_by_risk": 1,
+             }), \
              mock.patch.object(main, "print_trade_lesson"), \
              mock.patch.object(main, "print_trade_preview"), \
              mock.patch.object(main, "write_trade_note"):

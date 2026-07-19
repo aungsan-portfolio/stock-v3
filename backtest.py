@@ -214,13 +214,15 @@ def run_backtest(
     step: int = 21,
     verbose: bool = True,
     include_lstm: Optional[bool] = None,
+    settings=None,
 ) -> dict:
-    symbols = symbols or config.WATCHLIST
-    include_lstm = bool(config.BACKTEST_INCLUDE_LSTM if include_lstm is None else include_lstm)
-    allow_short = bool(config.ALLOW_SHORT)
-    min_hold = int(config.MIN_HOLD_BARS)
-    horizon = int(config.ML_HORIZON)
-    cost_per_order = float(config.BACKTEST_TRANSACTION_COST_PCT) + float(config.BACKTEST_SLIPPAGE_PCT)
+    cfg = settings or config.get_settings()
+    symbols = symbols or cfg.WATCHLIST
+    include_lstm = bool(cfg.BACKTEST_INCLUDE_LSTM if include_lstm is None else include_lstm)
+    allow_short = bool(cfg.ALLOW_SHORT)
+    min_hold = int(cfg.MIN_HOLD_BARS)
+    horizon = int(cfg.ML_HORIZON)
+    cost_per_order = float(cfg.BACKTEST_TRANSACTION_COST_PCT) + float(cfg.BACKTEST_SLIPPAGE_PCT)
 
     all_rows: list = []
     symbol_metrics: dict = {}
@@ -261,7 +263,7 @@ def run_backtest(
             n_orders = 0
             n_hard_stop_exits = 0
             n_lstm_folds = 0
-            hard_stop_pct = float(config.HARD_STOP_LOSS_PCT)
+            hard_stop_pct = float(cfg.HARD_STOP_LOSS_PCT)
 
             for start in range(train_min, len(X_all) - step + 1, step):
                 X_tr = X_all[:start]
@@ -442,7 +444,7 @@ def run_backtest(
         "signal_parity": check_signal_parity(),
         "allow_short": bool(allow_short),
         "min_hold_bars": int(min_hold),
-        "hard_stop_pct": round(float(config.HARD_STOP_LOSS_PCT), 6),
+        "hard_stop_pct": round(float(cfg.HARD_STOP_LOSS_PCT), 6),
         "cost_per_order": round(float(cost_per_order), 8),
         "position_state_simulation": True,
         "note": (
@@ -452,9 +454,9 @@ def run_backtest(
         ),
     })
 
-    config.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    metrics_path = config.REPORTS_DIR / "backtest_metrics.json"
-    trades_path = config.REPORTS_DIR / "backtest_trades.csv"
+    cfg.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    metrics_path = cfg.REPORTS_DIR / "backtest_metrics.json"
+    trades_path = cfg.REPORTS_DIR / "backtest_trades.csv"
     metrics_path.write_text(json.dumps(aggregate, indent=2), encoding="utf-8")
     if all_rows:
         pd.DataFrame(all_rows).to_csv(trades_path, index=False)

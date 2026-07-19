@@ -85,7 +85,8 @@ class TestDefaultUnchanged(unittest.TestCase):
     def setUp(self):
         # Be explicit so the test is correct even if a future default flips.
         self._stack = _flags(USE_REGIME_FEATURES=False,
-                             USE_MARKET_RELATIVE_FEATURES=False)
+                             USE_MARKET_RELATIVE_FEATURES=False,
+                             USE_CANDLESTICK_FEATURES=False)
         self._stack.__enter__()
         self.df = make_ohlcv(n=400, seed=3)
         self.feat = build_features(self.df)
@@ -110,7 +111,8 @@ class TestDefaultUnchanged(unittest.TestCase):
 class TestRegimeFeatures(unittest.TestCase):
     def setUp(self):
         self._stack = _flags(USE_REGIME_FEATURES=True,
-                             USE_MARKET_RELATIVE_FEATURES=False)
+                             USE_MARKET_RELATIVE_FEATURES=False,
+                             USE_CANDLESTICK_FEATURES=False)
         self._stack.__enter__()
         self.df = make_ohlcv(n=400, seed=5)
         self.feat = build_features(self.df)
@@ -166,7 +168,8 @@ class TestRegimeFeatures(unittest.TestCase):
         # Regime features must not alter how the base features are computed; on the
         # rows that survive both warmups the values must be identical.
         with _flags(USE_REGIME_FEATURES=False,
-                   USE_MARKET_RELATIVE_FEATURES=False):
+                   USE_MARKET_RELATIVE_FEATURES=False,
+                   USE_CANDLESTICK_FEATURES=False):
             feat_off = build_features(self.df)
         shared = self.feat.index
         self.assertTrue(set(shared).issubset(set(feat_off.index)))
@@ -180,7 +183,8 @@ class TestRegimeFeatures(unittest.TestCase):
 class TestMarketRelativeFeatures(unittest.TestCase):
     def setUp(self):
         self._stack = _flags(USE_REGIME_FEATURES=False,
-                             USE_MARKET_RELATIVE_FEATURES=True)
+                             USE_MARKET_RELATIVE_FEATURES=True,
+                             USE_CANDLESTICK_FEATURES=False)
         self._stack.__enter__()
         self.df = make_ohlcv(n=400, seed=9)
         self.market = make_market(self.df.index, seed=21)
@@ -222,14 +226,14 @@ class TestMarketRelativeFeatures(unittest.TestCase):
 # ── 4. Backward compatibility + benchmark fetch wrapper ──────────────
 class TestCompatAndBenchmark(unittest.TestCase):
     def test_one_arg_call_still_works_default(self):
-        with _flags(USE_REGIME_FEATURES=False, USE_MARKET_RELATIVE_FEATURES=False):
+        with _flags(USE_REGIME_FEATURES=False, USE_MARKET_RELATIVE_FEATURES=False, USE_CANDLESTICK_FEATURES=False):
             feat = build_features(make_ohlcv(n=300, seed=4))
         self.assertEqual(list(feat[BASE_14].columns), BASE_14)
 
     def test_both_flags_on_yields_full_column_set(self):
         df = make_ohlcv(n=400, seed=6)
         market = make_market(df.index, seed=31)
-        with _flags(USE_REGIME_FEATURES=True, USE_MARKET_RELATIVE_FEATURES=True):
+        with _flags(USE_REGIME_FEATURES=True, USE_MARKET_RELATIVE_FEATURES=True, USE_CANDLESTICK_FEATURES=False):
             self.assertEqual(get_feature_columns(),
                              BASE_14 + REGIME_COLS + MARKET_COLS)
             feat = build_features(df, market)

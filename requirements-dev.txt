@@ -1,8 +1,15 @@
 # Development / CI dependencies.
-#
-# The test suite (test_logic.py) and the verification script
-# (verify_watchlist.py) use only Python's standard-library `unittest` — no
-# pytest, no lint/type tooling — to keep the dependency surface small.
-#
-# Installing the runtime requirements is enough to run everything:
+# Contains testing, coverage, and static analysis libraries.
+
 -r requirements.txt
+
+# Testing & Coverage
+pytest>=8.0
+pytest-cov>=4.1
+coverage>=7.4
+
+# Static Analysis & Type Checking
+mypy>=1.9
+types-requests>=2.31
+types-PyYAML>=6.0
+pandas-stubs>=2.1

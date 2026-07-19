@@ -1,4 +1,4 @@
-﻿"""
+"""
 main.py â€” Stock Prediction Engine entry point.
 
 Commands:
@@ -504,7 +504,7 @@ def cmd_threshold_report(args) -> int:
         marker = "*" if abs(thr - config.BUY_THRESHOLD) < 1e-9 else " "
         print(f"{thr:>6.2f}{marker} {len(buys):>4} {holds:>5} {sells:>5}  {top}")
 
-    # â”€â”€ Write per-symbol CSV (confidence, scores, reason, action per threshold) â”€â”€
+    # ----------------------------------------------------------------------------
     config.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     csv_path = config.REPORTS_DIR / "threshold_report.csv"
     thr_cols = [f"action@{thr:.2f}" for thr in THRESHOLD_GRID]
@@ -528,9 +528,9 @@ def cmd_threshold_report(args) -> int:
                 + [s.reason]
             )
 
-    print(f"\nðŸ’¾ Report â†’ {csv_path}")
+    print(f"\n[REPORT] Report -> {csv_path}")
     print(
-        "\nâ„¹ï¸  Read-only analysis â€” config.py was NOT modified. To change the live\n"
+        "\n[INFO] Read-only analysis -- config.py was NOT modified. To change the live\n"
         "   threshold, edit BUY_THRESHOLD in config.py yourself."
     )
     return 0
@@ -786,7 +786,7 @@ def cmd_paper_coach(args) -> int:
             f"\nPlacing at most 1 PAPER order for {sym} through the existing "
             "IBKRBridge (all risk controls apply)..."
         )
-        accepted = bridge.execute_signal(candidate)
+        accepted = bridge.execute_signal(candidate, coach=True)
         order_result = {"symbol": sym, "accepted": bool(accepted)}
         if accepted:
             print(f"PAPER order accepted for {sym}. Existing risk controls were applied.")
@@ -1057,7 +1057,7 @@ def _daily_coach_execute(candidates, n_candidates: int) -> int:
                 "(all risk controls apply)â€¦"
             )
             lesson = build_trade_lesson(c, position_info=positions, open_order_info=working)
-            accepted = bridge.execute_signal(c)
+            accepted = bridge.execute_signal(c, coach=True)
             if accepted:
                 placed += 1
                 occupied.add(sym)
@@ -1886,7 +1886,780 @@ def cmd_run_scheduled(args) -> int:
     return result["exit_code"]
 
 
+def cmd_daytrade_scan(args) -> int:
+    from strategies.scanner.premarket_scanner import scan
+    import time
+    
+    rich_available = False
+    try:
+        from rich.console import Console
+        from rich.table import Table
+        from rich.live import Live
+        rich_available = True
+        console = Console()
+    except ImportError:
+        pass
+
+    def _display_scan(candidates, live=False):
+        if not candidates:
+            if not live:
+                print("  No candidates found.\n")
+            return None
+            
+        if rich_available:
+            table = Table(title="📈 Market Scanner", show_header=True, header_style="bold green")
+            table.add_column("Symbol", style="cyan", no_wrap=True)
+            table.add_column("Gap%", justify="right", style="green")
+            table.add_column("Sess Vol", justify="right")
+            table.add_column("RVol", justify="right", style="yellow")
+            table.add_column("Score", justify="right", style="magenta")
+            table.add_column("Sentiment", justify="right", style="magenta")
+            table.add_column("Catalyst", justify="right", style="blue")
+            table.add_column("Reason", style="default")
+            
+            for c in candidates:
+                row_style = "bold green" if c.score >= 80 else "bold yellow" if c.score >= 40 else "bold red"
+                table.add_row(
+                    c.symbol,
+                    f"{c.gap_pct:+.1f}",
+                    f"{c.premarket_volume:,}",
+                    f"{c.relative_volume:.1f}",
+                    f"{c.score:.1f}",
+                    f"{c.sentiment_score:+.2f}" if hasattr(c, "sentiment_score") else "",
+                    c.catalyst_type or "",
+                    c.reason,
+                    style=row_style,
+                )
+            if not live:
+                console.print(table)
+                print("\n")
+            return table
+        else:
+            from strategies.session import session_status
+            print(f"\n{'='*60}")
+            print("  MARKET SCANNER")
+            print(f"  Session: {session_status()}")
+            print(f"{'='*60}\n")
+            from strategies.session import is_market_open
+            volume_label = "Sess Vol" if is_market_open() else "PM Vol"
+            print(f"  {'Symbol':<8} {'Gap%':>7} {volume_label:>10} {'RVol':>5} {'Score':>5} {'Sent%':>5} {'Catalyst':<10} Reason")
+            print(f"  {'-'*8} {'-'*7} {'-'*10} {'-'*5} {'-'*5} {'-'*5} {'-'*10} {'-'*30}")
+            for c in candidates:
+                sent_str = f"{c.sentiment_score:>+5.2f}" if hasattr(c, 'sentiment_score') else "  N/A"
+                cat_str = c.catalyst_type if hasattr(c, 'catalyst_type') and c.catalyst_type else "None"
+                print(
+                    f"  {c.symbol:<8} {c.gap_pct:>+7.1f} {c.premarket_volume:>10,} "
+                    f"{c.relative_volume:>5.1f} {c.score:>5.1f} {sent_str} {cat_str:<10} {c.reason}"
+                )
+            print()
+            return None
+
+    if getattr(args, 'live', False) and rich_available:
+        with Live(console, refresh_per_second=1, screen=False) as live_context:
+            while True:
+                try:
+                    candidates = scan(max_candidates=args.top_n)
+                    table = _display_scan(candidates, live=True)
+                    if table:
+                        live_context.update(table)
+                    time.sleep(3)
+                except KeyboardInterrupt:
+                    break
+    else:
+        candidates = scan(max_candidates=args.top_n)
+        _display_scan(candidates, live=False)
+    return 0
+
+
+def cmd_daytrade_signals(args) -> int:
+    raw_symbols = args.symbols or list(getattr(config, "DAYTRADE_WATCHLIST", []))
+    symbols = []
+    for s in raw_symbols:
+        symbols.extend([x.strip().upper() for x in s.split(",") if x.strip()])
+    from strategies.session import session_status
+    print(f"\n{'='*60}")
+    print("  STRATEGY SIGNALS (DAY TRADING)")
+    print(f"  Session: {session_status()}")
+    print(f"  Symbols: {', '.join(symbols)}")
+    print(f"{'='*60}\n")
+
+    from alpaca_bridge import AlpacaBridge
+    bridge = AlpacaBridge()
+    try:
+        from strategies.orchestrator import evaluate_symbols_parallel, apply_portfolio_correlation
+        all_signals = evaluate_symbols_parallel(symbols, bridge=bridge)
+
+        mock_positions = getattr(args, 'mock_positions', None)
+        open_positions = mock_positions if mock_positions else []
+
+        if not mock_positions:
+            try:
+                if bridge.connect():
+                    open_positions = bridge.ib.positions()
+            except Exception:
+                pass
+
+        all_signals = apply_portfolio_correlation(all_signals, open_positions, bridge=bridge)
+
+        if not all_signals:
+            print("  No signals generated.\n")
+            return 0
+
+        all_signals.sort(key=lambda s: s.confidence, reverse=True)
+
+        for sig in all_signals:
+            rr = sig.reward_risk_ratio
+            print(f"  {sig.side:<4} {sig.symbol:<8} [{sig.strategy}]")
+            if getattr(args, 'verbose', False):
+                raw_conf = sig.metadata.get('raw_confidence', 'N/A')
+                raw_conf_str = f"{raw_conf:.2f}" if isinstance(raw_conf, float) else str(raw_conf)
+                print(f"       Confidence: {sig.confidence:.2f} (Raw: {raw_conf_str})")
+                
+                corr_pen = sig.metadata.get('correlation_penalty', 1.0)
+                max_corr = sig.metadata.get('max_correlation', 0.0)
+                comp_syms = sig.metadata.get('portfolio_overlap_symbols', [])
+                if comp_syms:
+                    print(f"       Correlation penalty: {corr_pen:.2f}")
+                    print(f"       Max corr: {max_corr:.2f} vs positions: {', '.join(comp_syms)}")
+            else:
+                print(f"       Confidence: {sig.confidence:.2f}")
+            print(f"       Entry: ${sig.entry_price:.2f}  Stop: ${sig.stop_price:.2f}  Target: ${sig.target_price:.2f}")
+            print(f"       Risk/share: ${sig.risk_per_share:.2f}  R:R = 1:{rr:.1f}")
+            if sig.pattern_name:
+                print(f"       Pattern: {sig.pattern_name}")
+            print(f"       Reason: {sig.reason}")
+        print(f"  Total signals: {len(all_signals)}\n")
+    finally:
+        bridge.disconnect()
+    return 0
+
+
+def cmd_daytrade_threshold_report(args) -> int:
+    strategy_name = args.strategy.upper()
+    raw_symbols = args.symbols or list(getattr(config, "DAYTRADE_WATCHLIST", []))
+    symbols = []
+    for s in raw_symbols:
+        symbols.extend([x.strip().upper() for x in s.split(",") if x.strip()])
+    lookback = args.lookback
+
+    print(f"\n{'='*60}")
+    print("  DAY TRADING THRESHOLD SWEEP REPORT")
+    print(f"  Strategy: {strategy_name}")
+    print(f"  Symbols: {', '.join(symbols)} ({len(symbols)} symbols)")
+    print(f"  Lookback: {lookback} days")
+    print(f"{'='*60}\n")
+
+    from strategies.backtester import run_portfolio_backtest
+    from strategies.constants import StrategyName
+    
+    name_map = {
+        "ORB": StrategyName.ORB,
+        "VWAP_BOUNCE": StrategyName.VWAP_BOUNCE,
+        "GAP_AND_GO": StrategyName.GAP_AND_GO,
+        "MOMENTUM_SCALP": StrategyName.MOMENTUM_SCALP,
+        "CANDLESTICK": StrategyName.CANDLESTICK
+    }
+    mapped_strategy = name_map.get(strategy_name)
+    if not mapped_strategy:
+        print(f"  ERROR: Unsupported strategy '{strategy_name}'")
+        return 1
+
+    strat_cfg = getattr(config, "STRATEGY_SETTINGS", {}).get(mapped_strategy)
+    current_thresh = float(getattr(strat_cfg, "confidence_min", 0.65) if strat_cfg else 0.65)
+
+    THRESHOLD_GRID = [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
+    
+    results = []
+    print(f" Running threshold grid simulation on {len(symbols)} symbols...")
+    for thr in THRESHOLD_GRID:
+        res = run_portfolio_backtest(
+            symbols=symbols,
+            strategy_name=strategy_name,
+            lookback_days=lookback,
+            override_min_confidence=thr,
+            plot=False
+        )
+        results.append((thr, res))
+
+    print("\n Thresh   Trades   Wins   Losses   Win Rate    Avg Win    Avg Loss    ProfFact    Net PnL   Status")
+    print("-" * 105)
+    
+    csv_rows = [["threshold", "trades", "wins", "losses", "win_rate", "avg_win", "avg_loss", "profit_factor", "net_pnl", "is_current", "status"]]
+    
+    for thr, res in results:
+        is_curr = abs(thr - current_thresh) < 1e-9
+        marker = "*" if is_curr else " "
+        win_rate_str = f"{res['win_rate']:.1f}%"
+        pnl_str = f"${res['net_pnl']:.2f}"
+        avg_win_str = f"${res['avg_win']:.2f}"
+        avg_loss_str = f"${res['avg_loss']:.2f}"
+        pf_str = f"{res['profit_factor']:.2f}" if res['profit_factor'] != float('inf') else "inf"
+        
+        status_str = "OK"
+        if res['total_trades'] < 30:
+            status_str = "Low Vol (!)"
+            
+        print(f"  {thr:>4.2f}{marker}   {res['total_trades']:>6}   {res['wins']:>4}   {res['losses']:>6}   {win_rate_str:>8}   {avg_win_str:>9}   {avg_loss_str:>9}   {pf_str:>9}   {pnl_str:>8}   {status_str}")
+        
+        csv_rows.append([
+            f"{thr:.2f}",
+            str(res['total_trades']),
+            str(res['wins']),
+            str(res['losses']),
+            win_rate_str,
+            avg_win_str,
+            avg_loss_str,
+            pf_str,
+            pnl_str,
+            "true" if is_curr else "false",
+            status_str
+        ])
+
+    config.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    csv_path = config.REPORTS_DIR / f"daytrade_threshold_report_{strategy_name.lower()}.csv"
+    
+    import csv
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerows(csv_rows)
+        
+    print(f"\n[REPORT] Report -> {csv_path}")
+    print(
+        "\n[INFO] Read-only analysis -- config.py was NOT modified. To change the live\n"
+        "   threshold, edit STRATEGY_SETTINGS in config.py yourself.\n"
+    )
+    return 0
+
+
+def cmd_daytrade_paper(args) -> int:
+    from strategies.session import session_status, is_market_open
+    dry_run = args.dry_run
+    raw_symbols = args.symbols or list(getattr(config, "DAYTRADE_WATCHLIST", []))
+    symbols = []
+    for s in raw_symbols:
+        symbols.extend([x.strip().upper() for x in s.split(",") if x.strip()])
+
+    print(f"\n{'='*60}")
+    print(f"  DAY TRADING PAPER {'(DRY RUN)' if dry_run else '(LIVE PAPER)'}")
+    print(f"  Session: {session_status()}")
+    print(f"{'='*60}\n")
+
+    if not dry_run and not is_market_open():
+        print(f"  ERROR: Market is not open. Session: {session_status()}")
+        print("  Refusing to place new paper orders outside regular market hours.\n")
+        sys.exit(3)
+
+    from alpaca_bridge import AlpacaBridge
+    bridge = AlpacaBridge()
+
+    if not dry_run:
+        if not bridge.connect():
+            print("  ERROR: Cannot connect to Alpaca paper broker.\n")
+            sys.exit(1)
+
+    try:
+        from strategies.orchestrator import evaluate_and_execute
+        from strategies.error_handler import TradingErrorHandler
+        error_handler = TradingErrorHandler(bridge=bridge)
+        
+        evaluate_and_execute(
+            watchlist=symbols, 
+            bridge=bridge, 
+            live_paper=not dry_run,
+            error_handler=error_handler
+        )
+
+        if dry_run:
+            print("  This was a DRY RUN. No orders were placed.")
+            print("  Run with --live-paper to place Alpaca paper orders.\n")
+
+    finally:
+        bridge.disconnect()
+    return 0
+
+
+def cmd_daytrade_flatten(args) -> int:
+    from alpaca_bridge import AlpacaBridge
+    print(f"\n{'='*60}")
+    print("  EMERGENCY FLATTEN ALL (DAY TRADING)")
+    print(f"{'='*60}\n")
+
+    bridge = AlpacaBridge()
+    if not bridge.connect():
+        print("  ERROR: Cannot connect to Alpaca paper broker.\n")
+        sys.exit(1)
+
+    try:
+        positions = bridge.ib.positions()
+        orders = bridge.ib.openTrades()
+        print(f"  Open positions: {len(positions)}")
+        print(f"  Working orders: {len(orders)}")
+
+        if not positions and not orders:
+            print("  Nothing to flatten.\n")
+            return 0
+
+        if not args.confirm:
+            print("\n  Add --confirm to actually cancel orders and flatten positions.\n")
+            return 0
+
+        bridge.flatten_all()
+        print("  All positions flattened and orders cancelled.\n")
+
+    finally:
+        bridge.disconnect()
+    return 0
+
+
+def cmd_daytrade_trade(args) -> int:
+    from strategies.base import TradeSignal
+    from strategies.command_parser import CommandParser
+    from strategies.session import is_market_open
+    from strategies.trade_journal import today_pnl
+    from strategies.order_manager import execute_signal
+    from strategies.trade_journal import day_trades_in_last_5_days
+    
+    dry_run = not args.live_paper
+    text = args.command_text
+    
+    print(f"\n{'='*60}")
+    print(f"  MANUAL TRADE COMMAND {'(DRY RUN)' if dry_run else '(LIVE PAPER)'}")
+    print(f"  Command: '{text}'")
+    print(f"{'='*60}\n")
+    
+    parser = CommandParser()
+    cmd = parser.parse(text)
+    
+    if not cmd.is_valid:
+        print(f"  ERROR: {cmd.error_msg}")
+        sys.exit(1)
+        
+    print(f"  Parsed Intent: {cmd.action}", end="")
+    if cmd.quantity:
+        print(f" | Qty: {cmd.quantity}", end="")
+    if cmd.symbol:
+        print(f" | Symbol: {cmd.symbol}", end="")
+    if cmd.limit_price:
+        print(f" | Limit: {cmd.limit_price}", end="")
+    print("\n")
+    
+    from alpaca_bridge import AlpacaBridge
+    bridge = AlpacaBridge()
+    if not dry_run:
+        if not bridge.connect():
+            print("  ERROR: Cannot connect to Alpaca paper broker.\n")
+            sys.exit(1)
+            
+    try:
+        if cmd.action == "FLATTEN":
+            print("  Executing: Flattening all positions and orders...")
+            if not dry_run:
+                bridge.flatten_all()
+                print("  Success: Flatten complete.")
+                
+        elif cmd.action == "CANCEL":
+            print("  Executing: Cancelling all open orders...")
+            if not dry_run:
+                order_count = len(bridge.ib.openTrades())
+                bridge._client.cancel_all_orders()
+                print(f"  Success: Cancelled up to {order_count} eligible orders.")
+                
+        elif cmd.action in ("BUY", "SELL", "SHORT"):
+            if not cmd.quantity or not cmd.symbol:
+                print("  ERROR: Quantity or symbol missing.")
+                sys.exit(1)
+
+            if not dry_run and not is_market_open():
+                print("  ERROR: Manual orders are only allowed during regular market hours.")
+                sys.exit(1)
+
+            if cmd.action == "SELL":
+                exit_qty = cmd.quantity
+                if not dry_run:
+                    long_qty = int(max(0, bridge.get_position(cmd.symbol)))
+                    if long_qty <= 0:
+                        print(f"  ERROR: No long {cmd.symbol} position is available to sell.")
+                        sys.exit(1)
+                    exit_qty = min(exit_qty, long_qty)
+                    
+                    if cmd.limit_price:
+                        from alpaca.trading.requests import LimitOrderRequest
+                        from alpaca.trading.enums import OrderSide, TimeInForce
+                        order = bridge._client.submit_order(LimitOrderRequest(
+                            symbol=cmd.symbol.upper().strip(),
+                            qty=exit_qty,
+                            side=OrderSide.SELL,
+                            time_in_force=TimeInForce.GTC,
+                            limit_price=round(cmd.limit_price, 2)
+                        ))
+                    else:
+                        from alpaca.trading.requests import MarketOrderRequest
+                        from alpaca.trading.enums import OrderSide, TimeInForce
+                        order = bridge._client.submit_order(MarketOrderRequest(
+                            symbol=cmd.symbol.upper().strip(),
+                            qty=exit_qty,
+                            side=OrderSide.SELL,
+                            time_in_force=TimeInForce.GTC
+                        ))
+                    print(
+                        f"  Result: PLACED | shares={exit_qty} | "
+                        f"Exit order {order.id}"
+                    )
+                else:
+                    print(
+                        f"  Result: DRY_RUN | shares={exit_qty} | "
+                        "Would reduce an existing long position"
+                    )
+                if dry_run:
+                    print("  (This was a DRY RUN. Use --live-paper to execute.)\n")
+                return 0
+
+            entry_side = "SELL" if cmd.action == "SHORT" else "BUY"
+            allow_short = getattr(config, "ALLOW_SHORT", False)
+            if entry_side == "SELL" and not allow_short:
+                print("  ERROR: Short entries are disabled.")
+                sys.exit(1)
+
+            if cmd.limit_price:
+                entry_price = cmd.limit_price
+            elif bridge._connected:
+                entry_price = bridge.market_price(cmd.symbol)
+            else:
+                from strategies.intraday_data import fetch_intraday
+                df = fetch_intraday(cmd.symbol)
+                entry_price = None if df.empty else float(df["close"].iloc[-1])
+            if not entry_price or entry_price <= 0:
+                print("  ERROR: Could not determine a valid entry price.")
+                sys.exit(1)
+
+            fallback_stop = getattr(config, "DAYTRADE_FALLBACK_STOP_PCT", 0.02)
+            risk_per_share = entry_price * fallback_stop
+            default_rr = getattr(config, "DEFAULT_TARGET_RR_RATIO", 2.0)
+            if entry_side == "BUY":
+                stop_price = entry_price - risk_per_share
+                target_price = entry_price + risk_per_share * default_rr
+            else:
+                stop_price = entry_price + risk_per_share
+                target_price = entry_price - risk_per_share * default_rr
+
+            signal = TradeSignal(
+                symbol=cmd.symbol,
+                strategy="MANUAL",
+                side=entry_side,
+                confidence=1.0,
+                entry_price=entry_price,
+                stop_price=stop_price,
+                target_price=target_price,
+                atr=0.0,
+                risk_per_share=risk_per_share,
+                reason="Manual command routed through risk controls",
+            )
+            is_connected = getattr(bridge, "is_connected", False) or getattr(bridge, "_connected", False)
+            equity = bridge.get_net_liquidation() if is_connected else config.PDT_MIN_EQUITY
+            current_pnl = today_pnl()
+            result = execute_signal(
+                signal=signal,
+                bridge=bridge,
+                equity=equity,
+                current_pnl=current_pnl,
+                day_trades_last_5_days=day_trades_in_last_5_days(),
+                dry_run=dry_run,
+                requested_shares=cmd.quantity,
+                entry_limit_price=cmd.limit_price,
+            )
+            print(
+                f"  Result: {result['status']} | shares={result['shares']} | "
+                f"{result['reason']}"
+            )
+            if result["status"] == "REJECTED":
+                sys.exit(2)
+                
+        if dry_run:
+            print("  (This was a DRY RUN. Use --live-paper to execute.)\n")
+            
+    finally:
+        bridge.disconnect()
+    return 0
+
+
+def cmd_daytrade_status(args) -> int:
+    from strategies.session import session_status, is_market_open, minutes_until_close
+    from strategies.trade_journal import today_trade_count, today_pnl
+    status = session_status()
+    
+    rich_available = False
+    try:
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.align import Align
+        rich_available = True
+        console = Console()
+    except ImportError:
+        pass
+
+    from alpaca_bridge import AlpacaBridge
+    bridge = None
+    if args.connect:
+        bridge = AlpacaBridge()
+        if not bridge.connect():
+            print("  ERROR: Cannot connect to Alpaca paper broker.\n")
+            sys.exit(1)
+            
+    try:
+        if rich_available:
+            account_text = (
+                f"Session:      {status}\n"
+            )
+            if is_market_open():
+                account_text += f"Minutes to close: {minutes_until_close():.0f}\n"
+            account_text += (
+                f"Trades Today: {today_trade_count()}\n"
+                f"Today PnL:    ${today_pnl():,.2f}\n"
+            )
+            
+            if bridge:
+                try:
+                    account_text += (
+                        f"\nALPACA Equity:    ${bridge.get_net_liquidation():,.2f}\n"
+                        f"Open Positions: {bridge.open_position_count()}\n"
+                        f"Working Orders: {len(bridge.ib.openTrades())}\n"
+                    )
+                except Exception as exc:
+                    account_text += f"\nALPACA state unavailable: {exc}\n"
+            
+            account_panel = Panel(
+                Align.center(account_text, vertical="middle"),
+                title="📊 Account Overview",
+                border_style="cyan"
+            )
+            
+            strategy_text = (
+                f"ORB:           {'ON' if getattr(config, 'STRATEGY_ORB_ENABLED', True) else 'OFF'}\n"
+                f"VWAP Bounce:   {'ON' if getattr(config, 'STRATEGY_VWAP_BOUNCE_ENABLED', True) else 'OFF'}\n"
+                f"Gap-and-Go:    {'ON' if getattr(config, 'STRATEGY_GAP_AND_GO_ENABLED', True) else 'OFF'}\n"
+                f"Momentum:      {'ON' if getattr(config, 'STRATEGY_MOMENTUM_SCALP_ENABLED', True) else 'OFF'}\n"
+                f"Candlestick:   {'ON' if getattr(config, 'STRATEGY_CANDLESTICK_ENABLED', True) else 'OFF'}\n"
+            )
+            strategy_panel = Panel(
+                Align.center(strategy_text, vertical="middle"),
+                title="📈 Strategies Enabled",
+                border_style="magenta"
+            )
+            
+            sizing_method = getattr(config, "SIZING_METHOD", "risk_percent")
+            max_risk_pct = getattr(config, "MAX_RISK_PER_TRADE_PCT", 1.0)
+            max_daily_loss_dollars = getattr(config, "MAX_DAILY_LOSS_DOLLARS", 1000.0)
+            max_daily_loss_pct = getattr(config, "MAX_DAILY_LOSS_PCT", 2.0)
+            max_trades_per_day = getattr(config, "MAX_TRADES_PER_DAY", 10)
+            max_open_positions = getattr(config, "MAX_OPEN_POSITIONS", 3)
+            use_atr = getattr(config, "TRAILING_STOP_USE_ATR", True)
+            atr_mult = getattr(config, "TRAILING_STOP_ATR_MULTIPLE", 1.5)
+            fallback_pct = getattr(config, "TRAILING_STOP_FALLBACK_PCT", 0.02)
+            
+            risk_text = (
+                f"Max risk/trade:  {max_risk_pct}%\n"
+                f"Max daily loss:  ${max_daily_loss_dollars} / {max_daily_loss_pct}%\n"
+                f"Max trades/day:  {max_trades_per_day}\n"
+                f"Max positions:   {max_open_positions}\n"
+                f"Trailing stop:   {'ON' if use_atr else 'OFF'} (ATRx{atr_mult})\n"
+                f"Sizing method:   {sizing_method}\n"
+            )
+            risk_panel = Panel(
+                Align.center(risk_text, vertical="middle"),
+                title="🛡️ Risk Settings",
+                border_style="yellow"
+            )
+            
+            console.print(account_panel)
+            console.print(strategy_panel)
+            console.print(risk_panel)
+            
+            try:
+                from strategies.trailing_stop import manager
+                active_stops = [s for s in manager.states.values() if s.active]
+                if active_stops:
+                    stop_text = ""
+                    for s in active_stops:
+                        trail_type = f"ATRx{s.trail_multiple}" if s.atr > 0 else f"{fallback_pct*100:.1f}%"
+                        side_label = "LONG" if s.side == "BUY" else "SHORT"
+                        peak_label = "peak" if s.side == "BUY" else "trough"
+                        stop_text += f"{s.symbol:<6} [{side_label:<5}] entry ${s.entry_price:.2f}  {peak_label} ${s.peak_price:.2f}  stop ${s.stop_price:.2f} ({trail_type})\n"
+                    
+                    stop_panel = Panel(
+                        stop_text.strip(),
+                        title="🛑 Active Trailing Stops",
+                        border_style="red"
+                    )
+                    console.print(stop_panel)
+            except Exception:
+                pass
+            
+        else:
+            print(f"\n{'='*60}")
+            print("  DAY TRADING STATUS")
+            print(f"{'='*60}\n")
+
+            print(f"  Session:        {status}")
+
+            if is_market_open():
+                print(f"  Minutes to close: {minutes_until_close():.0f}")
+
+            print(f"  Trades today:   {today_trade_count()}")
+            print(f"  Today PnL:      ${today_pnl():,.2f}")
+            print()
+
+            print("  Strategies enabled:")
+            print(f"    ORB:           {'ON' if getattr(config, 'STRATEGY_ORB_ENABLED', True) else 'OFF'}")
+            print(f"    VWAP Bounce:   {'ON' if getattr(config, 'STRATEGY_VWAP_BOUNCE_ENABLED', True) else 'OFF'}")
+            print(f"    Gap-and-Go:    {'ON' if getattr(config, 'STRATEGY_GAP_AND_GO_ENABLED', True) else 'OFF'}")
+            print(f"    Momentum:      {'ON' if getattr(config, 'STRATEGY_MOMENTUM_SCALP_ENABLED', True) else 'OFF'}")
+            print(f"    Candlestick:   {'ON' if getattr(config, 'STRATEGY_CANDLESTICK_ENABLED', True) else 'OFF'}")
+            print()
+
+            sizing_method = getattr(config, "SIZING_METHOD", "risk_percent")
+            max_risk_pct = getattr(config, "MAX_RISK_PER_TRADE_PCT", 1.0)
+            max_daily_loss_dollars = getattr(config, "MAX_DAILY_LOSS_DOLLARS", 1000.0)
+            max_daily_loss_pct = getattr(config, "MAX_DAILY_LOSS_PCT", 2.0)
+            max_trades_per_day = getattr(config, "MAX_TRADES_PER_DAY", 10)
+            max_open_positions = getattr(config, "MAX_OPEN_POSITIONS", 3)
+            use_atr = getattr(config, "TRAILING_STOP_USE_ATR", True)
+            fallback_pct = getattr(config, "TRAILING_STOP_FALLBACK_PCT", 0.02)
+            pdt_enabled = getattr(config, "PDT_ENABLED", True)
+
+            print("  Risk settings:")
+            print(f"    Max risk/trade:  {max_risk_pct}%")
+            print(f"    Max daily loss:  ${max_daily_loss_dollars} / {max_daily_loss_pct}%")
+            print(f"    Max trades/day:  {max_trades_per_day}")
+            print(f"    Max positions:   {max_open_positions}")
+            print(f"    PDT guard:       {'ON' if pdt_enabled else 'OFF'}")
+            print(f"    Sizing method:   {sizing_method}")
+            print()
+
+            if bridge:
+                print(f"  ALPACA equity:     ${bridge.get_net_liquidation():,.2f}")
+                print(f"  Open positions:  {bridge.open_position_count()}")
+                print(f"  Working orders:  {len(bridge.ib.openTrades())}")
+                print()
+                
+            try:
+                from strategies.trailing_stop import manager
+                active_stops = [s for s in manager.states.values() if s.active]
+                if active_stops:
+                    print("  Active Trailing Stops:")
+                    for s in active_stops:
+                        trail_type = f"ATRx{s.trail_multiple}" if s.atr > 0 else f"{fallback_pct*100:.1f}%"
+                        print(f"    {s.symbol:<8} entry ${s.entry_price:.2f}  peak ${s.peak_price:.2f}  stop ${s.stop_price:.2f}  ATR {s.atr:.2f}  mode {trail_type}")
+                    print()
+            except Exception:
+                pass
+                
+    finally:
+        if bridge:
+            bridge.disconnect()
+    return 0
+
+
+def cmd_daytrade_bot(args) -> int:
+    import time
+    from alpaca_bridge import AlpacaBridge
+    from strategies.scanner.premarket_scanner import scan
+    from strategies.orchestrator import evaluate_and_execute
+    from strategies.session import is_market_open, session_status
+    
+    print(f"\n{'='*60}")
+    print("  AUTOMATED DAY TRADING BOT STARTED")
+    print(f"{'='*60}\n")
+    
+    bridge = AlpacaBridge()
+    if not bridge.connect():
+        print("  ERROR: Cannot connect to Alpaca paper broker.\n")
+        sys.exit(1)
+            
+    watchlist = list(getattr(config, "DAYTRADE_WATCHLIST", []))
+    last_scan_time = 0
+
+    try:
+        from strategies.error_handler import TradingErrorHandler
+        error_handler = TradingErrorHandler(bridge=bridge)
+
+        while True:
+            current_time = time.time()
+            if not is_market_open():
+                from strategies.session import is_postmarket
+                if is_postmarket():
+                    print(f"[{session_status()}] Market closed. EOD reached, exiting cleanly.")
+                    print("Flattening all positions before exit...")
+                    bridge.flatten_all()
+                    sys.exit(0)
+
+                print(f"[{session_status()}] Market closed. Waiting...")
+                time.sleep(60)
+                continue
+
+            use_dynamic_scanner = getattr(config, "USE_DYNAMIC_SCANNER", True)
+            if use_dynamic_scanner:
+                if current_time - last_scan_time > 300:
+                    print("Running periodic scanner to update watchlist...")
+                    candidates = scan(max_candidates=10)
+                    if candidates:
+                        watchlist = [c.symbol for c in candidates]
+                    last_scan_time = current_time
+                    print(f"Updated watchlist: {watchlist}")
+            else:
+                watchlist = list(getattr(config, "DAYTRADE_WATCHLIST", []))
+
+            earnings_cal = getattr(config, "EARNINGS_CALENDAR", {})
+            blackout_days = getattr(config, "EARNINGS_BLACKOUT_DAYS", 2)
+            if earnings_cal:
+                from datetime import datetime, timedelta
+                today = datetime.now().date()
+                blacked_out = []
+                for sym, date_str in earnings_cal.items():
+                    try:
+                        earnings_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                        blackout_start = earnings_date - timedelta(days=blackout_days)
+                        if blackout_start <= today <= earnings_date:
+                            blacked_out.append(sym)
+                    except ValueError:
+                        pass
+                if blacked_out:
+                    watchlist = [s for s in watchlist if s not in blacked_out]
+                    print(f"  [EARNINGS BLACKOUT] Removed {blacked_out} from watchlist")
+
+            evaluate_and_execute(
+                watchlist=watchlist,
+                bridge=bridge,
+                live_paper=getattr(args, 'live_paper', False),
+                error_handler=error_handler,
+            )
+
+            print("Sleeping for 30 seconds before next evaluation...")
+            time.sleep(30)
+            
+    except KeyboardInterrupt:
+        print("\nStopping bot...")
+        bridge.flatten_all()
+        sys.exit(0)
+    finally:
+        bridge.disconnect()
+    return 0
+
+
+def cmd_daytrade_train(args) -> int:
+    from strategies.models.trainer import ModelTrainer
+    trainer = ModelTrainer()
+    print("Training Day Trading ML model...")
+    metrics = trainer.train(feature_csv_pattern=args.feature_file)
+    if "error" in metrics:
+        print(f"Error: {metrics['error']}")
+        return 1
+    else:
+        print(f"Success! Metrics: {metrics}")
+        return 0
+
+
 def main() -> int:
+
     parser = argparse.ArgumentParser(description="Stock Prediction Engine â€” IBKR Paper Trading")
     sub = parser.add_subparsers(dest="command")
 
@@ -1902,6 +2675,43 @@ def main() -> int:
                  "numbers, or file paths. Falls back to "
                  "config.MINERVINI_COACH_LANGUAGE, then English.",
         )
+
+    # Daytrading subcommands
+    p_dt_scan = sub.add_parser("daytrade-scan", help="Premarket/open-session scanner (Day Trading)")
+    p_dt_scan.add_argument("--top-n", type=int, default=10)
+    p_dt_scan.add_argument("--live", action="store_true", help="Auto-refresh scanner results")
+
+    p_dt_signals = sub.add_parser("daytrade-signals", help="Evaluate strategy signals on symbols (Day Trading)")
+    p_dt_signals.add_argument("--symbols", nargs="+", default=None)
+    p_dt_signals.add_argument("--verbose", action="store_true", help="Show verbose output")
+    p_dt_signals.add_argument("--mock-positions", nargs="+", default=None, help="Mock positions for testing correlation")
+
+    p_dt_paper = sub.add_parser("daytrade-paper", help="Paper trade via Alpaca (Day Trading)")
+    p_dt_paper.add_argument("--dry-run", action="store_true", help="Preview paper trades without placing orders")
+    p_dt_paper.add_argument("--live-paper", dest="dry_run", action="store_false", help="Place orders in the Alpaca paper account")
+    p_dt_paper.set_defaults(dry_run=True)
+    p_dt_paper.add_argument("--symbols", nargs="+", default=None)
+
+    p_dt_trade = sub.add_parser("daytrade-trade", help="Execute manual NLP text commands (Day Trading)")
+    p_dt_trade.add_argument("command_text", help="Command text, e.g. 'Buy 100 AAPL'")
+    p_dt_trade.add_argument("--live-paper", action="store_true", help="Place the order (otherwise dry run)")
+
+    p_dt_flatten = sub.add_parser("daytrade-flatten", help="Emergency flatten all positions (Day Trading)")
+    p_dt_flatten.add_argument("--confirm", action="store_true")
+
+    p_dt_status = sub.add_parser("daytrade-status", help="Show daytrading session and account status")
+    p_dt_status.add_argument("--connect", action="store_true", help="Query Alpaca paper account")
+
+    p_dt_bot = sub.add_parser("daytrade-bot", help="Run automated daytrading bot loop")
+    p_dt_bot.add_argument("--live-paper", action="store_true", help="Place paper orders in loop")
+
+    p_dt_train = sub.add_parser("daytrade-train", help="Train ML model for day trading signals")
+    p_dt_train.add_argument("--feature-file", default=None, help="Override feature CSV path")
+
+    p_dt_thresh = sub.add_parser("daytrade-threshold-report", help="Run threshold sweep analysis for Day Trading strategies")
+    p_dt_thresh.add_argument("--strategy", required=True, choices=["ORB", "VWAP_BOUNCE", "GAP_AND_GO", "MOMENTUM_SCALP", "CANDLESTICK"], help="Strategy to sweep")
+    p_dt_thresh.add_argument("--symbols", nargs="+", default=None, help="Symbols to test (space or comma-separated)")
+    p_dt_thresh.add_argument("--lookback", type=int, default=5, help="Number of lookback days")
 
     sub.add_parser("train", help="Train RF + LSTM models")
     sub.add_parser("predict", help="Show today's signals")
@@ -2132,6 +2942,25 @@ def main() -> int:
     )
 
     args = parser.parse_args()
+    if args.command == "daytrade-scan":
+        return cmd_daytrade_scan(args)
+    if args.command == "daytrade-signals":
+        return cmd_daytrade_signals(args)
+    if args.command == "daytrade-paper":
+        return cmd_daytrade_paper(args)
+    if args.command == "daytrade-trade":
+        return cmd_daytrade_trade(args)
+    if args.command == "daytrade-flatten":
+        return cmd_daytrade_flatten(args)
+    if args.command == "daytrade-status":
+        return cmd_daytrade_status(args)
+    if args.command == "daytrade-bot":
+        return cmd_daytrade_bot(args)
+    if args.command == "daytrade-train":
+        return cmd_daytrade_train(args)
+    if args.command == "daytrade-threshold-report":
+        return cmd_daytrade_threshold_report(args)
+
     if args.command == "train":
         return cmd_train(args)
     if args.command == "predict":

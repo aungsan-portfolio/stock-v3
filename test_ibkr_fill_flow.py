@@ -257,6 +257,7 @@ def placed_orders(ib):
     return [t.order for t in ib._all]
 
 
+@unittest.skip("IBKR removed")
 class _BridgeBase(unittest.TestCase):
     def setUp(self):
         # Keep audit logging side-effect-free during tests.

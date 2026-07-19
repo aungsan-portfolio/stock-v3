@@ -308,5 +308,80 @@ class TestCloseFollowup(unittest.TestCase):
         self.assertEqual(ox.close_followup(r, attempt=3, max_attempts=3), "giveup")
 
 
+class TestOrderExecAdditionalCoverage(unittest.TestCase):
+    def test_f_coercion_exceptions(self):
+        # Test fallback scenarios in _f()
+        self.assertEqual(ox._f("invalid", 10.0), 10.0)
+        self.assertEqual(ox._f(None, 5.0), 5.0)
+        self.assertEqual(ox._f(float("nan"), 2.0), 2.0)
+        self.assertEqual(ox._f(float("inf"), 3.0), 3.0)
+        self.assertEqual(ox._f(10.5), 10.5)
+
+    def test_order_ref_collisions_and_duplicates(self):
+        # 1. Verify identical input parameters result in exact identical orderRefs (deterministic)
+        ref1 = ox.deterministic_order_ref("2026-07-20", "TSLA", "BUY")
+        ref2 = ox.deterministic_order_ref("  2026-07-20  ", " tsla ", " buy ")
+        self.assertEqual(ref1, ref2)
+
+        # 2. Verify duplicate checking works correctly
+        working = [
+            wo("TSLA", action="BUY", order_type="LMT", order_ref=ref1),
+            wo("SPY", action="BUY", order_type="LMT", order_ref=""),
+            wo("MU", action="BUY", order_type="LMT", order_ref=None)
+        ]
+        self.assertTrue(ox.has_order_ref(ref1, working))
+        # Case insensitive/normalized check
+        self.assertTrue(ox.has_order_ref("2026-07-20:TSLA:BUY", working))
+        # Non-duplicate
+        self.assertFalse(ox.has_order_ref("2026-07-20:SPY:BUY", working))
+
+    def test_hard_stop_price_short_and_invalid(self):
+        # 1. Catastrophe hard stop price for SHORT (entry action SELL)
+        # short hard stop is entry * (1 + hard_pct)
+        self.assertAlmostEqual(ox.hard_stop_price(100.0, 0.05, "SELL"), 105.0)
+        self.assertAlmostEqual(ox.hard_stop_price(100.0, -0.05, "SELL"), 105.0) # absolute pct is used
+
+        # 2. Boundary conditions: invalid/negative prices
+        self.assertEqual(ox.hard_stop_price(-100.0, 0.05, "BUY"), 0.0)
+        self.assertEqual(ox.hard_stop_price(0.0, 0.05, "SELL"), 0.0)
+
+    def test_partial_then_cancelled_states(self):
+        # A bad state (Cancelled/Rejected/Inactive) with a partial fill is PARTIALLY_FILLED
+        r1 = ox.classify_trade(trade("Cancelled", filled=50.0, remaining=50.0))
+        self.assertEqual(r1.outcome, ox.PARTIALLY_FILLED)
+        self.assertTrue(r1.is_partial)
+
+        # A bad state (Cancelled/Rejected/Inactive) with no fill is REJECTED
+        r2 = ox.classify_trade(trade("Rejected", filled=0.0, remaining=100.0))
+        self.assertEqual(r2.outcome, ox.REJECTED)
+
+    def test_child_needs_resize_tolerance(self):
+        # Test boundary conditions around _EPS = 1e-9
+        # child_qty > filled_qty_value + 1e-9
+        self.assertTrue(ox.child_needs_resize(100.000000002, 100.0))
+        # exactly at the edge (child_qty = filled_qty_value + 1e-9)
+        self.assertFalse(ox.child_needs_resize(100.000000001, 100.0))
+        # just below edge (child_qty = filled_qty_value + 1e-10)
+        self.assertFalse(ox.child_needs_resize(100.0000000001, 100.0))
+
+    def test_verify_protective_child_edge_cases(self):
+        # 1. No matching parent_id but covers quantity -> falls back to matching by symbol/type
+        working = [wo("AAPL", action="SELL", order_type="STP", qty=100, parent_id=99)]
+        v1 = ox.verify_protective_child("AAPL", parent_id=5, filled_qty_value=100, working_orders=working)
+        self.assertTrue(v1["ok"])
+        self.assertEqual(v1["child"]["parent_id"], 99)
+
+        # 2. Covering check boundary
+        working2 = [wo("AAPL", action="SELL", order_type="STP", qty=99.999999999, parent_id=5)]
+        v2 = ox.verify_protective_child("AAPL", 5, 100.0, working2)
+        self.assertTrue(v2["ok"]) # covered within _EPS tolerance
+
+    def test_helper_primitives_coercion(self):
+        self.assertEqual(ox._id(0), "")
+        self.assertEqual(ox._id(None), "")
+        self.assertEqual(ox._id("  123  "), "123")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

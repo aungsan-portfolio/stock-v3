@@ -1,4 +1,4 @@
-﻿"""trade_coach.py — Guided Paper Trading Coach (READ-MOSTLY, beginner-friendly).
+"""trade_coach.py — Guided Paper Trading Coach (READ-MOSTLY, beginner-friendly).
 
 This module turns ensemble signals into a trade lesson + a safe paper-trade
 preview. It NEVER places orders on its own. Order placement is gated by:
@@ -39,6 +39,8 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import config
+import daytrading_levels
+import risk_math
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +137,177 @@ def _format_money(x: Optional[float]) -> str:
         return f"${float(x):,.2f}"
     except (TypeError, ValueError):
         return "n/a"
+
+
+def _daytrade_context_from_ohlcv(ohlcv) -> Dict[str, Any]:
+    """Build optional daily OHLCV-derived context without fetching data."""
+    context = {
+        "previous_day_pivot_levels": None,
+        "gap_pct": None,
+        "atr_dollars": None,
+    }
+    if ohlcv is None:
+        return context
+
+    try:
+        context["atr_dollars"] = daytrading_levels.atr_dollars_from_ohlc(
+            ohlcv, period=int(getattr(config, "ATR_PERIOD", 14))
+        )
+    except Exception:
+        logger.debug("ATR preview unavailable", exc_info=True)
+
+    try:
+        if len(ohlcv) >= 2:
+            prev = ohlcv.iloc[-2]
+            today = ohlcv.iloc[-1]
+            context["previous_day_pivot_levels"] = daytrading_levels.pivot_points(
+                prev["High"], prev["Low"], prev["Close"]
+            )
+            context["gap_pct"] = daytrading_levels.gap_pct(today["Open"], prev["Close"])
+    except Exception:
+        logger.debug("Daily pivot/gap preview unavailable", exc_info=True)
+
+    return context
+
+
+def _daytrade_formula_fields(signal, cash: float, ohlcv=None) -> Dict[str, Any]:
+    """Read-only day-trading formula preview fields.
+
+    This does not feed quantity, stop, or target into IBKRBridge. It exists only
+    to print practice math and to block weak/invalid paper practice candidates.
+    """
+    symbol = str(getattr(signal, "symbol", "")).upper().strip()
+    action = str(getattr(signal, "action", "")).upper().strip()
+    context = _daytrade_context_from_ohlcv(ohlcv)
+    fields: Dict[str, Any] = {
+        "planned_entry": None,
+        "suggested_stop": None,
+        "suggested_target_2r": None,
+        "suggested_target_3r": None,
+        "risk_per_share": None,
+        "reward_to_2r": None,
+        "rr_2r": None,
+        "suggested_shares_by_risk": 0,
+        "planned_risk_dollars": None,
+        "daytrade_formula_tradeable": False,
+        "daytrade_formula_reason": "daytrade formula preview unavailable",
+        "daytrade_formula_note": (
+            "Formula preview only; existing IBKRBridge sizing still applies."
+        ),
+        **context,
+    }
+
+    if action != "BUY":
+        fields["daytrade_formula_reason"] = f"action is {action}, not BUY"
+        return fields
+
+    try:
+        entry = float(getattr(signal, "price"))
+        if entry <= 0:
+            raise ValueError("entry price must be positive")
+
+        atr = fields.get("atr_dollars")
+        if atr is not None and float(atr) > 0:
+            stop = risk_math.atr_stop_price(
+                entry,
+                atr,
+                atr_multiple=float(getattr(config, "DAYTRADE_ATR_STOP_MULTIPLE", 1.5)),
+            )
+        else:
+            stop = entry * (1 - float(getattr(config, "STOP_LOSS_PCT", 0.004)))
+
+        target_2r = risk_math.required_target(entry, stop, 2.0)
+        target_3r = risk_math.required_target(entry, stop, 3.0)
+        rps = risk_math.risk_per_share(entry, stop)
+        reward_2r = risk_math.reward_per_share(entry, target_2r)
+        rr_2r = risk_math.risk_reward_ratio(entry, stop, target_2r)
+        shares = risk_math.shares_for_risk(
+            cash,
+            float(getattr(config, "DAYTRADE_PAPER_RISK_PCT", 0.001)),
+            entry,
+            stop,
+            max_trade_value=getattr(config, "MAX_TRADE_VALUE", None),
+            max_position_pct=getattr(config, "MAX_POSITION_PCT", None),
+        )
+        planned_risk = risk_math.planned_risk_dollars(shares, entry, stop)
+
+        fields.update(
+            {
+                "planned_entry": entry,
+                "suggested_stop": stop,
+                "suggested_target_2r": target_2r,
+                "suggested_target_3r": target_3r,
+                "risk_per_share": rps,
+                "reward_to_2r": reward_2r,
+                "rr_2r": rr_2r,
+                "suggested_shares_by_risk": shares,
+                "planned_risk_dollars": planned_risk,
+                "daytrade_formula_tradeable": shares > 0,
+                "daytrade_formula_reason": None if shares > 0 else "suggested shares by risk is 0",
+            }
+        )
+    except Exception as exc:
+        logger.debug("Daytrade formula preview unavailable for %s", symbol, exc_info=True)
+        fields["daytrade_formula_reason"] = f"invalid risk formula inputs: {exc}"
+
+    return fields
+
+
+def daytrade_refusal_reasons(
+    signal,
+    preview: Dict[str, Any],
+    positions: Optional[Dict[str, Any]] = None,
+    working: Optional[set] = None,
+) -> List[str]:
+    """Strict paper-practice refusal gates shared by paper/daily coach."""
+    positions = positions or {}
+    working = working or set()
+
+    symbol = str(getattr(signal, "symbol", "")).upper().strip()
+    action = str(getattr(signal, "action", "")).upper().strip()
+    confidence = float(getattr(signal, "confidence", 0.0))
+    buy_threshold = float(getattr(config, "BUY_THRESHOLD", 0.65))
+    min_rr = float(getattr(config, "DAYTRADE_MIN_RR", 2.0))
+
+    reasons: List[str] = []
+    if action != "BUY":
+        reasons.append(f"action is {action}, not BUY")
+    if confidence < buy_threshold:
+        reasons.append(f"confidence {confidence:.2f} < BUY_THRESHOLD {buy_threshold:.2f}")
+    if symbol in positions:
+        reasons.append("already holding this symbol")
+    if symbol in working:
+        reasons.append("a working order already exists for this symbol")
+    if not preview.get("tradeable", False):
+        reasons.append(preview.get("skip_reason") or "preview not tradeable")
+
+    try:
+        rr_2r = float(preview.get("rr_2r"))
+    except (TypeError, ValueError):
+        rr_2r = 0.0
+    if rr_2r + 1e-9 < min_rr:
+        reasons.append(f"R:R {rr_2r:.2f} < DAYTRADE_MIN_RR {min_rr:.2f}")
+
+    try:
+        risk_per_share = float(preview.get("risk_per_share"))
+    except (TypeError, ValueError):
+        risk_per_share = 0.0
+    if risk_per_share <= 0:
+        reasons.append("risk/share is invalid")
+
+    try:
+        suggested_shares = int(preview.get("suggested_shares_by_risk", 0))
+    except (TypeError, ValueError):
+        suggested_shares = 0
+    if suggested_shares <= 0:
+        reasons.append("suggested shares by risk is 0")
+
+    if preview.get("daytrade_formula_reason"):
+        reason = str(preview.get("daytrade_formula_reason"))
+        if reason not in reasons:
+            reasons.append(reason)
+
+    return reasons
 
 
 # ─── Minervini / SEPA overlay view (READ-ONLY, default-OFF) ──────────────────
@@ -374,6 +547,7 @@ def build_trade_preview(
     cash: float,
     current_positions: Optional[Dict[str, Any]] = None,
     open_orders: Optional[List[Any]] = None,
+    ohlcv=None,
 ) -> Dict[str, Any]:
     """Build a paper-trade preview for one signal. Never places an order.
 
@@ -430,6 +604,14 @@ def build_trade_preview(
         max_value = min(max_value, float(cap))
     qty = max(int(max_value / price), 0) if price > 0 else 0
 
+    # Commission breakeven check (mirrors ibkr_bridge._breakeven_pct).
+    _com_per_side = max(
+        float(getattr(config, "MIN_COMMISSION_PER_TRADE", 1.00)),
+        qty * float(getattr(config, "COMMISSION_PER_SHARE", 0.005)),
+    ) if qty > 0 and price > 0 else 0.0
+    _com_round_trip = 2.0 * _com_per_side
+    breakeven_pct = round(_com_round_trip / (qty * price), 4) if qty > 0 and price > 0 else 0.0
+
     # Mirror IBKRBridge._initial_stop_price for BUY.
     stop_price = round(price * (1 - float(config.STOP_LOSS_PCT)), 2) if action == "BUY" else None
     est_cost = round(qty * price, 2)
@@ -450,6 +632,16 @@ def build_trade_preview(
                  f"Worst-case loss if the stop fires immediately: {_format_money(max_loss)}."
         )
     )
+    # Append commission note to stop_explanation.
+    if qty > 0 and breakeven_pct > 0:
+        _breakeven_note = (
+            f" Estimated round-trip commission: {_format_money(_com_round_trip)} "
+            f"({_format_pct(breakeven_pct)}). "
+            f"Price must move at least {_format_pct(breakeven_pct)} to break even."
+        )
+        stop_explanation += _breakeven_note
+
+    formula_fields = _daytrade_formula_fields(signal, cash, ohlcv=ohlcv)
 
     return {
         "symbol": symbol,
@@ -467,10 +659,13 @@ def build_trade_preview(
         "trailing_pct": trail_pct,
         "take_profit_pct": float(getattr(config, "TAKE_PROFIT_PCT", 0.0)),
         "stop_loss_pct": float(getattr(config, "STOP_LOSS_PCT", 0.0)),
+        "breakeven_pct": breakeven_pct,
+        "est_commission_roundtrip": round(_com_round_trip, 2) if qty > 0 else 0.0,
         "position_cap_pct": float(getattr(config, "MAX_POSITION_PCT", 0.0)),
         "trade_cap_usd": float(getattr(config, "MAX_TRADE_VALUE", 0.0)) if getattr(config, "MAX_TRADE_VALUE", None) is not None else None,
         "confidence": confidence,
         "min_confidence_required": min_conf,
+        **formula_fields,
         # Read-only Minervini/SEPA setup explanation for this entry candidate
         # (None unless the overlay + coach switches are both on; never sizes or
         # blocks the order).
@@ -523,10 +718,10 @@ CHART_BLOCKING_STATUSES = {
 
 # Tunable chart-gate thresholds (kept local; they describe a *chart sanity*
 # floor, not a trading strategy).
-_CHART_RSI_OVERBOUGHT    = 75.0    # RSI above this = too extended
+_CHART_RSI_OVERBOUGHT    = 75.0    # RSI above this = too extended    # RSI above this = too extended
 _CHART_BB_OVERBOUGHT     = 0.95    # within top 5% of the Bollinger band = extended
 _CHART_MAX_DIST_SMA20    = 0.12    # >12% above the 20-day SMA = stretched
-_CHART_MIN_VOL_RATIO     = 0.7     # last volume must be at least 70% of 20d avg
+_CHART_MIN_VOL_RATIO     = 0.7     # last volume must be at least 70% of 20d avg     # last volume must be at least 70% of 20d avg
 
 
 def assess_chart_status(signal) -> Tuple[str, str]:
@@ -648,10 +843,14 @@ def evaluate_daily_candidate(
         reasons.append("a working order already exists for this symbol")
     if chart_status in CHART_BLOCKING_STATUSES:
         reasons.append(f"chart status {chart_status}: {chart_detail}")
-    if not preview.get("tradeable", False):
-        reasons.append(preview.get("skip_reason") or "preview not tradeable")
+    reasons.extend(daytrade_refusal_reasons(signal, preview, positions=positions, working=working))
 
-    accepted = not reasons
+    deduped_reasons: List[str] = []
+    for reason in reasons:
+        if reason and reason not in deduped_reasons:
+            deduped_reasons.append(reason)
+
+    accepted = not deduped_reasons
     return {
         "symbol": symbol,
         "action": action,
@@ -660,7 +859,7 @@ def evaluate_daily_candidate(
         "chart_detail": chart_detail,
         "why_selected": why_selected,
         "accepted": accepted,
-        "skip_reason": None if accepted else "; ".join(reasons),
+        "skip_reason": None if accepted else "; ".join(deduped_reasons),
         "quantity": preview.get("quantity", 0),
         "estimated_cost": preview.get("estimated_cost", 0.0),
         "stop_price": preview.get("stop_price"),
@@ -669,6 +868,19 @@ def evaluate_daily_candidate(
         "trailing_pct": preview.get("trailing_pct", 0.0),
         "max_loss_if_stop_triggers": preview.get("max_loss_if_stop_triggers"),
         "price": preview.get("price", float(getattr(signal, "price", 0.0))),
+        "planned_entry": preview.get("planned_entry"),
+        "suggested_stop": preview.get("suggested_stop"),
+        "suggested_target_2r": preview.get("suggested_target_2r"),
+        "suggested_target_3r": preview.get("suggested_target_3r"),
+        "risk_per_share": preview.get("risk_per_share"),
+        "reward_to_2r": preview.get("reward_to_2r"),
+        "rr_2r": preview.get("rr_2r"),
+        "suggested_shares_by_risk": preview.get("suggested_shares_by_risk", 0),
+        "planned_risk_dollars": preview.get("planned_risk_dollars"),
+        "previous_day_pivot_levels": preview.get("previous_day_pivot_levels"),
+        "gap_pct": preview.get("gap_pct"),
+        "atr_dollars": preview.get("atr_dollars"),
+        "daytrade_formula_note": preview.get("daytrade_formula_note"),
     }
 
 
@@ -857,6 +1069,29 @@ def print_daily_candidate(ev: Dict[str, Any], index: Optional[int] = None) -> No
     else:
         print(f"  Stop / trailing stop: {_format_money(ev['stop_price'])} (fixed protective stop)")
     print(f"  Est. possible loss  : {_format_money(ev['max_loss_if_stop_triggers'])}")
+    print(f"  Formula entry       : {_format_money(ev.get('planned_entry'))}")
+    print(f"  Formula stop        : {_format_money(ev.get('suggested_stop'))}")
+    print(f"  Formula 2R / 3R     : {_format_money(ev.get('suggested_target_2r'))} / {_format_money(ev.get('suggested_target_3r'))}")
+    print(f"  Formula risk/share  : {_format_money(ev.get('risk_per_share'))}")
+    rr_2r = ev.get("rr_2r")
+    rr_text = "n/a" if rr_2r is None else f"{float(rr_2r):.2f}"
+    print(f"  Formula R:R to 2R   : {rr_text}")
+    print(f"  Formula risk shares : {ev.get('suggested_shares_by_risk', 0)} shares")
+    print(f"  Formula planned risk: {_format_money(ev.get('planned_risk_dollars'))}")
+    if ev.get("atr_dollars") is not None:
+        print(f"  Daily ATR context   : {_format_money(ev.get('atr_dollars'))}")
+    if ev.get("gap_pct") is not None:
+        print(f"  Daily gap context   : {_format_pct(ev.get('gap_pct'))}")
+    pivots = ev.get("previous_day_pivot_levels")
+    if pivots:
+        print(
+            "  Previous pivots     : "
+            f"PP {_format_money(pivots.get('pp'))}, "
+            f"R1 {_format_money(pivots.get('r1'))}, "
+            f"S1 {_format_money(pivots.get('s1'))}"
+        )
+    if ev.get("daytrade_formula_note"):
+        print(f"  Formula note        : {ev['daytrade_formula_note']}")
     print("-" * 63)
 
 
@@ -881,6 +1116,14 @@ def print_trade_lesson(lesson: Dict[str, Any]) -> None:
     print(f"  Next action    : {lesson['next_action']}")
     if lesson["chart_check_required"]:
         print("  ⚠ Chart check is REQUIRED before any execution.")
+    _be_pct = lesson.get("breakeven_pct", 0.0)
+    if _be_pct > 0:
+        _be_str = _format_pct(_be_pct)
+        print(f"  Commission cost  : {_format_money(lesson.get('est_commission_roundtrip', 0.0))} round-trip")
+        print(f"  Breakeven        : price must move {_be_str} to cover commission")
+        if lesson.get("trailing_pct", 0) and _be_pct > lesson.get("trailing_pct", 0):
+            _gap = _format_pct(lesson["trailing_pct"])
+            print(f"  ⚠ Breakeven ({_be_str}) exceeds trailing stop ({_gap}) — commission may not be covered!")
     print("───────────────────────────────────────────────────────────────")
     print_minervini_view(lesson.get("minervini"))
 
@@ -902,8 +1145,30 @@ def print_trade_preview(preview: Dict[str, Any]) -> None:
     print(f"  Cash % cap          : {_format_pct(preview['position_cap_pct'])}")
     if preview.get("trade_cap_usd") is not None:
         print(f"  Trade $ cap         : {_format_money(preview['trade_cap_usd'])}")
-    print("\n  Question: Do you understand this trade? (yes/no)")
-    print("  No order placed.")
+    print("\n  Paper day-trading formula preview:")
+    print(f"    Planned entry      : {_format_money(preview.get('planned_entry'))}")
+    print(f"    Suggested stop     : {_format_money(preview.get('suggested_stop'))}")
+    print(f"    Target 2R / 3R     : {_format_money(preview.get('suggested_target_2r'))} / {_format_money(preview.get('suggested_target_3r'))}")
+    print(f"    Risk/share         : {_format_money(preview.get('risk_per_share'))}")
+    print(f"    Reward to 2R       : {_format_money(preview.get('reward_to_2r'))}")
+    rr_2r = preview.get("rr_2r")
+    rr_text = "n/a" if rr_2r is None else f"{float(rr_2r):.2f}"
+    print(f"    R:R to 2R          : {rr_text}")
+    print(f"    Shares by 0.1% risk: {preview.get('suggested_shares_by_risk', 0)}")
+    print(f"    Planned risk       : {_format_money(preview.get('planned_risk_dollars'))}")
+    if preview.get("atr_dollars") is not None:
+        print(f"    Daily ATR          : {_format_money(preview.get('atr_dollars'))}")
+    if preview.get("gap_pct") is not None:
+        print(f"    Daily gap          : {_format_pct(preview.get('gap_pct'))}")
+    pivots = preview.get("previous_day_pivot_levels")
+    if pivots:
+        print(
+            "    Previous pivots    : "
+            f"PP {_format_money(pivots.get('pp'))}, "
+            f"R1 {_format_money(pivots.get('r1'))}, "
+            f"S1 {_format_money(pivots.get('s1'))}"
+        )
+    print(f"    Note               : {preview.get('daytrade_formula_note')}")
     print("───────────────────────────────────────────────────────────────")
     print_minervini_view(preview.get("minervini"))
 
@@ -951,6 +1216,21 @@ def write_trade_note(
         lines.append(f"- **Stop price**       : {_format_money(preview['stop_price'])}")
         lines.append(f"- **Max loss @ stop**  : {_format_money(preview['max_loss_if_stop_triggers'])}")
         lines.append(f"- **Stop explanation** : {preview['stop_explanation']}")
+        lines.append("")
+        lines.append("### Paper day-trading formula preview")
+        lines.append(f"- **Planned entry**       : {_format_money(preview.get('planned_entry'))}")
+        lines.append(f"- **Suggested stop**      : {_format_money(preview.get('suggested_stop'))}")
+        lines.append(f"- **Suggested target 2R** : {_format_money(preview.get('suggested_target_2r'))}")
+        lines.append(f"- **Suggested target 3R** : {_format_money(preview.get('suggested_target_3r'))}")
+        lines.append(f"- **Risk/share**          : {_format_money(preview.get('risk_per_share'))}")
+        lines.append(f"- **Reward to 2R**        : {_format_money(preview.get('reward_to_2r'))}")
+        rr_2r = preview.get("rr_2r")
+        lines.append(f"- **R:R to 2R**           : {'n/a' if rr_2r is None else f'{float(rr_2r):.2f}'}")
+        lines.append(f"- **Shares by 0.1% risk** : {preview.get('suggested_shares_by_risk', 0)}")
+        lines.append(f"- **Planned risk dollars**: {_format_money(preview.get('planned_risk_dollars'))}")
+        lines.append(f"- **ATR dollars**         : {_format_money(preview.get('atr_dollars'))}")
+        lines.append(f"- **Gap pct**             : {_format_pct(preview.get('gap_pct'))}")
+        lines.append(f"- **Formula note**        : {preview.get('daytrade_formula_note')}")
         lines.append("")
     lines.append("### Action taken")
     if action_taken == "paper_order_placed" and order_result is not None:

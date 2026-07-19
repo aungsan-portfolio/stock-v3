@@ -1,8 +1,16 @@
 """
 config.py — Stock Prediction Engine Configuration
 Single source of truth — no magic numbers anywhere else.
+
+Dual-mode:
+  Module-level aliases (CAPITAL_NAMES) → backward-compatible global state.
+  Settings dataclass → testable dependency injection via get_settings() / set_settings().
 """
+from __future__ import annotations
 from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List, Optional
+
 
 # ── Paths ────────────────────────────────────────
 BASE_DIR        = Path(__file__).parent
@@ -17,77 +25,37 @@ LSTM_CKPT_FILE  = MODELS_DIR / "lstm_checkpoint.pt"
 # ── Stock Universe ───────────────────────────────
 WATCHLIST = [
     "SPY", "QQQ", "VTI",
-    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",
+    "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "META", "AMZN",
+    "GOOGL", "AVGO", "NFLX", "COST", "JPM", "BAC", "XOM", "UNH",
 ]
-
-# ── Full-Market Hot Scanner ──────────────────────
-# Safe, opt-in broad market discovery. This ONLY produces candidate symbols.
-# Prediction + risk rules still decide BUY/HOLD/SELL and whether any paper
-# order is placed. Nothing here enables live trading or auto-buying.
 FULL_MARKET_SCAN_ENABLED        = True
-# How long the downloaded Nasdaq Trader symbol directory is cached before a
-# re-download is attempted (data/symbol_universe.csv).
 FULL_MARKET_CACHE_HOURS         = 24
-# Hard cap on how many symbols a single full-market scan will fetch OHLCV for.
-# Beginner-safe default; raise deliberately once you understand the runtime cost.
 FULL_MARKET_MAX_SYMBOLS_TO_CHECK = 500
-
-# ── Full-market symbol SELECTION (which symbols out of the universe to scan) ──
-# The universe is stored alphabetically. Taking the first N would scan only A/AB
-# tickers, so selection decides *which* slice of the broad market each run looks
-# at. This is discovery only — it never places orders or changes risk rules.
-#   "alphabetical" : first N symbols (original behavior; for debugging only)
-#   "random"       : seeded random sample from the whole universe
-#   "rotation"     : a different sequential slice each run (covers the market over time)
-#   "hybrid"       : always include the core symbols below, then fill with a
-#                    rotating, shuffled sample of the rest (DEFAULT)
 FULL_MARKET_SELECTION_MODE = "hybrid"
-
-# Anchors always scanned in "hybrid" mode (when present in the universe) so a
-# broad scan never loses sight of the most liquid, widely-followed names.
+MAX_ACCEPTABLE_SLIPPAGE_PCT = 2.0
+TIER1_SYMBOLS_SOURCE = "cached_json"
 FULL_MARKET_CORE_SYMBOLS = [
     "SPY", "QQQ", "VTI",
     "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "META", "AMZN",
     "GOOGL", "AVGO", "NFLX", "COST", "JPM", "BAC", "XOM", "UNH",
 ]
-
-# Seed for the "random" sample and the hybrid fill shuffle — fixed for
-# reproducible selections; change it to draw a different sample.
 FULL_MARKET_RANDOM_SEED = 42
-
-# Persisted rotation cursor so "rotation"/"hybrid" advance through the universe
-# across runs instead of always starting in the same place.
 FULL_MARKET_ROTATION_STATE_FILE = DATA_DIR / "scan_rotation_state.json"
-# Keep only this many top-ranked candidates after scoring.
 HOT_SCAN_TOP_N                  = 30
-# Price band: skip penny stocks and very expensive tickers.
 HOT_SCAN_MIN_PRICE              = 5.0
 HOT_SCAN_MAX_PRICE              = 1000.0
-# Liquidity floor: skip thinly traded names.
 HOT_SCAN_MIN_AVG_VOLUME         = 1_000_000
-# When True, ETFs are excluded from candidates (common stocks only).
 HOT_SCAN_EXCLUDE_ETFS           = False
-# Reject names whose ATR% (volatility) is above this fraction of price.
 HOT_SCAN_MAX_ATR_PCT            = 0.12
-# Batch sizing + polite throttling for the data fetch loop.
-HOT_SCAN_CHUNK_SIZE             = 50
-HOT_SCAN_SLEEP_SECONDS          = 1.0
-
-# Nasdaq Trader official symbol directory files (pipe-delimited text).
+HOT_SCAN_CHUNK_SIZE             = 100
+HOT_SCAN_SLEEP_SECONDS          = 0.2
 NASDAQ_LISTED_URL  = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
 OTHER_LISTED_URL   = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
 SYMBOL_UNIVERSE_FILE = DATA_DIR / "symbol_universe.csv"
 HOT_CANDIDATES_FILE  = REPORTS_DIR / "hot_candidates.csv"
-# Audit trail of exactly which symbols a scan selected (and why) before scanning.
 SELECTED_SCAN_SYMBOLS_FILE = REPORTS_DIR / "selected_scan_symbols.csv"
 
 # ── IPO / New Listing Watch (WATCH-ONLY) ─────────
-# Symbols tracked for visibility only. daily-coach always shows a separate
-# "IPO / New Listing Watch" section for these. They are NEVER auto-trained,
-# NEVER auto-traded, and NEVER placed as orders. A symbol here only becomes an
-# official BUY candidate if it independently passes the normal model/risk rules
-# (i.e. it is also discovered/scanned and the ensemble issues a BUY). New
-# listings with fewer than MIN_HISTORY_DAYS of history are flagged watch-only.
 IPO_WATCH_SYMBOLS = ["SPCX"]
 
 # ── Data Settings ────────────────────────────────
@@ -109,32 +77,26 @@ BOLLINGER_STD       = 2
 ATR_PERIOD          = 14
 VOLUME_MA_PERIOD    = 20
 
-# ── Item 3: Regime / relative-strength feature set (default OFF) ──────
-# Extra engineered features for edge recovery (cross-sectional/RS + regime).
-# BOTH flags default to False, so get_feature_columns() returns the frozen
-# 14-feature ML set UNCHANGED and the on-disk RF/LSTM models keep loading.
-# Enabling either flag WIDENS the feature vector, which REQUIRES retraining
-# the models before live use (the old models expect 14 inputs). FEATURE_COLS is
-# captured at import time in the engines, so toggling a flag needs a process
-# restart, not a hot reload.
-USE_REGIME_FEATURES          = False  # single-symbol volatility / momentum / trend regime
-USE_MARKET_RELATIVE_FEATURES = False  # SPY-relative strength (needs market_df wired into engines)
-MARKET_BENCHMARK_SYMBOL      = "SPY"  # benchmark used for the relative-strength features
-
-# Regime-feature lookback windows (bars). All offline-computable from OHLCV.
-REGIME_VOL_SHORT             = 20     # short realized-vol window
-REGIME_VOL_LONG              = 60     # long realized-vol window (vol-regime denominator)
-REGIME_MOM_SHORT             = 63     # ~3-month time-series momentum
-REGIME_MOM_LONG              = 126    # ~6-month time-series momentum
-REGIME_RANK_WINDOW           = 126    # trailing window for time-series price rank in (0, 1]
-REGIME_HIGH_WINDOW           = 252    # ~52-week high window for distance-below-high
-
-# Market-relative feature windows (bars). Used only when a market_df is supplied
-# to build_features(); otherwise these features are emitted as neutral 0.0.
-REL_RET_SHORT                = 20     # short relative-return window vs benchmark
-REL_RET_LONG                 = 63     # long relative-return window vs benchmark
-RS_SLOPE_WINDOW              = 20     # momentum of the relative-strength (price-ratio) line
-MKT_TREND_SMA                = 50     # benchmark trend SMA for the broadcast market-regime feature
+# ── Feature Flags ────────────────────────────────
+USE_REGIME_FEATURES          = False
+USE_MARKET_RELATIVE_FEATURES = False
+MARKET_BENCHMARK_SYMBOL      = "SPY"
+REGIME_VOL_SHORT             = 20
+REGIME_VOL_LONG              = 60
+REGIME_MOM_SHORT             = 63
+REGIME_MOM_LONG              = 126
+REGIME_RANK_WINDOW           = 126
+REGIME_HIGH_WINDOW           = 252
+REL_RET_SHORT                = 20
+REL_RET_LONG                 = 63
+RS_SLOPE_WINDOW              = 20
+MKT_TREND_SMA                = 50
+USE_CANDLESTICK_FEATURES            = True
+CANDLESTICK_DOJI_THRESHOLD          = 0.10
+CANDLESTICK_LONGBODY_THRESHOLD      = 0.60
+CANDLESTICK_LONGSHADOW_MULTIPLIER   = 2.0
+CANDLESTICK_SHORT_BODY_MULTIPLIER   = 0.5
+USE_MICRO_FEATURES                  = False
 
 # ── ML Settings ─────────────────────────────────
 ML_WINDOW           = 20
@@ -145,459 +107,782 @@ RF_N_ESTIMATORS     = 100
 RF_MAX_DEPTH        = 6
 
 # ── LSTM Settings ────────────────────────────────
-LSTM_HIDDEN         = 64
-LSTM_LAYERS         = 2
-LSTM_DROPOUT        = 0.3
-LSTM_EPOCHS         = 50
-LSTM_BATCH          = 32
-LSTM_LR             = 1e-3
-LSTM_PATIENCE       = 7
-LSTM_WINDOW         = 30
+LSTM_HIDDEN            = 64
+LSTM_LAYERS            = 2
+LSTM_DROPOUT           = 0.3
+LSTM_EPOCHS            = 50
+LSTM_BATCH             = 32
+LSTM_LR                = 1e-3
+LSTM_PATIENCE          = 7
+LSTM_WINDOW            = 30
+LSTM_BIDIRECTIONAL     = False
+LSTM_GRAD_CLIP_NORM    = 1.0
+LSTM_CYCLE_LR_STEP     = 0
+LSTM_CYCLE_LR_BASE     = 1e-5
+LSTM_HYPEROPT_TRIALS   = 0
+LSTM_META_ENSEMBLE     = False
 
 # ── Signal Thresholds ────────────────────────────
-# Higher BUY threshold = fewer entries, better fit for risk-controlled trading.
-BUY_THRESHOLD       = 0.65
+BUY_THRESHOLD       = 0.55
 SELL_THRESHOLD      = 0.40
-
-# Minimum bars a position is held before an opposite signal may close it.
-# Aligned with ML_HORIZON so the held period matches the forward-direction
-# label the models are trained on.
 MIN_HOLD_BARS       = ML_HORIZON
 
 # ── Ensemble Weights ─────────────────────────────
-# weighted_blend (predictor.py) renormalizes over whichever weights are present,
-# so these need NOT sum to 1.0 — only the RF:technical ratio matters now that LSTM
-# is zeroed. Renormalization keeps RF and the technical path behaving exactly as
-# before (their relative influence is unchanged).
 WEIGHT_RF           = 0.40
-# LSTM disabled — Item 6b (edge-recovery roadmap), 2026-06-21. Per-symbol LSTM
-# validation AUC is sub-chance: 5/8 watchlist symbols score < 0.50 (e.g. NVDA 0.396,
-# QQQ 0.391, VTI 0.425), so blending the LSTM in only injected noise. A weight of 0.0
-# removes it from the score math entirely. NOTE: the LSTM may still load, but
-# predictor.ml_model_count only counts available models with positive weights, so a
-# zero-weight LSTM no longer satisfies MIN_ML_MODELS_FOR_SIGNAL by itself.
-WEIGHT_LSTM         = 0.0
+WEIGHT_LSTM         = 0.10
+# Alternative models weights: defaults are positive but they only influence the
+# blend when their respective models are trained and available.
+WEIGHT_XGB          = 0.20
+WEIGHT_TRANSFORMER  = 0.15
 WEIGHT_TECHNICAL    = 0.25
-
-# Trading safety: do not allow technical-only BUY/SELL signals.
-# 1 = at least one ML model (RF or LSTM) must be available; otherwise forced HOLD.
 MIN_ML_MODELS_FOR_SIGNAL = 1
 
-# ── Phase 1: Model performance / staleness gate (signal safety) ───
-# Per-symbol RF/LSTM metrics are persisted here at train time (see model_metrics.py)
-# and read by predictor.predict_all before issuing any BUY/SELL. A symbol whose
-# metrics are MISSING, STALE, or BELOW the floor is forced to HOLD with an
-# explanation. This is fail-closed by design: no trusted metric => no trade.
+# ── Model Gate ───────────────────────────────────
 MODEL_METRICS_FILE   = MODELS_DIR / "model_metrics.json"
-# Master switch for the gate. True = enforce (recommended). Tests may disable it
-# to isolate ensemble logic; do not ship it False.
 MODEL_GATE_ENABLED   = True
-# Minimum cross-validated RF accuracy required to trade a symbol. 0.50 = at least
-# coin-flip; a model at or below chance must not place orders. Raise to demand a
-# real edge once models clear this bar.
 MODEL_MIN_RF_ACCURACY = 0.50
-# Optional RF F1 floor. 0.0 = disabled; raise to also require balanced precision/recall.
 MODEL_MIN_RF_F1       = 0.0
-# Maximum model age (days since training) before a symbol is forced to HOLD.
-# Regime shifts make stale models dangerous; retrain to refresh the timestamp.
 MODEL_MAX_AGE_DAYS    = 30
-# Optional ROC-AUC floor. 0.0 = disabled (default; preserves current behavior).
-# AUC matches how the bot trades (it ranks/acts on the confident tail) far better
-# than 0.5-threshold accuracy. Raise (e.g. 0.55) to demand real ranking skill.
-# Computed at train time from pooled out-of-sample fold predictions (eval_metrics).
 MODEL_MIN_RF_AUC      = 0.0
-# Tail fraction held out at train time to produce an HONEST pre-refit walk-forward
-# estimate of the production model RECIPE (reported as holdout_auc). The shipped
-# final model is still refit on ALL rows afterwards — this number grades the
-# recipe on unseen forward bars, not the literal served object.
 MODEL_HOLDOUT_RATIO   = 0.15
 
-# ── Permutation / shuffled-label null test (read-only research) ───
-# Decisive check of whether a symbol's real CV-AUC beats its own shuffled-label
-# null distribution, with multiple-testing controlled via Benjamini-Hochberg.
-# Pure offline analysis; never connects to IBKR and never trades. Defaults stay
-# SMALL so a run is minutes, not hours.
-PERMUTATION_N_SHUFFLES     = 50    # null draws per symbol
-PERMUTATION_SAMPLE_SYMBOLS = 20    # symbols tested by default (0 = all; CLI --all overrides)
-PERMUTATION_FDR_Q          = 0.05  # Benjamini-Hochberg false-discovery rate
+# ── Permutation test ─────────────────────────────
+PERMUTATION_N_SHUFFLES     = 50
+PERMUTATION_SAMPLE_SYMBOLS = 20
+PERMUTATION_FDR_Q          = 0.05
 
 # ── Risk Management ──────────────────────────────
-# Small-basket mode: allow a few tiny positions instead of one large holding.
-MAX_POSITION_PCT    = 0.005
-# Absolute dollar cap per trade. Final size = min(cash * MAX_POSITION_PCT,
-# MAX_TRADE_VALUE) so a large account never sizes a single trade above this.
-MAX_TRADE_VALUE     = 500.0
-MAX_OPEN_POSITIONS  = 3
-
-# Fast loss control. Kept small because the goal is to be wrong small.
-STOP_LOSS_PCT       = 0.004   # -0.40% initial protective stop
-TAKE_PROFIT_PCT     = 0.015   # fallback fixed-bracket TP when trailing is disabled
-
-# Minimum forward return required for a BUY label. Set above broker fee + slippage
-# round trip so the model learns to cover costs, not microscopic moves.
+MAX_POSITION_PCT    = 0.02
+MAX_TRADE_VALUE     = 2000.0
+MAX_OPEN_POSITIONS  = 5
+STOP_LOSS_PCT       = 0.008
+TAKE_PROFIT_PCT     = 0.015
 MIN_PROFIT_MARGIN   = 0.003
+ESTIMATED_COMMISSION_PER_TRADE = 1.00
+MIN_COMMISSION_PER_TRADE       = 1.00
+COMMISSION_PER_SHARE           = 0.005
 
-# ── Labeling mode (target the model is trained on) ───
-# "binary"        : current fixed-horizon endpoint label — 1.0 if
-#                   Close[t+ML_HORIZON]/Close[t]-1 > MIN_PROFIT_MARGIN, else 0.0,
-#                   NaN where the future is unknown. Path-blind. DEFAULT (unchanged).
-# "triple_barrier": path-aware label — 1.0 if the +LABEL_TP_PCT barrier is touched
-#                   BEFORE the -LABEL_STOP_PCT barrier within ML_HORIZON bars (using
-#                   intrabar High/Low), else 0.0; NaN if the future window is
-#                   incomplete. Same-bar ties resolve pessimistically to the stop.
-# CAVEAT: triple_barrier simulates a FIXED TP/SL bracket, so it is a faithful proxy
-# ONLY for the fixed-bracket exit (USE_TRAILING_EXIT=False). With
-# USE_TRAILING_EXIT=True (current default) live exits use a TRAILING stop and no
-# fixed TP (see ibkr_bridge.py), so this label approximates — does not exactly
-# match — live P&L. Stays binary {0.0, 1.0, NaN} either way (no ensemble changes).
+# ── Labeling ─────────────────────────────────────
 LABEL_MODE          = "binary"
-LABEL_TP_PCT        = 0.015   # upper (take-profit) barrier; mirrors TAKE_PROFIT_PCT
-LABEL_STOP_PCT      = 0.004   # lower (stop) barrier; mirrors STOP_LOSS_PCT
-
-# Absolute backstop exit. A hard stop that overrides trailing logic to cap the
-# worst-case loss on any single position regardless of other exit settings.
+LABEL_TP_PCT        = 0.015
+LABEL_STOP_PCT      = 0.004
 HARD_STOP_LOSS_PCT  = 0.03
-
-# Winner management. Native trailing stop lets a correct trade keep running while
-# protecting profit when price reverses from its high.
 USE_TRAILING_EXIT   = True
-TRAILING_STOP_PCT   = 0.004   # fraction; IBKR trailingPercent uses this * 100 = 0.4%
+TRAILING_STOP_PCT   = 0.01
 
-# ── Production Safety Guards ─────────────────────
-# Default is long-only. SELL closes existing long positions; it does not open shorts.
+# ── Production Safety ────────────────────────────
 ALLOW_SHORT          = False
 MIN_TRADE_CASH       = 100.0
 LIMIT_ORDER_OFFSET_PCT = 0.001
-
-# Daily safety caps. These are intentionally conservative for paper-testing.
 MAX_DAILY_TRADES     = 6
 MAX_DAILY_LOSS_USD   = 150.0
-
-# Do not use yesterday's/daily historical close as the price source for order placement.
 ALLOW_HISTORICAL_PRICE_FOR_ORDERS = False
+COACH_ALLOW_HISTORICAL_PRICE = True
 
-# ── Phase 2: Order execution robustness (H4-H9) ──
-# Fill-driven confirmation replaces the old fixed ib.sleep(1) "accepted" check.
-# How long to wait for an order to reach a terminal (Filled/Cancelled) state
-# before classifying it WORKING/TIMEOUT, and how often to poll the event loop
-# while waiting. Kept short so a one-shot run does not hang; a timed-out order
-# still rests at the broker and is reconciled by the duplicate/working-order
-# guards on the next run.
+# ── Order Execution ──────────────────────────────
 ORDER_FILL_TIMEOUT_SECONDS = 8.0
 ORDER_POLL_SECONDS         = 0.25
-# Robust close: how many escalating attempts (marketable-limit -> market) to make
-# to drive a close to remaining == 0 before giving up and alerting.
 CLOSE_MAX_ATTEMPTS         = 3
-
-# ── Phase 3: Server-side protection + risk engine (C2, H19, H1, H3) ──
-# Protective exits rest at the broker as GTC so they survive between the
-# one-shot bot's runs (and overnight). All exits for one position share an OCA
-# group so the first to fill auto-cancels the rest (no leftover resting SELL
-# that could open an accidental short). HARD_STOP_LOSS_PCT (above) is the
-# independent catastrophe stop, sized to the actual filled qty.
 PROTECTIVE_TIF             = "GTC"
-# Account circuit breakers (H3 GROUNDWORK only; conservative paper-test values).
-# Block NEW entries when equity falls this fraction below the start-of-day
-# snapshot. Closes / flatten / protective repair stay allowed.
 ACCOUNT_MAX_DRAWDOWN_PCT   = 0.10
-# Per-symbol exposure cap as a fraction of current equity (groundwork). A single
-# new position whose value exceeds this share of equity is refused.
 MAX_SYMBOL_EXPOSURE_PCT    = 0.10
 
-# ── Phase 4: Data integrity for order pricing (H11-H16) ──
-# Guards that the price an order is placed at is real-time-enough, internally
-# sane, and agrees with the price the decision was made on. PAPER-SAFE: these
-# only refuse a NEW entry on a bad/stale quote; they never enable live trading,
-# never touch closes/flatten/protective repair, and keep delayed-data paper
-# trading working (REQUIRE_REALTIME_DATA_FOR_ORDERS stays False until live).
-#
-# When True, an order may ONLY be priced from a real-time last/midpoint; delayed
-# and prior-close fields are refused. This MUST stay False for paper accounts on
-# the delayed (15-min) feed (IBKR_MARKET_DATA_TYPE=3) or no order would ever get
-# a price. It is flipped True only at live conversion (Phase 6), together with a
-# real-time market-data subscription. The crossed/wide-spread/stale-close sanity
-# checks run regardless of this flag.
+# ── Data Integrity ───────────────────────────────
 REQUIRE_REALTIME_DATA_FOR_ORDERS = False
-# Reject a quote whose bid/ask spread exceeds this fraction of the midpoint (an
-# illiquid / unreliable snapshot). 0 disables the check.
-MAX_QUOTE_SPREAD_PCT             = 0.02   # 2%
-# Refuse to act on a signal when the live order price has moved more than this
-# fraction from the price the decision was made on (a stale / gapped signal,
-# H14). In this bot the decision price is a daily close and the order price is
-# an intraday quote, so this is a LARGE-GAP guard; tighten it toward 0.005 only
-# once decisions are made on the live IBKR quote. 0 disables the check.
-DECISION_PRICE_MAX_DEVIATION_PCT = 0.05   # 5%
-# US regular-hours gate for NEW entries (H15). True = refuse to OPEN a new
-# position outside 09:30-16:00 ET on a trading day (closes, emergency flatten,
-# and protective repair are NEVER gated). Set False to practise paper entries
-# outside market hours. Uses an approximate computed US holiday/early-close
-# calendar (data_integrity.py) -- not the broker calendar.
+MAX_QUOTE_SPREAD_PCT             = 0.02
+DECISION_PRICE_MAX_DEVIATION_PCT = 0.05
 MARKET_HOURS_GATE_ENABLED        = True
 
-# ── Backtest Settings ────────────────────────────
-# Daily position-state simulation costs. These are conservative defaults.
-BACKTEST_TRANSACTION_COST_PCT = 0.0005  # 5 bps per order
-BACKTEST_SLIPPAGE_PCT         = 0.0005  # 5 bps per order
-
-# Full walk-forward LSTM inside backtest is expensive. Default backtest uses
-# walk-forward RF + technical score with the same BUY/SELL thresholds and
-# broker-like position-state rules. Enable this only for slower full-ensemble runs.
+# ── Backtest ─────────────────────────────────────
+BACKTEST_TRANSACTION_COST_PCT = 0.0005
+BACKTEST_SLIPPAGE_PCT         = 0.0005
 BACKTEST_INCLUDE_LSTM         = False
 BACKTEST_LSTM_EPOCHS          = 8
 BACKTEST_LSTM_BATCH           = 64
 
-# ── IBKR Paper Trading ───────────────────────────
+# ── IBKR (Deprecated for compatibility) ──────────
 IBKR_HOST           = "127.0.0.1"
 IBKR_PORT           = 7497
 PAPER_IBKR_PORT     = 7497
 REQUIRE_PAPER_PORT  = True
-
 CLIENT_ID_BOT       = 1
 CLIENT_ID_CHECK     = 11
 CLIENT_ID_CANCEL    = 12
 CLIENT_ID_FLATTEN   = 13
-
-# Backward-compatible name used by older code.
 IBKR_CLIENT_ID      = CLIENT_ID_BOT
-
 PAPER_CAPITAL       = 100_000.0
-# Market data type: 1=live, 2=frozen, 3=delayed (15-min), 4=delayed-frozen.
-# 3 lets paper accounts without a real-time subscription still get prices.
 IBKR_MARKET_DATA_TYPE = 3
+
+# ── Alpaca ───────────────────────────────────────
+ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets"
 
 # ── Logging ──────────────────────────────────────
 LOG_FILE            = LOG_DIR / "stock_engine.log"
 LOG_MAX_BYTES       = 10 * 1024 * 1024
 LOG_BACKUP_COUNT    = 5
 
-
-# ─── Guided Paper Trading Coach ─────────────────────────────────────────────
-# A read-mostly, beginner-friendly flow that turns ensemble signals into a
-# trade lesson + paper preview, and only places a paper order when the user
-# explicitly confirms with BOTH `--confirm` AND `--chart-checked`.
-# Default behavior is preview only; nothing here auto-buys.
-COACH_MIN_CONFIDENCE_FOR_CANDIDATE = 0.65
+# ── Coach ────────────────────────────────────────
+COACH_MIN_CONFIDENCE_FOR_CANDIDATE = 0.55
 COACH_REQUIRE_CHART_CHECK          = True
 COACH_REQUIRE_USER_CONFIRM         = True
-# Cap how many new trades a single `paper-coach` run can propose. That older
-# single-symbol flow is meant to teach, not to generate a batch of orders.
 COACH_MAX_NEW_TRADES_PER_RUN       = 1
-# Where the human-readable lesson / preview is written. Always written, even
-# when no order is placed, so the user has an audit trail.
 COACH_REPORT_FILE                  = REPORTS_DIR / "trade_coach_report.md"
-# When True, the coach refuses to propose a paper trade for any symbol that is
-# already in positions() or has a working order on the paper account.
 COACH_SKIP_IF_POSITION_OR_WORKING  = True
-
-# ─── Guided Daily Trading Coach (multi-trade PAPER practice) ────────────────
-# The `daily-coach` command scans the full market, previews the best BUY
-# candidates, and — only with BOTH --confirm AND --chart-checked — may place
-# up to COACH_MAX_PAPER_TRADES_PER_RUN *paper* orders in a single run so the
-# user can practice and learn faster. Every existing risk control still
-# applies (MAX_TRADE_VALUE, MAX_POSITION_PCT, MAX_OPEN_POSITIONS,
-# MAX_DAILY_TRADES, ALLOW_SHORT=False, REQUIRE_PAPER_PORT=True, the
-# duplicate-position/working-order guards, and live-snapshot-only pricing).
-#
-# Hard cap on how many PAPER trades one daily-coach run may place. This is an
-# upper bound: --max-trades can only LOWER it, never raise it.
-COACH_MAX_PAPER_TRADES_PER_RUN     = 3
-# How many top candidates the default (preview-only) daily-coach run shows.
-COACH_DEFAULT_PREVIEW_CANDIDATES   = 3
-# Master live-trading kill switch. This bot is PAPER-TRADING ONLY. This must
-# stay False; daily-coach refuses to run if anything tries to flip it True or
-# tries to connect on a non-paper port while REQUIRE_PAPER_PORT is True.
+COACH_MAX_PAPER_TRADES_PER_RUN     = 1
+COACH_DEFAULT_PREVIEW_CANDIDATES   = 1
 COACH_LIVE_TRADING_ENABLED         = False
 
-# ─── Phase 5B-1: Supervised Scheduler / Market-Hours Runner (Path A) ─────────
-# A THIN orchestration layer (`scheduler_runner.py`, command `run-scheduled`) for
-# the one-shot Path A bot. It only DECIDES whether a scheduled run is allowed and
-# then calls the EXISTING one-shot paper command. It adds NO trading logic, NO
-# daemon loop, and NO new capability flag. Every existing gate still applies
-# (model gate, data-integrity gate, market-hours gate, daily-loss kill-switch,
-# startup reconciliation, paper-port lock). PAPER ONLY: it never enables live
-# trading and ships in plan/dry-run mode.
-#
-# For Windows Task Scheduler use `run_scheduled.bat` and set PYTHONUTF8=1 (or
-# `python -X utf8`) so the emoji-bearing logs cannot raise UnicodeEncodeError in
-# a non-UTF-8 scheduled console (the H17 `scheduled_dryrun.log` fix).
-#
-# Master switch for the `run-scheduled` command. False => every scheduled run is
-# blocked (logged + audited) and nothing is dispatched.
+# ── Day-trade Practice ───────────────────────────
+import datetime as _dt
+
+PREMARKET_START = _dt.time(4, 0)
+MARKET_OPEN = _dt.time(9, 30)
+MARKET_CLOSE = _dt.time(16, 0)
+POSTMARKET_END = _dt.time(20, 0)
+TIMEZONE = "US/Eastern"
+
+ORB_WINDOW_MINUTES = 15
+ORB_EXTENDED_MINUTES = 30
+
+INTRADAY_INTERVAL = "1m"
+INTRADAY_LOOKBACK_DAYS = 5
+DAILY_LOOKBACK_DAYS = 60
+PREMARKET_INTERVAL = "1m"
+CACHE_TTL_SECONDS = 30
+STALE_QUOTE_BUFFER_SECONDS = 30
+
+SCAN_MIN_PRICE = 5.0
+SCAN_MAX_PRICE = 1000.0
+SCAN_MIN_PREMARKET_VOLUME = 50_000
+SCAN_MIN_RELATIVE_VOLUME = 1.2
+SCAN_MIN_GAP_PCT = 1.5
+SCAN_MAX_GAP_PCT = 30.0
+SCAN_MIN_FLOAT_SHARES = 5_000_000
+SCAN_MAX_CANDIDATES = 15
+SCAN_CHUNK_SIZE = 50
+SCAN_SLEEP_SECONDS = 1.0
+
+DYNAMIC_SCREENER_ENABLED = True
+DYNAMIC_SCREENER_TARGET_SYMBOLS = 150
+DYNAMIC_SCREENER_CACHE_TTL = 120
+SCAN_SCORE_GAP_WEIGHT = 0.4
+SCAN_SCORE_RVOL_WEIGHT = 0.3
+SCAN_SCORE_VOL_WEIGHT = 0.3
+SCAN_SCORE_RVOL_CAP = 10.0
+SCAN_SCORE_VOL_NORMALIZER = 100_000
+SCAN_OPEN_MIN_MOVE_PCT = 0.25
+SCAN_OPEN_MIN_VOLUME = 100_000
+SCAN_OPEN_MIN_RELATIVE_VOLUME = 1.5
+
+NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
+OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
+SYMBOL_UNIVERSE_FILE = DATA_DIR / "symbol_universe.csv"
+SCAN_RESULTS_FILE = REPORTS_DIR / "scan_results.csv"
+
+VWAP_BOUNCE_TOLERANCE_PCT = 0.3
+VWAP_RECLAIM_BARS = 3
+
+EMA_9 = 9
+EMA_20 = 20
+EMA_50 = 50
+VWAP_STD_BANDS = 2
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+VOLUME_MA_PERIOD = 20
+
+STRATEGY_ORB_ENABLED = True
+STRATEGY_VWAP_BOUNCE_ENABLED = True
+STRATEGY_GAP_AND_GO_ENABLED = True
+STRATEGY_MOMENTUM_SCALP_ENABLED = True
+STRATEGY_CANDLESTICK_ENABLED = True
+
+@dataclass
+class StrategyConfig:
+    confidence_min: float = 0.65
+    max_risk_pct: float = 1.0
+    rr_ratio: float = 2.0
+
+from strategies.constants import StrategyName
+STRATEGY_SETTINGS = {
+    StrategyName.MOMENTUM_SCALP: StrategyConfig(confidence_min=0.65, max_risk_pct=1.0),
+    StrategyName.ORB: StrategyConfig(confidence_min=0.60, max_risk_pct=1.0),
+    StrategyName.VWAP_BOUNCE: StrategyConfig(confidence_min=0.55, max_risk_pct=1.0),
+    StrategyName.GAP_AND_GO: StrategyConfig(confidence_min=0.60, max_risk_pct=1.0),
+    StrategyName.CANDLESTICK: StrategyConfig(confidence_min=0.40, max_risk_pct=0.5),
+}
+
+ORB_MIN_VOLUME_RATIO = 1.5
+ORB_MIN_RANGE_ATR_RATIO = 0.5
+VWAP_RSI_OVERSOLD = 35
+VWAP_RSI_OVERBOUGHT = 65
+GAP_CONTINUATION_MIN_HOLD_BARS = 3
+VOLATILITY_PENALTY_MULTIPLIER = 4.0
+
+MAX_RISK_PER_TRADE_PCT = 1.0
+MAX_DAILY_LOSS_PCT = 3.0
+MAX_DAILY_LOSS_DOLLARS = 300.0
+MAX_TRADES_PER_DAY = 50
+MAX_CONSECUTIVE_LOSSES = 10
+MAX_POSITION_SIZE_DOLLARS = 5000.0
+MAX_POSITION_PCT_OF_EQUITY = 0.20
+
+CORRELATION_USE_ABS = True
+CORRELATION_TIMEFRAME = "5m"
+CORRELATION_LOOKBACK_BARS = 30
+CORRELATION_REJECT_THRESHOLD = 0.80
+CORRELATION_WARN_THRESHOLD = 0.60
+CORRELATION_MILD_PENALTY = 0.90
+CORRELATION_STRONG_PENALTY = 0.75
+CORRELATION_HARD_PENALTY = 0.50
+CORRELATION_CACHE_TTL_SECONDS = 300
+CORRELATION_CACHE_MAX_ENTRIES = 5000
+CORRELATION_CONSERVATIVE_REJECT = False
+MIN_CORRELATION_SAMPLES = 10
+
+TRAILING_STOP_ATR_MULTIPLE = 1.5
+TRAILING_STOP_FALLBACK_PCT = 0.02
+TRAILING_STOP_MIN_UPDATE_DELTA = 0.25
+TRAILING_STOP_UPDATE_COOLDOWN_SECONDS = 30
+TRAILING_STOP_ENABLE_SHORT = True
+TRAILING_STOP_USE_ATR = True
+NAKED_LIMIT_PROTECTION = "replace"
+
+DEFAULT_STOP_ATR_MULTIPLE = 1.5
+DEFAULT_TARGET_RR_RATIO = 2.0
+
+FLATTEN_BEFORE_CLOSE_MINUTES = 5
+FLATTEN_WARNING_MINUTES = 15
+FLATTEN_ON_DAILY_LOSS = False
+REENTRY_COOLDOWN_MINUTES = 5
+
+PDT_ENABLED = True
+PDT_MIN_EQUITY = 25_000.0
+PDT_MAX_DAY_TRADES_5_DAYS = 3
+
+SIZING_METHOD = "risk_based"
+FIXED_SHARE_COUNT = 100
+FIXED_DOLLAR_AMOUNT = 1000.0
+ATR_SIZING_MULTIPLIER = 1.5
+MIN_ATR_THRESHOLD = 0.01
+
+DEFAULT_ORDER_TYPE = "LMT"
+LIMIT_OFFSET_CENTS = 5
+IOC_ENABLED = False
+BRACKET_ORDER_ENABLED = True
+
+SCAN_ENABLE_SENTIMENT = True
+SCAN_SENTIMENT_MAX_HEADLINES = 5
+SCAN_SCORE_SENTIMENT_WEIGHT = 0.2
+SCAN_SENTIMENT_CACHE_TTL = 3600
+
+DAYTRADE_LOG_FILE = LOG_DIR / "daytrading.log"
+DAYTRADE_TRADE_JOURNAL_FILE = REPORTS_DIR / "trade_journal.jsonl"
+DISCORD_WEBHOOK_URL = ""
+
+DAYTRADE_WATCHLIST = ["NVDA", "TSLA", "META", "AMD", "NFLX", "MU", "PYPL", "MSFT", "AMZN", "UBER", "PLTR", "AVGO", "JPM", "AAPL", "BAC", "SPY", "QQQ"]
+
+DAYTRADE_ML_ENABLED = False
+DAYTRADE_ML_CONFIDENCE_WEIGHT = 0.3
+DAYTRADE_ML_MODEL_PATH = DATA_DIR / "models" / "signal_predictor.pkl"
+DAYTRADE_ML_MIN_TRAINING_SAMPLES = 10
+DAYTRADE_ML_AUTO_RETRAIN = True
+DAYTRADE_ML_RETRAIN_INTERVAL = 100
+DAYTRADE_ML_N_ESTIMATORS = 100
+DAYTRADE_ML_MAX_TRAINING_FILES = 90
+DAYTRADE_ML_MAX_TRAINING_ROWS = 100000
+DAYTRADE_ML_MAX_JOURNAL_ROWS = 100000
+DAYTRADE_ML_MAX_JOURNAL_BYTES = 16 * 1024 * 1024
+DAYTRADE_ML_MODEL_CACHE_MAX_ENTRIES = 4
+DAYTRADE_ML_TARGET_MATCH_HOURS = 24
+DAYTRADE_PARALLEL_EVALUATION_MAX_WORKERS = 3
+DAYTRADE_PARALLEL_EVALUATION_MIN_SYMBOLS = 4
+DAYTRADE_PARALLEL_EVALUATION_ENABLED = True
+DAYTRADE_PARALLEL_EVALUATION_FALLBACK_TO_SERIAL = True
+DAYTRADE_ML_MAX_DEPTH = 5
+DAYTRADE_ML_TEST_SIZE = 0.2
+
+DAYTRADE_PAPER_RISK_PCT            = 0.001
+DAYTRADE_MIN_RR                    = 2.0
+DAYTRADE_ATR_STOP_MULTIPLE         = 1.5
+DAYTRADE_MAX_PAPER_TRADES_PER_RUN  = 1
+
+# ── Scheduler ────────────────────────────────────
 SCHEDULER_ENABLED            = True
-# Default execution mode. True (ship value) => even `run-scheduled --execute`
-# stays a dry-run/plan preview and places NO orders. Flip to False ONLY when you
-# deliberately want `--execute` to forward to the (paper) order path; the bot is
-# still paper-locked, so this can never place a live order.
 SCHEDULER_DRY_RUN_DEFAULT    = True
-# Require US regular trading hours (RTH) for a scheduled run. True (recommended)
-# => a run outside 09:30-16:00 ET on a trading day (weekend/holiday/early-close
-# aware) is blocked, mirroring the Phase-4 market-hours gate via the same
-# data_integrity calendar. Set False only to practise scheduled plan runs
-# outside market hours.
 SCHEDULER_REQUIRE_RTH        = True
 
-# ─── Phase 5B-2: Reconnect watchdog / connection resilience (Path A) ─────────
-# Connection hardening for the ONE-SHOT Path A bot (see reconnect_watchdog.py and
-# reports/LIVE_TRADING_IMPLEMENTATION_PLAN_MM.md task 5.3). This is NOT a daemon
-# and NOT a forever reconnect loop. It only:
-#   * wraps the INITIAL connect in a BOUNDED exponential-backoff retry, so a
-#     transient TWS hiccup at startup does not abort the whole one-shot run; and
-#   * registers an ib.disconnectedEvent handler that, on a mid-run drop, marks
-#     the connection UNHEALTHY and FAILS CLOSED (no new entries) — it never
-#     places, cancels, or modifies any order.
-# It adds NO new live-readiness capability flag and NEVER bypasses a safety gate:
-# the paper-port lock is enforced BEFORE any retry, and startup reconciliation,
-# the data-integrity gate, the market-hours gate, the daily-loss kill-switch, and
-# the model gate all still run unchanged. PAPER ONLY throughout.
-#
-# Master switch. False => connect() behaves exactly as before (a single attempt,
-# no retry). The disconnect handler still marks health, but no reconnect is tried.
+# ── Reconnect ────────────────────────────────────
 IBKR_RECONNECT_ENABLED            = True
-# Maximum TOTAL connect attempts for one one-shot run (the first try PLUS
-# retries). Bounded by design: the retry loop ALWAYS terminates after this many
-# tries — it never retries forever. Must be >= 1 (clamped up to 1 if set lower).
 IBKR_RECONNECT_MAX_ATTEMPTS       = 3
-# Exponential-backoff base delay (seconds) between failed connect attempts:
-#   delay(n) = min(MAX_DELAY, BASE_DELAY * 2**n)   for the n-th retry (0-indexed)
 IBKR_RECONNECT_BASE_DELAY_SECONDS = 2.0
-# Hard ceiling (seconds) on any single backoff delay, so the bounded retry can
-# never sleep for an unreasonable stretch (worst-case total stays small).
 IBKR_RECONNECT_MAX_DELAY_SECONDS  = 30.0
-# Socket/request timeout (seconds) handed to ib_insync (ib.RequestTimeout and the
-# connect() timeout), mirroring flatten_vti.py / check_positions.py. Keeps a dead
-# TWS from hanging a one-shot run indefinitely. 0 disables the explicit timeout.
 IBKR_REQUEST_TIMEOUT_SECONDS      = 30.0
 
-# ─── Phase 5B-4: Alerting layer (Path A) ─────────────────────────────────────
-# A SAFE, offline-testable alerting layer (`alerts.py`) that turns the safety
-# EVENTS the bot already detects -- a mid-run disconnect / reconnect failure, an
-# unprotected long at startup or shutdown, a duplicate orderRef, an orphan exit
-# order, a daily-loss kill-switch trip, an order rejection, a partial fill, a
-# protective-child failure / emergency flatten, a blocked scheduled run -- into
-# operator ALERTS. It is INERT by default and CANNOT affect trading: it never
-# places, cancels, or modifies an order, never enables live trading, and never
-# blocks (an alert failure can never stop an emergency flatten / protective
-# repair). NO real email/SMS/Telegram/webhook is sent in this phase -- the
-# external channels are disabled, inert stubs that send nothing off-box.
-#
-# Master switch. Ships False => alerts.emit() is a no-op (no logging, no external
-# action). Turn on ONLY to surface alerts; this never enables live trading and
-# never relaxes any paper-only gate.
+# ── Alerts ───────────────────────────────────────
 ALERTS_ENABLED        = False
-# Log-only mode. Ships True => alerts go ONLY to the standard logger + the
-# order_audit trail; no external channel is ever consulted. Leave True until a
-# later, deliberately-configured phase wires a real (still optional) channel.
 ALERTS_LOG_ONLY       = True
-# Minimum severity that is actually delivered: "info" | "warning" | "critical".
-# Ships "warning" so routine INFO events (e.g. a market-closed scheduled-run
-# block) are not noisy, while CRITICAL events (disconnect, unprotected long,
-# kill-switch) always pass. An unrecognised value falls back to "warning".
 ALERT_MIN_SEVERITY    = "warning"
 
-# ─── Phase 6.1: Account-type assertion (paper DU / live U) ───────────────────
-# The paper-port lock (IBKR_PORT/PAPER_IBKR_PORT/REQUIRE_PAPER_PORT above) guards
-# the PORT (7497). It does NOT guard WHICH account is logged into TWS/Gateway on
-# that port -- a live ("U...") account on 7497 would otherwise pass every guard
-# and could place a real-money order. `account_guard.assert_account` closes that
-# gap: on every connect it reads `ib.managedAccounts()` and FAILS CLOSED unless
-# the account matches the expected ENVIRONMENT prefix (paper -> "DU", live -> "U"
-# + explicit LIVE_ACCOUNT_ID), refusing empty / malformed / ambiguous lists too.
-#
-# PAPER ONLY this phase: live mode stays INERT. COACH_LIVE_TRADING_ENABLED is
-# False and LIVE_ACCOUNT_ID is None, so `account_guard.live_mode_enabled()` is
-# False and the bridge ALWAYS asserts a "DU..." paper account. The guard is built
-# and fail-closed tested, so its live-readiness capability flag
-# (SUPPORTS_ACCOUNT_TYPE_ASSERTION) is honestly True; live trading stays disabled
-# because the SEPARATE IBKR_MARKET_DATA_TYPE and LIVE_ACCOUNT_ID scorecard gates
-# still FAIL, keeping `live-readiness` NOT READY.
-#
-# Master switch. Ships True => the assertion runs on every connect (fail-closed).
-# A documented escape hatch only; leave True for paper safety.
+# ── Account ──────────────────────────────────────
 ASSERT_ACCOUNT_TYPE       = True
-# Optional explicit paper account id. None => accept any single "DU..." paper
-# account (the normal case). Set to a specific "DU..." id to REQUIRE that exact
-# paper account; it also becomes MANDATORY when TWS exposes multiple accounts
-# (the guard never silently chooses one).
 EXPECTED_PAPER_ACCOUNT_ID = None
-# Explicit LIVE account id (must be a "U..." id). MUST stay None until live
-# conversion (Phase 6.2-6.4). While None, live mode can never be selected and the
-# `live-readiness` scorecard's "Explicit LIVE_ACCOUNT_ID configured" gate FAILS,
-# keeping the bot NOT READY for live trading.
 LIVE_ACCOUNT_ID           = None
 
-# ─── Minervini / SEPA paper overlay (ADDITIVE, default-OFF) ──────────────────
-# A beginner-safe overlay (minervini.py) on top of the RF+LSTM+Technical ensemble:
-# a Stage-2 trend-template filter, a VCP-like contraction approximation, a
-# pocket-pivot signal, 1R sizing off a dedicated setup stop, expectancy metrics,
-# and a beginner/Burmese coach. It is strictly ADDITIVE: it may only BLOCK a NEW
-# BUY (never a SELL / close / flatten / protective exit) and may only SHRINK
-# position size (never bypass MAX_POSITION_PCT / MAX_TRADE_VALUE / exposure /
-# MAX_OPEN_POSITIONS / MAX_DAILY_TRADES). It does NOT replace the model gate, does
-# NOT add a new ML feature column or a SUPPORTS_* capability flag, and is PAPER
-# ONLY. Every switch below ships False, so the overlay is a complete no-op until
-# explicitly enabled and tested in paper.
-#
-# Master kill-switch. False => the entire overlay is inert (no block, no sizing
-# change, no coach output) regardless of the sub-switches below.
+# ── Minervini ────────────────────────────────────
 MINERVINI_OVERLAY_ENABLED        = False
-# Hard-block a NEW BUY when the Stage-2 trend template fails (adds a
-# 'stage2_filter' reason in the existing entry gate; wired in a later milestone).
 MINERVINI_STAGE2_BLOCK_ENABLED   = False
-# Enable 1R position sizing: qty = min(notional_qty, risk_qty). Only ever shrinks.
 MINERVINI_SIZING_ENABLED         = False
-# Show beginner "why blocked / why this setup" coaching + preview math.
 MINERVINI_COACH_ENABLED          = False
-# Milestone B ONLY (deferred): place the dedicated setup stop as a live GTC/OCA
-# leg. MUST stay False in this branch; the dedicated stop is sizing/preview only.
 MINERVINI_LIVE_STOP_ENABLED      = False
-
-# Stage-2 trend-template thresholds.
-MINERVINI_NEAR_52W_HIGH_PCT      = 0.25   # price must be within 25% of the 52-week high
-MINERVINI_OFF_52W_LOW_PCT        = 0.30   # price must be >= 30% above the 52-week low
-MINERVINI_RS_RANK_MIN            = 70.0   # min relative-strength percentile; None-tolerant (skip if no benchmark)
-MINERVINI_MA_200_RISING_LOOKBACK = 20     # bars used to confirm the 200-day SMA slope is up
-
-# VCP-like contraction (a coarse APPROXIMATION, not a true manual VCP).
-MINERVINI_VCP_MIN_CONTRACTIONS   = 2      # min successive tightening segments to call it "VCP-like"
-MINERVINI_VCP_MAX_BASE_DEPTH_PCT = 0.35   # reject bases deeper than 35%
-MINERVINI_VCP_PIVOT_LOOKBACK     = 15     # bars per contraction segment / final pivot-low window
-
-# Pocket pivot.
-MINERVINI_POCKET_VOL_LOOKBACK    = 10     # up-day volume must exceed max down-day vol over N prior bars
-
-# 1R risk sizing — DEDICATED Minervini stop (NOT STOP_LOSS_PCT / HARD_STOP_LOSS_PCT).
-MINERVINI_RISK_PER_TRADE_USD     = 25.0   # max $ risk per trade = (entry - mini_stop) * risk_qty
-MINERVINI_STOP_BUFFER_PCT        = 0.005  # place the dedicated stop this far below the VCP pivot low
-MINERVINI_MAX_STOP_DISTANCE_PCT  = 0.10   # cap stop distance; a far pivot blanks risk-sizing (never enlarges)
-
-# Coach localization. "en" | "my" (Burmese). English is always the fallback.
+MINERVINI_NEAR_52W_HIGH_PCT      = 0.25
+MINERVINI_OFF_52W_LOW_PCT        = 0.30
+MINERVINI_RS_RANK_MIN            = 70.0
+MINERVINI_MA_200_RISING_LOOKBACK = 20
+MINERVINI_VCP_MIN_CONTRACTIONS   = 2
+MINERVINI_VCP_MAX_BASE_DEPTH_PCT = 0.35
+MINERVINI_VCP_PIVOT_LOOKBACK     = 15
+MINERVINI_POCKET_VOL_LOOKBACK    = 10
+MINERVINI_RISK_PER_TRADE_USD     = 25.0
+MINERVINI_STOP_BUFFER_PCT        = 0.005
+MINERVINI_MAX_STOP_DISTANCE_PCT  = 0.10
 MINERVINI_COACH_LANGUAGE         = "en"
 
-# ── M4-core: expectancy / R-multiple OFFLINE reporting (READ-ONLY) ───────────
-# Output paths + flags for the read-only `expectancy-report` CLI command. These
-# are report artifacts only: NO trading behavior, NO order path, NO broker
-# connection, NO live switch. Safe to change freely.
-EXPECTANCY_BACKTEST_TRADES   = REPORTS_DIR / "backtest_trades.csv"      # input ledger (read-only)
-EXPECTANCY_REPORT_JSON       = REPORTS_DIR / "expectancy_metrics.json"  # machine-readable output
-EXPECTANCY_REPORT_MD         = REPORTS_DIR / "expectancy_report.md"     # human-readable output
-# Proxy-risk mode is OFF by default. The backtest ledger has NO true Minervini
-# 1R stop, so R-multiple / expectancy are NOT computed unless a proxy is
-# explicitly requested (CLI --proxy-risk or this flag), and the proxy is always
-# clearly labeled as a hard-stop proxy - never presented as true Minervini R.
+# ── Expectancy Report ────────────────────────────
+EXPECTANCY_BACKTEST_TRADES   = REPORTS_DIR / "backtest_trades.csv"
+EXPECTANCY_REPORT_JSON       = REPORTS_DIR / "expectancy_metrics.json"
+EXPECTANCY_REPORT_MD         = REPORTS_DIR / "expectancy_report.md"
 EXPECTANCY_ENABLE_PROXY_RISK = False
 
-# ── Forward paper-test tracking (READ-ONLY report; PAPER-ONLY capture) ───────
-# Output paths for the read-only `forward-test-report` CLI command and the
-# append-only journal of REAL paper fills (reports/paper_trades.jsonl). Like the
-# expectancy block above, these are report/journal artifacts only: NO trading
-# behavior, NO order path change, NO broker connection from the report command,
-# NO live switch. The journal is written from inside the already-paper-locked
-# `paper` run via append-only, never-raise hooks (same safety class as
-# order_audit). Safe to change freely.
-FORWARD_TEST_JOURNAL     = REPORTS_DIR / "paper_trades.jsonl"        # append-only fill journal
-FORWARD_TEST_REPORT_JSON = REPORTS_DIR / "forward_test_metrics.json"  # machine-readable output
-FORWARD_TEST_REPORT_MD   = REPORTS_DIR / "forward_test_report.md"     # human-readable output
-# Optional label stamped on each journal event to delimit a forward-test window
-# (e.g. "2026-Q2-paper"). None -> unlabeled; the report aggregates all events and
-# supports an optional --session / --since filter. Never affects trading.
+# ── Forward Test Tracking ────────────────────────
+FORWARD_TEST_JOURNAL     = REPORTS_DIR / "paper_trades.jsonl"
+FORWARD_TEST_REPORT_JSON = REPORTS_DIR / "forward_test_metrics.json"
+FORWARD_TEST_REPORT_MD   = REPORTS_DIR / "forward_test_report.md"
 FORWARD_TEST_SESSION     = None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Dataclass-based Settings (dependency-injection friendly)
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Settings:
+    """Immutable-equivalent settings namespace for dependency injection.
+
+    Usage:
+        # copy from module-level defaults
+        cfg = Settings.from_defaults()
+        # override
+        cfg.BUY_THRESHOLD = 0.70
+        # inject
+        predictor = Predictor(settings=cfg)
+    """
+    # Paths
+    BASE_DIR: Path = BASE_DIR
+    DATA_DIR: Path = DATA_DIR
+    MODELS_DIR: Path = MODELS_DIR
+    REPORTS_DIR: Path = REPORTS_DIR
+    LOG_DIR: Path = LOG_DIR
+    ML_MODELS_FILE: Path = ML_MODELS_FILE
+    LSTM_CKPT_FILE: Path = LSTM_CKPT_FILE
+
+    # Universe
+    WATCHLIST: List[str] = field(default_factory=lambda: list(WATCHLIST))
+    FULL_MARKET_SCAN_ENABLED: bool = FULL_MARKET_SCAN_ENABLED
+    FULL_MARKET_CACHE_HOURS: int = FULL_MARKET_CACHE_HOURS
+    FULL_MARKET_MAX_SYMBOLS_TO_CHECK: int = FULL_MARKET_MAX_SYMBOLS_TO_CHECK
+    FULL_MARKET_SELECTION_MODE: str = FULL_MARKET_SELECTION_MODE
+    FULL_MARKET_CORE_SYMBOLS: List[str] = field(default_factory=lambda: list(FULL_MARKET_CORE_SYMBOLS))
+    FULL_MARKET_RANDOM_SEED: int = FULL_MARKET_RANDOM_SEED
+    FULL_MARKET_ROTATION_STATE_FILE: Path = FULL_MARKET_ROTATION_STATE_FILE
+    HOT_SCAN_TOP_N: int = HOT_SCAN_TOP_N
+    HOT_SCAN_MIN_PRICE: float = HOT_SCAN_MIN_PRICE
+    HOT_SCAN_MAX_PRICE: float = HOT_SCAN_MAX_PRICE
+    HOT_SCAN_MIN_AVG_VOLUME: int = HOT_SCAN_MIN_AVG_VOLUME
+    HOT_SCAN_EXCLUDE_ETFS: bool = HOT_SCAN_EXCLUDE_ETFS
+    HOT_SCAN_MAX_ATR_PCT: float = HOT_SCAN_MAX_ATR_PCT
+    HOT_SCAN_CHUNK_SIZE: int = HOT_SCAN_CHUNK_SIZE
+    HOT_SCAN_SLEEP_SECONDS: float = HOT_SCAN_SLEEP_SECONDS
+    NASDAQ_LISTED_URL: str = NASDAQ_LISTED_URL
+    OTHER_LISTED_URL: str = OTHER_LISTED_URL
+    SYMBOL_UNIVERSE_FILE: Path = SYMBOL_UNIVERSE_FILE
+    HOT_CANDIDATES_FILE: Path = HOT_CANDIDATES_FILE
+    SELECTED_SCAN_SYMBOLS_FILE: Path = SELECTED_SCAN_SYMBOLS_FILE
+    IPO_WATCH_SYMBOLS: List[str] = field(default_factory=lambda: list(IPO_WATCH_SYMBOLS))
+
+    # Data
+    PRICE_PERIOD: str = PRICE_PERIOD
+    PRICE_INTERVAL: str = PRICE_INTERVAL
+    MIN_HISTORY_DAYS: int = MIN_HISTORY_DAYS
+    CACHE_TTL_SECONDS: int = CACHE_TTL_SECONDS
+
+    # Technical
+    SMA_SHORT: int = SMA_SHORT
+    SMA_LONG: int = SMA_LONG
+    EMA_PERIOD: int = EMA_PERIOD
+    RSI_PERIOD: int = RSI_PERIOD
+    MACD_FAST: int = MACD_FAST
+    MACD_SLOW: int = MACD_SLOW
+    MACD_SIGNAL: int = MACD_SIGNAL
+    BOLLINGER_PERIOD: int = BOLLINGER_PERIOD
+    BOLLINGER_STD: int = BOLLINGER_STD
+    ATR_PERIOD: int = ATR_PERIOD
+    VOLUME_MA_PERIOD: int = VOLUME_MA_PERIOD
+
+    # Features
+    USE_REGIME_FEATURES: bool = USE_REGIME_FEATURES
+    USE_MARKET_RELATIVE_FEATURES: bool = USE_MARKET_RELATIVE_FEATURES
+    MARKET_BENCHMARK_SYMBOL: str = MARKET_BENCHMARK_SYMBOL
+    REGIME_VOL_SHORT: int = REGIME_VOL_SHORT
+    REGIME_VOL_LONG: int = REGIME_VOL_LONG
+    REGIME_MOM_SHORT: int = REGIME_MOM_SHORT
+    REGIME_MOM_LONG: int = REGIME_MOM_LONG
+    REGIME_RANK_WINDOW: int = REGIME_RANK_WINDOW
+    REGIME_HIGH_WINDOW: int = REGIME_HIGH_WINDOW
+    REL_RET_SHORT: int = REL_RET_SHORT
+    REL_RET_LONG: int = REL_RET_LONG
+    RS_SLOPE_WINDOW: int = RS_SLOPE_WINDOW
+    MKT_TREND_SMA: int = MKT_TREND_SMA
+    USE_CANDLESTICK_FEATURES: bool = USE_CANDLESTICK_FEATURES
+    CANDLESTICK_DOJI_THRESHOLD: float = CANDLESTICK_DOJI_THRESHOLD
+    CANDLESTICK_LONGBODY_THRESHOLD: float = CANDLESTICK_LONGBODY_THRESHOLD
+    CANDLESTICK_LONGSHADOW_MULTIPLIER: float = CANDLESTICK_LONGSHADOW_MULTIPLIER
+    CANDLESTICK_SHORT_BODY_MULTIPLIER: float = CANDLESTICK_SHORT_BODY_MULTIPLIER
+    USE_MICRO_FEATURES: bool = USE_MICRO_FEATURES
+
+    # ML
+    ML_WINDOW: int = ML_WINDOW
+    ML_HORIZON: int = ML_HORIZON
+    ML_TEST_RATIO: float = ML_TEST_RATIO
+    RANDOM_STATE: int = RANDOM_STATE
+    RF_N_ESTIMATORS: int = RF_N_ESTIMATORS
+    RF_MAX_DEPTH: int = RF_MAX_DEPTH
+
+    # LSTM
+    LSTM_HIDDEN: int = LSTM_HIDDEN
+    LSTM_LAYERS: int = LSTM_LAYERS
+    LSTM_DROPOUT: float = LSTM_DROPOUT
+    LSTM_EPOCHS: int = LSTM_EPOCHS
+    LSTM_BATCH: int = LSTM_BATCH
+    LSTM_LR: float = LSTM_LR
+    LSTM_PATIENCE: int = LSTM_PATIENCE
+    LSTM_WINDOW: int = LSTM_WINDOW
+    LSTM_BIDIRECTIONAL: bool = LSTM_BIDIRECTIONAL
+    LSTM_GRAD_CLIP_NORM: float = LSTM_GRAD_CLIP_NORM
+    LSTM_CYCLE_LR_STEP: int = LSTM_CYCLE_LR_STEP
+    LSTM_CYCLE_LR_BASE: float = LSTM_CYCLE_LR_BASE
+    LSTM_HYPEROPT_TRIALS: int = LSTM_HYPEROPT_TRIALS
+    LSTM_META_ENSEMBLE: bool = LSTM_META_ENSEMBLE
+
+    # Signal
+    BUY_THRESHOLD: float = BUY_THRESHOLD
+    SELL_THRESHOLD: float = SELL_THRESHOLD
+    MIN_HOLD_BARS: int = MIN_HOLD_BARS
+    WEIGHT_RF: float = WEIGHT_RF
+    WEIGHT_LSTM: float = WEIGHT_LSTM
+    WEIGHT_XGB: float = WEIGHT_XGB
+    WEIGHT_TRANSFORMER: float = WEIGHT_TRANSFORMER
+    WEIGHT_TECHNICAL: float = WEIGHT_TECHNICAL
+    MIN_ML_MODELS_FOR_SIGNAL: int = MIN_ML_MODELS_FOR_SIGNAL
+
+    # Model gate
+    MODEL_METRICS_FILE: Path = MODEL_METRICS_FILE
+    MODEL_GATE_ENABLED: bool = MODEL_GATE_ENABLED
+    MODEL_MIN_RF_ACCURACY: float = MODEL_MIN_RF_ACCURACY
+    MODEL_MIN_RF_F1: float = MODEL_MIN_RF_F1
+    MODEL_MAX_AGE_DAYS: int = MODEL_MAX_AGE_DAYS
+    MODEL_MIN_RF_AUC: float = MODEL_MIN_RF_AUC
+    MODEL_HOLDOUT_RATIO: float = MODEL_HOLDOUT_RATIO
+
+    # Permutation
+    PERMUTATION_N_SHUFFLES: int = PERMUTATION_N_SHUFFLES
+    PERMUTATION_SAMPLE_SYMBOLS: int = PERMUTATION_SAMPLE_SYMBOLS
+    PERMUTATION_FDR_Q: float = PERMUTATION_FDR_Q
+
+    # Risk
+    MAX_POSITION_PCT: float = MAX_POSITION_PCT
+    MAX_TRADE_VALUE: float = MAX_TRADE_VALUE
+    MAX_OPEN_POSITIONS: int = MAX_OPEN_POSITIONS
+    STOP_LOSS_PCT: float = STOP_LOSS_PCT
+    TAKE_PROFIT_PCT: float = TAKE_PROFIT_PCT
+    MIN_PROFIT_MARGIN: float = MIN_PROFIT_MARGIN
+    ESTIMATED_COMMISSION_PER_TRADE: float = ESTIMATED_COMMISSION_PER_TRADE
+    MIN_COMMISSION_PER_TRADE: float = MIN_COMMISSION_PER_TRADE
+    COMMISSION_PER_SHARE: float = COMMISSION_PER_SHARE
+
+    # Labeling
+    LABEL_MODE: str = LABEL_MODE
+    LABEL_TP_PCT: float = LABEL_TP_PCT
+    LABEL_STOP_PCT: float = LABEL_STOP_PCT
+    HARD_STOP_LOSS_PCT: float = HARD_STOP_LOSS_PCT
+    USE_TRAILING_EXIT: bool = USE_TRAILING_EXIT
+    TRAILING_STOP_PCT: float = TRAILING_STOP_PCT
+
+    # Safety
+    ALLOW_SHORT: bool = ALLOW_SHORT
+    MIN_TRADE_CASH: float = MIN_TRADE_CASH
+    LIMIT_ORDER_OFFSET_PCT: float = LIMIT_ORDER_OFFSET_PCT
+    MAX_DAILY_TRADES: int = MAX_DAILY_TRADES
+    MAX_DAILY_LOSS_USD: float = MAX_DAILY_LOSS_USD
+    ALLOW_HISTORICAL_PRICE_FOR_ORDERS: bool = ALLOW_HISTORICAL_PRICE_FOR_ORDERS
+    COACH_ALLOW_HISTORICAL_PRICE: bool = COACH_ALLOW_HISTORICAL_PRICE
+
+    # Order exec
+    ORDER_FILL_TIMEOUT_SECONDS: float = ORDER_FILL_TIMEOUT_SECONDS
+    ORDER_POLL_SECONDS: float = ORDER_POLL_SECONDS
+    CLOSE_MAX_ATTEMPTS: int = CLOSE_MAX_ATTEMPTS
+    PROTECTIVE_TIF: str = PROTECTIVE_TIF
+    ACCOUNT_MAX_DRAWDOWN_PCT: float = ACCOUNT_MAX_DRAWDOWN_PCT
+    MAX_SYMBOL_EXPOSURE_PCT: float = MAX_SYMBOL_EXPOSURE_PCT
+
+    # Data integrity
+    REQUIRE_REALTIME_DATA_FOR_ORDERS: bool = REQUIRE_REALTIME_DATA_FOR_ORDERS
+    MAX_QUOTE_SPREAD_PCT: float = MAX_QUOTE_SPREAD_PCT
+    DECISION_PRICE_MAX_DEVIATION_PCT: float = DECISION_PRICE_MAX_DEVIATION_PCT
+    MARKET_HOURS_GATE_ENABLED: bool = MARKET_HOURS_GATE_ENABLED
+
+    # Backtest
+    BACKTEST_TRANSACTION_COST_PCT: float = BACKTEST_TRANSACTION_COST_PCT
+    BACKTEST_SLIPPAGE_PCT: float = BACKTEST_SLIPPAGE_PCT
+    BACKTEST_INCLUDE_LSTM: bool = BACKTEST_INCLUDE_LSTM
+    BACKTEST_LSTM_EPOCHS: int = BACKTEST_LSTM_EPOCHS
+    BACKTEST_LSTM_BATCH: int = BACKTEST_LSTM_BATCH
+
+    # IBKR
+    IBKR_HOST: str = IBKR_HOST
+    IBKR_PORT: int = IBKR_PORT
+    PAPER_IBKR_PORT: int = PAPER_IBKR_PORT
+    REQUIRE_PAPER_PORT: bool = REQUIRE_PAPER_PORT
+    CLIENT_ID_BOT: int = CLIENT_ID_BOT
+    CLIENT_ID_CHECK: int = CLIENT_ID_CHECK
+    CLIENT_ID_CANCEL: int = CLIENT_ID_CANCEL
+    CLIENT_ID_FLATTEN: int = CLIENT_ID_FLATTEN
+    IBKR_CLIENT_ID: int = IBKR_CLIENT_ID
+    PAPER_CAPITAL: float = PAPER_CAPITAL
+    IBKR_MARKET_DATA_TYPE: int = IBKR_MARKET_DATA_TYPE
+
+    # Alpaca
+    ALPACA_PAPER_BASE_URL: str = ALPACA_PAPER_BASE_URL
+
+    # Logging
+    LOG_FILE: Path = LOG_FILE
+    LOG_MAX_BYTES: int = LOG_MAX_BYTES
+    LOG_BACKUP_COUNT: int = LOG_BACKUP_COUNT
+
+    # Coach
+    COACH_MIN_CONFIDENCE_FOR_CANDIDATE: float = COACH_MIN_CONFIDENCE_FOR_CANDIDATE
+    COACH_REQUIRE_CHART_CHECK: bool = COACH_REQUIRE_CHART_CHECK
+    COACH_REQUIRE_USER_CONFIRM: bool = COACH_REQUIRE_USER_CONFIRM
+    COACH_MAX_NEW_TRADES_PER_RUN: int = COACH_MAX_NEW_TRADES_PER_RUN
+    COACH_REPORT_FILE: Path = COACH_REPORT_FILE
+    COACH_SKIP_IF_POSITION_OR_WORKING: bool = COACH_SKIP_IF_POSITION_OR_WORKING
+    COACH_MAX_PAPER_TRADES_PER_RUN: int = COACH_MAX_PAPER_TRADES_PER_RUN
+    COACH_DEFAULT_PREVIEW_CANDIDATES: int = COACH_DEFAULT_PREVIEW_CANDIDATES
+    COACH_LIVE_TRADING_ENABLED: bool = COACH_LIVE_TRADING_ENABLED
+
+    # Daytrade
+    DAYTRADE_PAPER_RISK_PCT: float = DAYTRADE_PAPER_RISK_PCT
+    DAYTRADE_MIN_RR: float = DAYTRADE_MIN_RR
+    DAYTRADE_ATR_STOP_MULTIPLE: float = DAYTRADE_ATR_STOP_MULTIPLE
+    DAYTRADE_MAX_PAPER_TRADES_PER_RUN: int = DAYTRADE_MAX_PAPER_TRADES_PER_RUN
+
+    # Scheduler
+    SCHEDULER_ENABLED: bool = SCHEDULER_ENABLED
+    SCHEDULER_DRY_RUN_DEFAULT: bool = SCHEDULER_DRY_RUN_DEFAULT
+    SCHEDULER_REQUIRE_RTH: bool = SCHEDULER_REQUIRE_RTH
+
+    # Reconnect
+    IBKR_RECONNECT_ENABLED: bool = IBKR_RECONNECT_ENABLED
+    IBKR_RECONNECT_MAX_ATTEMPTS: int = IBKR_RECONNECT_MAX_ATTEMPTS
+    IBKR_RECONNECT_BASE_DELAY_SECONDS: float = IBKR_RECONNECT_BASE_DELAY_SECONDS
+    IBKR_RECONNECT_MAX_DELAY_SECONDS: float = IBKR_RECONNECT_MAX_DELAY_SECONDS
+    IBKR_REQUEST_TIMEOUT_SECONDS: float = IBKR_REQUEST_TIMEOUT_SECONDS
+
+    # Alerts
+    ALERTS_ENABLED: bool = ALERTS_ENABLED
+    ALERTS_LOG_ONLY: bool = ALERTS_LOG_ONLY
+    ALERT_MIN_SEVERITY: str = ALERT_MIN_SEVERITY
+
+    # Account
+    ASSERT_ACCOUNT_TYPE: bool = ASSERT_ACCOUNT_TYPE
+    EXPECTED_PAPER_ACCOUNT_ID: Optional[str] = EXPECTED_PAPER_ACCOUNT_ID
+    LIVE_ACCOUNT_ID: Optional[str] = LIVE_ACCOUNT_ID
+
+    # Minervini
+    MINERVINI_OVERLAY_ENABLED: bool = MINERVINI_OVERLAY_ENABLED
+    MINERVINI_STAGE2_BLOCK_ENABLED: bool = MINERVINI_STAGE2_BLOCK_ENABLED
+    MINERVINI_SIZING_ENABLED: bool = MINERVINI_SIZING_ENABLED
+    MINERVINI_COACH_ENABLED: bool = MINERVINI_COACH_ENABLED
+    MINERVINI_LIVE_STOP_ENABLED: bool = MINERVINI_LIVE_STOP_ENABLED
+    MINERVINI_NEAR_52W_HIGH_PCT: float = MINERVINI_NEAR_52W_HIGH_PCT
+    MINERVINI_OFF_52W_LOW_PCT: float = MINERVINI_OFF_52W_LOW_PCT
+    MINERVINI_RS_RANK_MIN: float = MINERVINI_RS_RANK_MIN
+    MINERVINI_MA_200_RISING_LOOKBACK: int = MINERVINI_MA_200_RISING_LOOKBACK
+    MINERVINI_VCP_MIN_CONTRACTIONS: int = MINERVINI_VCP_MIN_CONTRACTIONS
+    MINERVINI_VCP_MAX_BASE_DEPTH_PCT: float = MINERVINI_VCP_MAX_BASE_DEPTH_PCT
+    MINERVINI_VCP_PIVOT_LOOKBACK: int = MINERVINI_VCP_PIVOT_LOOKBACK
+    MINERVINI_POCKET_VOL_LOOKBACK: int = MINERVINI_POCKET_VOL_LOOKBACK
+    MINERVINI_RISK_PER_TRADE_USD: float = MINERVINI_RISK_PER_TRADE_USD
+    MINERVINI_STOP_BUFFER_PCT: float = MINERVINI_STOP_BUFFER_PCT
+    MINERVINI_MAX_STOP_DISTANCE_PCT: float = MINERVINI_MAX_STOP_DISTANCE_PCT
+    MINERVINI_COACH_LANGUAGE: str = MINERVINI_COACH_LANGUAGE
+
+    # Expectancy
+    EXPECTANCY_BACKTEST_TRADES: Path = EXPECTANCY_BACKTEST_TRADES
+    EXPECTANCY_REPORT_JSON: Path = EXPECTANCY_REPORT_JSON
+    EXPECTANCY_REPORT_MD: Path = EXPECTANCY_REPORT_MD
+    EXPECTANCY_ENABLE_PROXY_RISK: bool = EXPECTANCY_ENABLE_PROXY_RISK
+
+    # Forward test
+    # Daytrade V1 Integrated Settings
+    PREMARKET_START: _dt.time = PREMARKET_START
+    MARKET_OPEN: _dt.time = MARKET_OPEN
+    MARKET_CLOSE: _dt.time = MARKET_CLOSE
+    POSTMARKET_END: _dt.time = POSTMARKET_END
+    TIMEZONE: str = TIMEZONE
+    ORB_WINDOW_MINUTES: int = ORB_WINDOW_MINUTES
+    ORB_EXTENDED_MINUTES: int = ORB_EXTENDED_MINUTES
+    INTRADAY_INTERVAL: str = INTRADAY_INTERVAL
+    INTRADAY_LOOKBACK_DAYS: int = INTRADAY_LOOKBACK_DAYS
+    DAILY_LOOKBACK_DAYS: int = DAILY_LOOKBACK_DAYS
+    PREMARKET_INTERVAL: str = PREMARKET_INTERVAL
+    CACHE_TTL_SECONDS: int = CACHE_TTL_SECONDS
+    STALE_QUOTE_BUFFER_SECONDS: int = STALE_QUOTE_BUFFER_SECONDS
+    SCAN_MIN_PRICE: float = SCAN_MIN_PRICE
+    SCAN_MAX_PRICE: float = SCAN_MAX_PRICE
+    SCAN_MIN_PREMARKET_VOLUME: int = SCAN_MIN_PREMARKET_VOLUME
+    SCAN_MIN_RELATIVE_VOLUME: float = SCAN_MIN_RELATIVE_VOLUME
+    SCAN_MIN_GAP_PCT: float = SCAN_MIN_GAP_PCT
+    SCAN_MAX_GAP_PCT: float = SCAN_MAX_GAP_PCT
+    SCAN_MIN_FLOAT_SHARES: int = SCAN_MIN_FLOAT_SHARES
+    SCAN_MAX_CANDIDATES: int = SCAN_MAX_CANDIDATES
+    SCAN_CHUNK_SIZE: int = SCAN_CHUNK_SIZE
+    SCAN_SLEEP_SECONDS: float = SCAN_SLEEP_SECONDS
+    DYNAMIC_SCREENER_ENABLED: bool = DYNAMIC_SCREENER_ENABLED
+    DYNAMIC_SCREENER_TARGET_SYMBOLS: int = DYNAMIC_SCREENER_TARGET_SYMBOLS
+    DYNAMIC_SCREENER_CACHE_TTL: int = DYNAMIC_SCREENER_CACHE_TTL
+    SCAN_SCORE_GAP_WEIGHT: float = SCAN_SCORE_GAP_WEIGHT
+    SCAN_SCORE_RVOL_WEIGHT: float = SCAN_SCORE_RVOL_WEIGHT
+    SCAN_SCORE_VOL_WEIGHT: float = SCAN_SCORE_VOL_WEIGHT
+    SCAN_SCORE_RVOL_CAP: float = SCAN_SCORE_RVOL_CAP
+    SCAN_SCORE_VOL_NORMALIZER: int = SCAN_SCORE_VOL_NORMALIZER
+    SCAN_OPEN_MIN_MOVE_PCT: float = SCAN_OPEN_MIN_MOVE_PCT
+    SCAN_OPEN_MIN_VOLUME: int = SCAN_OPEN_MIN_VOLUME
+    SCAN_OPEN_MIN_RELATIVE_VOLUME: float = SCAN_OPEN_MIN_RELATIVE_VOLUME
+    NASDAQ_LISTED_URL: str = NASDAQ_LISTED_URL
+    OTHER_LISTED_URL: str = OTHER_LISTED_URL
+    SYMBOL_UNIVERSE_FILE: Path = SYMBOL_UNIVERSE_FILE
+    SCAN_RESULTS_FILE: Path = SCAN_RESULTS_FILE
+    VWAP_BOUNCE_TOLERANCE_PCT: float = VWAP_BOUNCE_TOLERANCE_PCT
+    VWAP_RECLAIM_BARS: int = VWAP_RECLAIM_BARS
+    EMA_9: int = EMA_9
+    EMA_20: int = EMA_20
+    EMA_50: int = EMA_50
+    VWAP_STD_BANDS: int = VWAP_STD_BANDS
+    RSI_PERIOD: int = RSI_PERIOD
+    ATR_PERIOD: int = ATR_PERIOD
+    MACD_FAST: int = MACD_FAST
+    MACD_SLOW: int = MACD_SLOW
+    MACD_SIGNAL: int = MACD_SIGNAL
+    VOLUME_MA_PERIOD: int = VOLUME_MA_PERIOD
+    STRATEGY_ORB_ENABLED: bool = STRATEGY_ORB_ENABLED
+    STRATEGY_VWAP_BOUNCE_ENABLED: bool = STRATEGY_VWAP_BOUNCE_ENABLED
+    STRATEGY_GAP_AND_GO_ENABLED: bool = STRATEGY_GAP_AND_GO_ENABLED
+    STRATEGY_MOMENTUM_SCALP_ENABLED: bool = STRATEGY_MOMENTUM_SCALP_ENABLED
+    STRATEGY_CANDLESTICK_ENABLED: bool = STRATEGY_CANDLESTICK_ENABLED
+    STRATEGY_SETTINGS: dict = field(default_factory=lambda: dict(STRATEGY_SETTINGS))
+    ORB_MIN_VOLUME_RATIO: float = ORB_MIN_VOLUME_RATIO
+    ORB_MIN_RANGE_ATR_RATIO: float = ORB_MIN_RANGE_ATR_RATIO
+    VWAP_RSI_OVERSOLD: float = VWAP_RSI_OVERSOLD
+    VWAP_RSI_OVERBOUGHT: float = VWAP_RSI_OVERBOUGHT
+    GAP_CONTINUATION_MIN_HOLD_BARS: int = GAP_CONTINUATION_MIN_HOLD_BARS
+    VOLATILITY_PENALTY_MULTIPLIER: float = VOLATILITY_PENALTY_MULTIPLIER
+    MAX_RISK_PER_TRADE_PCT: float = MAX_RISK_PER_TRADE_PCT
+    MAX_DAILY_LOSS_PCT: float = MAX_DAILY_LOSS_PCT
+    MAX_DAILY_LOSS_DOLLARS: float = MAX_DAILY_LOSS_DOLLARS
+    MAX_TRADES_PER_DAY: int = MAX_TRADES_PER_DAY
+    MAX_CONSECUTIVE_LOSSES: int = MAX_CONSECUTIVE_LOSSES
+    MAX_POSITION_SIZE_DOLLARS: float = MAX_POSITION_SIZE_DOLLARS
+    MAX_POSITION_PCT_OF_EQUITY: float = MAX_POSITION_PCT_OF_EQUITY
+    CORRELATION_USE_ABS: bool = CORRELATION_USE_ABS
+    CORRELATION_TIMEFRAME: str = CORRELATION_TIMEFRAME
+    CORRELATION_LOOKBACK_BARS: int = CORRELATION_LOOKBACK_BARS
+    CORRELATION_REJECT_THRESHOLD: float = CORRELATION_REJECT_THRESHOLD
+    CORRELATION_WARN_THRESHOLD: float = CORRELATION_WARN_THRESHOLD
+    CORRELATION_MILD_PENALTY: float = CORRELATION_MILD_PENALTY
+    CORRELATION_STRONG_PENALTY: float = CORRELATION_STRONG_PENALTY
+    CORRELATION_HARD_PENALTY: float = CORRELATION_HARD_PENALTY
+    CORRELATION_CACHE_TTL_SECONDS: int = CORRELATION_CACHE_TTL_SECONDS
+    CORRELATION_CACHE_MAX_ENTRIES: int = CORRELATION_CACHE_MAX_ENTRIES
+    CORRELATION_CONSERVATIVE_REJECT: bool = CORRELATION_CONSERVATIVE_REJECT
+    MIN_CORRELATION_SAMPLES: int = MIN_CORRELATION_SAMPLES
+    TRAILING_STOP_ATR_MULTIPLE: float = TRAILING_STOP_ATR_MULTIPLE
+    TRAILING_STOP_FALLBACK_PCT: float = TRAILING_STOP_FALLBACK_PCT
+    TRAILING_STOP_MIN_UPDATE_DELTA: float = TRAILING_STOP_MIN_UPDATE_DELTA
+    TRAILING_STOP_UPDATE_COOLDOWN_SECONDS: int = TRAILING_STOP_UPDATE_COOLDOWN_SECONDS
+    TRAILING_STOP_ENABLE_SHORT: bool = TRAILING_STOP_ENABLE_SHORT
+    TRAILING_STOP_USE_ATR: bool = TRAILING_STOP_USE_ATR
+    NAKED_LIMIT_PROTECTION: str = NAKED_LIMIT_PROTECTION
+    DEFAULT_STOP_ATR_MULTIPLE: float = DEFAULT_STOP_ATR_MULTIPLE
+    DEFAULT_TARGET_RR_RATIO: float = DEFAULT_TARGET_RR_RATIO
+    FLATTEN_BEFORE_CLOSE_MINUTES: int = FLATTEN_BEFORE_CLOSE_MINUTES
+    FLATTEN_WARNING_MINUTES: int = FLATTEN_WARNING_MINUTES
+    FLATTEN_ON_DAILY_LOSS: bool = FLATTEN_ON_DAILY_LOSS
+    REENTRY_COOLDOWN_MINUTES: int = REENTRY_COOLDOWN_MINUTES
+    PDT_ENABLED: bool = PDT_ENABLED
+    PDT_MIN_EQUITY: float = PDT_MIN_EQUITY
+    PDT_MAX_DAY_TRADES_5_DAYS: int = PDT_MAX_DAY_TRADES_5_DAYS
+    SIZING_METHOD: str = SIZING_METHOD
+    FIXED_SHARE_COUNT: int = FIXED_SHARE_COUNT
+    FIXED_DOLLAR_AMOUNT: float = FIXED_DOLLAR_AMOUNT
+    ATR_SIZING_MULTIPLIER: float = ATR_SIZING_MULTIPLIER
+    MIN_ATR_THRESHOLD: float = MIN_ATR_THRESHOLD
+    DEFAULT_ORDER_TYPE: str = DEFAULT_ORDER_TYPE
+    LIMIT_OFFSET_CENTS: int = LIMIT_OFFSET_CENTS
+    IOC_ENABLED: bool = IOC_ENABLED
+    BRACKET_ORDER_ENABLED: bool = BRACKET_ORDER_ENABLED
+    SCAN_ENABLE_SENTIMENT: bool = SCAN_ENABLE_SENTIMENT
+    SCAN_SENTIMENT_MAX_HEADLINES: int = SCAN_SENTIMENT_MAX_HEADLINES
+    SCAN_SCORE_SENTIMENT_WEIGHT: float = SCAN_SCORE_SENTIMENT_WEIGHT
+    SCAN_SENTIMENT_CACHE_TTL: int = SCAN_SENTIMENT_CACHE_TTL
+    DAYTRADE_LOG_FILE: Path = DAYTRADE_LOG_FILE
+    DAYTRADE_TRADE_JOURNAL_FILE: Path = DAYTRADE_TRADE_JOURNAL_FILE
+    DISCORD_WEBHOOK_URL: str = DISCORD_WEBHOOK_URL
+    DAYTRADE_WATCHLIST: List[str] = field(default_factory=lambda: DAYTRADE_WATCHLIST)
+    DAYTRADE_ML_ENABLED: bool = DAYTRADE_ML_ENABLED
+    DAYTRADE_ML_CONFIDENCE_WEIGHT: float = DAYTRADE_ML_CONFIDENCE_WEIGHT
+    DAYTRADE_ML_MODEL_PATH: Path = DAYTRADE_ML_MODEL_PATH
+    DAYTRADE_ML_MIN_TRAINING_SAMPLES: int = DAYTRADE_ML_MIN_TRAINING_SAMPLES
+    DAYTRADE_ML_AUTO_RETRAIN: bool = DAYTRADE_ML_AUTO_RETRAIN
+    DAYTRADE_ML_RETRAIN_INTERVAL: int = DAYTRADE_ML_RETRAIN_INTERVAL
+    DAYTRADE_ML_N_ESTIMATORS: int = DAYTRADE_ML_N_ESTIMATORS
+    DAYTRADE_ML_MAX_TRAINING_FILES: int = DAYTRADE_ML_MAX_TRAINING_FILES
+    DAYTRADE_ML_MAX_TRAINING_ROWS: int = DAYTRADE_ML_MAX_TRAINING_ROWS
+    DAYTRADE_ML_MAX_JOURNAL_ROWS: int = DAYTRADE_ML_MAX_JOURNAL_ROWS
+    DAYTRADE_ML_MAX_JOURNAL_BYTES: int = DAYTRADE_ML_MAX_JOURNAL_BYTES
+    DAYTRADE_ML_MODEL_CACHE_MAX_ENTRIES: int = DAYTRADE_ML_MODEL_CACHE_MAX_ENTRIES
+    DAYTRADE_ML_TARGET_MATCH_HOURS: int = DAYTRADE_ML_TARGET_MATCH_HOURS
+    DAYTRADE_PARALLEL_EVALUATION_MAX_WORKERS: int = DAYTRADE_PARALLEL_EVALUATION_MAX_WORKERS
+    DAYTRADE_PARALLEL_EVALUATION_MIN_SYMBOLS: int = DAYTRADE_PARALLEL_EVALUATION_MIN_SYMBOLS
+    DAYTRADE_PARALLEL_EVALUATION_ENABLED: bool = DAYTRADE_PARALLEL_EVALUATION_ENABLED
+    DAYTRADE_PARALLEL_EVALUATION_FALLBACK_TO_SERIAL: bool = DAYTRADE_PARALLEL_EVALUATION_FALLBACK_TO_SERIAL
+    DAYTRADE_ML_MAX_DEPTH: int = DAYTRADE_ML_MAX_DEPTH
+    DAYTRADE_ML_TEST_SIZE: float = DAYTRADE_ML_TEST_SIZE
+
+    FORWARD_TEST_JOURNAL: Path = FORWARD_TEST_JOURNAL
+    FORWARD_TEST_REPORT_JSON: Path = FORWARD_TEST_REPORT_JSON
+    FORWARD_TEST_REPORT_MD: Path = FORWARD_TEST_REPORT_MD
+    FORWARD_TEST_SESSION: Optional[str] = FORWARD_TEST_SESSION
+
+
+# Default instance — mutate only in tests via set_config().
+_default_settings = Settings()
+
+def get_settings() -> Settings:
+    return _default_settings
+
+def set_settings(s: Settings) -> None:
+    global _default_settings
+    _default_settings = s

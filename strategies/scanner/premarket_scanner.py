@@ -1,0 +1,378 @@
+"""
+premarket_scanner.py -- Gap, volume, and open-session momentum scanner.
+
+Discovers candidates by scanning for:
+  1. Pre-market gap/volume before the open
+  2. Regular-session movement/volume after the open
+  3. Price within configured band
+  4. Relative volume or session activity
+
+This is DISCOVERY ONLY -- it never places orders.
+"""
+import csv
+import logging
+import os
+import threading
+import time as _time
+from dataclasses import dataclass, asdict
+from typing import List, Optional
+
+import pandas as pd
+
+import config
+from strategies.intraday_data import fetch_intraday, fetch_daily, previous_close
+from strategies.session import is_market_open, session_status
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ScanCandidate:
+    symbol: str
+    prev_close: float
+    current_price: float
+    gap_pct: float
+    premarket_volume: int
+    relative_volume: float
+    score: float
+    reason: str
+    sentiment_score: float = 0.0
+    catalyst_type: Optional[str] = None
+    top_headline: str = ""
+
+
+_screener_cache = {"data": None, "fetched_at": 0}
+_cache_lock = threading.Lock()
+
+def _load_universe() -> List[str]:
+    if getattr(config, "DYNAMIC_SCREENER_ENABLED", False):
+        with _cache_lock:
+            now = _time.time()
+            if _screener_cache["data"] is not None and (now - _screener_cache["fetched_at"]) < getattr(config, "DYNAMIC_SCREENER_CACHE_TTL", 120):
+                return _screener_cache["data"]
+
+            api_key = os.environ.get("APCA_API_KEY_ID", "")
+            secret_key = os.environ.get("APCA_API_SECRET_KEY", "")
+            
+            try:
+                from alpaca.data.historical import ScreenerClient
+                from alpaca.data.requests import MostActivesRequest, MarketMoversRequest
+                from alpaca.data.enums import MostActivesBy, MarketType
+
+                screener = ScreenerClient(api_key, secret_key)
+                symbols_pool = set()
+                
+                # Fetch Most Actives
+                actives = screener.get_most_actives(
+                    MostActivesRequest(by=MostActivesBy.VOLUME, top=50, market_type=MarketType.STOCKS)
+                )
+                def _is_valid_equity(sym: str) -> bool:
+                    if "." in sym or "-" in sym:
+                        return False
+                    if len(sym) > 4 and sym.endswith(("W", "WS", "RT", "WW", "U", "WT", "R")):
+                        return False
+                    return True
+
+                for r in actives.most_actives:
+                    if _is_valid_equity(r.symbol):
+                        symbols_pool.add(r.symbol)
+                
+                # Fetch Market Movers (Gainers/Losers)
+                gainers = screener.get_market_movers(
+                    MarketMoversRequest(top=50, market_type=MarketType.STOCKS)
+                )
+                for r in gainers.gainers:
+                    if _is_valid_equity(r.symbol):
+                        symbols_pool.add(r.symbol)
+                for r in gainers.losers:
+                    if _is_valid_equity(r.symbol):
+                        symbols_pool.add(r.symbol)
+                    
+                final_symbols = list(symbols_pool)
+                if final_symbols:
+                    logger.info("Fetched dynamic symbol universe from Alpaca (%d unique symbols)", len(final_symbols))
+                    _screener_cache["data"] = final_symbols
+                    _screener_cache["fetched_at"] = now
+                    return final_symbols
+                else:
+                    logger.warning("Dynamic screener returned empty lists (e.g. premarket stale). Falling back.")
+            except Exception as e:
+                logger.warning(f"Dynamic screener failed: {e}. Falling back to SYMBOL_UNIVERSE_FILE.")
+
+    # 2nd -> SYMBOL_UNIVERSE_FILE (CSV)
+    path = config.SYMBOL_UNIVERSE_FILE
+    if path.exists():
+        df = pd.read_csv(path)
+        if "symbol" in df.columns:
+            syms = df["symbol"].dropna().astype(str).str.upper().tolist()
+            if syms:
+                return syms
+
+    # 3rd -> static watchlist fallback
+    logger.info("No symbol universe file or dynamic symbols; falling back to WATCHLIST")
+    return list(getattr(config, "DAYTRADE_WATCHLIST", []))
+
+
+def _as_et_index(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if not isinstance(df.index, pd.DatetimeIndex):
+        logger.warning("Time filter skipped for %s: index is not DatetimeIndex", symbol)
+        return pd.DataFrame()
+
+    df_et = df.copy()
+    try:
+        if df_et.index.tz is None:
+            df_et.index = df_et.index.tz_localize(config.TIMEZONE)
+        else:
+            df_et.index = df_et.index.tz_convert(config.TIMEZONE)
+    except Exception:
+        logger.warning("Time conversion failed for %s", symbol, exc_info=True)
+        return pd.DataFrame()
+    return df_et
+
+
+def _premarket_bars(df: pd.DataFrame, symbol: str = "UNKNOWN") -> pd.DataFrame:
+    """Return 04:00-09:30 ET bars from an intraday DataFrame."""
+    df_et = _as_et_index(df, symbol)
+    if df_et.empty:
+        return pd.DataFrame()
+    pm_open = config.PREMARKET_START
+    market_open = config.MARKET_OPEN
+    mask = [pm_open <= ts.time() < market_open for ts in df_et.index]
+    return df_et.loc[mask]
+
+
+def _regular_session_bars(df: pd.DataFrame, symbol: str = "UNKNOWN") -> pd.DataFrame:
+    """Return 09:30-16:00 ET bars from an intraday DataFrame."""
+    df_et = _as_et_index(df, symbol)
+    if df_et.empty:
+        return pd.DataFrame()
+    mask = [config.MARKET_OPEN <= ts.time() <= config.MARKET_CLOSE for ts in df_et.index]
+    return df_et.loc[mask]
+
+
+def _relative_volume(symbol: str, volume: int) -> float:
+    daily = fetch_daily(symbol, lookback_days=30)
+    if daily.empty or len(daily) < config.VOLUME_MA_PERIOD:
+        logger.debug(
+            "Insufficient daily volume history for %s; using neutral relative volume",
+            symbol,
+        )
+        return 1.0
+
+    avg_vol = float(daily["volume"].tail(config.VOLUME_MA_PERIOD).mean())
+    if avg_vol <= 0:
+        return 1.0
+    return volume / avg_vol
+
+
+def _score(gap_pct: float, relative_volume: float, volume: int, sentiment_score: float = 0.0) -> float:
+    gap_weight = getattr(config, "SCAN_SCORE_GAP_WEIGHT", 0.4)
+    rvol_weight = getattr(config, "SCAN_SCORE_RVOL_WEIGHT", 0.3)
+    vol_weight = getattr(config, "SCAN_SCORE_VOL_WEIGHT", 0.3)
+    sentiment_weight = getattr(config, "SCAN_SCORE_SENTIMENT_WEIGHT", 0.2)
+    rvol_cap = getattr(config, "SCAN_SCORE_RVOL_CAP", 10.0)
+    vol_normalizer = getattr(config, "SCAN_SCORE_VOL_NORMALIZER", 100_000)
+
+    base_score = (
+        abs(gap_pct) * gap_weight
+        + min(relative_volume, rvol_cap) * rvol_weight
+        + min(volume / vol_normalizer, rvol_cap) * vol_weight
+    )
+    
+    sentiment_bonus = sentiment_score * sentiment_weight * 10
+    return base_score + max(sentiment_bonus, 0)
+
+
+def _passes_premarket_filters(
+    symbol: str,
+    gap_pct: float,
+    current_price: float,
+    volume: int,
+    relative_volume: float,
+) -> bool:
+    allow_short = getattr(config, "ALLOW_SHORT", False)
+    if gap_pct < 0 and not allow_short:
+        logger.debug("%s skipped: gap-down with ALLOW_SHORT=False", symbol)
+        return False
+
+    if current_price < config.SCAN_MIN_PRICE or current_price > config.SCAN_MAX_PRICE:
+        logger.debug("%s skipped: price %.2f outside scan range", symbol, current_price)
+        return False
+    if abs(gap_pct) < config.SCAN_MIN_GAP_PCT:
+        logger.debug("%s skipped: gap %.2f%% below %.2f%%", symbol, gap_pct, config.SCAN_MIN_GAP_PCT)
+        return False
+    if abs(gap_pct) > config.SCAN_MAX_GAP_PCT:
+        logger.debug("%s skipped: gap %.2f%% above %.2f%%", symbol, gap_pct, config.SCAN_MAX_GAP_PCT)
+        return False
+    if volume < config.SCAN_MIN_PREMARKET_VOLUME:
+        logger.debug("%s skipped: PM volume %d below %d", symbol, volume, config.SCAN_MIN_PREMARKET_VOLUME)
+        return False
+    if relative_volume < config.SCAN_MIN_RELATIVE_VOLUME:
+        logger.debug("%s skipped: rvol %.2f below %.2f", symbol, relative_volume, config.SCAN_MIN_RELATIVE_VOLUME)
+        return False
+    return True
+
+
+def _passes_open_filters(
+    symbol: str,
+    move_pct: float,
+    current_price: float,
+    volume: int,
+    relative_volume: float,
+) -> bool:
+    allow_short = getattr(config, "ALLOW_SHORT", False)
+    if move_pct < 0 and not allow_short:
+        logger.debug("%s skipped: down move with ALLOW_SHORT=False", symbol)
+        return False
+    if current_price < config.SCAN_MIN_PRICE or current_price > config.SCAN_MAX_PRICE:
+        logger.debug("%s skipped: price %.2f outside scan range", symbol, current_price)
+        return False
+    if abs(move_pct) < getattr(config, "SCAN_OPEN_MIN_MOVE_PCT", 0.25):
+        logger.debug("%s skipped: open move %.2f%% too small", symbol, move_pct)
+        return False
+    if volume < getattr(config, "SCAN_OPEN_MIN_VOLUME", 100_000):
+        logger.debug("%s skipped: session volume %d too small", symbol, volume)
+        return False
+    if relative_volume < getattr(config, "SCAN_OPEN_MIN_RELATIVE_VOLUME", 0.05):
+        logger.debug("%s skipped: session rvol %.2f too small", symbol, relative_volume)
+        return False
+    return True
+
+
+def _compute_premarket_candidate(symbol: str) -> Optional[ScanCandidate]:
+    prev = previous_close(symbol)
+    if prev is None or prev <= 0:
+        return None
+
+    df = fetch_intraday(
+        symbol,
+        interval=config.PREMARKET_INTERVAL,
+        lookback_days=1,
+        prepost=True,
+    )
+    if df.empty:
+        return None
+
+    pm_df = _premarket_bars(df, symbol)
+    if pm_df.empty:
+        logger.debug("No premarket bars for %s", symbol)
+        return None
+
+    current = float(pm_df["close"].iloc[-1])
+    volume = int(pm_df["volume"].sum())
+    gap_pct = ((current - prev) / prev) * 100.0
+    rel_vol = _relative_volume(symbol, volume)
+
+    if not _passes_premarket_filters(symbol, gap_pct, current, volume, rel_vol):
+        return None
+
+    score = _score(gap_pct, rel_vol, volume)
+    direction = "GAP_UP" if gap_pct > 0 else "GAP_DOWN"
+    reason = f"{direction} {gap_pct:+.1f}% | PM vol {volume:,} | rvol {rel_vol:.2f}x"
+
+    return ScanCandidate(symbol, prev, current, gap_pct, volume, rel_vol, score, reason)
+
+
+def _compute_open_candidate(symbol: str) -> Optional[ScanCandidate]:
+    prev = previous_close(symbol)
+    if prev is None or prev <= 0:
+        return None
+
+    df = fetch_intraday(
+        symbol,
+        interval=config.INTRADAY_INTERVAL,
+        lookback_days=1,
+    )
+    if df.empty:
+        return None
+
+    reg_df = _regular_session_bars(df, symbol)
+    if reg_df.empty:
+        logger.debug("No regular-session bars for %s", symbol)
+        return None
+
+    current = float(reg_df["close"].iloc[-1])
+    open_price = float(reg_df["open"].iloc[0])
+    volume = int(reg_df["volume"].sum())
+    move_pct = ((current - open_price) / open_price) * 100.0 if open_price > 0 else 0.0
+    gap_pct = ((current - prev) / prev) * 100.0
+    rel_vol = _relative_volume(symbol, volume)
+
+    if not _passes_open_filters(symbol, move_pct, current, volume, rel_vol):
+        return None
+
+    score = _score(move_pct, rel_vol, volume)
+    direction = "OPEN_UP" if move_pct > 0 else "OPEN_DOWN"
+    reason = (
+        f"{direction} {move_pct:+.2f}% | vs prev {gap_pct:+.2f}% | "
+        f"session vol {volume:,} | rvol {rel_vol:.2f}x"
+    )
+
+    return ScanCandidate(symbol, prev, current, gap_pct, volume, rel_vol, score, reason)
+
+
+def scan(symbols: List[str] = None, max_candidates: int = None) -> List[ScanCandidate]:
+    from strategies.scanner.news_sentiment import analyze_news_sentiment
+    symbols = symbols or _load_universe()
+    max_candidates = max_candidates or config.SCAN_MAX_CANDIDATES
+    mode = "OPEN" if is_market_open() else "PREMARKET"
+
+    candidates = []
+    for i in range(0, len(symbols), config.SCAN_CHUNK_SIZE):
+        chunk = symbols[i : i + config.SCAN_CHUNK_SIZE]
+        for sym in chunk:
+            symbol = str(sym).upper()
+            try:
+                if is_market_open():
+                    cand = _compute_open_candidate(symbol)
+                else:
+                    cand = _compute_premarket_candidate(symbol)
+                if cand is not None:
+                    candidates.append(cand)
+            except Exception:
+                logger.warning("Scan error for %s", symbol, exc_info=True)
+
+        if i + config.SCAN_CHUNK_SIZE < len(symbols):
+            _time.sleep(config.SCAN_SLEEP_SECONDS)
+
+    candidates.sort(key=lambda c: c.score, reverse=True)
+    top = candidates[:max_candidates * 2]
+    
+    if getattr(config, "SCAN_ENABLE_SENTIMENT", False):
+        logger.info(f"Fetching news sentiment for top {len(top)} candidates...")
+        for cand in top:
+            news_res = analyze_news_sentiment(cand.symbol)
+            cand.sentiment_score = news_res.get("sentiment_score", 0.0)
+            cand.catalyst_type = news_res.get("catalyst_type")
+            cand.top_headline = news_res.get("top_headline", "")
+            
+            sentiment_weight = getattr(config, "SCAN_SCORE_SENTIMENT_WEIGHT", 0.2)
+            sentiment_bonus = cand.sentiment_score * sentiment_weight * 10
+            cand.score += max(sentiment_bonus, 0)
+            
+        top.sort(key=lambda c: c.score, reverse=True)
+        
+    top = top[:max_candidates]
+
+    _save_results(top)
+    logger.info(
+        "Scanner mode=%s session=%s found %d candidates (top %d from %d symbols)",
+        mode, session_status(), len(top), max_candidates, len(symbols),
+    )
+    return top
+
+
+def _save_results(candidates: List[ScanCandidate]):
+    if not candidates:
+        logger.debug("No scan candidates; skipping CSV write")
+        return
+
+    path = config.SCAN_RESULTS_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(asdict(candidates[0]).keys()))
+        writer.writeheader()
+        for c in candidates:
+            writer.writerow(asdict(c))

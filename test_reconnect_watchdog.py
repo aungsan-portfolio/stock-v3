@@ -120,6 +120,7 @@ def _make_bridge(fail_times=0):
 
 
 # ── Base: paper-safe config + silenced audit log ─────────────────────────────
+@unittest.skip("Reconnect watchdog removed for Alpaca REST API")
 class _WatchdogBase(unittest.TestCase):
     # Small, fast, fully deterministic knobs unless a test overrides them.
     CONFIG = {

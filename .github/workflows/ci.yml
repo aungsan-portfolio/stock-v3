@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    name: py-compile + unit tests
+    name: Type Check + Unit Tests + Coverage
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -30,12 +30,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
-      - name: Byte-compile all modules
+      - name: Static type checking (mypy)
         run: |
-          python -m py_compile \
-            config.py errors.py data_manager.py ai_engine.py lstm_engine.py \
-            predictor.py backtest.py ibkr_bridge.py logging_setup.py main.py \
-            test.py test_logic.py verify_watchlist.py
+          mypy . --exclude "torch/"
 
-      - name: Run unit tests
-        run: python -m unittest test_logic -v
+      - name: Run unit tests with coverage
+        run: |
+          pytest

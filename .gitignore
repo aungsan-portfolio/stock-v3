@@ -1,4 +1,4 @@
-﻿__pycache__/
+__pycache__/
 *.py[cod]
 *$py.class
 
@@ -21,3 +21,22 @@ models_backup_before_train_hot/
 *.bak
 phase1_incomplete_checkpoint.diff
 models_backup_before_fullmarket_training/
+
+# Python and virtual environment exclusions
+.venv/
+.testdeps/
+.coverage
+.pytest_cache/
+.mypy_cache/
+coverage.xml
+predict.pid
+predict_output.txt
+temp/
+_pdf_raw_ch1.txt
+ai_engine.py.orig
+alternative_models.py.orig
+main.py.orig
+models_backup_before_candlestick_*/
+models_backup_before_fullmarket_*/
+models_backup_before_edge_*/
+

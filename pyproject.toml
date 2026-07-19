@@ -1,0 +1,33 @@
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+addopts = "--cov=. --cov-report=term-missing --cov-report=xml --cov-fail-under=10 -v"
+
+[tool.coverage.run]
+omit = [
+    "test_*",
+    "verify_*",
+    "test.py",
+    "lstm_hyperopt.py",
+    "enable_candlestick_features.py",
+]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_configs = true
+check_untyped_defs = true
+disallow_untyped_defs = false
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = [
+    "yfinance.*",
+    "ib_insync.*",
+    "sklearn.*",
+    "joblib.*",
+    "torch.*",
+    "optuna.*",
+]
+ignore_missing_imports = true

@@ -1,59 +1,48 @@
-import asyncio
+"""protect_vti_gtc.py — Place Stop Loss and Take Profit orders on Alpaca for existing VTI position."""
 from datetime import datetime
-
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-
-from ib_insync import IB, Stock, LimitOrder, StopOrder
-
-HOST = "127.0.0.1"
-PORT = 7497
-CLIENT_ID = 101
+from ibkr_bridge import IBKRBridge
 
 SYMBOL = "VTI"
 TAKE_PROFIT_PRICE = 413.78
 STOP_LOSS_PRICE = 341.82
 
-ib = IB()
+bridge = IBKRBridge()
 
 try:
-    ib.connect(HOST, PORT, clientId=CLIENT_ID, timeout=15)
+    if not bridge.connect():
+        print("Could not connect to Alpaca")
+        exit(1)
 
-    contract = Stock(SYMBOL, "SMART", "USD")
-    ib.qualifyContracts(contract)
-
-    positions = [p for p in ib.positions() if p.contract.symbol == SYMBOL]
-    qty = sum(p.position for p in positions)
-
+    qty = int(bridge.get_position(SYMBOL))
     if qty <= 0:
-        raise SystemExit("No long VTI position found. Nothing to protect.")
+        print(f"No long {SYMBOL} position found. Nothing to protect.")
+        exit(0)
 
-    qty = int(qty)
+    # Submit separate limit and stop orders for protection on Alpaca
+    from alpaca.trading.enums import OrderSide, TimeInForce
+    from alpaca.trading.requests import LimitOrderRequest, StopOrderRequest
 
-    oca_group = f"VTI_PROTECT_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    print(f"Submitting protection for {SYMBOL}: {qty} shares")
+    
+    # Take Profit
+    tp_order = bridge._client.submit_order(LimitOrderRequest(
+        symbol=SYMBOL, qty=qty,
+        side=OrderSide.SELL,
+        time_in_force=TimeInForce.GTC,
+        limit_price=round(TAKE_PROFIT_PRICE, 2)
+    ))
+    
+    # Stop Loss
+    sl_order = bridge._client.submit_order(StopOrderRequest(
+        symbol=SYMBOL, qty=qty,
+        side=OrderSide.SELL,
+        time_in_force=TimeInForce.GTC,
+        stop_price=round(STOP_LOSS_PRICE, 2)
+    ))
 
-    take_profit = LimitOrder("SELL", qty, TAKE_PROFIT_PRICE)
-    stop_loss = StopOrder("SELL", qty, STOP_LOSS_PRICE)
-
-    for order in (take_profit, stop_loss):
-        order.tif = "GTC"
-        order.ocaGroup = oca_group
-        order.ocaType = 1
-        order.transmit = True
-
-    tp_trade = ib.placeOrder(contract, take_profit)
-    sl_trade = ib.placeOrder(contract, stop_loss)
-
-    ib.sleep(2)
-
-    print(f"Protected VTI position: {qty} shares")
-    print(f"Take-profit: SELL LMT x{qty} @ {TAKE_PROFIT_PRICE} GTC")
-    print(f"Stop-loss:   SELL STP x{qty} @ {STOP_LOSS_PRICE} GTC")
-    print(f"OCA group:   {oca_group}")
-    print("TP status:", tp_trade.orderStatus.status)
-    print("SL status:", sl_trade.orderStatus.status)
+    print(f"Protected {SYMBOL} position: {qty} shares")
+    print(f"Take-profit (LMT): {tp_order.id} @ {TAKE_PROFIT_PRICE}")
+    print(f"Stop-loss   (STP): {sl_order.id} @ {STOP_LOSS_PRICE}")
 
 finally:
-    if ib.isConnected():
-        ib.disconnect()
-    loop.close()
+    bridge.disconnect()

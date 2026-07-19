@@ -1,4 +1,4 @@
-﻿"""
+"""
 test_data_integrity.py - Phase 4 tests for local data_integrity.py API.
 
 Run:
