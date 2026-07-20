@@ -479,7 +479,14 @@ class DynamicTrailingStopManager:
 
                 close_ok = False
                 if hasattr(bridge, "close_position"):
-                    close_ok = bridge.close_position(symbol)
+                    for attempt in range(3):
+                        try:
+                            close_ok = bridge.close_position(symbol)
+                            if close_ok:
+                                break
+                        except Exception as close_err:
+                            logger.warning(f"Attempt {attempt+1} to emergency close {symbol} failed: {close_err}")
+                        time.sleep(1.5)
                 else:
                     logger.critical(f"Bridge {bridge.__class__.__name__} does not support close_position. Cannot emergency close!")
                 

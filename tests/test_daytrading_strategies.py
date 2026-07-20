@@ -790,6 +790,25 @@ def test_production_shape_mockorder_filter(monkeypatch):
     evaluate_and_execute(["GOOG"], bridge_mock, live_paper=True)
     assert len(executed_signals) == 0
 
+    # Test completely invalid order shape (no symbol and no contract)
+    class BadMockOrder:
+        pass
+    
+    bridge_mock_bad = mock.MagicMock()
+    bridge_mock_bad.is_connected = True
+    bridge_mock_bad.ib.positions.return_value = []
+    bridge_mock_bad.ib.openTrades.return_value = [BadMockOrder()]
+    
+    executed_signals_bad = []
+    def mock_execute_bad(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run):
+        executed_signals_bad.append(signal)
+        return {"status": "DRY_RUN", "reason": "Mocked execution"}
+    monkeypatch.setattr(strategies.orchestrator, "execute_signal", mock_execute_bad)
+    
+    # Evaluating signals should trigger fail-closed (allow_new_entries=False), blocking GOOG
+    evaluate_and_execute(["GOOG"], bridge_mock_bad, live_paper=True)
+    assert len(executed_signals_bad) == 0
+
 
 # ----------------------------------------------------------------------
 # 17. Naked Position with Existing Stop & Cancel-then-Flatten Test

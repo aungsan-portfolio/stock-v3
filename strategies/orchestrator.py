@@ -391,6 +391,10 @@ def evaluate_and_execute(
                     o_sym = getattr(contract, "symbol", "")
             if o_sym:
                 pending_symbols.add(str(o_sym).upper().strip())
+            else:
+                logger.error("Failed to extract symbol from order object: %s. Disabling new entries this cycle (fail-closed).", o)
+                if live_paper:
+                    allow_new_entries = False
 
     for sig in all_signals:
         sym = sig.symbol.upper().strip()
