@@ -76,7 +76,8 @@ class MockPosition:
 
 
 class MockOrder:
-    def __init__(self, symbol: str, action: str, qty: float, order_type: str, limit_price: float, status: str, client_order_id: str):
+    def __init__(self, order_id: str, symbol: str, action: str, qty: float, order_type: str, limit_price: float, status: str, client_order_id: str):
+        self.id = order_id
         self.contract = _Contract(symbol)
         self.action = action
         self.totalQuantity = qty
@@ -125,7 +126,7 @@ class MockIB:
                 status = status_map.get(raw_status.lower(), "Submitted")
                 lmt_price = float(o.limit_price) if o.limit_price is not None else 0.0
                 order_type = "LMT" if o.type.value.upper() == "LIMIT" else "MKT"
-                res.append(MockOrder(o.symbol, action, qty, order_type, lmt_price, status, o.client_order_id))
+                res.append(MockOrder(str(o.id), o.symbol, action, qty, order_type, lmt_price, status, o.client_order_id))
             return res
         except Exception as exc:
             logger.error("MockIB.openTrades() failed: %s", exc)

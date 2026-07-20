@@ -749,6 +749,127 @@ def test_consecutive_outage_alert(monkeypatch):
     assert strategies.orchestrator._consecutive_broker_failures == 0
 
 
+# ----------------------------------------------------------------------
+# 16. Production Shape MockOrder Symbol Filter Test
+# ----------------------------------------------------------------------
+def test_production_shape_mockorder_filter(monkeypatch):
+    from unittest import mock
+    from strategies.base import TradeSignal
+    from strategies.orchestrator import evaluate_and_execute
+    import strategies.orchestrator
+    
+    # sig_goog has strategy ORB
+    sig_goog = TradeSignal(symbol="GOOG", side="BUY", entry_price=300.0, stop_price=290.0, target_price=320.0, risk_per_share=10.0, confidence=0.75, strategy="ORB", atr=1.0, reason="")
+    monkeypatch.setattr(strategies.orchestrator, "evaluate_symbols_parallel", lambda w, bridge: [sig_goog])
+    
+    executed_signals = []
+    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run):
+        executed_signals.append(signal)
+        return {"status": "DRY_RUN", "reason": "Mocked execution"}
+        
+    monkeypatch.setattr(strategies.orchestrator, "execute_signal", mock_execute)
+    monkeypatch.setattr(strategies.orchestrator, "apply_portfolio_correlation", lambda sigs, open_pos, bridge: sigs)
+    monkeypatch.setattr(strategies.orchestrator, "today_pnl", lambda: 0.0)
+    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda: 0)
+    
+    # MockOrder object that does NOT have symbol attribute but has contract.symbol
+    class TestMockOrder:
+        def __init__(self, symbol):
+            class Contract:
+                def __init__(self, s):
+                    self.symbol = s
+            self.contract = Contract(symbol)
+            self.id = "mock-id-123"
+            
+    bridge_mock = mock.MagicMock()
+    bridge_mock.is_connected = True
+    bridge_mock.ib.positions.return_value = []
+    bridge_mock.ib.openTrades.return_value = [TestMockOrder("GOOG")]
+    
+    # GOOG should be skipped because there is a working order for it.
+    evaluate_and_execute(["GOOG"], bridge_mock, live_paper=True)
+    assert len(executed_signals) == 0
+
+
+# ----------------------------------------------------------------------
+# 17. Naked Position with Existing Stop & Cancel-then-Flatten Test
+# ----------------------------------------------------------------------
+def test_naked_position_with_existing_stop_and_flatten(monkeypatch):
+    from unittest import mock
+    from strategies.trailing_stop import manager, TrailingStopState
+    
+    # Setup trailing stop manager states
+    import time
+    manager.reset("AAPL")
+    state = TrailingStopState(
+        symbol="AAPL",
+        side="BUY",
+        entry_price=150.0,
+        peak_price=150.0,
+        atr=2.0,
+        stop_price=145.0,
+        trail_multiple=2.5,
+        last_updated=time.time(),
+        active=True,
+        order_id=None
+    )
+    manager.states["AAPL"] = state
+    
+    class TestMockOrder:
+        def __init__(self, symbol, order_id):
+            class Contract:
+                def __init__(self, s):
+                    self.symbol = s
+            self.contract = Contract(symbol)
+            self.id = order_id
+            self.side = "sell"
+            self.stop_price = 145.0
+            
+    bridge_mock = mock.MagicMock()
+    # Mock openTrades to return an order with the correct stop price, allowing reconciliation
+    bridge_mock.ib.openTrades.return_value = [TestMockOrder("AAPL", "broker-stop-order-999")]
+    
+    # 1. Test existing stop order adoption (reconciliation)
+    ret_state = manager.ensure_initialized(
+        symbol="AAPL",
+        side="BUY",
+        avg_cost=150.0,
+        open_orders=[TestMockOrder("AAPL", "broker-stop-order-999")],
+        current_price=149.0
+    )
+    assert ret_state.order_id == "broker-stop-order-999"
+    
+    # Reset order_id to trigger naked position flow
+    state.order_id = None
+    
+    # Mock market price to be below stop price, forcing fallback to flatten
+    bridge_mock.market_price.return_value = 140.0 # Stale/invalid stop (145.0 > 140.0)
+    
+    # Mock close_position and cancel_order to record calls
+    cancelled_orders = []
+    def mock_cancel(order_id):
+        cancelled_orders.append(order_id)
+        return True
+    bridge_mock.cancel_order = mock_cancel
+    
+    flattened_symbols = []
+    def mock_close(symbol):
+        flattened_symbols.append(symbol)
+        return True
+    bridge_mock.close_position = mock_close
+    
+    # Mock discord alert to not make HTTP calls
+    import strategies.trailing_stop
+    monkeypatch.setattr(strategies.trailing_stop, "send_discord_alert", lambda msg: None)
+    
+    # 2. Test emergency flatten calls cancel_order first then close_position
+    manager.handle_naked_position("AAPL", 100, bridge_mock, dry_run=False)
+    
+    assert "broker-stop-order-999" in cancelled_orders
+    assert "AAPL" in flattened_symbols
+    assert state.active is False
+
+
 
 
 

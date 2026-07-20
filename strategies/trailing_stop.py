@@ -131,12 +131,17 @@ class DynamicTrailingStopManager:
             target_side = "sell" if side == "BUY" else "buy"
             
             for o in open_orders:
-                o_sym = getattr(o, "symbol", "")
+                o_sym = getattr(o, "symbol", None)
+                if not o_sym:
+                    contract = getattr(o, "contract", None)
+                    if contract:
+                        o_sym = getattr(contract, "symbol", "")
+                o_sym = str(o_sym).upper().strip() if o_sym else ""
                 o_side = getattr(o, "side", "")
                 o_side_str = getattr(o_side, "value", o_side)
                 o_side_str = str(o_side_str).lower() if o_side_str else ""
                 
-                if o_sym == symbol and o_side_str == target_side:
+                if o_sym == symbol.upper().strip() and o_side_str == target_side:
                     o_stop = getattr(o, "stop_price", None)
                     if o_stop is not None:
                         broker_stop_price = float(o_stop)
@@ -190,12 +195,17 @@ class DynamicTrailingStopManager:
         """Adopt stop_order_id from active open orders and perform direction-aware price merge."""
         target_side = "sell" if state.side == "BUY" else "buy"
         for o in open_orders:
-            o_sym = getattr(o, "symbol", "")
+            o_sym = getattr(o, "symbol", None)
+            if not o_sym:
+                contract = getattr(o, "contract", None)
+                if contract:
+                    o_sym = getattr(contract, "symbol", "")
+            o_sym = str(o_sym).upper().strip() if o_sym else ""
             o_side = getattr(o, "side", "")
             o_side_str = getattr(o_side, "value", o_side)
             o_side_str = str(o_side_str).lower() if o_side_str else ""
             
-            if o_sym == state.symbol and o_side_str == target_side:
+            if o_sym == state.symbol.upper().strip() and o_side_str == target_side:
                 o_stop = getattr(o, "stop_price", None)
                 if o_stop is not None:
                     broker_stop_price = float(o_stop)
@@ -449,6 +459,24 @@ class DynamicTrailingStopManager:
                 logger.error(f"Failed to send Discord alert: {alert_exc}")
             
             try:
+                # Cancel open orders for this symbol first to release held shares
+                try:
+                    open_orders = bridge.ib.openTrades()
+                    for o in open_orders:
+                        o_sym = getattr(o, "symbol", None)
+                        if not o_sym:
+                            contract = getattr(o, "contract", None)
+                            if contract:
+                                o_sym = getattr(contract, "symbol", "")
+                        o_sym = str(o_sym).upper().strip() if o_sym else ""
+                        if o_sym == symbol.upper().strip():
+                            order_id = getattr(o, "id", None)
+                            if order_id and hasattr(bridge, "cancel_order"):
+                                logger.info(f"Cancelling working order {order_id} for {symbol} before emergency flatten.")
+                                bridge.cancel_order(str(order_id))
+                except Exception as cancel_exc:
+                    logger.error(f"Failed to cancel open orders for {symbol} before flattening: {cancel_exc}")
+
                 close_ok = False
                 if hasattr(bridge, "close_position"):
                     close_ok = bridge.close_position(symbol)

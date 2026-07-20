@@ -66,6 +66,8 @@ import csv
 import json
 import logging
 import sys
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import config
 from logging_setup import setup_logging
@@ -2702,22 +2704,34 @@ def cmd_daytrade_bot(args) -> int:
             time.sleep(30)
             
     except KeyboardInterrupt:
-        print("\nStopping bot...")
         if not _already_flattened:
             _already_flattened = True
             try:
                 bridge.flatten_all()
             except Exception as e:
-                print(f"Error flattening positions during KeyboardInterrupt: {e}")
+                try:
+                    print(f"Error flattening positions during KeyboardInterrupt: {e}")
+                except Exception:
+                    pass
+        try:
+            print("\nStopping bot...")
+        except Exception:
+            pass
         sys.exit(0)
     except Exception as exc:
-        print(f"\n🚨 CRITICAL ERROR: Unhandled exception in bot loop: {exc}")
         if not _already_flattened:
             _already_flattened = True
             try:
                 bridge.flatten_all()
             except Exception as e:
-                print(f"Error flattening positions during loop crash: {e}")
+                try:
+                    print(f"Error flattening positions during loop crash: {e}")
+                except Exception:
+                    pass
+        try:
+            print(f"\n🚨 CRITICAL ERROR: Unhandled exception in bot loop: {exc}")
+        except Exception:
+            pass
         sys.exit(1)
     finally:
         if bg_scanner:

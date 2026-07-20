@@ -382,9 +382,15 @@ def evaluate_and_execute(
         active_symbols = {
             p.contract.symbol.upper().strip() for p in cached_open_positions if p.position != 0
         }
-        pending_symbols = {
-            o.symbol.upper().strip() for o in open_orders
-        }
+        pending_symbols = set()
+        for o in open_orders:
+            o_sym = getattr(o, "symbol", None)
+            if not o_sym:
+                contract = getattr(o, "contract", None)
+                if contract:
+                    o_sym = getattr(contract, "symbol", "")
+            if o_sym:
+                pending_symbols.add(str(o_sym).upper().strip())
 
     for sig in all_signals:
         sym = sig.symbol.upper().strip()
