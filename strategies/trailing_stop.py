@@ -80,16 +80,9 @@ class DynamicTrailingStopManager:
             else:
                 trail_distance = fill_price * fallback_pct
                 
-            if signal.side.upper() == "BUY":
-                initial_stop = fill_price - trail_distance
-            else:
-                initial_stop = fill_price + trail_distance
-                
-            # Ensure we don't start looser than the signal's original stop
-            if signal.side.upper() == "BUY":
-                initial_stop = max(initial_stop, signal.stop_price)
-            else:
-                initial_stop = min(initial_stop, signal.stop_price)
+            # The initial trailing stop must start exactly at the signal's stop price
+            # to be aligned with the broker-side bracket stop order.
+            initial_stop = signal.stop_price
 
             state = TrailingStopState(
                 symbol=signal.symbol,
@@ -157,12 +150,10 @@ class DynamicTrailingStopManager:
             if original_stop is not None:
                 calculated_stop = original_stop
 
-            final_stop = calculated_stop
             if broker_stop_price is not None:
-                if side == "BUY":
-                    final_stop = max(calculated_stop, broker_stop_price)
-                else:
-                    final_stop = min(calculated_stop, broker_stop_price)
+                final_stop = broker_stop_price
+            else:
+                final_stop = calculated_stop
 
             atr = 0.0
             try:
@@ -314,6 +305,37 @@ class DynamicTrailingStopManager:
             state = self.states.get(symbol)
             if not state or not state.active or state.order_id is not None:
                 return
+
+            # Query broker fresh to make sure position still exists and is non-zero
+            fresh_qty = 0.0
+            if hasattr(bridge, "ib") and hasattr(bridge.ib, "positions"):
+                try:
+                    positions = bridge.ib.positions()
+                    for p in positions:
+                        p_sym = getattr(p, "symbol", None)
+                        if not p_sym:
+                            contract = getattr(p, "contract", None)
+                            if contract:
+                                p_sym = getattr(contract, "symbol", "")
+                        p_sym = str(p_sym).upper().strip() if p_sym else ""
+                        if p_sym == symbol.upper().strip():
+                            fresh_qty = float(p.position)
+                            break
+                except Exception as p_exc:
+                    logger.warning(f"Failed to query fresh position for {symbol}: {p_exc}")
+                    fresh_qty = float(position_qty)
+            else:
+                fresh_qty = float(position_qty)
+
+            if fresh_qty == 0.0:
+                logger.info(f"Fresh position query for {symbol} returned 0. Marking trailing stop inactive (stopped out).")
+                state.active = False
+                state.remediation_in_progress = False
+                state.order_id = None
+                self._save_state()
+                return
+
+            position_qty = fresh_qty
 
             try:
                 market_is_open = is_market_open()

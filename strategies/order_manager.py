@@ -40,6 +40,15 @@ def _validate_signal_prices(signal: TradeSignal) -> str:
             f"entry/stop distance {derived_risk:.6f}"
         )
 
+    # Validate signal geometry using tick size (SEC Rule 612)
+    tick_size = 0.01 if signal.entry_price >= 1.0 else 0.0001
+    target_dist = round(abs(signal.target_price - signal.entry_price), 6)
+    stop_dist = round(abs(signal.entry_price - signal.stop_price), 6)
+    if target_dist <= tick_size:
+        return f"Target distance {target_dist:.5f} is less than or equal to tick size {tick_size:.5f} (invalid geometry)"
+    if stop_dist <= tick_size:
+        return f"Stop distance {stop_dist:.5f} is less than or equal to tick size {tick_size:.5f} (invalid geometry)"
+
     if side == "BUY":
         if signal.stop_price >= signal.entry_price:
             return "BUY stop must be below entry"

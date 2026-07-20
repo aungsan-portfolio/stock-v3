@@ -844,7 +844,16 @@ def test_naked_position_with_existing_stop_and_flatten(monkeypatch):
             self.side = "sell"
             self.stop_price = 145.0
             
+    class TestMockPosition:
+        def __init__(self, symbol, qty):
+            class Contract:
+                def __init__(self, s):
+                    self.symbol = s
+            self.contract = Contract(symbol)
+            self.position = qty
+            
     bridge_mock = mock.MagicMock()
+    bridge_mock.ib.positions.return_value = [TestMockPosition("AAPL", 100.0)]
     # Mock openTrades to return an order with the correct stop price, allowing reconciliation
     bridge_mock.ib.openTrades.return_value = [TestMockOrder("AAPL", "broker-stop-order-999")]
     
