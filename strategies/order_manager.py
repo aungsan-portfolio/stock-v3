@@ -240,6 +240,8 @@ def execute_signal(
         result["status"] = "DRY_RUN"
         result["reason"] = "Dry run -- no order placed"
         logger.info("[DRY RUN] Would place: %s %d %s", signal.side, shares, signal.symbol)
+        # Update idempotency cache even in dry run to avoid repeating spams in dry-run logs
+        _recent_orders[cache_key] = time.time()
         return result
 
     if not config.BRACKET_ORDER_ENABLED:

@@ -326,6 +326,15 @@ def evaluate_and_execute(
 
     all_signals.sort(key=lambda s: s.confidence, reverse=True)
 
+    # Prevent same-symbol multi-order entry within the same cycle by keeping only the highest confidence signal
+    deduped_signals = []
+    seen_symbols = set()
+    for sig in all_signals:
+        if sig.symbol not in seen_symbols:
+            seen_symbols.add(sig.symbol)
+            deduped_signals.append(sig)
+    all_signals = deduped_signals
+
     current_pnl = broker_pnl if live_paper else today_pnl()
 
     from strategies.error_handler import TradingErrorHandler
