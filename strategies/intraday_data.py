@@ -14,9 +14,12 @@ from typing import Optional
 import pandas as pd
 import yfinance as yf
 import os
+import threading
 
 import config
 from strategies.performance import profile_latency
+
+_cache_lock = threading.RLock()
 
 logger = logging.getLogger(__name__)
 
@@ -49,27 +52,29 @@ def _get_cache_file(key: str) -> str:
 
 
 def _read_cache(key: str, ttl: int = None) -> Optional[pd.DataFrame]:
-    cache_file = _get_cache_file(key)
-    if not os.path.exists(cache_file):
-        return None
-    try:
-        mtime = os.path.getmtime(cache_file)
-        limit = ttl if ttl is not None else getattr(config, "INTRADAY_CACHE_TTL_SECONDS", 30)
-        if (_time.time() - mtime) > limit:
+    with _cache_lock:
+        cache_file = _get_cache_file(key)
+        if not os.path.exists(cache_file):
             return None
-        with open(cache_file, "rb") as f:
-            return pickle.load(f)
-    except Exception:
-        return None
+        try:
+            mtime = os.path.getmtime(cache_file)
+            limit = ttl if ttl is not None else getattr(config, "INTRADAY_CACHE_TTL_SECONDS", 30)
+            if (_time.time() - mtime) > limit:
+                return None
+            with open(cache_file, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            return None
 
 
 def _write_cache(key: str, df: pd.DataFrame):
-    cache_file = _get_cache_file(key)
-    try:
-        with open(cache_file, "wb") as f:
-            pickle.dump(df, f)
-    except Exception as e:
-        logger.warning(f"Failed to write cache for {key}: {e}")
+    with _cache_lock:
+        cache_file = _get_cache_file(key)
+        try:
+            with open(cache_file, "wb") as f:
+                pickle.dump(df, f)
+        except Exception as e:
+            logger.warning(f"Failed to write cache for {key}: {e}")
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:

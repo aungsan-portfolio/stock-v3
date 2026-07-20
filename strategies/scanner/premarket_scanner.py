@@ -376,3 +376,73 @@ def _save_results(candidates: List[ScanCandidate]):
         writer.writeheader()
         for c in candidates:
             writer.writerow(asdict(c))
+
+
+class BackgroundScanner:
+    def __init__(self, interval_minutes: int = 10, max_candidates: int = 10, initial_watchlist: List[str] = None):
+        self.interval_seconds = interval_minutes * 60
+        self.max_candidates = max_candidates
+        self.watchlist = initial_watchlist or []
+        self.last_scan_completed = _time.time() if initial_watchlist else 0.0
+        self._lock = threading.Lock()
+        self._thread = None
+        self._stop_event = threading.Event()
+        self._running = False
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        logger.info("[BackgroundScanner] Periodic background scanner thread started.")
+
+    def stop(self):
+        self._running = False
+        self._stop_event.set()
+        if self._thread:
+            try:
+                self._thread.join(timeout=2)
+            except Exception:
+                pass
+            self._thread = None
+            logger.info("[BackgroundScanner] Periodic background scanner thread stopped.")
+
+    def _run_loop(self):
+        from strategies.session import is_market_open, is_premarket
+        while self._running:
+            # Sleep in small steps to be responsive to stop requests
+            sleep_step = 5.0
+            elapsed = 0.0
+            while elapsed < self.interval_seconds:
+                if not self._running:
+                    return
+                if self._stop_event.wait(timeout=sleep_step):
+                    return
+                elapsed += sleep_step
+
+            if is_market_open() or is_premarket():
+                logger.info("[BackgroundScanner] Starting periodic background scan...")
+                try:
+                    candidates = scan(max_candidates=self.max_candidates)
+                    if candidates:
+                        new_watchlist = [c.symbol for c in candidates]
+                        with self._lock:
+                            self.watchlist = new_watchlist
+                            self.last_scan_completed = _time.time()
+                        logger.info(f"[BackgroundScanner] Background scan completed. New watchlist: {self.watchlist}")
+                    else:
+                        with self._lock:
+                            self.last_scan_completed = _time.time()
+                        logger.info("[BackgroundScanner] Background scan completed with no candidates.")
+                except Exception as e:
+                    logger.error(f"[BackgroundScanner] Error during periodic scan: {e}", exc_info=True)
+
+    def get_watchlist(self) -> List[str]:
+        with self._lock:
+            return list(self.watchlist)
+
+    def get_last_scan_completed_time(self) -> float:
+        with self._lock:
+            return self.last_scan_completed

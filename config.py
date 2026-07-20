@@ -262,6 +262,7 @@ SCAN_MIN_FLOAT_SHARES = 5_000_000
 SCAN_MAX_CANDIDATES = 15
 SCAN_CHUNK_SIZE = 50
 SCAN_SLEEP_SECONDS = 1.0
+SCANNER_REFRESH_MINUTES = 10
 
 DYNAMIC_SCREENER_ENABLED = True
 DYNAMIC_SCREENER_TARGET_SYMBOLS = 150
@@ -297,14 +298,25 @@ class StrategyConfig:
     confidence_min: float = 0.65
     max_risk_pct: float = 1.0
     rr_ratio: float = 2.0
+    priority: int = 10
+    entry_cutoff_time: Optional[str] = None
+
+    def __post_init__(self):
+        from datetime import datetime
+        self.cutoff_time_obj = None
+        if self.entry_cutoff_time:
+            try:
+                self.cutoff_time_obj = datetime.strptime(self.entry_cutoff_time, "%H:%M").time()
+            except Exception:
+                pass
 
 from strategies.constants import StrategyName
 STRATEGY_SETTINGS = {
-    StrategyName.MOMENTUM_SCALP: StrategyConfig(confidence_min=0.65, max_risk_pct=1.0),
-    StrategyName.ORB: StrategyConfig(confidence_min=0.60, max_risk_pct=1.0),
-    StrategyName.VWAP_BOUNCE: StrategyConfig(confidence_min=0.55, max_risk_pct=1.0),
-    StrategyName.GAP_AND_GO: StrategyConfig(confidence_min=0.60, max_risk_pct=1.0),
-    StrategyName.CANDLESTICK: StrategyConfig(confidence_min=0.40, max_risk_pct=0.5),
+    StrategyName.ORB: StrategyConfig(confidence_min=0.60, max_risk_pct=1.0, priority=1),
+    StrategyName.VWAP_BOUNCE: StrategyConfig(confidence_min=0.55, max_risk_pct=1.0, priority=2),
+    StrategyName.MOMENTUM_SCALP: StrategyConfig(confidence_min=0.65, max_risk_pct=1.0, priority=3),
+    StrategyName.GAP_AND_GO: StrategyConfig(confidence_min=0.60, max_risk_pct=1.0, priority=4, entry_cutoff_time="10:30"),
+    StrategyName.CANDLESTICK: StrategyConfig(confidence_min=0.40, max_risk_pct=0.5, priority=5),
 }
 
 ORB_MIN_VOLUME_RATIO = 1.5
@@ -319,6 +331,7 @@ MAX_DAILY_LOSS_PCT = 3.0
 MAX_DAILY_LOSS_DOLLARS = 300.0
 MAX_TRADES_PER_DAY = 50
 MAX_CONSECUTIVE_LOSSES = 10
+CONSECUTIVE_OUTAGE_LIMIT = 10
 MAX_POSITION_SIZE_DOLLARS = 5000.0
 MAX_POSITION_PCT_OF_EQUITY = 0.20
 
@@ -753,6 +766,7 @@ class Settings:
     SCAN_MAX_CANDIDATES: int = SCAN_MAX_CANDIDATES
     SCAN_CHUNK_SIZE: int = SCAN_CHUNK_SIZE
     SCAN_SLEEP_SECONDS: float = SCAN_SLEEP_SECONDS
+    SCANNER_REFRESH_MINUTES: int = SCANNER_REFRESH_MINUTES
     DYNAMIC_SCREENER_ENABLED: bool = DYNAMIC_SCREENER_ENABLED
     DYNAMIC_SCREENER_TARGET_SYMBOLS: int = DYNAMIC_SCREENER_TARGET_SYMBOLS
     DYNAMIC_SCREENER_CACHE_TTL: int = DYNAMIC_SCREENER_CACHE_TTL
@@ -788,6 +802,7 @@ class Settings:
     MAX_DAILY_LOSS_DOLLARS: float = MAX_DAILY_LOSS_DOLLARS
     MAX_TRADES_PER_DAY: int = MAX_TRADES_PER_DAY
     MAX_CONSECUTIVE_LOSSES: int = MAX_CONSECUTIVE_LOSSES
+    CONSECUTIVE_OUTAGE_LIMIT: int = CONSECUTIVE_OUTAGE_LIMIT
     MAX_POSITION_SIZE_DOLLARS: float = MAX_POSITION_SIZE_DOLLARS
     MAX_POSITION_PCT_OF_EQUITY: float = MAX_POSITION_PCT_OF_EQUITY
     CORRELATION_USE_ABS: bool = CORRELATION_USE_ABS

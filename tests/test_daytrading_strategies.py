@@ -413,6 +413,342 @@ def test_run_backtest_happy_path(monkeypatch):
     assert np.isclose(result["net_pnl"], 488.60)
 
 
+# ----------------------------------------------------------------------
+# 10. Same-Symbol Deduplication - Highest Confidence Test
+# ----------------------------------------------------------------------
+def test_same_symbol_dedup_highest_confidence(monkeypatch):
+    from unittest import mock
+    from strategies.base import TradeSignal
+    from strategies.orchestrator import evaluate_and_execute
+    import strategies.orchestrator
+    
+    # 1. Create multiple signals for the same symbol
+    sig_orb = TradeSignal(
+        symbol="AAPL",
+        side="BUY",
+        entry_price=150.0,
+        stop_price=148.0,
+        target_price=154.0,
+        risk_per_share=2.0,
+        confidence=0.88,
+        strategy="ORB",
+        atr=1.0,
+        reason="ORB trigger"
+    )
+    sig_mom = TradeSignal(
+        symbol="AAPL",
+        side="BUY",
+        entry_price=150.0,
+        stop_price=148.0,
+        target_price=154.0,
+        risk_per_share=2.0,
+        confidence=0.81,
+        strategy="Momentum",
+        atr=1.0,
+        reason="Momentum trigger"
+    )
+    sig_gap = TradeSignal(
+        symbol="AAPL",
+        side="BUY",
+        entry_price=150.0,
+        stop_price=148.0,
+        target_price=154.0,
+        risk_per_share=2.0,
+        confidence=0.63,
+        strategy="Gap",
+        atr=1.0,
+        reason="Gap trigger"
+    )
+    
+    # Mock evaluate_symbols_parallel to return all 3 signals
+    monkeypatch.setattr(strategies.orchestrator, "evaluate_symbols_parallel", lambda w, bridge: [sig_mom, sig_orb, sig_gap])
+    
+    # Mock execute_signal to capture calls
+    executed_signals = []
+    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run):
+        executed_signals.append(signal)
+        return {"status": "DRY_RUN", "reason": "Mocked execution"}
+    
+    monkeypatch.setattr(strategies.orchestrator, "execute_signal", mock_execute)
+    monkeypatch.setattr(strategies.orchestrator, "apply_portfolio_correlation", lambda sigs, open_pos, bridge: sigs)
+    monkeypatch.setattr(strategies.orchestrator, "today_pnl", lambda: 0.0)
+    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda: 0)
+    
+    # Mock bridge
+    bridge_mock = mock.MagicMock()
+    bridge_mock.is_connected = False
+    
+    evaluate_and_execute(["AAPL"], bridge_mock, live_paper=False)
+    
+    # Verify that only the highest confidence signal (sig_orb, 0.88) was executed
+    assert len(executed_signals) == 1
+    assert executed_signals[0].strategy == "ORB"
+    assert executed_signals[0].confidence == 0.88
+
+
+# ----------------------------------------------------------------------
+# 11. Orchestrator active position / pending order skips
+# ----------------------------------------------------------------------
+def test_orchestrator_skips_active_and_pending_symbols(monkeypatch):
+    from unittest import mock
+    from types import SimpleNamespace
+    from strategies.base import TradeSignal
+    from strategies.orchestrator import evaluate_and_execute
+    import strategies.orchestrator
+    
+    sig_aapl = TradeSignal(symbol="AAPL", side="BUY", entry_price=100.0, stop_price=90.0, target_price=120.0, risk_per_share=10.0, confidence=0.85, strategy="ORB", atr=1.0, reason="")
+    sig_msft = TradeSignal(symbol="MSFT", side="BUY", entry_price=200.0, stop_price=190.0, target_price=220.0, risk_per_share=10.0, confidence=0.80, strategy="ORB", atr=1.0, reason="")
+    sig_goog = TradeSignal(symbol="GOOG", side="BUY", entry_price=300.0, stop_price=290.0, target_price=320.0, risk_per_share=10.0, confidence=0.75, strategy="ORB", atr=1.0, reason="")
+    
+    monkeypatch.setattr(strategies.orchestrator, "evaluate_symbols_parallel", lambda w, bridge: [sig_aapl, sig_msft, sig_goog])
+    
+    executed_signals = []
+    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run):
+        executed_signals.append(signal)
+        return {"status": "DRY_RUN", "reason": "Mocked execution"}
+    
+    monkeypatch.setattr(strategies.orchestrator, "execute_signal", mock_execute)
+    monkeypatch.setattr(strategies.orchestrator, "apply_portfolio_correlation", lambda sigs, open_pos, bridge: sigs)
+    monkeypatch.setattr(strategies.orchestrator, "today_pnl", lambda: 0.0)
+    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda: 0)
+    
+    # Mock bridge
+    bridge_mock = mock.MagicMock()
+    bridge_mock.is_connected = True
+    bridge_mock.market_price.return_value = 100.0
+    
+    # AAPL has position
+    class FakePosition:
+        def __init__(self, symbol, position):
+            self.contract = SimpleNamespace(symbol=symbol)
+            self.position = position
+            self.avgCost = 100.0
+            self.marketValue = 100.0
+            self.unrealizedPnL = 0.0
+    
+    bridge_mock.ib.positions.return_value = [FakePosition("AAPL", 10)]
+    
+    # MSFT has open order
+    class FakeOrder:
+        def __init__(self, symbol):
+            self.symbol = symbol
+    
+    bridge_mock.ib.openTrades.return_value = [FakeOrder("MSFT")]
+    
+    evaluate_and_execute(["AAPL", "MSFT", "GOOG"], bridge_mock, live_paper=True)
+    
+    # Verify:
+    # AAPL (active position) and MSFT (pending order) must be skipped.
+    # GOOG (clean symbol) must be executed successfully.
+    executed_symbols = {s.symbol for s in executed_signals}
+    assert "GOOG" in executed_symbols
+    assert "AAPL" not in executed_symbols
+    assert "MSFT" not in executed_symbols
+    assert len(executed_symbols) == 1
+
+
+# ----------------------------------------------------------------------
+# 12. Orchestrator Fail-Closed on Broker Outage Test
+# ----------------------------------------------------------------------
+def test_orchestrator_fail_closed_on_broker_outage(monkeypatch):
+    from unittest import mock
+    from strategies.base import TradeSignal
+    from strategies.orchestrator import evaluate_and_execute
+    import strategies.orchestrator
+    
+    sig_goog = TradeSignal(symbol="GOOG", side="BUY", entry_price=300.0, stop_price=290.0, target_price=320.0, risk_per_share=10.0, confidence=0.75, strategy="ORB", atr=1.0, reason="")
+    monkeypatch.setattr(strategies.orchestrator, "evaluate_symbols_parallel", lambda w, bridge: [sig_goog])
+    
+    executed_signals = []
+    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run):
+        executed_signals.append(signal)
+        return {"status": "DRY_RUN", "reason": "Mocked execution"}
+    
+    monkeypatch.setattr(strategies.orchestrator, "execute_signal", mock_execute)
+    monkeypatch.setattr(strategies.orchestrator, "apply_portfolio_correlation", lambda sigs, open_pos, bridge: sigs)
+    monkeypatch.setattr(strategies.orchestrator, "today_pnl", lambda: 0.0)
+    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda: 0)
+    
+    # 1. Test Broker Outage on positions in Live Paper (fail-closed)
+    bridge_mock_1 = mock.MagicMock()
+    bridge_mock_1.is_connected = True
+    bridge_mock_1.ib.positions.side_effect = RuntimeError("Broker connection lost")
+    
+    evaluate_and_execute(["GOOG"], bridge_mock_1, live_paper=True)
+    assert len(executed_signals) == 0  # Should be skipped/blocked
+    
+    # 2. Test Broker Outage on openTrades in Live Paper (fail-closed)
+    bridge_mock_2 = mock.MagicMock()
+    bridge_mock_2.is_connected = True
+    bridge_mock_2.ib.positions.return_value = []
+    bridge_mock_2.ib.openTrades.side_effect = RuntimeError("Broker API error")
+    
+    evaluate_and_execute(["GOOG"], bridge_mock_2, live_paper=True)
+    assert len(executed_signals) == 0  # Should be skipped/blocked
+    
+    # 3. Test Broker Outage in Dry Run (should NOT block, since it's not live)
+    evaluate_and_execute(["GOOG"], bridge_mock_2, live_paper=False)
+    assert len(executed_signals) == 1
+    assert executed_signals[0].symbol == "GOOG"
+
+
+# ----------------------------------------------------------------------
+# 13. Strategy Priority Sorting Test
+# ----------------------------------------------------------------------
+def test_strategy_priority_sorting(monkeypatch):
+    from unittest import mock
+    from strategies.base import TradeSignal
+    from strategies.orchestrator import evaluate_and_execute
+    import strategies.orchestrator
+    
+    # sig_gap has lower priority (4) but higher confidence (0.95)
+    sig_gap = TradeSignal(
+        symbol="AAPL",
+        side="BUY",
+        entry_price=100.0,
+        stop_price=90.0,
+        target_price=120.0,
+        risk_per_share=10.0,
+        confidence=0.95,
+        strategy="GAP_AND_GO",
+        atr=1.0,
+        reason=""
+    )
+    # sig_orb has higher priority (1) but lower confidence (0.80)
+    sig_orb = TradeSignal(
+        symbol="AAPL",
+        side="BUY",
+        entry_price=100.0,
+        stop_price=90.0,
+        target_price=120.0,
+        risk_per_share=10.0,
+        confidence=0.80,
+        strategy="ORB",
+        atr=1.0,
+        reason=""
+    )
+    
+    monkeypatch.setattr(strategies.orchestrator, "evaluate_symbols_parallel", lambda w, bridge: [sig_gap, sig_orb])
+    
+    executed_signals = []
+    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run):
+        executed_signals.append(signal)
+        return {"status": "DRY_RUN", "reason": "Mocked execution"}
+        
+    monkeypatch.setattr(strategies.orchestrator, "execute_signal", mock_execute)
+    monkeypatch.setattr(strategies.orchestrator, "apply_portfolio_correlation", lambda sigs, open_pos, bridge: sigs)
+    monkeypatch.setattr(strategies.orchestrator, "today_pnl", lambda: 0.0)
+    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda: 0)
+    
+    bridge_mock = mock.MagicMock()
+    bridge_mock.is_connected = False
+    
+    evaluate_and_execute(["AAPL"], bridge_mock, live_paper=False)
+    
+    # Should execute sig_orb first and discard sig_gap due to same-symbol deduplication
+    assert len(executed_signals) == 1
+    assert executed_signals[0].strategy == "ORB"
+    assert executed_signals[0].confidence == 0.80
+
+
+# ----------------------------------------------------------------------
+# 14. Strategy-Specific Time Cutoff Test
+# ----------------------------------------------------------------------
+def test_strategy_specific_time_cutoff(monkeypatch):
+    from unittest import mock
+    from datetime import datetime, time
+    from strategies.base import TradeSignal
+    from strategies.orchestrator import evaluate_and_execute
+    import strategies.orchestrator
+    
+    # GAP_AND_GO has cutoff at 10:30
+    sig_gap = TradeSignal(symbol="MSFT", side="BUY", entry_price=100.0, stop_price=90.0, target_price=120.0, risk_per_share=10.0, confidence=0.85, strategy="GAP_AND_GO", atr=1.0, reason="")
+    # ORB has no cutoff
+    sig_orb = TradeSignal(symbol="AAPL", side="BUY", entry_price=100.0, stop_price=90.0, target_price=120.0, risk_per_share=10.0, confidence=0.85, strategy="ORB", atr=1.0, reason="")
+    
+    monkeypatch.setattr(strategies.orchestrator, "evaluate_symbols_parallel", lambda w, bridge: [sig_gap, sig_orb])
+    
+    executed_signals = []
+    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run):
+        executed_signals.append(signal)
+        return {"status": "DRY_RUN", "reason": "Mocked execution"}
+        
+    monkeypatch.setattr(strategies.orchestrator, "execute_signal", mock_execute)
+    monkeypatch.setattr(strategies.orchestrator, "apply_portfolio_correlation", lambda sigs, open_pos, bridge: sigs)
+    monkeypatch.setattr(strategies.orchestrator, "today_pnl", lambda: 0.0)
+    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda: 0)
+    
+    # Mock current time to be 11:00 AM (past the GAP_AND_GO cutoff of 10:30 AM)
+    class MockDatetime:
+        @classmethod
+        def now(cls, tz=None):
+            from zoneinfo import ZoneInfo
+            return datetime(2026, 7, 20, 11, 0, 0, tzinfo=ZoneInfo("US/Eastern"))
+            
+    # Mock session's now_eastern to return our custom time
+    import strategies.session
+    monkeypatch.setattr(strategies.session, "now_eastern", MockDatetime.now)
+    
+    bridge_mock = mock.MagicMock()
+    bridge_mock.is_connected = False
+    
+    evaluate_and_execute(["AAPL", "MSFT"], bridge_mock, live_paper=False)
+    
+    # GAP_AND_GO (MSFT) should be skipped/filtered out.
+    # ORB (AAPL) should execute successfully because it has no cutoff time.
+    executed_symbols = {s.symbol for s in executed_signals}
+    assert "AAPL" in executed_symbols
+    assert "MSFT" not in executed_symbols
+    assert len(executed_symbols) == 1
+
+
+# ----------------------------------------------------------------------
+# 15. Consecutive Outage Alert Test
+# ----------------------------------------------------------------------
+def test_consecutive_outage_alert(monkeypatch):
+    from unittest import mock
+    from strategies.orchestrator import evaluate_and_execute
+    import strategies.orchestrator
+    import config
+    
+    # Reset failures count
+    strategies.orchestrator._consecutive_broker_failures = 9  # Almost at limit 10
+    config.CONSECUTIVE_OUTAGE_LIMIT = 10
+    
+    # Mock webhook alert to verify it is called exactly once
+    alerts_sent = []
+    def mock_send_alert(msg):
+        alerts_sent.append(msg)
+        
+    import strategies.webhook
+    monkeypatch.setattr(strategies.webhook, "send_discord_alert", mock_send_alert)
+    monkeypatch.setattr(strategies.orchestrator, "evaluate_symbols_parallel", lambda w, bridge: [])
+    
+    # Outage 1 (hits limit 10)
+    bridge_mock_1 = mock.MagicMock()
+    bridge_mock_1.is_connected = True
+    bridge_mock_1.ib.positions.side_effect = RuntimeError("Outage")
+    
+    evaluate_and_execute([], bridge_mock_1, live_paper=True)
+    assert len(alerts_sent) == 1
+    assert "10 consecutive broker communication failures" in alerts_sent[0]
+    assert strategies.orchestrator._consecutive_broker_failures == 10
+    
+    # Outage 2 (at 11, should NOT alert again since it's only sent once when it equals the limit)
+    evaluate_and_execute([], bridge_mock_1, live_paper=True)
+    assert len(alerts_sent) == 1  # Still 1
+    assert strategies.orchestrator._consecutive_broker_failures == 11
+    
+    # Success resets to 0
+    bridge_mock_success = mock.MagicMock()
+    bridge_mock_success.is_connected = True
+    bridge_mock_success.ib.positions.return_value = []
+    bridge_mock_success.ib.openTrades.return_value = []
+    
+    evaluate_and_execute([], bridge_mock_success, live_paper=True)
+    assert strategies.orchestrator._consecutive_broker_failures == 0
+
+
 
 
 

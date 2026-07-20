@@ -18,6 +18,8 @@ from strategies.performance import profile_latency
 
 logger = logging.getLogger(__name__)
 
+_consecutive_broker_failures = 0
+
 _ALL_STRATEGIES = [
     ORBStrategy(),
     VWAPBounceStrategy(),
@@ -243,12 +245,22 @@ def evaluate_and_execute(
     logger.info(f"Evaluating signals for {len(watchlist)} symbols...")
     print(f"Evaluating signals for {len(watchlist)} symbols...")
     
+    global _consecutive_broker_failures
+    broker_fetch_ok = True
+
     cached_open_positions = []
+    open_orders = []
     equity = config.PDT_MIN_EQUITY
     broker_pnl = None
     broker_state_available = False
+    allow_new_entries = True
     
     is_connected = getattr(bridge, "is_connected", False) or getattr(bridge, "_connected", False)
+    if live_paper and not is_connected:
+        logger.warning("Broker is not connected in live paper mode — skipping NEW entries this cycle")
+        allow_new_entries = False
+        broker_fetch_ok = False
+        
     if bridge and is_connected:
         try:
             cached_open_positions = bridge.ib.positions()
@@ -262,6 +274,10 @@ def evaluate_and_execute(
             broker_state_available = True
         except Exception as e:
             logger.error(f"Failed to fetch Alpaca portfolio state: {e}")
+            if live_paper:
+                logger.warning("Could not fetch portfolio state in live paper mode — skipping NEW entries this cycle")
+                allow_new_entries = False
+                broker_fetch_ok = False
 
     current_pnl = broker_pnl if live_paper else today_pnl()
     if (
@@ -290,7 +306,15 @@ def evaluate_and_execute(
                     manager.reset(symbol)
             
             # Fetch open orders once
-            open_orders = bridge.ib.openTrades()
+            try:
+                open_orders = bridge.ib.openTrades()
+            except Exception as exc:
+                logger.error(f"Failed to fetch open trades: {exc}")
+                open_orders = []
+                if live_paper:
+                    logger.warning("Could not fetch open orders in live paper mode — skipping NEW entries this cycle")
+                    allow_new_entries = False
+                    broker_fetch_ok = False
             
             for p in cached_open_positions:
                 if p.position != 0:
@@ -317,6 +341,21 @@ def evaluate_and_execute(
     except Exception as e:
         logger.error(f"Failed to update trailing stops: {e}")
 
+    if live_paper:
+        if not broker_fetch_ok:
+            _consecutive_broker_failures += 1
+            limit = getattr(config, "CONSECUTIVE_OUTAGE_LIMIT", 10)
+            if _consecutive_broker_failures == limit:
+                msg = f"🚨 [OUTAGE ALERT] Daytrading bot has encountered {limit} consecutive broker communication failures/outages. New entries are blocked."
+                logger.critical(msg)
+                try:
+                    from strategies.webhook import send_discord_alert
+                    send_discord_alert(msg)
+                except Exception as exc:
+                    logger.warning("Failed to send outage alert: %s", exc)
+        else:
+            _consecutive_broker_failures = 0
+
     logger.debug("[HOOK] before fetch & evaluate_symbols_parallel")
 
     all_signals = evaluate_symbols_parallel(watchlist, bridge=bridge)
@@ -324,14 +363,55 @@ def evaluate_and_execute(
 
     all_signals = apply_portfolio_correlation(all_signals, cached_open_positions, bridge=bridge)
 
-    all_signals.sort(key=lambda s: s.confidence, reverse=True)
+    def get_signal_sorting_key(sig):
+        strat_cfg = getattr(config, "STRATEGY_SETTINGS", {}).get(sig.strategy)
+        priority = getattr(strat_cfg, "priority", 10) if strat_cfg else 10
+        return (priority, -sig.confidence)
 
-    # Prevent same-symbol multi-order entry within the same cycle by keeping only the highest confidence signal
+    all_signals.sort(key=get_signal_sorting_key)
+
+    # Prevent same-symbol multi-order entry within the same cycle by keeping only the highest priority/confidence signal,
+    # skip any symbols with existing active positions or pending working orders at the broker,
+    # and skip any signals past their strategy-specific entry cutoff time.
     deduped_signals = []
     seen_symbols = set()
+
+    active_symbols = set()
+    pending_symbols = set()
+    if broker_state_available:
+        active_symbols = {
+            p.contract.symbol.upper().strip() for p in cached_open_positions if p.position != 0
+        }
+        pending_symbols = {
+            o.symbol.upper().strip() for o in open_orders
+        }
+
     for sig in all_signals:
-        if sig.symbol not in seen_symbols:
-            seen_symbols.add(sig.symbol)
+        sym = sig.symbol.upper().strip()
+        
+        # Check strategy-specific time cutoff
+        strat_cfg = getattr(config, "STRATEGY_SETTINGS", {}).get(sig.strategy)
+        cutoff_time_obj = getattr(strat_cfg, "cutoff_time_obj", None) if strat_cfg else None
+        if cutoff_time_obj:
+            from strategies.session import now_eastern
+            current_et = now_eastern().time()
+            if current_et >= cutoff_time_obj:
+                logger.info(
+                    "Skipped %s: strategy %s is past entry cutoff time (%s)",
+                    sig.symbol,
+                    sig.strategy,
+                    strat_cfg.entry_cutoff_time
+                )
+                continue
+                
+        if sym in active_symbols:
+            logger.info("Skipped %s: active position already exists", sig.symbol)
+            continue
+        if sym in pending_symbols:
+            logger.info("Skipped %s: working order already pending", sig.symbol)
+            continue
+        if sym not in seen_symbols:
+            seen_symbols.add(sym)
             deduped_signals.append(sig)
     all_signals = deduped_signals
 
@@ -343,6 +423,9 @@ def evaluate_and_execute(
 
     logger.debug("[HOOK] before execute")
     for sig in all_signals:
+        if not allow_new_entries:
+            logger.info("Skipped execution of signal %s: new entries disabled this cycle", sig.symbol)
+            continue
         try:
             result = execute_signal(
                 signal=sig,

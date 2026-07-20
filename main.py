@@ -2577,11 +2577,37 @@ def cmd_daytrade_bot(args) -> int:
         sys.exit(1)
             
     watchlist = list(getattr(config, "DAYTRADE_WATCHLIST", []))
-    last_scan_time = 0
+    use_dynamic_scanner = getattr(config, "USE_DYNAMIC_SCANNER", True)
+    bg_scanner = None
+
+    if use_dynamic_scanner:
+        print("Running initial synchronous scanner scan on startup...")
+        try:
+            candidates = scan(max_candidates=10)
+            if candidates:
+                watchlist = [c.symbol for c in candidates]
+            print(f"Initial watchlist populated: {watchlist}")
+        except Exception as exc:
+            print(f"Warning: Initial startup scan failed: {exc}. Using fallback watchlist.")
+
+        from strategies.scanner.premarket_scanner import BackgroundScanner
+        refresh_min = getattr(config, "SCANNER_REFRESH_MINUTES", 10)
+        bg_scanner = BackgroundScanner(
+            interval_minutes=refresh_min,
+            max_candidates=10,
+            initial_watchlist=watchlist
+        )
+        bg_scanner.start()
+
     _already_flattened = False
 
     def handle_graceful_exit(signum, frame):
         nonlocal _already_flattened
+        if bg_scanner:
+            try:
+                bg_scanner.stop()
+            except Exception:
+                pass
         if not _already_flattened:
             _already_flattened = True
             print(f"\n[SIGNAL] Received signal {signum}. Triggering emergency flatten...")
@@ -2614,15 +2640,21 @@ def cmd_daytrade_bot(args) -> int:
                 time.sleep(60)
                 continue
 
-            use_dynamic_scanner = getattr(config, "USE_DYNAMIC_SCANNER", True)
             if use_dynamic_scanner:
-                if current_time - last_scan_time > 300:
-                    print("Running periodic scanner to update watchlist...")
-                    candidates = scan(max_candidates=10)
-                    if candidates:
-                        watchlist = [c.symbol for c in candidates]
-                    last_scan_time = current_time
-                    print(f"Updated watchlist: {watchlist}")
+                if bg_scanner:
+                    watchlist = bg_scanner.get_watchlist()
+                    # Check for staleness (15 minutes = 900 seconds)
+                    last_completed = bg_scanner.get_last_scan_completed_time()
+                    if last_completed > 0:
+                        elapsed_seconds = current_time - last_completed
+                        if elapsed_seconds > 900:
+                            logger.warning(
+                                "Dynamic watchlist is stale! Last successful background scan was %.1f minutes ago.",
+                                elapsed_seconds / 60.0
+                            )
+                            print(f"  🚨 [WARNING] Watchlist is stale (last scan: {elapsed_seconds / 60.0:.1f}m ago)!")
+                else:
+                    watchlist = list(getattr(config, "DAYTRADE_WATCHLIST", []))
             else:
                 watchlist = list(getattr(config, "DAYTRADE_WATCHLIST", []))
 
@@ -2688,6 +2720,11 @@ def cmd_daytrade_bot(args) -> int:
                 print(f"Error flattening positions during loop crash: {e}")
         sys.exit(1)
     finally:
+        if bg_scanner:
+            try:
+                bg_scanner.stop()
+            except Exception:
+                pass
         bridge.disconnect()
     return 0
 
