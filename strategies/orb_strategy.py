@@ -72,7 +72,7 @@ class ORBStrategy(BaseStrategy):
                 metadata={"orb_high": orb_high, "orb_low": orb_low, "orb_range": orb_range},
             )
 
-        allow_short = getattr(config, "ALLOW_SHORT", True)
+        allow_short = getattr(config, "ALLOW_SHORT", False)
         if price < orb_low and vol_ok and rsi > 25 and allow_short:
             stop = orb_high
             risk = stop - price

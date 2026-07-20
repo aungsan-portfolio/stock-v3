@@ -87,18 +87,39 @@ def is_premarket() -> bool:
     return config.PREMARKET_START <= t < config.MARKET_OPEN
 
 
+def market_close_time(day: date = None) -> time:
+    day = day or now_eastern().date()
+    # 1. Thanksgiving Friday (Friday after 4th Thursday of November)
+    thanksgiving = _nth_weekday(day.year, 11, 3, 4)
+    day_after_tg = thanksgiving + timedelta(days=1)
+    if day == day_after_tg:
+        return time(13, 0)
+
+    # 2. Christmas Eve (December 24, if it falls on a weekday)
+    if day.month == 12 and day.day == 24 and day.weekday() < 5:
+        return time(13, 0)
+
+    # 3. July 3 Early Close Rule: If July 4 falls on a Tue, Wed, Thu, or Fri, July 3 is an early close
+    if day.month == 7 and day.day == 3 and day.weekday() in (0, 1, 2, 3, 4):
+        tomorrow = day + timedelta(days=1)
+        if tomorrow.weekday() in (1, 2, 3, 4):  # Tue, Wed, Thu, Fri
+            return time(13, 0)
+
+    return config.MARKET_CLOSE
+
+
 def is_market_open() -> bool:
     if not is_market_day():
         return False
     t = current_session_time()
-    return config.MARKET_OPEN <= t < config.MARKET_CLOSE
+    return config.MARKET_OPEN <= t < market_close_time()
 
 
 def is_postmarket() -> bool:
     if not is_market_day():
         return False
     t = current_session_time()
-    return config.MARKET_CLOSE <= t < config.POSTMARKET_END
+    return market_close_time() <= t < config.POSTMARKET_END
 
 
 def is_trading_hours() -> bool:
@@ -107,9 +128,10 @@ def is_trading_hours() -> bool:
 
 def minutes_until_close() -> float:
     now = now_eastern()
+    close_t = market_close_time(now.date())
     close_dt = now.replace(
-        hour=config.MARKET_CLOSE.hour,
-        minute=config.MARKET_CLOSE.minute,
+        hour=close_t.hour,
+        minute=close_t.minute,
         second=0, microsecond=0,
     )
     delta = (close_dt - now).total_seconds() / 60.0

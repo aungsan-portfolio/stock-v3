@@ -33,6 +33,8 @@ def evaluate_symbol(symbol: str, bridge: object = None) -> List[TradeSignal]:
     if df.empty:
         logger.warning("No data for %s", symbol)
         return []
+    if len(df) > 1:
+        df = df.iloc[:-1]
     return _evaluate_on_df(symbol, df)
 
 

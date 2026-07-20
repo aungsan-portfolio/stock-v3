@@ -2561,10 +2561,11 @@ def cmd_daytrade_status(args) -> int:
 
 def cmd_daytrade_bot(args) -> int:
     import time
+    import signal as sig_module
     from alpaca_bridge import AlpacaBridge
     from strategies.scanner.premarket_scanner import scan
     from strategies.orchestrator import evaluate_and_execute
-    from strategies.session import is_market_open, session_status
+    from strategies.session import is_market_open, session_status, now_eastern
     
     print(f"\n{'='*60}")
     print("  AUTOMATED DAY TRADING BOT STARTED")
@@ -2577,6 +2578,22 @@ def cmd_daytrade_bot(args) -> int:
             
     watchlist = list(getattr(config, "DAYTRADE_WATCHLIST", []))
     last_scan_time = 0
+    _already_flattened = False
+
+    def handle_graceful_exit(signum, frame):
+        nonlocal _already_flattened
+        if not _already_flattened:
+            _already_flattened = True
+            print(f"\n[SIGNAL] Received signal {signum}. Triggering emergency flatten...")
+            try:
+                bridge.flatten_all()
+            except Exception as e:
+                print(f"Error flattening positions during signal handler: {e}")
+        sys.exit(0)
+
+    # Register handlers
+    sig_module.signal(sig_module.SIGTERM, handle_graceful_exit)
+    sig_module.signal(sig_module.SIGINT, handle_graceful_exit)
 
     try:
         from strategies.error_handler import TradingErrorHandler
@@ -2589,6 +2606,7 @@ def cmd_daytrade_bot(args) -> int:
                 if is_postmarket():
                     print(f"[{session_status()}] Market closed. EOD reached, exiting cleanly.")
                     print("Flattening all positions before exit...")
+                    _already_flattened = True
                     bridge.flatten_all()
                     sys.exit(0)
 
@@ -2608,11 +2626,26 @@ def cmd_daytrade_bot(args) -> int:
             else:
                 watchlist = list(getattr(config, "DAYTRADE_WATCHLIST", []))
 
+            # Union watchlist with open positions to ensure strategy-level exits track held symbols
+            open_symbols = []
+            try:
+                if hasattr(bridge, "ib") and hasattr(bridge.ib, "positions"):
+                    open_positions = bridge.ib.positions()
+                    open_symbols = [p.contract.symbol for p in open_positions]
+                elif hasattr(bridge, "positions_plain"):
+                    open_symbols = [p["symbol"] for p in bridge.positions_plain()]
+            except Exception as exc:
+                print(f"Error fetching open positions for watchlist union: {exc}")
+            
+            if open_symbols:
+                watchlist = list(set(watchlist) | set(open_symbols))
+                print(f"Watchlist union with open positions: {watchlist}")
+
             earnings_cal = getattr(config, "EARNINGS_CALENDAR", {})
             blackout_days = getattr(config, "EARNINGS_BLACKOUT_DAYS", 2)
             if earnings_cal:
                 from datetime import datetime, timedelta
-                today = datetime.now().date()
+                today = now_eastern().date()
                 blacked_out = []
                 for sym, date_str in earnings_cal.items():
                     try:
@@ -2638,8 +2671,22 @@ def cmd_daytrade_bot(args) -> int:
             
     except KeyboardInterrupt:
         print("\nStopping bot...")
-        bridge.flatten_all()
+        if not _already_flattened:
+            _already_flattened = True
+            try:
+                bridge.flatten_all()
+            except Exception as e:
+                print(f"Error flattening positions during KeyboardInterrupt: {e}")
         sys.exit(0)
+    except Exception as exc:
+        print(f"\n🚨 CRITICAL ERROR: Unhandled exception in bot loop: {exc}")
+        if not _already_flattened:
+            _already_flattened = True
+            try:
+                bridge.flatten_all()
+            except Exception as e:
+                print(f"Error flattening positions during loop crash: {e}")
+        sys.exit(1)
     finally:
         bridge.disconnect()
     return 0

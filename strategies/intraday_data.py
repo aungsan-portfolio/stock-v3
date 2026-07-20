@@ -48,13 +48,14 @@ def _get_cache_file(key: str) -> str:
     return os.path.join(_cache_dir, f"{key}.pkl")
 
 
-def _read_cache(key: str) -> Optional[pd.DataFrame]:
+def _read_cache(key: str, ttl: int = None) -> Optional[pd.DataFrame]:
     cache_file = _get_cache_file(key)
     if not os.path.exists(cache_file):
         return None
     try:
         mtime = os.path.getmtime(cache_file)
-        if (_time.time() - mtime) > config.CACHE_TTL_SECONDS:
+        limit = ttl if ttl is not None else getattr(config, "INTRADAY_CACHE_TTL_SECONDS", 30)
+        if (_time.time() - mtime) > limit:
             return None
         with open(cache_file, "rb") as f:
             return pickle.load(f)
@@ -338,7 +339,7 @@ def fetch_daily(symbol: str, lookback_days: int = None, bridge = None) -> pd.Dat
     lookback_days = lookback_days or config.DAILY_LOOKBACK_DAYS
     source = "alpaca" if bridge is not None and bridge.is_connected else "yf"
     key = _cache_key(symbol, "1d", lookback_days, False, source=source)
-    cached_df = _read_cache(key)
+    cached_df = _read_cache(key, ttl=config.CACHE_TTL_SECONDS)
     if cached_df is not None:
         return cached_df.copy()
 
@@ -352,7 +353,7 @@ def fetch_daily(symbol: str, lookback_days: int = None, bridge = None) -> pd.Dat
         False,
         source=f"{source}_fallback",
     )
-    fallback_df = _read_cache(fallback_key)
+    fallback_df = _read_cache(fallback_key, ttl=config.CACHE_TTL_SECONDS)
     if fallback_df is not None:
         return fallback_df.copy()
         
@@ -393,7 +394,7 @@ def fetch_daily(symbol: str, lookback_days: int = None, bridge = None) -> pd.Dat
 def fetch_daily_yfinance(symbol: str, lookback_days: int = None) -> pd.DataFrame:
     lookback_days = lookback_days or config.DAILY_LOOKBACK_DAYS
     key = _cache_key(symbol, "1d", lookback_days, False, source="yf")
-    cached_df = _read_cache(key)
+    cached_df = _read_cache(key, ttl=config.CACHE_TTL_SECONDS)
     if cached_df is not None:
         return cached_df.copy()
 

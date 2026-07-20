@@ -112,11 +112,24 @@ def read_journal(journal_file: Optional[Path] = None):
                 records.append(json.loads(line))
     return records
 
+def _is_today_record(timestamp_str: str, today_date, eastern_timezone) -> bool:
+    if not timestamp_str:
+        return False
+    try:
+        timestamp = datetime.fromisoformat(timestamp_str)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return timestamp.astimezone(eastern_timezone).date() == today_date
+    except Exception:
+        return False
+
 def today_trades(journal_file: Optional[Path] = None):
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    current_eastern = now_eastern()
+    eastern_timezone = current_eastern.tzinfo
+    today_date = current_eastern.date()
     return [
         r for r in read_journal(journal_file)
-        if r.get("timestamp", "").startswith(today_str)
+        if _is_today_record(r.get("timestamp", ""), today_date, eastern_timezone)
         and (
             r.get("event_type") == "ORDER_SUBMITTED"
             or (
@@ -132,11 +145,13 @@ def today_trade_count(journal_file: Optional[Path] = None) -> int:
     return len(today_trades(journal_file))
 
 def today_pnl(journal_file: Optional[Path] = None) -> float:
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    current_eastern = now_eastern()
+    eastern_timezone = current_eastern.tzinfo
+    today_date = current_eastern.date()
     return sum(
         r.get("realized_pnl", r.get("pnl", 0.0)) or 0.0
         for r in read_journal(journal_file)
-        if r.get("timestamp", "").startswith(today_str)
+        if _is_today_record(r.get("timestamp", ""), today_date, eastern_timezone)
     )
 
 def count_day_trades_in_records(records: list[dict], current_date) -> int:

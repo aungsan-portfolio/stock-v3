@@ -179,7 +179,7 @@ def run_backtest(symbol: str, strategy_name: str, lookback_days: int = 5, overri
                 stop_val = risk_math.trailing_stop_price(
                     current_price=current_high,
                     atr=use_atr,
-                    atr_multiple=getattr(config, 'ATR_MULTIPLE', 1.5),
+                    atr_multiple=getattr(config, 'TRAILING_STOP_ATR_MULTIPLE', 1.5),
                     side=math_side,
                     highest_price=active_trade['peak']
                 )
@@ -189,7 +189,7 @@ def run_backtest(symbol: str, strategy_name: str, lookback_days: int = 5, overri
                 stop_val = risk_math.trailing_stop_price(
                     current_price=current_low,
                     atr=use_atr,
-                    atr_multiple=getattr(config, 'ATR_MULTIPLE', 1.5),
+                    atr_multiple=getattr(config, 'TRAILING_STOP_ATR_MULTIPLE', 1.5),
                     side=math_side,
                     lowest_price=active_trade['peak']
                 )
@@ -477,7 +477,7 @@ def run_portfolio_backtest(symbols: List[str], strategy_name: str, lookback_days
                 realized_pnl = _realized_pnl(
                     trade["side"], trade["entry"], executed_exit, shares, commission
                 )
-                trade['pnl'] = realized_pnl / shares
+                trade['pnl'] = realized_pnl
                 current_equity += realized_pnl
                 trade['realized_pnl'] = realized_pnl
                 trades.append(trade)
@@ -509,7 +509,7 @@ def run_portfolio_backtest(symbols: List[str], strategy_name: str, lookback_days
                 stop_val = risk_math.trailing_stop_price(
                     current_price=current_high,
                     atr=use_atr,
-                    atr_multiple=getattr(config, 'ATR_MULTIPLE', 1.5),
+                    atr_multiple=getattr(config, 'TRAILING_STOP_ATR_MULTIPLE', 1.5),
                     side=math_side,
                     highest_price=trade['peak']
                 )
@@ -519,7 +519,7 @@ def run_portfolio_backtest(symbols: List[str], strategy_name: str, lookback_days
                 stop_val = risk_math.trailing_stop_price(
                     current_price=current_low,
                     atr=use_atr,
-                    atr_multiple=getattr(config, 'ATR_MULTIPLE', 1.5),
+                    atr_multiple=getattr(config, 'TRAILING_STOP_ATR_MULTIPLE', 1.5),
                     side=math_side,
                     lowest_price=trade['peak']
                 )
@@ -654,7 +654,7 @@ def run_portfolio_backtest(symbols: List[str], strategy_name: str, lookback_days
         realized_pnl = _realized_pnl(
             trade["side"], trade["entry"], executed_exit, shares, commission
         )
-        trade['pnl'] = realized_pnl / shares
+        trade['pnl'] = realized_pnl
         current_equity += realized_pnl
         trade['realized_pnl'] = realized_pnl
         trade['exit_time'] = final_time
