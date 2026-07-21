@@ -755,9 +755,17 @@ class AlpacaBridge:
     def flatten_all(self, confirm: bool = False) -> dict:
         self._require_connection()
         logger.info("Flattening all positions and orders on Alpaca paper account")
-        try:
             # Cancel all orders
-            self._client.cancel_all_orders()
+            try:
+                self._client.cancel_orders()
+            except Exception as e:
+                logger.warning("cancel_orders failed: %s. Canceling one by one.", e)
+                active_orders = self._get_active_orders()
+                for o in active_orders:
+                    try:
+                        self._client.cancel_order_by_id(str(o.id))
+                    except Exception as inner_e:
+                        logger.error("Failed to cancel order %s: %s", o.id, inner_e)
             # Close all positions
             positions = self._client.get_all_positions()
             for p in positions:
