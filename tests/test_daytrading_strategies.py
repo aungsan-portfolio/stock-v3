@@ -41,6 +41,14 @@ def isolate_config():
         setattr(config, attr, val)
 
 
+@pytest.fixture(autouse=True)
+def mock_market_open(monkeypatch):
+    import strategies.session
+    import strategies.trailing_stop
+    monkeypatch.setattr(strategies.session, "is_market_open", lambda: True)
+    monkeypatch.setattr(strategies.trailing_stop, "is_market_open", lambda: True)
+
+
 # ----------------------------------------------------------------------
 # 1. VWAP Calculation Math Test
 # ----------------------------------------------------------------------
@@ -896,6 +904,53 @@ def test_naked_position_with_existing_stop_and_flatten(monkeypatch):
     assert "broker-stop-order-999" in cancelled_orders
     assert "AAPL" in flattened_symbols
     assert state.active is False
+
+
+def test_bracket_leg_held_status_not_naked(monkeypatch):
+    import time
+    from unittest import mock
+    from strategies.trailing_stop import manager, TrailingStopState
+    
+    manager.reset("AAPL")
+    state = TrailingStopState(
+        symbol="AAPL",
+        side="BUY",
+        entry_price=150.0,
+        peak_price=150.0,
+        atr=2.0,
+        stop_price=145.0,
+        trail_multiple=2.5,
+        last_updated=time.time(),
+        active=True,
+        order_id=None # starts with None to force reconciliation
+    )
+    manager.states["AAPL"] = state
+    
+    class TestMockOrderHeld:
+        def __init__(self, symbol, order_id, status="held"):
+            class Contract:
+                def __init__(self, s):
+                    self.symbol = s
+            self.contract = Contract(symbol)
+            self.id = order_id
+            self.side = "sell"
+            self.stop_price = 145.0
+            self.status = status # 'held' or 'suspended'
+            
+    # Mock open_orders returned to contain a held stop order
+    mock_held_order = TestMockOrderHeld("AAPL", "broker-stop-order-held", status="held")
+    
+    # ensure_initialized should find and adopt the held order, setting state.order_id to 'broker-stop-order-held'
+    ret_state = manager.ensure_initialized(
+        symbol="AAPL",
+        side="BUY",
+        avg_cost=150.0,
+        open_orders=[mock_held_order],
+        current_price=149.0
+    )
+    
+    assert ret_state.order_id == "broker-stop-order-held"
+    assert ret_state.active is True
 
 
 

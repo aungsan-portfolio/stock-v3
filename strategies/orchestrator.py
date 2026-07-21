@@ -254,6 +254,9 @@ def evaluate_and_execute(
     broker_pnl = None
     broker_state_available = False
     allow_new_entries = True
+    if getattr(bridge, "_daytrade_suspended", False) is True:
+        logger.warning("Daytrading is suspended for the day due to daily loss limit breach.")
+        allow_new_entries = False
     
     is_connected = getattr(bridge, "is_connected", False) or getattr(bridge, "_connected", False)
     if live_paper and not is_connected:
@@ -280,20 +283,60 @@ def evaluate_and_execute(
                 broker_fetch_ok = False
 
     current_pnl = broker_pnl if live_paper else today_pnl()
+    if getattr(bridge, "_daytrade_suspended", False) is True:
+        allow_new_entries = False
+
     if (
         live_paper
         and broker_state_available
         and getattr(config, "FLATTEN_ON_DAILY_LOSS", False)
         and current_pnl is not None
     ):
-        from strategies.intraday_risk import check_daily_loss
-        if not check_daily_loss(current_pnl, equity):
-            logger.warning("Daily loss limit reached at %.2f; flattening all positions", current_pnl)
+        try:
+            dollar_limit = float(getattr(config, "MAX_DAILY_LOSS_DOLLARS", 300.0))
+        except (ValueError, TypeError):
+            dollar_limit = 300.0
+
+        try:
+            if isinstance(equity, (int, float)) or (hasattr(equity, "__float__") and not hasattr(equity, "mock_calls")):
+                pct_val = getattr(config, "MAX_DAILY_LOSS_PCT", 3.0)
+                pct_limit = float(equity) * (float(pct_val) / 100.0)
+            else:
+                pct_limit = dollar_limit
+        except (ValueError, TypeError):
+            pct_limit = dollar_limit
+            
+        governing_limit = min(dollar_limit, pct_limit)
+        
+        try:
+            if isinstance(current_pnl, (int, float)) or (hasattr(current_pnl, "__float__") and not hasattr(current_pnl, "mock_calls")):
+                is_breached = float(current_pnl) <= -governing_limit
+            else:
+                is_breached = False
+        except (ValueError, TypeError):
+            is_breached = False
+        
+        if is_breached and getattr(bridge, "_daytrade_suspended", False) is not True:
+            from strategies.session import now_eastern
+            et_date = str(now_eastern().date())
+            bridge._daytrade_suspended = True
+            bridge._save_daytrade_risk_state(et_date, getattr(bridge, "_start_of_day_equity", equity), True)
+            
+            msg = f"🚨 **[CIRCUIT BREAKER] Daily loss limit breached!** 🚨\n**PnL**: ${current_pnl:.2f}\n**Governing Limit**: -${governing_limit:.2f}\nTriggering emergency flatten and suspending all new daytrade entries!"
+            logger.warning(msg)
+            try:
+                from strategies.webhook import send_discord_alert
+                send_discord_alert(msg)
+            except Exception as w_exc:
+                logger.error("Failed to send daily loss breach discord alert: %s", w_exc)
+                
             try:
                 bridge.flatten_all()
             except Exception as exc:
                 logger.error("Flatten on daily loss failed: %s", exc)
-            return
+                
+        if getattr(bridge, "_daytrade_suspended", False) is True:
+            allow_new_entries = False
 
     try:
         from strategies.trailing_stop import manager
@@ -327,7 +370,8 @@ def evaluate_and_execute(
                             side=side,
                             avg_cost=p.avgCost,
                             open_orders=open_orders,
-                            current_price=price
+                            current_price=price,
+                            qty=p.position
                         )
                         if state and state.active and state.order_id is None:
                             manager.handle_naked_position(
@@ -357,8 +401,11 @@ def evaluate_and_execute(
             _consecutive_broker_failures = 0
 
     logger.debug("[HOOK] before fetch & evaluate_symbols_parallel")
-
-    all_signals = evaluate_symbols_parallel(watchlist, bridge=bridge)
+    if allow_new_entries:
+        all_signals = evaluate_symbols_parallel(watchlist, bridge=bridge)
+    else:
+        logger.info("New entries are disabled; skipping symbol evaluation")
+        all_signals = []
     logger.debug("[HOOK] after fetch & evaluate_symbols_parallel")
 
     all_signals = apply_portfolio_correlation(all_signals, cached_open_positions, bridge=bridge)

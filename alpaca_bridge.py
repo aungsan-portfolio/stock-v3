@@ -115,14 +115,16 @@ class MockIB:
             return []
 
     def openTrades(self) -> List[MockOrder]:
-        self.bridge._require_connection()
         try:
-            al_orders = self.bridge._client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
+            al_orders = self.bridge._get_active_orders()
             res = []
+            active_statuses = {"new", "partially_filled", "submitted", "queued", "held", "accepted", "pending_new", "accepted_for_bidding", "stopped", "suspended", "calculated"}
             for o in al_orders:
+                raw_status = o.status.value if hasattr(o.status, "value") else str(o.status)
+                if raw_status.lower() not in active_statuses:
+                    continue
                 action = "BUY" if o.side.value.upper() == "BUY" else "SELL"
                 qty = float(o.qty)
-                raw_status = o.status.value if hasattr(o.status, "value") else str(o.status)
                 status = status_map.get(raw_status.lower(), "Submitted")
                 lmt_price = float(o.limit_price) if o.limit_price is not None else 0.0
                 order_type = "LMT" if o.type.value.upper() == "LIMIT" else "MKT"
@@ -217,6 +219,19 @@ class AlpacaBridge:
                 return False
 
             logger.info("Connected to Alpaca Paper Account | Status: %s | Equity: %s", acct.status, acct.equity)
+            from strategies.session import now_eastern
+            et_date = str(now_eastern().date())
+            state = self._load_daytrade_risk_state()
+            if state.get("date") == et_date:
+                self._start_of_day_equity = float(state.get("start_of_day_equity", acct.equity))
+                self._daytrade_suspended = bool(state.get("suspended", False))
+                logger.info("Restored start-of-day equity: $%.2f, suspended: %s", self._start_of_day_equity, self._daytrade_suspended)
+            else:
+                self._start_of_day_equity = float(acct.equity)
+                self._daytrade_suspended = False
+                self._save_daytrade_risk_state(et_date, self._start_of_day_equity, False)
+                logger.info("Initialized new day start-of-day equity: $%.2f", self._start_of_day_equity)
+            self._session_start_time = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=24)
             self._connected = True
             self._conn_health.mark_healthy()
             return True
@@ -230,6 +245,48 @@ class AlpacaBridge:
         self._data_client = None
         self._connected = False
         logger.info("Disconnected from Alpaca")
+
+    def _load_daytrade_risk_state(self) -> dict:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'daytrade_risk_state.json')
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r") as f:
+                import json
+                return json.load(f)
+        except Exception as e:
+            logger.error("Failed to load daytrade risk state: %s", e)
+            return {}
+
+    def _save_daytrade_risk_state(self, date_str: str, equity: float, suspended: bool):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'daytrade_risk_state.json')
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                import json
+                json.dump({
+                    "date": date_str,
+                    "start_of_day_equity": equity,
+                    "suspended": suspended
+                }, f, indent=2)
+        except Exception as e:
+            logger.error("Failed to save daytrade risk state: %s", e)
+
+    def _get_active_orders(self) -> list:
+        self._require_connection()
+        try:
+            after_time = getattr(self, "_session_start_time", None)
+            if after_time is None:
+                after_time = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=24)
+            return self._client.get_orders(filter=GetOrdersRequest(
+                status=QueryOrderStatus.ALL,
+                after=after_time,
+                limit=500,
+                direction="desc"
+            ))
+        except Exception as exc:
+            logger.error("Failed to query active orders from broker: %s", exc)
+            return []
 
     # ── Account Services ─────────────────────────────────────────
     def get_cash(self) -> float:
@@ -249,11 +306,17 @@ class AlpacaBridge:
             return 0.0
 
     def account_daily_pnl(self) -> float:
-        return 0.0
+        if getattr(self, "_start_of_day_equity", 0.0) <= 0.0:
+            return 0.0
+        return self.get_net_liquidation() - self._start_of_day_equity
 
     def snapshot_start_of_day_equity(self) -> float:
-        # For swing trading, start-of-day equity equals current equity or cash
-        return self.get_net_liquidation()
+        from strategies.session import now_eastern
+        et_date = str(now_eastern().date())
+        current_equity = self.get_net_liquidation()
+        self._start_of_day_equity = current_equity
+        self._save_daytrade_risk_state(et_date, current_equity, getattr(self, "_daytrade_suspended", False))
+        return self._start_of_day_equity
 
     def get_position(self, symbol: str) -> float:
         self._require_connection()
@@ -267,19 +330,27 @@ class AlpacaBridge:
             return 0.0
 
     def working_order_symbols(self) -> set:
-        self._require_connection()
         try:
-            al_orders = self._client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
-            return {o.symbol.upper().strip() for o in al_orders}
+            al_orders = self._get_active_orders()
+            active_statuses = {"new", "partially_filled", "submitted", "queued", "held", "accepted", "pending_new", "accepted_for_bidding", "stopped", "suspended", "calculated"}
+            symbols = set()
+            for o in al_orders:
+                raw_status = o.status.value if hasattr(o.status, "value") else str(o.status)
+                if raw_status.lower() in active_statuses:
+                    symbols.add(o.symbol.upper().strip())
+            return symbols
         except Exception as exc:
             logger.error("working_order_symbols failed: %s", exc)
             return set()
 
     def has_working_order(self, symbol: str, action: Optional[str] = None) -> bool:
-        self._require_connection()
         try:
-            al_orders = self._client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
+            al_orders = self._get_active_orders()
+            active_statuses = {"new", "partially_filled", "submitted", "queued", "held", "accepted", "pending_new", "accepted_for_bidding", "stopped", "suspended", "calculated"}
             for o in al_orders:
+                raw_status = o.status.value if hasattr(o.status, "value") else str(o.status)
+                if raw_status.lower() not in active_statuses:
+                    continue
                 if o.symbol.upper().strip() == symbol.upper().strip():
                     if action is None or o.side.value.upper() == action.upper():
                         return True
@@ -535,11 +606,14 @@ class AlpacaBridge:
             return order_exec.OrderResult(outcome=order_exec.REJECTED, status="Rejected", filled=0.0, remaining=float(qty))
 
     def _cancel_symbol_working_orders(self, symbol: str) -> int:
-        self._require_connection()
         canceled = 0
         try:
-            al_orders = self._client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
+            al_orders = self._get_active_orders()
+            active_statuses = {"new", "partially_filled", "submitted", "queued", "held", "accepted", "pending_new", "accepted_for_bidding", "stopped", "suspended", "calculated"}
             for o in al_orders:
+                raw_status = o.status.value if hasattr(o.status, "value") else str(o.status)
+                if raw_status.lower() not in active_statuses:
+                    continue
                 if o.symbol.upper().strip() == symbol.upper().strip():
                     self._client.cancel_order_by_id(str(o.id))
                     canceled += 1
@@ -548,11 +622,17 @@ class AlpacaBridge:
         return canceled
 
     def _duplicate_ref_working(self, symbol: str, action: str) -> bool:
-        self._require_connection()
         ref = order_exec.deterministic_order_ref(self._today(), symbol, action)
         try:
-            al_orders = self._client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
-            return any(getattr(o, "client_order_id", None) == ref for o in al_orders)
+            al_orders = self._get_active_orders()
+            active_statuses = {"new", "partially_filled", "submitted", "queued", "held", "accepted", "pending_new", "accepted_for_bidding", "stopped", "suspended", "calculated"}
+            for o in al_orders:
+                raw_status = o.status.value if hasattr(o.status, "value") else str(o.status)
+                if raw_status.lower() not in active_statuses:
+                    continue
+                if getattr(o, "client_order_id", None) == ref:
+                    return True
+            return False
         except Exception:
             return False
 
@@ -572,13 +652,15 @@ class AlpacaBridge:
 
     def working_orders_plain(self) -> list:
         # Returns list of plain dicts for live_invariants and reconciliation
-        self._require_connection()
         try:
-            al_orders = self._client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
+            al_orders = self._get_active_orders()
+            active_statuses = {"new", "partially_filled", "submitted", "queued", "held", "accepted", "pending_new", "accepted_for_bidding", "stopped", "suspended", "calculated"}
             res = []
             for o in al_orders:
-                action = "BUY" if o.side.value.upper() == "BUY" else "SELL"
                 raw_status = o.status.value if hasattr(o.status, "value") else str(o.status)
+                if raw_status.lower() not in active_statuses:
+                    continue
+                action = "BUY" if o.side.value.upper() == "BUY" else "SELL"
                 status = status_map.get(raw_status.lower(), "Submitted")
                 order_type = "LMT" if o.type.value.upper() == "LIMIT" else "MKT"
                 res.append({

@@ -183,3 +183,49 @@ def test_backfill_closed_trades(tmp_path):
     assert last_record["realized_pnl"] == 50.0
     assert last_record["is_win"] is True
     assert last_record["exit_reason"] == "PROFIT_EXIT"
+
+
+def test_emergency_flatten_cooldown_integration(tmp_path):
+    from unittest.mock import patch
+    from strategies.trade_journal import log_trade
+    from strategies.intraday_risk import pre_trade_check
+    from datetime import datetime, timezone
+    import json
+
+    journal = tmp_path / "journal.jsonl"
+    
+    # Log the exit record (representing an emergency flatten loss of -$50.0)
+    log_trade(
+        symbol="AAPL",
+        side="SELL",
+        strategy="ORB",
+        qty=10,
+        entry_price=100.0,
+        stop_price=95.0,
+        target_price=120.0,
+        exit_price=95.0,
+        pnl=-50.0,
+        event_type="TRADE_CLOSED",
+        journal_file=journal
+    )
+    
+    with (
+        patch("strategies.trade_journal.config.DAYTRADE_TRADE_JOURNAL_FILE", journal),
+        patch("strategies.intraday_risk.config.DAYTRADE_TRADE_JOURNAL_FILE", journal),
+        patch("strategies.intraday_risk.config.REENTRY_COOLDOWN_MINUTES", 5),
+        patch("strategies.intraday_risk.get_consecutive_losses", return_value=0),
+        patch("strategies.intraday_risk.check_flatten_zone", return_value=True),
+        patch("strategies.trade_journal.now_eastern", return_value=datetime.now(timezone.utc).astimezone())
+    ):
+        # The cooldown should block AAPL since it was closed with a loss less than 5 mins ago
+        reason = pre_trade_check(
+            equity=100000.0,
+            current_pnl=-50.0,
+            trades_today=1,
+            open_positions=0,
+            day_trades_last_5_days=0,
+            risk_dollars=50.0,
+            symbol="AAPL"
+        )
+        assert reason is not None
+        assert "Re-entry cooldown active for AAPL" in reason

@@ -282,7 +282,7 @@ def execute_signal(
         try:
             from strategies.trailing_stop import manager
             stop_order_id = order_ids[2] if len(order_ids) >= 3 else (order_ids[1] if len(order_ids) >= 2 else None)
-            manager.initialize_position(signal, limit_price, stop_order_id=stop_order_id)
+            manager.initialize_position(signal, limit_price, qty=shares, stop_order_id=stop_order_id)
         except Exception as e:
             logger.error("Failed to init trailing stop for %s: %s", signal.symbol, e)
         

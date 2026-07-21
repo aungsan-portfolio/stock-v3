@@ -38,6 +38,9 @@ class TrailingStopState:
     last_remediation_time: float = 0.0
     remediation_attempts: int = 0
     escalation_alerted: bool = False
+    qty: float = 0.0
+    strategy: str = "UNKNOWN"
+    signal_id: Optional[str] = None
 
 class DynamicTrailingStopManager:
     def __init__(self):
@@ -67,7 +70,7 @@ class DynamicTrailingStopManager:
         except Exception as e:
             logger.error(f"Failed to save trailing stop state: {e}")
 
-    def initialize_position(self, signal: TradeSignal, fill_price: float, stop_order_id: Optional[str] = None) -> TrailingStopState:
+    def initialize_position(self, signal: TradeSignal, fill_price: float, qty: float = 0.0, stop_order_id: Optional[str] = None) -> TrailingStopState:
         """Initialize trailing stop when order is filled."""
         with self._lock:
             atr = getattr(signal, 'atr', 0.0)
@@ -94,6 +97,9 @@ class DynamicTrailingStopManager:
                 trail_multiple=mult,
                 last_updated=time.time(),
                 order_id=stop_order_id,
+                qty=qty,
+                strategy=getattr(signal, "strategy", "UNKNOWN"),
+                signal_id=getattr(signal, "signal_id", None),
                 active=True
             )
             self.states[signal.symbol] = state
@@ -101,7 +107,7 @@ class DynamicTrailingStopManager:
             logger.info(f"Initialized Trailing Stop for {signal.symbol}: Entry ${fill_price:.2f}, Stop ${initial_stop:.2f}")
             return state
 
-    def ensure_initialized(self, symbol: str, side: str, avg_cost: float, open_orders: list, current_price: float, original_stop: Optional[float] = None) -> Optional[TrailingStopState]:
+    def ensure_initialized(self, symbol: str, side: str, avg_cost: float, open_orders: list, current_price: float, original_stop: Optional[float] = None, qty: float = 0.0) -> Optional[TrailingStopState]:
         """Ensure trailing stop state is initialized for an active position."""
         with self._lock:
             state = self.states.get(symbol)
@@ -175,6 +181,8 @@ class DynamicTrailingStopManager:
                 trail_multiple=mult,
                 last_updated=time.time(),
                 order_id=stop_order_id,
+                qty=qty,
+                strategy="RECONCILED",
                 active=True
             )
             self.states[symbol] = state
@@ -329,6 +337,31 @@ class DynamicTrailingStopManager:
 
             if fresh_qty == 0.0:
                 logger.info(f"Fresh position query for {symbol} returned 0. Marking trailing stop inactive (stopped out).")
+                # Log stopped out exit to trade journal
+                exit_price = state.stop_price
+                qty_closed = getattr(state, "qty", 0.0) or abs(position_qty)
+                pnl_val = (exit_price - state.entry_price) * qty_closed if state.side == "BUY" else (state.entry_price - exit_price) * qty_closed
+                
+                try:
+                    from strategies.trade_journal import log_trade
+                    log_trade(
+                        symbol=symbol,
+                        side="SELL" if state.side == "BUY" else "BUY",
+                        strategy=getattr(state, "strategy", "UNKNOWN"),
+                        qty=int(qty_closed),
+                        entry_price=state.entry_price,
+                        stop_price=state.stop_price,
+                        target_price=exit_price,
+                        exit_price=exit_price,
+                        exit_reason="STOP_OUT",
+                        pnl=pnl_val,
+                        notes="Stopped out exit",
+                        event_type="TRADE_CLOSED",
+                        signal_id=getattr(state, "signal_id", None)
+                    )
+                except Exception as e_log:
+                    logger.error("Failed to log stopped out exit to journal: %s", e_log)
+                
                 state.active = False
                 state.remediation_in_progress = False
                 state.order_id = None
@@ -517,9 +550,54 @@ class DynamicTrailingStopManager:
                     if current_state and current_state.active:
                         current_state.remediation_in_progress = False
                         if close_ok:
-                            current_state.active = False
-                            current_state.remediation_attempts = 0
-                            current_state.escalation_alerted = False
+                            is_success = False
+                            if isinstance(close_ok, bool):
+                                is_success = close_ok
+                            elif hasattr(close_ok, "is_filled"):
+                                is_success = close_ok.is_filled or close_ok.outcome == "FILLED"
+                            else:
+                                is_success = bool(close_ok)
+
+                            if is_success:
+                                current_state.active = False
+                                current_state.remediation_attempts = 0
+                                current_state.escalation_alerted = False
+                                
+                                # Log exit to trade journal
+                                exit_price = getattr(close_ok, "avg_fill_price", 0.0) or 0.0
+                                qty_closed = getattr(close_ok, "filled", 0.0) or 0.0
+                                
+                                if exit_price <= 0.0:
+                                    try:
+                                        exit_price = bridge.market_price(symbol) or 0.0
+                                    except Exception:
+                                        exit_price = 0.0
+                                if exit_price <= 0.0:
+                                    exit_price = current_state.stop_price
+                                if qty_closed <= 0.0:
+                                    qty_closed = getattr(current_state, "qty", 0.0) or abs(position_qty)
+                                    
+                                pnl_val = (exit_price - current_state.entry_price) * qty_closed if current_state.side == "BUY" else (current_state.entry_price - exit_price) * qty_closed
+                                
+                                try:
+                                    from strategies.trade_journal import log_trade
+                                    log_trade(
+                                        symbol=symbol,
+                                        side="SELL" if current_state.side == "BUY" else "BUY",
+                                        strategy=getattr(current_state, "strategy", "UNKNOWN"),
+                                        qty=int(qty_closed),
+                                        entry_price=current_state.entry_price,
+                                        stop_price=current_state.stop_price,
+                                        target_price=exit_price,
+                                        exit_price=exit_price,
+                                        exit_reason="EMERGENCY_FLATTEN",
+                                        pnl=pnl_val,
+                                        notes="Emergency flatten exit",
+                                        event_type="TRADE_CLOSED",
+                                        signal_id=getattr(current_state, "signal_id", None)
+                                    )
+                                except Exception as e_log:
+                                    logger.error("Failed to log emergency close to journal: %s", e_log)
                         self._save_state()
             except Exception as e:
                 logger.error(f"EMERGENCY FLATTEN FAILED for {symbol}: {e}")
