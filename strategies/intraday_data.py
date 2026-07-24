@@ -100,58 +100,60 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _validate_intraday_data(df: pd.DataFrame, symbol: str, interval: str) -> pd.DataFrame:
-    """Validates intraday OHLCV data for staleness, NaN values, and frozen feeds."""
-    if df.empty:
-        return df
+def _validate_intraday_data(df: pd.DataFrame, symbol: str, interval: str, validate_staleness: bool = True) -> pd.DataFrame:
+    """
+    Validates intraday DataFrame for zero/negative prices, frozen feeds, and stale quotes.
+    Returns empty DataFrame if validation fails.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
 
     try:
-        # 1. NaN / None Guard
-        if df[["open", "high", "low", "close"]].isna().any().any():
-            logger.warning("Data validation failed for %s: NaN values detected.", symbol)
-            return pd.DataFrame()
+        # 1. Price Sanitization Check (Non-positive prices)
+        price_cols = [col for col in ['open', 'high', 'low', 'close'] if col in df.columns]
+        if price_cols:
+            if (df[price_cols] <= 0).any().any():
+                logger.warning("Data validation failed for %s: Non-positive price detected.", symbol)
+                return pd.DataFrame()
 
-        # 2. Frozen Price Guard (Price Unchanged AND Volume is Zero)
-        if len(df) >= 8:
-            last_8 = df.iloc[-8:]
-            price_frozen = last_8["close"].nunique() == 1
-            volume_frozen = last_8["volume"].sum() == 0
-            if price_frozen and volume_frozen:
+        # 2. Frozen Feed Check (Constant close prices)
+        if 'close' in df.columns and len(df) >= 10:
+            recent_closes = df['close'].tail(10)
+            if recent_closes.nunique() == 1:
                 logger.warning("Data validation failed for %s: True frozen price feed detected.", symbol)
                 return pd.DataFrame()
 
-        # 3. Stale Quote Guard
-        last_timestamp = df.index[-1]
-        
-        if last_timestamp.tzinfo is None:
-            import pytz
-            tz = pytz.timezone(getattr(config, "TIMEZONE", "US/Eastern"))
-            last_timestamp = tz.localize(last_timestamp)
+        # 3. Stale Quote Guard (Only for live real-time feeds when validate_staleness is True)
+        if validate_staleness:
+            last_timestamp = df.index[-1]
             
-        current_time = pd.Timestamp.now(tz=last_timestamp.tz)
-        
-        # We only apply staleness check if market is currently open
-        from strategies.session import is_market_open
-        if is_market_open():
-            staleness_seconds = (current_time - last_timestamp).total_seconds()
-            
-            # Interval-based formula: interval_seconds * 2 + buffer
-            interval_seconds = 60 # Default to 1m
-            if "m" in interval:
-                interval_seconds = int(interval.replace("m", "")) * 60
-            elif "h" in interval:
-                interval_seconds = int(interval.replace("h", "")) * 3600
+            if last_timestamp.tzinfo is None:
+                import pytz
+                tz = pytz.timezone(getattr(config, "TIMEZONE", "US/Eastern"))
+                last_timestamp = tz.localize(last_timestamp)
                 
-            buffer_seconds = getattr(config, "STALE_QUOTE_BUFFER_SECONDS", 30)
-            max_stale = (interval_seconds * 2) + buffer_seconds 
+            current_time = pd.Timestamp.now(tz=last_timestamp.tz)
+            
+            from strategies.session import is_market_open
+            if is_market_open():
+                staleness_seconds = (current_time - last_timestamp).total_seconds()
+                
+                interval_seconds = 60 # Default to 1m
+                if "m" in interval:
+                    interval_seconds = int(interval.replace("m", "")) * 60
+                elif "h" in interval:
+                    interval_seconds = int(interval.replace("h", "")) * 3600
+                    
+                buffer_seconds = getattr(config, "STALE_QUOTE_BUFFER_SECONDS", 30)
+                max_stale = getattr(config, "STALE_QUOTE_MAX_SECONDS", 1200)
 
-            if staleness_seconds > max_stale:
-                logger.warning(
-                    "Data validation failed for %s: Stale quote. "
-                    "Last bar was %ss ago (Limit: %ss).",
-                    symbol, staleness_seconds, max_stale
-                )
-                return pd.DataFrame()
+                if staleness_seconds > max_stale:
+                    logger.warning(
+                        "Data validation failed for %s: Stale quote. "
+                        "Last bar was %ss ago (Limit: %ss).",
+                        symbol, staleness_seconds, max_stale
+                    )
+                    return pd.DataFrame()
     except Exception as e:
         logger.error("Error checking validation for %s: %s", symbol, e)
         return pd.DataFrame()
@@ -181,6 +183,89 @@ def _bars_to_frame(bars) -> pd.DataFrame:
     ])
 
 
+def fetch_intraday_alpaca(
+    symbol: str,
+    interval: str = None,
+    lookback_days: int = None,
+    prepost: bool = False,
+) -> pd.DataFrame:
+    api_key = os.environ.get("APCA_API_KEY_ID", "")
+    secret_key = os.environ.get("APCA_API_SECRET_KEY", "")
+    if not api_key or not secret_key:
+        return pd.DataFrame()
+
+    interval = interval or config.INTRADAY_INTERVAL
+    lookback_days = lookback_days or config.INTRADAY_LOOKBACK_DAYS
+
+    key = _cache_key(symbol, interval, lookback_days, prepost, source="alpaca_api")
+    cached_df = _read_cache(key)
+    if cached_df is not None:
+        return cached_df.copy()
+
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+        from datetime import timezone
+
+        client = StockHistoricalDataClient(api_key, secret_key)
+        start = datetime.now(timezone.utc) - timedelta(days=lookback_days or 1)
+        tf = TimeFrame.Minute
+        if interval == "5m":
+            tf = TimeFrame(5, TimeFrame.Unit.Minute)
+        elif interval == "15m":
+            tf = TimeFrame(15, TimeFrame.Unit.Minute)
+        elif interval == "1h":
+            tf = TimeFrame.Hour
+
+        bars_dict = None
+        try:
+            req = StockBarsRequest(
+                symbol_or_symbols=symbol.upper(),
+                timeframe=tf,
+                start=start,
+                feed="sip",
+            )
+            bars_dict = client.get_stock_bars(req)
+        except Exception as sip_err:
+            logger.debug("Alpaca SIP feed error for %s (%s). Falling back to IEX feed.", symbol, sip_err)
+            try:
+                req = StockBarsRequest(
+                    symbol_or_symbols=symbol.upper(),
+                    timeframe=tf,
+                    start=start,
+                    feed="iex",
+                )
+                bars_dict = client.get_stock_bars(req)
+            except Exception as iex_err:
+                logger.warning("Alpaca IEX feed error for %s (%s).", symbol, iex_err)
+                return pd.DataFrame()
+
+        if not hasattr(bars_dict, "df") or bars_dict.df.empty:
+            return pd.DataFrame()
+
+        df = bars_dict.df
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.xs(symbol.upper(), level="symbol")
+
+        df = df.rename(columns={
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "volume": "volume"
+        })
+        df.index.name = "datetime"
+        validate_staleness = (lookback_days is not None and lookback_days <= 1)
+        df = _validate_intraday_data(df, symbol, interval, validate_staleness=validate_staleness)
+        if not df.empty:
+            _write_cache(key, df.copy())
+        return df
+    except Exception as e:
+        logger.warning("Alpaca data fetch failed for %s: %s", symbol, e)
+        return pd.DataFrame()
+
+
 @profile_latency(sample_rate=1.0)
 def fetch_intraday(
     symbol: str,
@@ -192,13 +277,23 @@ def fetch_intraday(
     interval = interval or config.INTRADAY_INTERVAL
     lookback_days = lookback_days or config.INTRADAY_LOOKBACK_DAYS
 
-    source = "alpaca" if bridge is not None and bridge.is_connected else "yf"
+    has_alpaca_keys = bool(os.environ.get("APCA_API_KEY_ID") and os.environ.get("APCA_API_SECRET_KEY"))
+    if bridge is not None and bridge.is_connected:
+        source = "alpaca"
+    elif has_alpaca_keys:
+        source = "alpaca_api"
+    else:
+        source = "yf"
+
     key = _cache_key(symbol, interval, lookback_days, prepost, source=source)
     cached_df = _read_cache(key)
     if cached_df is not None:
         return cached_df.copy()
 
     if bridge is None or not bridge.is_connected:
+        df_alpaca = fetch_intraday_alpaca(symbol, interval, lookback_days, prepost)
+        if not df_alpaca.empty:
+            return df_alpaca
         return fetch_intraday_yfinance(symbol, interval, lookback_days, prepost)
 
     fallback_key = _cache_key(
@@ -258,9 +353,9 @@ def fetch_intraday_yfinance(
     interval = interval or config.INTRADAY_INTERVAL
     lookback_days = lookback_days or config.INTRADAY_LOOKBACK_DAYS
 
-    if interval == "1m" and lookback_days > 30:
-        logger.warning("yfinance only supports up to 30 days of 1m data. Capping lookback to 30 days.")
-        lookback_days = 30
+    if interval == "1m" and lookback_days > 7:
+        logger.warning("yfinance only supports up to 7 days of 1m data. Capping lookback to 7 days.")
+        lookback_days = 7
 
     key = _cache_key(symbol, interval, lookback_days, prepost, source="yf")
     cached_df = _read_cache(key)
@@ -329,7 +424,8 @@ def fetch_intraday_yfinance(
             return pd.DataFrame()
 
     df = df.dropna(subset=["close"])
-    df = _validate_intraday_data(df, symbol, interval)
+    validate_staleness = (lookback_days is not None and lookback_days <= 1)
+    df = _validate_intraday_data(df, symbol, interval, validate_staleness=validate_staleness)
     if not df.empty:
         _write_cache(key, df.copy())
     logger.debug(
