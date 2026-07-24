@@ -657,6 +657,7 @@ def run_portfolio_backtest(
                             'id': trade_id_counter,
                             'symbol': sym,
                             'side': best_signal.side,
+                            'confidence': float(best_signal.confidence),
                             'shares': shares,
                             'entry': entry_price,
                             'stop': best_signal.stop_price,
