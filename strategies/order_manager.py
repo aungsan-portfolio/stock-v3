@@ -366,7 +366,10 @@ def execute_signal(
             stop_order_id = order.get("stop_order_id") if isinstance(order, dict) else getattr(order, "stop_order_id", None)
             if not stop_order_id:
                 stop_order_id = order_ids[2] if len(order_ids) >= 3 else (order_ids[1] if len(order_ids) >= 2 else None)
-            manager.initialize_position(signal, limit_price, qty=shares, stop_order_id=stop_order_id)
+            tp_order_id = order.get("tp_order_id") if isinstance(order, dict) else getattr(order, "tp_order_id", None)
+            if not tp_order_id and len(order_ids) >= 2:
+                tp_order_id = order_ids[1]
+            manager.initialize_position(signal, limit_price, qty=shares, stop_order_id=stop_order_id, bridge=bridge, tp_order_id=tp_order_id)
         except Exception as e:
             logger.error("Failed to init trailing stop for %s: %s", signal.symbol, e)
         
