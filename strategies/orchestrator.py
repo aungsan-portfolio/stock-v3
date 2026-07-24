@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -274,6 +275,10 @@ def evaluate_and_execute(
                 broker_pnl = bridge.daily_pnl()
             else:
                 broker_pnl = today_pnl()
+            if hasattr(bridge, "sync_today_trades_to_journal"):
+                bridge.sync_today_trades_to_journal()
+                from strategies.trade_journal import auto_verify_first_trades
+                auto_verify_first_trades()
             broker_state_available = True
         except Exception as e:
             logger.error(f"Failed to fetch Alpaca portfolio state: {e}")
@@ -401,10 +406,30 @@ def evaluate_and_execute(
             _consecutive_broker_failures = 0
 
     logger.debug("[HOOK] before fetch & evaluate_symbols_parallel")
+    
+    # Phase 5: 5-Minute Bar Boundary Cadence Gate
+    now_utc = datetime.now(timezone.utc)
+    # Determine current 5m bar boundary timestamp
+    current_5m_bar_ts = now_utc.replace(second=0, microsecond=0)
+    current_5m_bar_ts = current_5m_bar_ts.replace(minute=(current_5m_bar_ts.minute // 5) * 5)
+    current_5m_bar_str = current_5m_bar_ts.isoformat()
+
+    global _last_evaluated_5m_bar_str
+    if "_last_evaluated_5m_bar_str" not in globals():
+        _last_evaluated_5m_bar_str = None
+
+    should_evaluate_5m_bar = False
     if allow_new_entries:
+        if _last_evaluated_5m_bar_str != current_5m_bar_str:
+            should_evaluate_5m_bar = True
+            _last_evaluated_5m_bar_str = current_5m_bar_str
+            logger.info(f"[5M BAR CADENCE] New 5m bar boundary reached ({current_5m_bar_str}). Running strategy signal evaluation...")
+        else:
+            logger.debug(f"[5M BAR CADENCE] Intra-bar tick ({now_utc.strftime('%H:%M:%S')}). Skipping signal evaluation (last evaluated bar: {current_5m_bar_str}).")
+
+    if allow_new_entries and should_evaluate_5m_bar:
         all_signals = evaluate_symbols_parallel(watchlist, bridge=bridge)
     else:
-        logger.info("New entries are disabled; skipping symbol evaluation")
         all_signals = []
     logger.debug("[HOOK] after fetch & evaluate_symbols_parallel")
 
