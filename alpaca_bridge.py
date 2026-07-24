@@ -456,12 +456,15 @@ class AlpacaBridge:
         return round(price * (1 + tp), 2) if action == "BUY" else round(price * (1 - tp), 2)
 
     # ── Placement & Execution ────────────────────────────────────
-    def _place_open_bracket(self, symbol: str, action: str, qty: int, price: float, confidence: float) -> order_exec.OrderResult:
+    def _place_open_bracket(self, symbol: str, action: str, qty: int, price: float, confidence: float, strategy_name: str = "") -> order_exec.OrderResult:
         self._require_connection()
         limit_price = self._limit_price(action, price)
         stop_price = self._initial_stop_price(action, price)
         take_profit_price = self._take_profit_price(action, price)
-        client_order_id = order_exec.deterministic_order_ref(self._today(), symbol, action)
+        
+        strat_tag = str(strategy_name or "UNKNOWN").replace("StrategyName.", "").upper()
+        ts_suffix = str(int(time.time()))[-5:]
+        client_order_id = f"dt_{strat_tag[:10]}_{symbol}_{action}_{ts_suffix}"[:48]
 
         order_audit.log_event(
             order_audit.STAGE_SUBMIT, kind="open", symbol=symbol, action=action,
@@ -480,8 +483,25 @@ class AlpacaBridge:
                 stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
             ))
             
-            # Wait for execution outcome
-            result = self._await_order_outcome(str(order.id))
+            parent_id = str(order.id)
+            stop_leg_id = None
+            try:
+                from alpaca.trading.requests import GetOrderByIdRequest
+                nested_order = self._client.get_order_by_id(parent_id, GetOrderByIdRequest(nested=True))
+                legs = getattr(nested_order, "legs", []) or []
+                for leg in legs:
+                    leg_type = str(getattr(leg, "order_type", getattr(leg, "type", ""))).lower()
+                    leg_stop = getattr(leg, "stop_price", None)
+                    if "stop" in leg_type or leg_stop is not None:
+                        stop_leg_id = str(leg.id)
+                        logger.info(f"Extracted stop leg ID {stop_leg_id} for parent bracket order {parent_id}")
+                        break
+            except Exception as leg_exc:
+                logger.warning(f"Could not extract nested child leg ID for {parent_id}: {leg_exc}")
+
+            result = self._await_order_outcome(parent_id)
+            if stop_leg_id:
+                setattr(result, "stop_order_id", stop_leg_id)
             return self._finalize_open(symbol, action, result, qty)
         except Exception as exc:
             logger.error("submit_order failed: %s", exc)
@@ -799,12 +819,27 @@ class AlpacaBridge:
             take_profit=TakeProfitRequest(limit_price=round(target_price, 2)),
             stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
         ))
-        order_ids = [str(order.id)]
-        legs = getattr(order, "legs", []) or []
-        for leg in legs:
-            order_ids.append(str(leg.id))
+        parent_id = str(order.id)
+        order_ids = [parent_id]
+        stop_leg_id = None
+        try:
+            from alpaca.trading.requests import GetOrderByIdRequest
+            nested_order = self._client.get_order_by_id(parent_id, GetOrderByIdRequest(nested=True))
+            legs = getattr(nested_order, "legs", []) or []
+            for leg in legs:
+                leg_id = str(leg.id)
+                order_ids.append(leg_id)
+                leg_type = str(getattr(leg, "order_type", getattr(leg, "type", ""))).lower()
+                leg_stop = getattr(leg, "stop_price", None)
+                if "stop" in leg_type or leg_stop is not None:
+                    stop_leg_id = leg_id
+                    logger.info(f"Extracted stop leg ID {stop_leg_id} for parent bracket order {parent_id}")
+        except Exception as leg_exc:
+            logger.warning(f"Could not extract nested child leg ID for {parent_id}: {leg_exc}")
+
         return {
-            "order_id": str(order.id),
+            "order_id": parent_id,
+            "stop_order_id": stop_leg_id,
             "order_ids": order_ids,
             "status": "Submitted"
         }
@@ -821,16 +856,18 @@ class AlpacaBridge:
         ))
         return {"order_id": str(order.id)}
 
-    def modify_stop_order(self, order_id: str, new_stop: float) -> bool:
+    def modify_stop_order(self, order_id: str, new_stop: float) -> Optional[str]:
         self._require_connection()
         try:
             from alpaca.trading.requests import ReplaceOrderRequest
             req = ReplaceOrderRequest(stop_price=round(new_stop, 2))
-            self._client.replace_order_by_id(order_id, req)
-            return True
+            new_order = self._client.replace_order_by_id(order_id, req)
+            new_id = str(getattr(new_order, "id", order_id))
+            logger.info(f"Replaced stop order {order_id} -> new order ID {new_id} at stop price ${new_stop:.2f}")
+            return new_id
         except Exception as exc:
             logger.error("Failed to modify stop order %s: %s", order_id, exc)
-            return False
+            return None
 
     def cancel_order(self, order_id: str) -> bool:
         self._require_connection()
@@ -840,6 +877,111 @@ class AlpacaBridge:
         except Exception as exc:
             logger.error("Failed to cancel order %s: %s", order_id, exc)
             return False
+
+    def sync_today_trades_to_journal(self) -> int:
+        """Fetch today's filled orders from Alpaca and sync into trade_journal.jsonl."""
+        if not self._connected or not self._client:
+            return 0
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            from strategies.session import now_eastern
+            from strategies.trade_journal import log_fill, read_journal
+            import pytz
+
+            today_date = now_eastern().date()
+            existing_records = read_journal()
+            existing_order_ids = {str(r.get("execution_id") or r.get("order_id") or "") for r in existing_records}
+
+            req = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=500)
+            orders = self._client.get_orders(req)
+            synced_count = 0
+
+            for o in sorted(orders, key=lambda x: x.filled_at if x.filled_at else _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)):
+                if o.filled_at is None or not o.filled_qty or float(o.filled_qty) <= 0:
+                    continue
+                filled_utc = o.filled_at
+                if filled_utc.tzinfo is None:
+                    filled_utc = filled_utc.replace(tzinfo=_dt.timezone.utc)
+                
+                et_tz = pytz.timezone("US/Eastern")
+                filled_et = filled_utc.astimezone(et_tz)
+                if filled_et.date() != today_date:
+                    continue
+
+                order_id_str = str(o.id)
+                if order_id_str in existing_order_ids:
+                    continue
+
+                client_ref = getattr(o, "client_order_id", "") or ""
+                parts = client_ref.split("_")
+                strat = parts[1] if len(parts) >= 2 and parts[0] == "dt" else "UNKNOWN"
+
+                side = o.side.value.upper() if hasattr(o.side, "value") else str(o.side).upper()
+                fill_price = float(o.filled_avg_price or 0.0)
+                qty = int(float(o.filled_qty))
+
+                expected_price = (
+                    float(o.stop_price) if getattr(o, "stop_price", None) and float(o.stop_price) > 0
+                    else (float(o.limit_price) if getattr(o, "limit_price", None) and float(o.limit_price) > 0 else fill_price)
+                )
+                slippage = abs(fill_price - expected_price) / expected_price if expected_price > 0 else 0.0
+
+                submitted_at = getattr(o, "submitted_at", None) or getattr(o, "created_at", None)
+                fill_latency_ms = 0.0
+                if submitted_at and getattr(o, "filled_at", None):
+                    try:
+                        fill_latency_ms = max(0.0, (o.filled_at - submitted_at).total_seconds() * 1000.0)
+                    except Exception:
+                        fill_latency_ms = 0.0
+
+                tier = "5-10" if (5.0 <= fill_price < 10.0) else (">10" if fill_price >= 10.0 else "<5")
+                log_fill(
+                    symbol=o.symbol,
+                    side=side,
+                    qty=qty,
+                    fill_price=fill_price,
+                    expected_price=expected_price,
+                    slippage=slippage,
+                    fill_latency_ms=fill_latency_ms,
+                    order_id=order_id_str,
+                    execution_id=order_id_str,
+                    timestamp=filled_utc.isoformat(),
+                    strategy=strat,
+                    price_tier=tier,
+                )
+                if side == "SELL":
+                    try:
+                        from strategies.intraday_risk import register_symbol_loss
+                        from strategies.trailing_stop import get_trailing_manager
+                        from strategies.trade_journal import get_today_closed_trades
+
+                        is_loss = True  # Default fail-safe to True
+                        mgr = get_trailing_manager()
+                        state = mgr.states.get(o.symbol)
+
+                        if state and state.entry_price > 0:
+                            if fill_price >= state.entry_price:
+                                is_loss = False
+                        else:
+                            closed_trades = [t for t in get_today_closed_trades() if t.get("symbol") == o.symbol]
+                            if closed_trades and float(closed_trades[-1].get("realized_pnl", 0.0) or 0.0) >= 0:
+                                is_loss = False
+
+                        if is_loss:
+                            register_symbol_loss(o.symbol, filled_utc)
+                    except Exception:
+                        try:
+                            from strategies.intraday_risk import register_symbol_loss
+                            register_symbol_loss(o.symbol, filled_utc)
+                        except Exception:
+                            pass
+                existing_order_ids.add(order_id_str)
+                synced_count += 1
+            return synced_count
+        except Exception as exc:
+            logger.warning("sync_today_trades_to_journal failed: %s", exc)
+            return 0
 
     def open_position_count(self) -> int:
         self._require_connection()
@@ -923,7 +1065,8 @@ class AlpacaBridge:
                 logger.warning("Qty=0 for BUY %s", symbol)
                 return False
 
-            result = self._place_open_bracket(symbol, "BUY", qty, price, signal.confidence)
+            strat_name = getattr(signal, "strategy", getattr(signal, "strategy_name", ""))
+            result = self._place_open_bracket(symbol, "BUY", qty, price, signal.confidence, strategy_name=strat_name)
             paper_ledger.record_entry(
                 signal, result,
                 order_ref=order_exec.deterministic_order_ref(self._today(), symbol, "BUY"),
