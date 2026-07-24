@@ -40,7 +40,7 @@ def _validate_signal_prices(signal: TradeSignal) -> str:
             f"entry/stop distance {derived_risk:.6f}"
         )
 
-    # Validate signal geometry using tick size (SEC Rule 612)
+    # Validate signal geometry using tick size (SEC Rule 612) and Noise Floor
     tick_size = 0.01 if signal.entry_price >= 1.0 else 0.0001
     target_dist = round(abs(signal.target_price - signal.entry_price), 6)
     stop_dist = round(abs(signal.entry_price - signal.stop_price), 6)
@@ -48,6 +48,14 @@ def _validate_signal_prices(signal: TradeSignal) -> str:
         return f"Target distance {target_dist:.5f} is less than or equal to tick size {tick_size:.5f} (invalid geometry)"
     if stop_dist <= tick_size:
         return f"Stop distance {stop_dist:.5f} is less than or equal to tick size {tick_size:.5f} (invalid geometry)"
+
+    # Phase 3: Pre-submission Veto for Too-Tight Signals (< max(0.05, entry * 0.002))
+    min_required_dist = max(0.05, signal.entry_price * 0.002)
+    if stop_dist < min_required_dist:
+        return (
+            f"Pre-submission Veto: Stop distance ${stop_dist:.4f} is too tight "
+            f"(< min required noise floor ${min_required_dist:.4f})"
+        )
 
     if side == "BUY":
         if signal.stop_price >= signal.entry_price:

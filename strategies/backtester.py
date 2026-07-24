@@ -616,6 +616,13 @@ def run_portfolio_backtest(
                             best_signal = sig
 
                     if best_signal:
+                        # Phase 3: Pre-submission Veto Parity (< max(0.05, entry * 0.002))
+                        stop_dist = abs(best_signal.entry_price - best_signal.stop_price)
+                        min_required_dist = max(0.05, best_signal.entry_price * 0.002)
+                        if stop_dist < min_required_dist:
+                            best_signal = None
+
+                    if best_signal:
                         entry_price = best_signal.entry_price
                         entry_price = entry_price * (1 + slippage_pct) if best_signal.side == 'BUY' else entry_price * (1 - slippage_pct)
                         
