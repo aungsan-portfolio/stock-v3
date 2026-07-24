@@ -921,19 +921,42 @@ class AlpacaBridge:
                 fill_price = float(o.filled_avg_price or 0.0)
                 qty = int(float(o.filled_qty))
 
-                expected_price = (
-                    float(o.stop_price) if getattr(o, "stop_price", None) and float(o.stop_price) > 0
-                    else (float(o.limit_price) if getattr(o, "limit_price", None) and float(o.limit_price) > 0 else fill_price)
-                )
-                slippage = abs(fill_price - expected_price) / expected_price if expected_price > 0 else 0.0
+                from strategies.order_registry import get_registered_order
+                reg = get_registered_order(order_id_str)
+                
+                order_type = "ENTRY"
+                if reg:
+                    expected_price = reg["expected_price"]
+                    order_type = reg.get("order_type", "ENTRY")
+                else:
+                    if getattr(o, "stop_price", None) and float(o.stop_price) > 0:
+                        expected_price = float(o.stop_price)
+                        order_type = "STOP_LOSS"
+                    elif getattr(o, "limit_price", None) and float(o.limit_price) > 0:
+                        expected_price = float(o.limit_price)
+                        order_type = "TAKE_PROFIT" if side == "SELL" else "ENTRY"
+                    else:
+                        expected_price = fill_price
 
+                # Signed Slippage: Positive (+) = Adverse, Negative (-) = Favorable
+                if expected_price > 0:
+                    if side == "BUY":
+                        slippage = (fill_price - expected_price) / expected_price
+                    else:
+                        slippage = (expected_price - fill_price) / expected_price
+                else:
+                    slippage = 0.0
+
+                # Execution Latency: Only for ENTRY / immediate execution. Mark None (N/A) for stop legs
                 submitted_at = getattr(o, "submitted_at", None) or getattr(o, "created_at", None)
-                fill_latency_ms = 0.0
+                fill_latency_ms = None
                 if submitted_at and getattr(o, "filled_at", None):
                     try:
-                        fill_latency_ms = max(0.0, (o.filled_at - submitted_at).total_seconds() * 1000.0)
+                        duration_sec = (o.filled_at - submitted_at).total_seconds()
+                        if order_type == "ENTRY" or duration_sec <= 10.0:
+                            fill_latency_ms = max(0.0, duration_sec * 1000.0)
                     except Exception:
-                        fill_latency_ms = 0.0
+                        fill_latency_ms = None
 
                 tier = "5-10" if (5.0 <= fill_price < 10.0) else (">10" if fill_price >= 10.0 else "<5")
                 log_fill(

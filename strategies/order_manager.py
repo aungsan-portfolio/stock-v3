@@ -202,6 +202,20 @@ def execute_signal(
     strat_cfg = getattr(config, "STRATEGY_SETTINGS", {}).get(signal.strategy)
     risk_pct = strat_cfg.max_risk_pct if strat_cfg else 1.0
 
+    open_syms = []
+    if is_connected and hasattr(bridge, "get_open_positions"):
+        try:
+            positions_list = bridge.get_open_positions()
+            open_syms = [getattr(p, "symbol", "") for p in positions_list if hasattr(p, "symbol")]
+        except Exception:
+            pass
+
+    # Macro ETF Overlap Safety (Prevent holding SPY and QQQ simultaneously)
+    if signal.symbol in {"SPY", "QQQ"} and any(s in {"SPY", "QQQ"} for s in open_syms):
+        result["reason"] = f"Macro ETF Overlap: Cannot hold SPY and QQQ simultaneously"
+        logger.info("Blocked %s: %s", signal.symbol, result["reason"])
+        return result
+
     risk_reason = pre_trade_check(
         equity=equity,
         current_pnl=current_pnl,
@@ -209,7 +223,9 @@ def execute_signal(
         open_positions=open_pos,
         day_trades_last_5_days=day_trades_last_5_days,
         risk_dollars=risk_dollars,
+        symbol=signal.symbol,
         max_risk_pct=risk_pct,
+        open_symbols=open_syms,
     )
 
     if risk_reason:
@@ -259,19 +275,65 @@ def execute_signal(
 
     try:
         limit_price = executable_signal.entry_price
+        stop_price = signal.stop_price
+        target_price = signal.target_price
+
+        # Fresh pre-submission quote check to minimize quote staleness
+        get_latest_p = getattr(bridge, "get_latest_price", None)
+        if callable(get_latest_p):
+            try:
+                fresh_p = get_latest_p(signal.symbol)
+                if fresh_p and fresh_p > 0:
+                    slippage = abs(fresh_p - executable_signal.entry_price) / executable_signal.entry_price
+                    if slippage > 0.003: # 0.3% threshold
+                        logger.warning(
+                            f"[PRE-SUBMISSION VETO] Signal quote stale for {signal.symbol}: "
+                            f"signal=${executable_signal.entry_price:.2f}, fresh=${fresh_p:.2f} "
+                            f"(slippage={slippage*100:.2f}% > 0.30%). Trade aborted for safety."
+                        )
+                        result["status"] = "VETOED"
+                        result["reason"] = f"Pre-submission quote slippage {slippage*100:.2f}% exceeded 0.3% threshold"
+                        return result
+
+                    offset_stop = executable_signal.entry_price - signal.stop_price
+                    offset_target = signal.target_price - executable_signal.entry_price
+                    limit_price = fresh_p
+                    stop_price = round(fresh_p - offset_stop, 2)
+                    target_price = round(fresh_p + offset_target, 2)
+                    logger.info(f"Refreshed pre-submission quote for {signal.symbol}: limit=${limit_price:.2f}, stop=${stop_price:.2f}, target=${target_price:.2f}")
+            except Exception as q_err:
+                logger.debug(f"Pre-submission quote refresh skipped for {signal.symbol}: {q_err}")
 
         order = bridge.place_bracket_order(
             symbol=signal.symbol,
             side=signal.side,
             qty=shares,
             entry_price=limit_price,
-            stop_price=signal.stop_price,
-            target_price=signal.target_price,
+            stop_price=stop_price,
+            target_price=target_price,
         )
         order_ids = order.get("order_ids") or []
         register_signal = getattr(bridge, "register_order_signal", None)
         if callable(register_signal):
             register_signal(order_ids, signal.signal_id)
+
+        # Register expected prices for signed slippage and execution latency tracking
+        try:
+            from strategies.order_registry import register_order_expected_price
+            now_ts = time.time()
+            parent_id = order_ids[0] if order_ids else order.get("order_id")
+            stop_id = order.get("stop_order_id") or (order_ids[2] if len(order_ids) >= 3 else (order_ids[1] if len(order_ids) >= 2 else None))
+            tp_id = order.get("tp_order_id") or (order_ids[1] if len(order_ids) >= 2 else None)
+            exit_side = "SELL" if signal.side.upper() == "BUY" else "BUY"
+
+            if parent_id:
+                register_order_expected_price(parent_id, expected_price=signal.entry_price, side=signal.side, order_type="ENTRY", submit_ts=now_ts, symbol=signal.symbol)
+            if stop_id:
+                register_order_expected_price(stop_id, expected_price=stop_price, side=exit_side, order_type="STOP_LOSS", submit_ts=now_ts, symbol=signal.symbol)
+            if tp_id and tp_id != stop_id:
+                register_order_expected_price(tp_id, expected_price=target_price, side=exit_side, order_type="TAKE_PROFIT", submit_ts=now_ts, symbol=signal.symbol)
+        except Exception as reg_err:
+            logger.debug(f"Failed to register order expected price: {reg_err}")
 
         result["status"] = "PLACED"
         result["reason"] = "Order placed"
@@ -281,7 +343,9 @@ def execute_signal(
         # We also initialize trailing stop directly upon submission in paper-mode
         try:
             from strategies.trailing_stop import manager
-            stop_order_id = order_ids[2] if len(order_ids) >= 3 else (order_ids[1] if len(order_ids) >= 2 else None)
+            stop_order_id = order.get("stop_order_id") if isinstance(order, dict) else getattr(order, "stop_order_id", None)
+            if not stop_order_id:
+                stop_order_id = order_ids[2] if len(order_ids) >= 3 else (order_ids[1] if len(order_ids) >= 2 else None)
             manager.initialize_position(signal, limit_price, qty=shares, stop_order_id=stop_order_id)
         except Exception as e:
             logger.error("Failed to init trailing stop for %s: %s", signal.symbol, e)
