@@ -203,12 +203,24 @@ def execute_signal(
     risk_pct = strat_cfg.max_risk_pct if strat_cfg else 1.0
 
     open_syms = []
-    if is_connected and hasattr(bridge, "get_open_positions"):
+    if is_connected:
         try:
-            positions_list = bridge.get_open_positions()
-            open_syms = [getattr(p, "symbol", "") for p in positions_list if hasattr(p, "symbol")]
-        except Exception:
-            pass
+            get_pos_fn = getattr(bridge, "get_positions", None) or getattr(bridge, "get_open_positions", None)
+            if not callable(get_pos_fn):
+                err_msg = "Risk guard failure: Broker bridge missing position retrieval method"
+                logger.error(f"[FAIL-LOUD RISK GUARD] {err_msg}")
+                result["reason"] = err_msg
+                return result
+            positions_list = get_pos_fn()
+            open_syms = [
+                getattr(p, "symbol", "") if hasattr(p, "symbol") else (p.get("symbol") if isinstance(p, dict) else str(p))
+                for p in positions_list
+            ]
+        except Exception as pos_err:
+            err_msg = f"Risk guard failure: Could not verify open positions ({pos_err})"
+            logger.error(f"[FAIL-LOUD RISK GUARD] {err_msg}")
+            result["reason"] = err_msg
+            return result
 
     # Macro ETF Overlap Safety (Prevent holding SPY and QQQ simultaneously)
     if signal.symbol in {"SPY", "QQQ"} and any(s in {"SPY", "QQQ"} for s in open_syms):

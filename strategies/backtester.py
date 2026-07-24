@@ -100,7 +100,7 @@ def run_backtest(symbol: str, strategy_name: str, lookback_days: int = 5, overri
     current_equity = start_equity
     equity_curve = [{"time": df.index[0], "equity": start_equity}]
     
-    slippage_pct = getattr(config, 'BACKTEST_SLIPPAGE_PCT', 0.05) / 100.0
+    slippage_pct = getattr(config, 'BACKTEST_SLIPPAGE_FRAC', getattr(config, 'BACKTEST_SLIPPAGE_PCT', 0.0005))
     commission = getattr(config, 'BACKTEST_COMMISSION_PER_TRADE', 1.00)
     
     last_date = None
@@ -379,18 +379,29 @@ def run_backtest(symbol: str, strategy_name: str, lookback_days: int = 5, overri
     }
 
 
-def run_portfolio_backtest(symbols: List[str], strategy_name: str, lookback_days: int = 5, override_min_confidence: float = None, plot: bool = False) -> dict:
-    logger.info(f"Running PORTFOLIO backtest for {len(symbols)} symbols using {strategy_name}")
+def run_portfolio_backtest(
+    symbols: List[str],
+    strategy_name: str,
+    lookback_days: int = 5,
+    override_min_confidence: float = None,
+    plot: bool = False,
+    live_parity: bool = True,
+    data_dict: dict = None,
+) -> dict:
+    logger.info(f"Running PORTFOLIO backtest for {len(symbols)} symbols using {strategy_name} (live_parity={live_parity})")
     
-    strategies = {
+    strategies_map = {
         "ORB": ORBStrategy(),
         "VWAP_BOUNCE": VWAPBounceStrategy(),
         "GAP_AND_GO": GapAndGoStrategy(),
         "MOMENTUM_SCALP": MomentumScalpStrategy(),
         "CANDLESTICK": CandlestickPatternStrategy()
     }
-    strategy = strategies.get(strategy_name.upper())
-    if not strategy:
+
+    is_live_mix = strategy_name.upper() in {"LIVE_MIX", "ALL_STRATEGIES", "MIX"}
+    strategy = None if is_live_mix else strategies_map.get(strategy_name.upper())
+    
+    if not is_live_mix and not strategy:
         logger.error(f"Unknown strategy: {strategy_name}")
         return {
             "total_trades": 0, "win_rate": 0.0, "net_pnl": 0.0, "wins": 0, "losses": 0,
@@ -399,20 +410,23 @@ def run_portfolio_backtest(symbols: List[str], strategy_name: str, lookback_days
         
     if override_min_confidence is not None:
         min_confidence = override_min_confidence
-    else:
+    elif strategy:
         min_confidence = _minimum_confidence_for(strategy)
+    else:
+        min_confidence = 0.65
 
-    # Load data
-    from strategies.indicators import add_all_indicators
-    data_dict = {}
-    for sym in symbols:
-        df = fetch_intraday_yfinance(sym, lookback_days=lookback_days)
-        if not df.empty:
-            df = add_all_indicators(df)
-            data_dict[sym] = df
+    # Load data if not pre-cached
+    if data_dict is None:
+        from strategies.indicators import add_all_indicators
+        data_dict = {}
+        for sym in symbols:
+            df = fetch_intraday_yfinance(sym, lookback_days=lookback_days)
+            if not df.empty:
+                df = add_all_indicators(df)
+                data_dict[sym] = df
             
     if not data_dict:
-        logger.error("No data fetched for any symbol.")
+        logger.error("No data available for any symbol.")
         return {
             "total_trades": 0, "win_rate": 0.0, "net_pnl": 0.0, "wins": 0, "losses": 0,
             "profit_factor": 0.0, "avg_win": 0.0, "avg_loss": 0.0
@@ -426,8 +440,8 @@ def run_portfolio_backtest(symbols: List[str], strategy_name: str, lookback_days
     start_equity = 100_000.0
     current_equity = start_equity
     
-    max_positions = getattr(config, 'PORTFOLIO_MAX_POSITIONS', 5)
-    slippage_pct = getattr(config, 'BACKTEST_SLIPPAGE_PCT', 0.05) / 100.0
+    max_positions = getattr(config, 'PORTFOLIO_MAX_POSITIONS', 3)
+    slippage_pct = getattr(config, 'BACKTEST_SLIPPAGE_FRAC', getattr(config, 'BACKTEST_SLIPPAGE_PCT', 0.0005))
     commission = getattr(config, 'BACKTEST_COMMISSION_PER_TRADE', 1.00)
     alloc_pct = getattr(config, "PORTFOLIO_ALLOCATION_PER_TRADE", 0.20)
     
@@ -439,12 +453,17 @@ def run_portfolio_backtest(symbols: List[str], strategy_name: str, lookback_days
     day_opening_equity = start_equity
     mock_executions = []
     trade_id_counter = 0
+
+    # Live Parity state tracking
+    last_symbol_loss_time = {}
+    symbol_consecutive_losses = {}
     
     for t in all_times:
         current_date = t.date()
         if last_date is None or current_date != last_date:
             day_opening_equity = current_equity
             last_date = current_date
+            symbol_consecutive_losses = {} # Reset per-symbol loss counts on new day
 
         # 1. Check Exits using t-1 stop
         exited_symbols = []
@@ -482,6 +501,15 @@ def run_portfolio_backtest(symbols: List[str], strategy_name: str, lookback_days
                 trade['realized_pnl'] = realized_pnl
                 trades.append(trade)
                 exited_symbols.append(sym)
+
+                # Parity state updates
+                if live_parity:
+                    if realized_pnl < 0:
+                        last_symbol_loss_time[sym] = t
+                        symbol_consecutive_losses[sym] = symbol_consecutive_losses.get(sym, 0) + 1
+                    else:
+                        symbol_consecutive_losses[sym] = 0
+                        last_symbol_loss_time.pop(sym, None)
                 
                 # Append exit mock execution
                 mock_executions.append({
@@ -495,7 +523,7 @@ def run_portfolio_backtest(symbols: List[str], strategy_name: str, lookback_days
                 })
                 continue
                 
-            # Update Trailing Stop at end of bar
+            # Update Trailing Stop at end of bar using risk_math
             bar_atr = row.get('atr')
             if bar_atr is not None and not np.isnan(bar_atr) and bar_atr > 0:
                 use_atr = bar_atr
@@ -543,36 +571,53 @@ def run_portfolio_backtest(symbols: List[str], strategy_name: str, lookback_days
                     daily_loss_hit = True
                     
             if not daily_loss_hit:
+                # Check portfolio-level max trades per day
+                today_trades_count = len([tr for tr in trades if tr['exit_time'].date() == current_date])
+                if live_parity and today_trades_count >= getattr(config, "MAX_TRADES_PER_DAY", 15):
+                    continue
+
                 for sym, df in data_dict.items():
+                    if len(active_positions) >= max_positions:
+                        break
                     if sym in active_positions: continue
                     if t not in df.index: continue
                     
                     current_df = df.loc[:t]
                     if len(current_df) < 30: continue
-                    
-                    # Check Consecutive Losses rule (Chronologically sorted)
-                    sorted_trades = sorted(trades, key=lambda x: x['exit_time'])
-                    consecutive_losses = 0
-                    for t_rec in reversed(sorted_trades):
-                        if t_rec['exit_time'].date() != current_date:
-                            break
-                        if t_rec.get('realized_pnl', 0.0) < 0:
-                            consecutive_losses += 1
-                        else:
-                            break
-                    if consecutive_losses >= getattr(config, "MAX_CONSECUTIVE_LOSSES", 3):
-                        break # Block remaining portfolio entry attempts
-                        
-                    # Check PDT rule
-                    day_trades_count = count_day_trades_in_records(mock_executions, current_date)
-                    if getattr(config, "PDT_ENABLED", True) and current_equity < getattr(config, "PDT_MIN_EQUITY", 25000.0):
-                        if day_trades_count >= getattr(config, "PDT_MAX_DAY_TRADES_5_DAYS", 3):
+
+                    if live_parity:
+                        # Check correlated tech cluster exposure cap (Option A Parity)
+                        from strategies.intraday_risk import check_correlated_cluster_exposure
+                        if check_correlated_cluster_exposure(list(active_positions.keys()), sym):
                             continue
-                            
-                    signal = strategy.evaluate(sym, current_df)
-                    if signal and signal.confidence >= min_confidence:
-                        entry_price = signal.entry_price
-                        entry_price = entry_price * (1 + slippage_pct) if signal.side == 'BUY' else entry_price * (1 - slippage_pct)
+
+                        # Check 5-min symbol cooldown on loss
+                        if last_loss := last_symbol_loss_time.get(sym):
+                            if (t - last_loss).total_seconds() / 60.0 < getattr(config, "REENTRY_COOLDOWN_MINUTES", 5):
+                                continue
+                        # Check 2-loss blacklist per symbol
+                        if symbol_consecutive_losses.get(sym, 0) >= getattr(config, "MAX_SYMBOL_CONSECUTIVE_LOSSES", 2):
+                            continue
+
+                    # Evaluate signal(s)
+                    best_signal = None
+                    if is_live_mix:
+                        candidates_signals = []
+                        for s_inst in strategies_map.values():
+                            sig = s_inst.evaluate(sym, current_df)
+                            if sig and sig.confidence >= min_confidence:
+                                candidates_signals.append(sig)
+                        if candidates_signals:
+                            candidates_signals.sort(key=lambda s: s.confidence, reverse=True)
+                            best_signal = candidates_signals[0]
+                    else:
+                        sig = strategy.evaluate(sym, current_df)
+                        if sig and sig.confidence >= min_confidence:
+                            best_signal = sig
+
+                    if best_signal:
+                        entry_price = best_signal.entry_price
+                        entry_price = entry_price * (1 + slippage_pct) if best_signal.side == 'BUY' else entry_price * (1 - slippage_pct)
                         
                         # Apply Sizing Parity
                         sizing_method = getattr(config, "SIZING_METHOD", "risk_based")
@@ -580,12 +625,12 @@ def run_portfolio_backtest(symbols: List[str], strategy_name: str, lookback_days
                             risk_pct = getattr(config, "MAX_RISK_PER_TRADE_PCT", 1.0) / 100.0
                             max_trade_val = getattr(config, "MAX_TRADE_VALUE", None)
                             max_pos_pct = getattr(config, "MAX_POSITION_PCT", None)
-                            math_side = "LONG" if signal.side == "BUY" else "SHORT"
+                            math_side = "LONG" if best_signal.side == "BUY" else "SHORT"
                             shares = risk_math.shares_for_risk(
                                 account_equity=current_equity,
                                 risk_pct=risk_pct,
                                 entry_price=entry_price,
-                                stop_price=signal.stop_price,
+                                stop_price=best_signal.stop_price,
                                 side=math_side,
                                 max_trade_value=max_trade_val,
                                 max_position_pct=max_pos_pct
@@ -604,13 +649,15 @@ def run_portfolio_backtest(symbols: List[str], strategy_name: str, lookback_days
                         active_positions[sym] = {
                             'id': trade_id_counter,
                             'symbol': sym,
-                            'side': signal.side,
+                            'side': best_signal.side,
                             'shares': shares,
                             'entry': entry_price,
-                            'stop': signal.stop_price,
-                            'target': signal.target_price,
+                            'stop': best_signal.stop_price,
+                            'target': best_signal.target_price,
+                            'peak': entry_price,
                             'entry_time': t,
-                            'reason': signal.reason
+                            'strategy': getattr(best_signal, "strategy", strategy_name),
+                            'reason': best_signal.reason
                         }
                         
                         # Append entry mock execution
@@ -620,7 +667,7 @@ def run_portfolio_backtest(symbols: List[str], strategy_name: str, lookback_days
                             "type": "FILL",
                             "execution_id": f"backtest-entry-{trade_id_counter}",
                             "qty": float(shares),
-                            "side": "BUY" if signal.side == "BUY" else "SELL",
+                            "side": "BUY" if best_signal.side == "BUY" else "SELL",
                             "symbol": sym
                         })
                         
@@ -726,5 +773,6 @@ def run_portfolio_backtest(symbols: List[str], strategy_name: str, lookback_days
         "ending_equity": current_equity,
         "profit_factor": profit_factor,
         "avg_win": avg_win,
-        "avg_loss": avg_loss
+        "avg_loss": avg_loss,
+        "trades": trades,
     }
