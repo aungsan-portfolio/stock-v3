@@ -57,7 +57,8 @@ def record_trade(day: str | None = None) -> int:
 
 def loss_breached(start_equity: float, current_equity: float) -> bool:
     """Return True when the configured daily loss limit has been exceeded."""
-    return (float(start_equity) - float(current_equity)) >= float(config.MAX_DAILY_LOSS_USD)
+    limit = getattr(config, "MAX_DAILY_LOSS_SWING", getattr(config, "MAX_DAILY_LOSS_USD", 150.0))
+    return (float(start_equity) - float(current_equity)) >= float(limit)
 
 
 # ── Phase 3 (H1): start-of-day equity snapshot for the daily-loss kill-switch ──

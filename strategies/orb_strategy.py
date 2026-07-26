@@ -25,7 +25,8 @@ class ORBStrategy(BaseStrategy):
         if len(df) < config.ORB_WINDOW_MINUTES + 5:
             return None
 
-        df = add_all_indicators(df)
+        if "atr" not in df.columns or "orb_high" not in df.columns:
+            df = add_all_indicators(df)
 
         orb_high = df["orb_high"].iloc[-1]
         orb_low = df["orb_low"].iloc[-1]
