@@ -112,7 +112,8 @@ class MockIB:
             return res
         except Exception as exc:
             logger.error("MockIB.positions() failed: %s", exc)
-            return []
+            self.bridge._conn_health.mark_unhealthy(f"MockIB.positions error: {exc}")
+            raise RuntimeError(f"Alpaca API outage while fetching positions: {exc}")
 
     def openTrades(self) -> List[MockOrder]:
         try:
@@ -705,7 +706,7 @@ class AlpacaBridge:
         except Exception as exc:
             logger.error("positions_plain failed: %s", exc)
             self._conn_health.mark_unhealthy(f"positions_plain error: {exc}")
-            return []
+            raise RuntimeError(f"Alpaca API outage while fetching positions: {exc}")
 
     def working_orders_plain(self) -> list:
         # Returns list of plain dicts for live_invariants and reconciliation

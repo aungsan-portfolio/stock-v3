@@ -292,7 +292,9 @@ def evaluate_and_execute(
                 broker_fetch_ok = False
 
     current_pnl = broker_pnl if live_paper else today_pnl()
-    if getattr(bridge, "_daytrade_suspended", False) is True:
+    gate = getattr(bridge, "entry_gate", None)
+    if (gate is not None and getattr(gate, "halted", False) is True) or getattr(bridge, "_daytrade_suspended", False) is True:
+        logger.warning("Entry gate is HALTED or daytrade is suspended — skipping NEW entries this cycle")
         allow_new_entries = False
 
     if (

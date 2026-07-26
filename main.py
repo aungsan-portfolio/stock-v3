@@ -2598,6 +2598,15 @@ def cmd_daytrade_bot(args) -> int:
     if not bridge.connect():
         print("  ERROR: Cannot connect to Alpaca paper broker.\n")
         sys.exit(1)
+
+    try:
+        recon = bridge.reconcile_startup_state()
+        _print_startup_reconciliation(recon)
+        if recon.get("halt_new_entries") or getattr(bridge.entry_gate, "halted", False):
+            print("  WARNING: Startup reconciliation halted new entries.\n")
+    except Exception as recon_err:
+        print(f"  WARNING: Startup reconciliation failed: {recon_err}. Halting new entries.")
+        bridge.entry_gate.halt("Startup reconciliation failure")
             
     watchlist = list(getattr(config, "DAYTRADE_WATCHLIST", []))
     use_dynamic_scanner = getattr(config, "USE_DYNAMIC_SCANNER", True)
