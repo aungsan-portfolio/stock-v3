@@ -261,13 +261,23 @@ def _print_startup_reconciliation(recon: dict) -> None:
         print(f"Orphan exit order(s) with no covering long: {orphan_syms}")
 
 
-def _place_paper_orders(signals) -> int:
-    """Place signals on the IBKR PAPER account via the existing IBKRBridge.
+def _place_paper_orders(signals, broker: str = "ibkr") -> int:
+    """Place signals on the PAPER account via IBKRBridge or AlpacaBridge."""
+    if str(broker).lower() == "alpaca":
+        from alpaca_bridge import AlpacaBridge
+        bridge = AlpacaBridge()
+        if not bridge.connect():
+            print("❌ Could not connect to Alpaca Paper Broker.")
+            return 1
+        try:
+            result = bridge.execute_all(signals)
+            print(f"\n✅ Orders accepted : {result.get('placed', 0)}")
+            print(f"   Skipped         : {result.get('skipped', 0)}")
+            print(f"   Total signals   : {result.get('total', len(signals))}")
+        finally:
+            bridge.disconnect()
+        return 0
 
-    All existing risk controls (paper-port lock, long-only, position/trade caps,
-    duplicate-order guard) live inside IBKRBridge and are intentionally NOT
-    bypassed here. Returns a process exit code.
-    """
     # Windows asyncio policy fix for ib_insync.
     import asyncio
     if sys.platform == "win32" and hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
@@ -286,13 +296,13 @@ def _place_paper_orders(signals) -> int:
     try:
         from ibkr_bridge import IBKRBridge
     except ImportError:
-        print("âŒ ib_insync not installed. Run: pip install ib_insync")
+        print("â Œ ib_insync not installed. Run: pip install ib_insync")
         return 2
 
     bridge = IBKRBridge()
     if not bridge.connect():
         print(
-            "âŒ Could not connect to IBKR TWS.\n"
+            "â Œ Could not connect to IBKR TWS.\n"
             "   Ensure TWS/Gateway is running on port 7497 (paper).\n"
             "   Settings â†’ API â†’ Enable Socket Clients â†’ Port 7497"
         )
@@ -325,10 +335,11 @@ def cmd_paper(args) -> int:
         print(f"{icon} {s.symbol:<6}  {s.action:<6}  {s.confidence:>5.2f}  ${s.price:>9.2f}")
 
     if args.dry_run:
-        print("\nâš ï¸  Dry-run mode â€” no orders placed.")
+        print("\nâš ï¸   Dry-run mode â€” no orders placed.")
         return 0
 
-    return _place_paper_orders(signals)
+    broker = getattr(args, "broker", "ibkr")
+    return _place_paper_orders(signals, broker=broker)
 
 
 # â”€â”€ Full-market hot scanner commands â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -2854,8 +2865,9 @@ def main() -> int:
              "on/after this date (YYYY-MM-DD)",
     )
 
-    pp = sub.add_parser("paper", help="Execute signals on IBKR paper")
+    pp = sub.add_parser("paper", help="Execute signals on paper trading broker")
     pp.add_argument("--dry-run", action="store_true", help="Preview signals without placing orders")
+    pp.add_argument("--broker", choices=["ibkr", "alpaca"], default="ibkr", help="Broker for paper orders (default: ibkr)")
 
     # â”€â”€ Full-market hot scanner subcommands â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _add_hot_flags(p, with_execute: bool = False) -> None:
