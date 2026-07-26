@@ -2609,6 +2609,7 @@ def cmd_daytrade_bot(args) -> int:
         bridge.entry_gate.halt("Startup reconciliation failure")
             
     watchlist = list(getattr(config, "DAYTRADE_WATCHLIST", []))
+    last_known_open_symbols = []
     use_dynamic_scanner = getattr(config, "USE_DYNAMIC_SCANNER", True)
     bg_scanner = None
 
@@ -2698,8 +2699,11 @@ def cmd_daytrade_bot(args) -> int:
                     open_symbols = [p.contract.symbol for p in open_positions]
                 elif hasattr(bridge, "positions_plain"):
                     open_symbols = [p["symbol"] for p in bridge.positions_plain()]
+                if open_symbols:
+                    last_known_open_symbols = list(open_symbols)
             except Exception as exc:
-                print(f"Error fetching open positions for watchlist union: {exc}")
+                print(f"Error fetching open positions for watchlist union: {exc}. Using cached open_symbols.")
+                open_symbols = list(last_known_open_symbols)
             
             if open_symbols:
                 watchlist = list(set(watchlist) | set(open_symbols))

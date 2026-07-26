@@ -815,8 +815,10 @@ class AlpacaBridge:
     def flatten_all(self, confirm: bool = False) -> dict:
         self._require_connection()
         logger.info("Flattening all positions and orders on Alpaca paper account")
+        closed_count = 0
+        failed_symbols = []
         try:
-            # Cancel all orders
+            # 1. Cancel all active orders
             try:
                 self._client.cancel_orders()
             except Exception as e:
@@ -827,14 +829,58 @@ class AlpacaBridge:
                         self._client.cancel_order_by_id(str(o.id))
                     except Exception as inner_e:
                         logger.error("Failed to cancel order %s: %s", o.id, inner_e)
-            # Close all positions
-            positions = self._client.get_all_positions()
+
+            # 2. Close all positions with per-symbol retry
+            positions = []
+            try:
+                positions = self._client.get_all_positions()
+            except Exception as p_err:
+                logger.error("flatten_all: Failed to fetch positions: %s", p_err)
+                try:
+                    alerts.send_alert(f"🚨 CRITICAL: flatten_all failed to fetch positions from Alpaca: {p_err}", level="ERROR")
+                except Exception:
+                    pass
+                return {"status": "error", "message": str(p_err), "positions_closed": 0}
+
             for p in positions:
-                self._client.close_position(p.symbol)
-            return {"status": "success", "positions_closed": len(positions)}
+                symbol = p.symbol.upper().strip()
+                close_success = False
+                for attempt in range(3):
+                    try:
+                        self._client.close_position(symbol)
+                        close_success = True
+                        closed_count += 1
+                        logger.info("Successfully closed position %s on attempt %d", symbol, attempt + 1)
+                        break
+                    except Exception as c_err:
+                        logger.warning("Attempt %d to close position %s failed: %s", attempt + 1, symbol, c_err)
+                        time.sleep(0.5)
+
+                if not close_success:
+                    failed_symbols.append(symbol)
+                    logger.error("CRITICAL: Failed to close position %s after 3 attempts", symbol)
+
+            # 3. Verification scan
+            remaining_positions = []
+            try:
+                remaining_positions = [p for p in self._client.get_all_positions() if float(p.qty) != 0]
+            except Exception:
+                pass
+
+            if failed_symbols or remaining_positions:
+                rem_syms = failed_symbols or [p.symbol for p in remaining_positions]
+                msg = f"🚨 CRITICAL FLATTEN ALERT: Failed to close positions for: {rem_syms}"
+                logger.error(msg)
+                try:
+                    alerts.send_alert(msg, level="ERROR")
+                except Exception:
+                    pass
+                return {"status": "partial", "positions_closed": closed_count, "failed_symbols": rem_syms}
+
+            return {"status": "success", "positions_closed": closed_count, "failed_symbols": []}
         except Exception as exc:
             logger.error("flatten_all failed: %s", exc)
-            return {"status": "error", "message": str(exc)}
+            return {"status": "error", "message": str(exc), "positions_closed": closed_count}
 
     def graceful_shutdown(self) -> dict:
         self._require_connection()

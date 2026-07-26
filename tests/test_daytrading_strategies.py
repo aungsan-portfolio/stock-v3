@@ -1018,6 +1018,69 @@ def test_regression_c2_canonical_slot_cap_single_source():
     assert getattr(config, "PORTFOLIO_MAX_POSITIONS", None) == 5
 
 
+def test_regression_outage_positions_raise_fail_closed():
+    """Regression test: verify API outage during position fetch causes order_manager to fail-closed reject trade."""
+    from unittest import mock
+    from strategies.base import TradeSignal
+    from strategies.order_manager import execute_signal
+    
+    bridge = mock.MagicMock()
+    bridge.is_connected = True
+    bridge.positions_plain.side_effect = RuntimeError("Alpaca API Outage")
+    bridge.get_positions.side_effect = RuntimeError("Alpaca API Outage")
+    
+    sig = TradeSignal(
+        symbol="AAPL", side="BUY", entry_price=100.0, stop_price=90.0, target_price=120.0,
+        risk_per_share=10.0, confidence=0.85, strategy="ORB", atr=1.0, reason=""
+    )
+    
+    res = execute_signal(sig, bridge=bridge, equity=100000.0, current_pnl=0.0, dry_run=False)
+    assert res["status"] == "REJECTED"
+    assert "Risk guard failure" in res["reason"]
+
+
+def test_regression_entry_gate_halted_blocks_new_entries(monkeypatch):
+    """Regression test: verify entry_gate.halted=True forces allow_new_entries=False in orchestrator."""
+    from unittest import mock
+    from strategies.orchestrator import evaluate_and_execute
+    import strategies.orchestrator
+    
+    bridge = mock.MagicMock()
+    bridge.is_connected = True
+    bridge.entry_gate = mock.MagicMock()
+    bridge.entry_gate.halted = True
+    bridge.get_net_liquidation.return_value = 100000.0
+    bridge.account_daily_pnl.return_value = 0.0
+    
+    executed_signals = []
+    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run):
+        executed_signals.append(signal)
+        return {"status": "DRY_RUN", "reason": "Mocked execution"}
+        
+    monkeypatch.setattr(strategies.orchestrator, "execute_signal", mock_execute)
+    monkeypatch.setattr(strategies.orchestrator, "today_pnl", lambda: 0.0)
+    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda: 0)
+    
+    strategies.orchestrator._last_evaluated_5m_bar_str = None
+    evaluate_and_execute(["AAPL"], bridge, live_paper=True)
+    assert len(executed_signals) == 0  # Blocked because entry_gate.halted is True
+
+
+def test_regression_ensure_protective_stops_error_halts_entry_gate():
+    """Regression test: verify position fetch failure during protective stop scan halts entry gate."""
+    from unittest import mock
+    from alpaca_bridge import AlpacaBridge
+    
+    bridge = AlpacaBridge()
+    bridge._connected = True
+    bridge._client = mock.MagicMock()
+    bridge._client.get_all_positions.side_effect = RuntimeError("API Outage")
+    
+    report = bridge.ensure_protective_stops()
+    assert "PORTFOLIO_FETCH_ERROR" in report["failed"]
+    assert bridge.entry_gate.halted is True
+
+
 
 
 

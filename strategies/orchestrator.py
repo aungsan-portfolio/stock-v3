@@ -399,7 +399,7 @@ def evaluate_and_execute(
     if live_paper:
         if not broker_fetch_ok:
             _consecutive_broker_failures += 1
-            limit = getattr(config, "CONSECUTIVE_OUTAGE_LIMIT", 10)
+            limit = getattr(config, "CONSECUTIVE_OUTAGE_LIMIT", 3)
             if _consecutive_broker_failures == limit:
                 msg = f"🚨 [OUTAGE ALERT] Daytrading bot has encountered {limit} consecutive broker communication failures/outages. New entries are blocked."
                 logger.critical(msg)
