@@ -16,6 +16,9 @@ from strategies.gap_strategy import GapAndGoStrategy
 from strategies.momentum_strategy import MomentumScalpStrategy
 from strategies.candlestick_strategy import CandlestickPatternStrategy
 from strategies.trade_journal import count_day_trades_in_records
+from strategies.position_sizer import calculate_shares
+from strategies.scoring import RiskAdjustedSignalScorer
+from strategies.session import should_flatten
 
 logger = logging.getLogger(__name__)
 
@@ -233,27 +236,39 @@ def run_backtest(symbol: str, strategy_name: str, lookback_days: int = 5, overri
                     
             # Check Strategy Entry Signal
             signal = strategy.evaluate(symbol, current_df)
+            if signal:
+                # Apply RiskAdjustedSignalScorer confidence parity (C4)
+                try:
+                    scorer = RiskAdjustedSignalScorer()
+                    score = scorer.score_signal(signal)
+                    signal.confidence = score.final_confidence
+                except Exception:
+                    pass
+
             if signal and signal.confidence >= min_confidence:
                 # Apply slippage to entry price
                 entry_price = signal.entry_price
                 entry_price = entry_price * (1 + slippage_pct) if signal.side == 'BUY' else entry_price * (1 - slippage_pct)
                 
-                # Apply Sizing Parity
+                # Apply Sizing Parity (C3)
                 sizing_method = getattr(config, "SIZING_METHOD", "risk_based")
                 if sizing_method == "risk_based":
-                    risk_pct = getattr(config, "MAX_RISK_PER_TRADE_PCT", 1.0) / 100.0
-                    max_trade_val = getattr(config, "MAX_TRADE_VALUE", None)
-                    max_pos_pct = getattr(config, "MAX_POSITION_PCT", None)
-                    math_side = "LONG" if signal.side == "BUY" else "SHORT"
-                    shares = risk_math.shares_for_risk(
-                        account_equity=current_equity,
-                        risk_pct=risk_pct,
-                        entry_price=entry_price,
-                        stop_price=signal.stop_price,
-                        side=math_side,
-                        max_trade_value=max_trade_val,
-                        max_position_pct=max_pos_pct
-                    )
+                    try:
+                        shares = calculate_shares(signal, current_equity, getattr(strategy, "name", "ORB"))
+                    except Exception:
+                        risk_pct = getattr(config, "MAX_RISK_PER_TRADE_PCT", 1.0) / 100.0
+                        max_trade_val = getattr(config, "MAX_TRADE_VALUE", None)
+                        max_pos_pct = getattr(config, "MAX_POSITION_PCT", None)
+                        math_side = "LONG" if signal.side == "BUY" else "SHORT"
+                        shares = risk_math.shares_for_risk(
+                            account_equity=current_equity,
+                            risk_pct=risk_pct,
+                            entry_price=entry_price,
+                            stop_price=signal.stop_price,
+                            side=math_side,
+                            max_trade_value=max_trade_val,
+                            max_position_pct=max_pos_pct
+                        )
                 elif sizing_method == "fixed_dollars":
                     dollar_amount = getattr(config, "FIXED_DOLLAR_AMOUNT", 1000.0)
                     shares = math.floor(dollar_amount / entry_price)

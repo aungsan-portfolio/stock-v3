@@ -526,6 +526,8 @@ def test_orchestrator_skips_active_and_pending_symbols(monkeypatch):
     # Mock bridge
     bridge_mock = mock.MagicMock()
     bridge_mock.is_connected = True
+    bridge_mock.get_net_liquidation.return_value = 100000.0
+    bridge_mock.account_daily_pnl.return_value = 0.0
     bridge_mock.market_price.return_value = 100.0
     
     # AAPL has position
@@ -1006,7 +1008,7 @@ def test_regression_c6_orb_new_york_nan_masking():
     
     # Post-09:45 AM NY bar (13:45 UTC and later) should have valid numeric ORB high/low
     assert not np.isnan(res["orb_high"].iloc[3])
-    assert res["orb_high"].iloc[3] == 104.0  # Max high of bars up to 13:45
+    assert res["orb_high"].iloc[3] == 103.0  # Max high of bars strictly within ORB window (13:30, 13:35, 13:40)
 
 
 def test_regression_c2_canonical_slot_cap_single_source():

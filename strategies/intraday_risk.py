@@ -98,6 +98,10 @@ def get_recent_symbol_loss_time(symbol: str, journal_file=None) -> Optional[date
                 journal_time = closed_at
 
     if mem_time and journal_time:
+        if mem_time.tzinfo is None:
+            mem_time = mem_time.replace(tzinfo=timezone.utc)
+        if journal_time.tzinfo is None:
+            journal_time = journal_time.replace(tzinfo=timezone.utc)
         return max(mem_time, journal_time)
     return mem_time or journal_time
 

@@ -153,7 +153,7 @@ def add_opening_range(df: pd.DataFrame, orb_minutes: int = None) -> pd.DataFrame
 
         day_start = regular_bars.index[0]
         orb_end = day_start + pd.Timedelta(minutes=orb_minutes)
-        orb_bars = day_df.loc[(day_df.index >= day_start) & (day_df.index <= orb_end)]
+        orb_bars = day_df.loc[(day_df.index >= day_start) & (day_df.index < orb_end)]
 
         if not orb_bars.empty:
             orb_h = orb_bars["high"].max()

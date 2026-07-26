@@ -268,20 +268,14 @@ def evaluate_and_execute(
     if bridge and is_connected:
         try:
             cached_open_positions = bridge.ib.positions()
-            try:
-                raw_equity = bridge.get_net_liquidation()
-                equity = float(raw_equity) if not hasattr(raw_equity, "mock_calls") else 100000.0
-            except Exception:
-                equity = 100000.0
+            equity = float(bridge.get_net_liquidation())
 
             if hasattr(bridge, "account_daily_pnl"):
-                raw_pnl = bridge.account_daily_pnl()
-                broker_pnl = float(raw_pnl) if not hasattr(raw_pnl, "mock_calls") else (today_pnl() or 0.0)
+                broker_pnl = float(bridge.account_daily_pnl())
             elif hasattr(bridge, "daily_pnl"):
-                raw_pnl = bridge.daily_pnl()
-                broker_pnl = float(raw_pnl) if not hasattr(raw_pnl, "mock_calls") else (today_pnl() or 0.0)
+                broker_pnl = float(bridge.daily_pnl())
             else:
-                broker_pnl = today_pnl() or 0.0
+                broker_pnl = today_pnl()
             if hasattr(bridge, "sync_today_trades_to_journal"):
                 try:
                     bridge.sync_today_trades_to_journal()
