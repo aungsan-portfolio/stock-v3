@@ -213,7 +213,12 @@ def execute_signal(
     open_syms = []
     if is_connected:
         try:
-            get_pos_fn = getattr(bridge, "get_positions", None) or getattr(bridge, "get_open_positions", None)
+            get_pos_fn = (
+                getattr(bridge, "get_positions", None)
+                or getattr(bridge, "get_open_positions", None)
+                or getattr(bridge, "positions_plain", None)
+                or (lambda: bridge.ib.positions() if hasattr(bridge, "ib") else None)
+            )
             if not callable(get_pos_fn):
                 err_msg = "Risk guard failure: Broker bridge missing position retrieval method"
                 logger.error(f"[FAIL-LOUD RISK GUARD] {err_msg}")

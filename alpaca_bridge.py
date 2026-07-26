@@ -688,6 +688,14 @@ class AlpacaBridge:
         pass
 
     # ── Reconciliation & Flattening ──────────────────────────────
+    def get_positions(self) -> list:
+        """Return position objects (MockPosition) compatible with IBKR/OrderManager interface."""
+        return self.ib.positions()
+
+    def get_open_positions(self) -> list:
+        """Alias for get_positions for OrderManager risk check compatibility."""
+        return self.get_positions()
+
     def positions_plain(self) -> list:
         # Returns list of plain dicts for live_invariants and reconciliation
         self._require_connection()
@@ -696,6 +704,7 @@ class AlpacaBridge:
             return [{"symbol": p.symbol, "qty": float(p.qty)} for p in al_positions]
         except Exception as exc:
             logger.error("positions_plain failed: %s", exc)
+            self._conn_health.mark_unhealthy(f"positions_plain error: {exc}")
             return []
 
     def working_orders_plain(self) -> list:
@@ -760,6 +769,8 @@ class AlpacaBridge:
             positions = self._client.get_all_positions()
         except Exception as exc:
             logger.warning("Could not read positions for startup protection scan: %s", exc)
+            self.entry_gate.halt()
+            report["failed"].append("PORTFOLIO_FETCH_ERROR")
             return report
 
         working = self.working_orders_plain()
