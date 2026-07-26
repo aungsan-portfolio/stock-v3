@@ -266,10 +266,20 @@ def _place_paper_orders(signals, broker: str = "ibkr") -> int:
     if str(broker).lower() == "alpaca":
         from alpaca_bridge import AlpacaBridge
         bridge = AlpacaBridge()
+        print(f"\n{'='*60}")
+        print("  SWING TRADING ENGINE (ALPACA SWING SUB-ACCOUNT)")
+        print(f"{'='*60}\n")
         if not bridge.connect():
             print("❌ Could not connect to Alpaca Paper Broker.")
             return 1
         try:
+            try:
+                acct_equity = bridge.get_net_liquidation()
+                print(f"  Connected to Alpaca Paper Account | Status: ACTIVE | Equity: ${acct_equity:,.2f}")
+                print(f"  Open Positions: {bridge.open_position_count()}\n")
+            except Exception as e:
+                print(f"  Connected to Alpaca Paper Account | Equity fetch info: {e}\n")
+
             result = bridge.execute_all(signals)
             print(f"\n✅ Orders accepted : {result.get('placed', 0)}")
             print(f"   Skipped         : {result.get('skipped', 0)}")
