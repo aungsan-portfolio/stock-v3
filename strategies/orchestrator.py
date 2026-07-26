@@ -268,17 +268,21 @@ def evaluate_and_execute(
     if bridge and is_connected:
         try:
             cached_open_positions = bridge.ib.positions()
-            equity = bridge.get_net_liquidation()
+            equity = float(bridge.get_net_liquidation())
+
             if hasattr(bridge, "account_daily_pnl"):
-                broker_pnl = bridge.account_daily_pnl()
+                broker_pnl = float(bridge.account_daily_pnl())
             elif hasattr(bridge, "daily_pnl"):
-                broker_pnl = bridge.daily_pnl()
+                broker_pnl = float(bridge.daily_pnl())
             else:
                 broker_pnl = today_pnl()
             if hasattr(bridge, "sync_today_trades_to_journal"):
-                bridge.sync_today_trades_to_journal()
-                from strategies.trade_journal import auto_verify_first_trades
-                auto_verify_first_trades()
+                try:
+                    bridge.sync_today_trades_to_journal()
+                    from strategies.trade_journal import auto_verify_first_trades
+                    auto_verify_first_trades()
+                except Exception as sync_err:
+                    logger.warning("sync_today_trades_to_journal error: %s", sync_err)
             broker_state_available = True
         except Exception as e:
             logger.error(f"Failed to fetch Alpaca portfolio state: {e}")

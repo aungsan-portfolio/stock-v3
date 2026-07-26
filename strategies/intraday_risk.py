@@ -74,16 +74,89 @@ def get_consecutive_losses(journal_file=None) -> int:
     return consecutive_losses
 
 
+_RECENT_SYMBOL_LOSS_TIMESTAMPS: dict = {}
+
+
+def register_symbol_loss(symbol: str, timestamp: Optional[datetime] = None) -> None:
+    """Register an in-memory loss timestamp for a symbol to enforce re-entry cooldown instantly."""
+    ts = timestamp or datetime.now(timezone.utc)
+    _RECENT_SYMBOL_LOSS_TIMESTAMPS[symbol.upper().strip()] = ts
+    logger.info(f"Registered instant loss cooldown timestamp for {symbol} at {ts}")
+
+
 def get_recent_symbol_loss_time(symbol: str, journal_file=None) -> Optional[datetime]:
+    sym = symbol.upper().strip()
+    mem_time = _RECENT_SYMBOL_LOSS_TIMESTAMPS.get(sym)
+    
+    symbol_trades = [trade for trade in get_today_closed_trades(journal_file) if trade.get("symbol") == sym]
+    journal_time = None
+    if symbol_trades:
+        last_trade = symbol_trades[-1]
+        if float(last_trade.get("realized_pnl", 0.0) or 0.0) < 0:
+            closed_at = last_trade.get("closed_at")
+            if isinstance(closed_at, datetime):
+                journal_time = closed_at
+
+    if mem_time and journal_time:
+        if mem_time.tzinfo is None:
+            mem_time = mem_time.replace(tzinfo=timezone.utc)
+        if journal_time.tzinfo is None:
+            journal_time = journal_time.replace(tzinfo=timezone.utc)
+        return max(mem_time, journal_time)
+    return mem_time or journal_time
+
+
+def get_symbol_consecutive_losses(symbol: str, journal_file=None) -> int:
     symbol_trades = [trade for trade in get_today_closed_trades(journal_file) if trade.get("symbol") == symbol]
     if not symbol_trades:
-        return None
+        return 0
 
-    last_trade = symbol_trades[-1]
-    if float(last_trade.get("realized_pnl", 0.0) or 0.0) < 0:
-        closed_at = last_trade.get("closed_at")
-        if isinstance(closed_at, datetime):
-            return closed_at
+    grouped_cycles = []
+    current_group = []
+
+    for trade in symbol_trades:
+        if not current_group:
+            current_group.append(trade)
+            continue
+
+        last = current_group[-1]
+        same_entry = (
+            (trade.get("entry_order_id") and trade.get("entry_order_id") == last.get("entry_order_id"))
+            or (trade.get("signal_id") and trade.get("signal_id") == last.get("signal_id"))
+        )
+
+        if same_entry:
+            current_group.append(trade)
+        else:
+            grouped_cycles.append(current_group)
+            current_group = [trade]
+
+    if current_group:
+        grouped_cycles.append(current_group)
+
+    consecutive_losses = 0
+    for cycle in reversed(grouped_cycles):
+        cycle_pnl = sum(float(t.get("realized_pnl", 0.0) or 0.0) for t in cycle)
+        if cycle_pnl < 0:
+            consecutive_losses += 1
+        else:
+            break
+
+    return consecutive_losses
+
+
+TECH_CORRELATED_CLUSTER = {"NVDA", "AAPL", "MSFT", "AMZN", "TSLA", "META", "AMD", "GOOGL", "QQQ", "PLTR", "AVGO", "MU", "NFLX"}
+
+def check_correlated_cluster_exposure(open_symbols: list, new_symbol: str) -> Optional[str]:
+    """Prevent sector risk concentration by capping simultaneous open positions in the Tech correlated cluster."""
+    if not new_symbol or new_symbol.upper() not in TECH_CORRELATED_CLUSTER:
+        return None
+    
+    max_tech_open = getattr(config, "MAX_CORRELATED_TECH_POSITIONS", 2)
+    open_syms = [str(s).upper() for s in (open_symbols or [])]
+    tech_count = sum(1 for s in open_syms if s in TECH_CORRELATED_CLUSTER)
+    if tech_count >= max_tech_open:
+        return f"Correlated Tech Cluster Cap reached ({tech_count}/{max_tech_open}): Blocked {new_symbol} to prevent sector concentration risk"
     return None
 
 
@@ -96,10 +169,16 @@ def pre_trade_check(
     risk_dollars: float,
     symbol: Optional[str] = None,
     max_risk_pct: float = 1.0,
+    open_symbols: Optional[list] = None,
 ) -> str:
     """Run all risk checks before placing a trade."""
     if current_pnl is None:
         return "Current broker PnL unavailable; refusing new entries"
+
+    if symbol and open_symbols:
+        cluster_err = check_correlated_cluster_exposure(open_symbols, symbol)
+        if cluster_err:
+            return cluster_err
 
     if not check_daily_loss(current_pnl, equity):
         return f"Daily loss limit reached (PnL ${current_pnl:.2f})"
@@ -115,6 +194,9 @@ def pre_trade_check(
     if not check_max_positions(open_positions):
         return f"Max open positions reached ({open_positions}/{config.MAX_OPEN_POSITIONS})"
 
+    if symbol and open_symbols and symbol.upper().strip() in [str(s).upper().strip() for s in open_symbols]:
+        return f"Duplicate entry blocked: already holding {symbol}"
+
     if not check_pdt(day_trades_last_5_days, equity):
         return (
             f"PDT warning: {day_trades_last_5_days} day trades in 5 days, "
@@ -126,6 +208,12 @@ def pre_trade_check(
         return f"Flatten zone: {mins:.0f} min until close, no new entries"
 
     if symbol:
+        symbol_losses = get_symbol_consecutive_losses(symbol)
+        max_symbol_losses = getattr(config, "MAX_SYMBOL_CONSECUTIVE_LOSSES", 2)
+        if symbol_losses >= max_symbol_losses:
+            logger.info("Re-entry blocked for %s: consecutive loss limit reached (%d/%d)", symbol, symbol_losses, max_symbol_losses)
+            return f"Symbol consecutive loss limit reached for {symbol} ({symbol_losses}/{max_symbol_losses})"
+
         last_loss_time = get_recent_symbol_loss_time(symbol)
         if last_loss_time is not None:
             cooldown_minutes = getattr(config, "REENTRY_COOLDOWN_MINUTES", 5)

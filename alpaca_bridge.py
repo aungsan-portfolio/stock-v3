@@ -12,7 +12,7 @@ from typing import List, Optional
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce, QueryOrderStatus
-from alpaca.trading.requests import LimitOrderRequest, StopLossRequest, TakeProfitRequest, GetOrdersRequest
+from alpaca.trading.requests import LimitOrderRequest, StopLossRequest, TakeProfitRequest, GetOrdersRequest, MarketOrderRequest
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -456,11 +456,15 @@ class AlpacaBridge:
         return round(price * (1 + tp), 2) if action == "BUY" else round(price * (1 - tp), 2)
 
     # ── Placement & Execution ────────────────────────────────────
-    def _place_open_bracket(self, symbol: str, action: str, qty: int, price: float, confidence: float, strategy_name: str = "") -> order_exec.OrderResult:
+    def _place_open_bracket(
+        self, symbol: str, action: str, qty: int, price: float, confidence: float,
+        strategy_name: str = "", custom_stop_price: Optional[float] = None,
+        custom_target_price: Optional[float] = None
+    ) -> order_exec.OrderResult:
         self._require_connection()
         limit_price = self._limit_price(action, price)
-        stop_price = self._initial_stop_price(action, price)
-        take_profit_price = self._take_profit_price(action, price)
+        stop_price = custom_stop_price if custom_stop_price is not None else self._initial_stop_price(action, price)
+        take_profit_price = custom_target_price if custom_target_price is not None else self._take_profit_price(action, price)
         
         strat_tag = str(strategy_name or "UNKNOWN").replace("StrategyName.", "").upper()
         ts_suffix = str(int(time.time()))[-5:]
@@ -605,15 +609,16 @@ class AlpacaBridge:
         )
 
         try:
-            # Cancel working limit/stop orders first
-            self._cancel_symbol_working_orders(symbol)
+            # Cancel working limit/stop orders first and poll for cancellation confirmation
+            if not self._cancel_symbol_working_orders(symbol, timeout_seconds=10.0):
+                logger.error("Aborting close_position for %s: working order cancellation unconfirmed/timed out", symbol)
+                return order_exec.OrderResult(outcome=order_exec.REJECTED, status="CancellationTimeout", filled=0.0, remaining=float(qty))
             
             # Submit market order to close position
-            order = self._client.submit_order(LimitOrderRequest(
+            order = self._client.submit_order(MarketOrderRequest(
                 symbol=symbol, qty=qty,
                 side=OrderSide.BUY if action == "BUY" else OrderSide.SELL,
-                time_in_force=TimeInForce.GTC,
-                limit_price=round(price, 2),
+                time_in_force=TimeInForce.DAY,
                 client_order_id=client_order_id,
             ))
             
@@ -625,21 +630,44 @@ class AlpacaBridge:
             logger.error("close_position failed for %s: %s", symbol, exc)
             return order_exec.OrderResult(outcome=order_exec.REJECTED, status="Rejected", filled=0.0, remaining=float(qty))
 
-    def _cancel_symbol_working_orders(self, symbol: str) -> int:
-        canceled = 0
+    def _cancel_symbol_working_orders(self, symbol: str, timeout_seconds: float = 10.0) -> bool:
+        sym_upper = symbol.upper().strip()
+        active_statuses = {"new", "partially_filled", "submitted", "queued", "held", "accepted", "pending_new", "accepted_for_bidding", "stopped", "suspended", "calculated"}
+        
         try:
             al_orders = self._get_active_orders()
-            active_statuses = {"new", "partially_filled", "submitted", "queued", "held", "accepted", "pending_new", "accepted_for_bidding", "stopped", "suspended", "calculated"}
-            for o in al_orders:
-                raw_status = o.status.value if hasattr(o.status, "value") else str(o.status)
-                if raw_status.lower() not in active_statuses:
-                    continue
-                if o.symbol.upper().strip() == symbol.upper().strip():
-                    self._client.cancel_order_by_id(str(o.id))
-                    canceled += 1
+            matching_ids = [
+                str(o.id) for o in al_orders
+                if o.symbol.upper().strip() == sym_upper
+                and (o.status.value if hasattr(o.status, "value") else str(o.status)).lower() in active_statuses
+            ]
+            if not matching_ids:
+                return True
+
+            for oid in matching_ids:
+                try:
+                    self._client.cancel_order_by_id(oid)
+                except Exception as c_exc:
+                    logger.warning("Cancel request for order %s (%s) error: %s", oid, symbol, c_exc)
+
+            # Poll for cancellation confirmation with 10s timeout
+            start_time = time.time()
+            while time.time() - start_time < timeout_seconds:
+                remaining_orders = [
+                    o for o in self._get_active_orders()
+                    if o.symbol.upper().strip() == sym_upper
+                    and (o.status.value if hasattr(o.status, "value") else str(o.status)).lower() in active_statuses
+                ]
+                if not remaining_orders:
+                    return True
+                time.sleep(0.5)
+
+            logger.error("Timed out waiting for working order cancellation for %s after %.1fs", symbol, timeout_seconds)
+            alerts.send_alert(f"CRITICAL: Timed out canceling working orders for {symbol} before position close", level="CRITICAL")
+            return False
         except Exception as exc:
-            logger.error("cancel_symbol_working_orders failed: %s", exc)
-        return canceled
+            logger.error("cancel_symbol_working_orders failed for %s: %s", symbol, exc)
+            return False
 
     def _duplicate_ref_working(self, symbol: str, action: str) -> bool:
         ref = order_exec.deterministic_order_ref(self._today(), symbol, action)
@@ -1089,7 +1117,18 @@ class AlpacaBridge:
                 return False
 
             strat_name = getattr(signal, "strategy", getattr(signal, "strategy_name", ""))
-            result = self._place_open_bracket(symbol, "BUY", qty, price, signal.confidence, strategy_name=strat_name)
+            stop_price = getattr(signal, "stop_price", getattr(signal, "stop_loss", None))
+            target_price = getattr(signal, "target_price", getattr(signal, "take_profit", None))
+            if coach and (stop_price is None or target_price is None or stop_price <= 0 or target_price <= 0):
+                logger.warning("Rejecting execute_signal for %s: missing explicit stop_loss/target_price geometry (fail-closed)", symbol)
+                return False
+
+            result = self._place_open_bracket(
+                symbol, "BUY", qty, price, signal.confidence,
+                strategy_name=strat_name,
+                custom_stop_price=stop_price,
+                custom_target_price=target_price
+            )
             paper_ledger.record_entry(
                 signal, result,
                 order_ref=order_exec.deterministic_order_ref(self._today(), symbol, "BUY"),
@@ -1151,9 +1190,10 @@ class AlpacaBridge:
             )
 
             if opens_new:
+                max_open = int(getattr(config_module, "MAX_OPEN_POSITIONS"))
                 planned_total = len(occupied_symbols | planned_new_symbols)
-                if planned_total >= int(self._c("MAX_OPEN_POSITIONS", 5)):
-                    logger.warning("Max positions (%d) reached — skipping %s", self._c("MAX_OPEN_POSITIONS", 5), symbol)
+                if planned_total >= max_open:
+                    logger.warning("Max positions (%d) reached — skipping %s", max_open, symbol)
                     skipped += 1
                     continue
 

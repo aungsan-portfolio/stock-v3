@@ -124,18 +124,18 @@ def add_opening_range(df: pd.DataFrame, orb_minutes: int = None) -> pd.DataFrame
     if not hasattr(df.index, "date"):
         return df
 
-    # Localize or convert index to US/Eastern timezone to handle timezone naive/aware inputs robustly
+    # Localize or convert index to America/New_York timezone to handle timezone naive/aware inputs robustly
     idx = df.index
     if idx.tz is None:
-        idx_eastern = idx.tz_localize("UTC").tz_convert("US/Eastern")
+        idx_eastern = idx.tz_localize("UTC").tz_convert("America/New_York")
     else:
-        idx_eastern = idx.tz_convert("US/Eastern")
+        idx_eastern = idx.tz_convert("America/New_York")
 
-    # Get unique dates in US/Eastern
+    # Get unique dates in America/New_York
     unique_dates = pd.Series(idx_eastern.date).unique()
 
     for date_val in unique_dates:
-        # Filter day data using Eastern timezone index dates
+        # Filter day data using New York timezone index dates
         eastern_day_mask = idx_eastern.date == date_val
         day_df = df.loc[eastern_day_mask]
         day_idx_eastern = idx_eastern[eastern_day_mask]
@@ -143,7 +143,7 @@ def add_opening_range(df: pd.DataFrame, orb_minutes: int = None) -> pd.DataFrame
         if day_df.empty:
             continue
 
-        # Get regular session bars starting at 9:30 AM US/Eastern
+        # Get regular session bars starting at 9:30 AM America/New_York
         market_open_time = config.MARKET_OPEN  # Typically datetime.time(9, 30)
         regular_mask = day_idx_eastern.time >= market_open_time
         regular_bars = day_df.loc[regular_mask]
@@ -153,13 +153,15 @@ def add_opening_range(df: pd.DataFrame, orb_minutes: int = None) -> pd.DataFrame
 
         day_start = regular_bars.index[0]
         orb_end = day_start + pd.Timedelta(minutes=orb_minutes)
-        orb_bars = day_df.loc[(day_df.index >= day_start) & (day_df.index <= orb_end)]
+        orb_bars = day_df.loc[(day_df.index >= day_start) & (day_df.index < orb_end)]
 
         if not orb_bars.empty:
             orb_h = orb_bars["high"].max()
             orb_l = orb_bars["low"].min()
-            df.loc[eastern_day_mask, "orb_high"] = orb_h
-            df.loc[eastern_day_mask, "orb_low"] = orb_l
+            # Causal assignment: Only populate orb_high/orb_low AFTER the ORB window completion
+            post_orb_mask = eastern_day_mask & (df.index >= orb_end)
+            df.loc[post_orb_mask, "orb_high"] = orb_h
+            df.loc[post_orb_mask, "orb_low"] = orb_l
 
     return df
 

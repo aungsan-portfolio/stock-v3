@@ -89,8 +89,8 @@ def test_opening_range_high_low_detection():
     config.ORB_WINDOW_MINUTES = 5
     df_orb_res = add_opening_range(df_orb, orb_minutes=5)
 
-    assert df_orb_res["orb_high"].iloc[0] == 105.0
-    assert df_orb_res["orb_low"].iloc[0] == 97.0
+    assert np.isnan(df_orb_res["orb_high"].iloc[0])
+    assert np.isnan(df_orb_res["orb_low"].iloc[0])
     assert df_orb_res["orb_high"].iloc[-1] == 105.0
 
 
@@ -295,8 +295,10 @@ def test_orb_gap_up_boundary_isolation():
     day2_mask = df_res.index.date == pd.Timestamp("2026-07-21").date()
     df_day2 = df_res.loc[day2_mask]
     
-    assert df_day2["orb_high"].iloc[0] == 121.0
-    assert df_day2["orb_low"].iloc[0] == 119.0
+    assert np.isnan(df_day2["orb_high"].iloc[0])
+    assert np.isnan(df_day2["orb_low"].iloc[0])
+    assert df_day2["orb_high"].iloc[-1] == 121.0
+    assert df_day2["orb_low"].iloc[-1] == 119.0
 
 
 # ----------------------------------------------------------------------
@@ -407,7 +409,8 @@ def test_run_backtest_happy_path(monkeypatch):
     config.SIZING_METHOD = "fixed"
     config.FIXED_SHARE_COUNT = 100
     config.BACKTEST_COMMISSION_PER_TRADE = 1.00
-    config.BACKTEST_SLIPPAGE_PCT = 0.05
+    config.BACKTEST_SLIPPAGE_FRAC = 0.0005
+    config.BACKTEST_SLIPPAGE_PCT = 0.0005
 
     # 9.7 Run the backtester
     result = strategies.backtester.run_backtest("AAPL", "ORB", lookback_days=5)
@@ -523,6 +526,8 @@ def test_orchestrator_skips_active_and_pending_symbols(monkeypatch):
     # Mock bridge
     bridge_mock = mock.MagicMock()
     bridge_mock.is_connected = True
+    bridge_mock.get_net_liquidation.return_value = 100000.0
+    bridge_mock.account_daily_pnl.return_value = 0.0
     bridge_mock.market_price.return_value = 100.0
     
     # AAPL has position
@@ -543,6 +548,7 @@ def test_orchestrator_skips_active_and_pending_symbols(monkeypatch):
     
     bridge_mock.ib.openTrades.return_value = [FakeOrder("MSFT")]
     
+    strategies.orchestrator._last_evaluated_5m_bar_str = None
     evaluate_and_execute(["AAPL", "MSFT", "GOOG"], bridge_mock, live_paper=True)
     
     # Verify:
@@ -582,6 +588,7 @@ def test_orchestrator_fail_closed_on_broker_outage(monkeypatch):
     bridge_mock_1.is_connected = True
     bridge_mock_1.ib.positions.side_effect = RuntimeError("Broker connection lost")
     
+    strategies.orchestrator._last_evaluated_5m_bar_str = None
     evaluate_and_execute(["GOOG"], bridge_mock_1, live_paper=True)
     assert len(executed_signals) == 0  # Should be skipped/blocked
     
@@ -591,10 +598,12 @@ def test_orchestrator_fail_closed_on_broker_outage(monkeypatch):
     bridge_mock_2.ib.positions.return_value = []
     bridge_mock_2.ib.openTrades.side_effect = RuntimeError("Broker API error")
     
+    strategies.orchestrator._last_evaluated_5m_bar_str = None
     evaluate_and_execute(["GOOG"], bridge_mock_2, live_paper=True)
     assert len(executed_signals) == 0  # Should be skipped/blocked
     
     # 3. Test Broker Outage in Dry Run (should NOT block, since it's not live)
+    strategies.orchestrator._last_evaluated_5m_bar_str = None
     evaluate_and_execute(["GOOG"], bridge_mock_2, live_paper=False)
     assert len(executed_signals) == 1
     assert executed_signals[0].symbol == "GOOG"
@@ -651,6 +660,7 @@ def test_strategy_priority_sorting(monkeypatch):
     bridge_mock = mock.MagicMock()
     bridge_mock.is_connected = False
     
+    strategies.orchestrator._last_evaluated_5m_bar_str = None
     evaluate_and_execute(["AAPL"], bridge_mock, live_paper=False)
     
     # Should execute sig_orb first and discard sig_gap due to same-symbol deduplication
@@ -700,6 +710,7 @@ def test_strategy_specific_time_cutoff(monkeypatch):
     bridge_mock = mock.MagicMock()
     bridge_mock.is_connected = False
     
+    strategies.orchestrator._last_evaluated_5m_bar_str = None
     evaluate_and_execute(["AAPL", "MSFT"], bridge_mock, live_paper=False)
     
     # GAP_AND_GO (MSFT) should be skipped/filtered out.
@@ -951,6 +962,61 @@ def test_bracket_leg_held_status_not_naked(monkeypatch):
     
     assert ret_state.order_id == "broker-stop-order-held"
     assert ret_state.active is True
+
+
+def test_regression_c1_pre_trade_check_open_symbols():
+    """Regression test C1: verify pre_trade_check accepts open_symbols without TypeError."""
+    from strategies.intraday_risk import pre_trade_check
+    result = pre_trade_check(
+        equity=100000.0,
+        current_pnl=50.0,
+        trades_today=1,
+        open_positions=1,
+        day_trades_last_5_days=0,
+        risk_dollars=100.0,
+        symbol="AAPL",
+        max_risk_pct=1.0,
+        open_symbols=["MSFT"],
+    )
+    # Should pass without TypeError
+    assert isinstance(result, str) or result is None or result == ""
+
+
+def test_regression_c6_orb_new_york_nan_masking():
+    """Regression test C6: verify ORB high/low are masked as NaN prior to 09:45 AM America/New_York."""
+    import pandas as pd
+    import numpy as np
+    from strategies.indicators import add_opening_range
+    import config
+
+    # Generate 5-min bars starting at 09:30 AM America/New_York (13:30 UTC)
+    idx = pd.date_range("2026-07-24 13:30:00", periods=6, freq="5min", tz="UTC")
+    df = pd.DataFrame({
+        "open": [100.0, 101.0, 102.0, 103.0, 104.0, 105.0],
+        "high": [101.0, 102.0, 103.0, 104.0, 105.0, 106.0],
+        "low": [99.0, 100.0, 101.0, 102.0, 103.0, 104.0],
+        "close": [100.5, 101.5, 102.5, 103.5, 104.5, 105.5],
+        "volume": [1000, 1100, 1200, 1300, 1400, 1500]
+    }, index=idx)
+
+    res = add_opening_range(df, orb_minutes=15)
+    
+    # 09:30 (13:30 UTC), 09:35 (13:35 UTC), 09:40 (13:40 UTC) bars must be NaN
+    assert np.isnan(res["orb_high"].iloc[0])
+    assert np.isnan(res["orb_high"].iloc[1])
+    assert np.isnan(res["orb_high"].iloc[2])
+    
+    # Post-09:45 AM NY bar (13:45 UTC and later) should have valid numeric ORB high/low
+    assert not np.isnan(res["orb_high"].iloc[3])
+    assert res["orb_high"].iloc[3] == 103.0  # Max high of bars strictly within ORB window (13:30, 13:35, 13:40)
+
+
+def test_regression_c2_canonical_slot_cap_single_source():
+    """Regression test C2: verify MAX_OPEN_POSITIONS = 5 is single canonical source across config."""
+    import config
+    assert config.MAX_OPEN_POSITIONS == 5
+    assert getattr(config, "PORTFOLIO_MAX_POSITIONS", None) == 5
+
 
 
 

@@ -1009,7 +1009,7 @@ def _daily_coach_execute(candidates, n_candidates: int) -> int:
             f"working_orders={len(working)}"
         )
 
-        max_open = int(getattr(config, "MAX_OPEN_POSITIONS", 3))
+        max_open = int(getattr(config, "MAX_OPEN_POSITIONS"))
         occupied = set(positions) | set(working)
 
         # Evaluate every candidate against the static per-symbol gates first.
@@ -2453,7 +2453,7 @@ def cmd_daytrade_status(args) -> int:
             max_daily_loss_dollars = getattr(config, "MAX_DAILY_LOSS_DOLLARS", 1000.0)
             max_daily_loss_pct = getattr(config, "MAX_DAILY_LOSS_PCT", 2.0)
             max_trades_per_day = getattr(config, "MAX_TRADES_PER_DAY", 10)
-            max_open_positions = getattr(config, "MAX_OPEN_POSITIONS", 3)
+            max_open_positions = getattr(config, "MAX_OPEN_POSITIONS")
             use_atr = getattr(config, "TRAILING_STOP_USE_ATR", True)
             atr_mult = getattr(config, "TRAILING_STOP_ATR_MULTIPLE", 1.5)
             fallback_pct = getattr(config, "TRAILING_STOP_FALLBACK_PCT", 0.02)
@@ -2523,7 +2523,7 @@ def cmd_daytrade_status(args) -> int:
             max_daily_loss_dollars = getattr(config, "MAX_DAILY_LOSS_DOLLARS", 1000.0)
             max_daily_loss_pct = getattr(config, "MAX_DAILY_LOSS_PCT", 2.0)
             max_trades_per_day = getattr(config, "MAX_TRADES_PER_DAY", 10)
-            max_open_positions = getattr(config, "MAX_OPEN_POSITIONS", 3)
+            max_open_positions = getattr(config, "MAX_OPEN_POSITIONS")
             use_atr = getattr(config, "TRAILING_STOP_USE_ATR", True)
             fallback_pct = getattr(config, "TRAILING_STOP_FALLBACK_PCT", 0.02)
             pdt_enabled = getattr(config, "PDT_ENABLED", True)

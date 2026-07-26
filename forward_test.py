@@ -236,7 +236,7 @@ def generate_report(journal_path=None, *, session: Optional[str] = None,
 
     base = float(start_equity if start_equity is not None
                  else getattr(config, "PAPER_CAPITAL", 100_000.0))
-    cap = float(getattr(config, "MAX_DAILY_LOSS_USD", 0.0) or 0.0)
+    cap = float(getattr(config, "MAX_DAILY_LOSS_SWING", getattr(config, "MAX_DAILY_LOSS_USD", 0.0)) or 0.0)
 
     ordered = sorted(closed, key=lambda t: (t.exit_date or ""))
     realized_seq = [float(t.realized_pnl or 0.0) for t in ordered]
