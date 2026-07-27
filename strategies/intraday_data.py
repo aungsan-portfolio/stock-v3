@@ -205,16 +205,16 @@ def fetch_intraday_alpaca(
     try:
         from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.data.requests import StockBarsRequest
-        from alpaca.data.timeframe import TimeFrame
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
         from datetime import timezone
 
         client = StockHistoricalDataClient(api_key, secret_key)
         start = datetime.now(timezone.utc) - timedelta(days=lookback_days or 1)
         tf = TimeFrame.Minute
         if interval == "5m":
-            tf = TimeFrame(5, TimeFrame.Unit.Minute)
+            tf = TimeFrame(5, TimeFrameUnit.Minute)
         elif interval == "15m":
-            tf = TimeFrame(15, TimeFrame.Unit.Minute)
+            tf = TimeFrame(15, TimeFrameUnit.Minute)
         elif interval == "1h":
             tf = TimeFrame.Hour
 
@@ -354,8 +354,8 @@ def fetch_intraday_yfinance(
     lookback_days = lookback_days or config.INTRADAY_LOOKBACK_DAYS
 
     if interval == "1m" and lookback_days > 7:
-        logger.warning("yfinance only supports up to 7 days of 1m data. Capping lookback to 7 days.")
-        lookback_days = 7
+        logger.info("yfinance 1m data requested for >7 days. Automatically using 5m interval for 30-day lookback.")
+        interval = "5m"
 
     key = _cache_key(symbol, interval, lookback_days, prepost, source="yf")
     cached_df = _read_cache(key)
@@ -435,16 +435,73 @@ def fetch_intraday_yfinance(
     return df
 
 
+def fetch_daily_alpaca(symbol: str, lookback_days: int = None) -> pd.DataFrame:
+    api_key = os.environ.get("APCA_API_KEY_ID", "")
+    secret_key = os.environ.get("APCA_API_SECRET_KEY", "")
+    if not api_key or not secret_key:
+        return pd.DataFrame()
+
+    lookback_days = lookback_days or config.DAILY_LOOKBACK_DAYS
+    key = _cache_key(symbol, "1d", lookback_days, False, source="alpaca_daily")
+    # Daily bars don't change during market day — cache for 12 hours (43200s)
+    cached_df = _read_cache(key, ttl=43200)
+    if cached_df is not None:
+        return cached_df.copy()
+
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+        from datetime import timezone
+
+        client = StockHistoricalDataClient(api_key, secret_key)
+        start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol.upper().strip(),
+            timeframe=TimeFrame.Day,
+            start=start,
+        )
+        bars_dict = client.get_stock_bars(req)
+        if not hasattr(bars_dict, "df") or bars_dict.df.empty:
+            return pd.DataFrame()
+
+        df = bars_dict.df
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.xs(symbol.upper().strip(), level="symbol")
+
+        df = df.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume"})
+        df.index.name = "datetime"
+        if not df.empty:
+            _write_cache(key, df.copy())
+        return df
+    except Exception as e:
+        logger.warning("fetch_daily_alpaca failed for %s: %s", symbol, e)
+        return pd.DataFrame()
+
+
 @profile_latency(sample_rate=1.0)
 def fetch_daily(symbol: str, lookback_days: int = None, bridge = None) -> pd.DataFrame:
     lookback_days = lookback_days or config.DAILY_LOOKBACK_DAYS
-    source = "alpaca" if bridge is not None and bridge.is_connected else "yf"
+    has_alpaca_keys = bool(os.environ.get("APCA_API_KEY_ID") and os.environ.get("APCA_API_SECRET_KEY"))
+
+    if bridge is not None and bridge.is_connected:
+        source = "alpaca"
+    elif has_alpaca_keys:
+        source = "alpaca_daily"
+    else:
+        source = "yf"
+
     key = _cache_key(symbol, "1d", lookback_days, False, source=source)
-    cached_df = _read_cache(key, ttl=config.CACHE_TTL_SECONDS)
+    ttl = 43200 if "alpaca" in source else config.CACHE_TTL_SECONDS
+    cached_df = _read_cache(key, ttl=ttl)
     if cached_df is not None:
         return cached_df.copy()
 
     if bridge is None or not bridge.is_connected:
+        if has_alpaca_keys:
+            df_alpaca = fetch_daily_alpaca(symbol, lookback_days)
+            if not df_alpaca.empty:
+                return df_alpaca
         return fetch_daily_yfinance(symbol, lookback_days)
 
     fallback_key = _cache_key(
@@ -473,7 +530,12 @@ def fetch_daily(symbol: str, lookback_days: int = None, bridge = None) -> pd.Dat
             bridge.ib.sleep(attempt)
             
         if not bars:
-            logger.warning("No broker daily data returned for %s after 3 attempts. Falling back to yfinance.", symbol)
+            logger.warning("No broker daily data returned for %s after 3 attempts. Falling back to Alpaca/yfinance.", symbol)
+            if has_alpaca_keys:
+                df_alpaca = fetch_daily_alpaca(symbol, lookback_days)
+                if not df_alpaca.empty:
+                    _write_cache(fallback_key, df_alpaca.copy())
+                    return df_alpaca
             df = fetch_daily_yfinance(symbol, lookback_days)
             if not df.empty:
                 _write_cache(fallback_key, df.copy())
@@ -485,7 +547,12 @@ def fetch_daily(symbol: str, lookback_days: int = None, bridge = None) -> pd.Dat
         _write_cache(key, df.copy())
         return df
     except Exception as e:
-        logger.exception("Failed to fetch broker daily data for %s: %s. Falling back to yfinance.", symbol, e)
+        logger.exception("Failed to fetch broker daily data for %s: %s. Falling back to Alpaca/yfinance.", symbol, e)
+        if has_alpaca_keys:
+            df_alpaca = fetch_daily_alpaca(symbol, lookback_days)
+            if not df_alpaca.empty:
+                _write_cache(fallback_key, df_alpaca.copy())
+                return df_alpaca
         df = fetch_daily_yfinance(symbol, lookback_days)
         if not df.empty:
             _write_cache(fallback_key, df.copy())

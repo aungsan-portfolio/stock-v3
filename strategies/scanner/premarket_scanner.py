@@ -67,9 +67,14 @@ def _load_universe() -> List[str]:
                     MostActivesRequest(by=MostActivesBy.VOLUME, top=50, market_type=MarketType.STOCKS)
                 )
                 def _is_valid_equity(sym: str) -> bool:
-                    if "." in sym or "-" in sym:
+                    if not sym or not isinstance(sym, str):
                         return False
-                    if len(sym) > 4 and sym.endswith(("W", "WS", "RT", "WW", "U", "WT", "R")):
+                    sym = sym.upper().strip()
+                    if "." in sym or "-" in sym or "/" in sym or "+" in sym:
+                        return False
+                    if len(sym) > 4 and sym.endswith(("W", "WS", "RT", "WW", "U", "WT", "R", "Z", "C")):
+                        return False
+                    if len(sym) >= 5 and not sym.startswith("QQQ"):
                         return False
                     return True
 
@@ -99,18 +104,26 @@ def _load_universe() -> List[str]:
             except Exception as e:
                 logger.warning(f"Dynamic screener failed: {e}. Falling back to SYMBOL_UNIVERSE_FILE.")
 
-    # 2nd -> SYMBOL_UNIVERSE_FILE (CSV)
+    # 2nd -> static watchlist & core symbols fallback (prevents yfinance spam on delisted symbols)
+    core_syms = getattr(config, "FULL_MARKET_CORE_SYMBOLS", []) or getattr(config, "WATCHLIST", [])
+    if core_syms:
+        logger.info("Falling back to core symbols/watchlist universe (%d symbols)", len(core_syms))
+        return list(dict.fromkeys(core_syms))
+
+    # 3rd -> SYMBOL_UNIVERSE_FILE (CSV)
     path = config.SYMBOL_UNIVERSE_FILE
     if path.exists():
         df = pd.read_csv(path)
         if "symbol" in df.columns:
+            if "avg_volume" in df.columns:
+                df = df[df["avg_volume"] >= 100_000]
+            if "close" in df.columns:
+                df = df[df["close"] >= 5.0]
             syms = df["symbol"].dropna().astype(str).str.upper().tolist()
             if syms:
-                return syms
+                return syms[:100]
 
-    # 3rd -> static watchlist fallback
-    logger.info("No symbol universe file or dynamic symbols; falling back to WATCHLIST")
-    return list(getattr(config, "DAYTRADE_WATCHLIST", []))
+    return ["SPY", "QQQ", "AAPL", "NVDA", "MSFT", "AMZN", "AMD", "TSLA"]
 
 
 def _as_et_index(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
@@ -133,23 +146,27 @@ def _as_et_index(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
 
 
 def _premarket_bars(df: pd.DataFrame, symbol: str = "UNKNOWN") -> pd.DataFrame:
-    """Return 04:00-09:30 ET bars from an intraday DataFrame."""
+    """Return 04:00-09:30 ET bars for the latest session date from an intraday DataFrame."""
     df_et = _as_et_index(df, symbol)
     if df_et.empty:
         return pd.DataFrame()
+    latest_date = df_et.index.date[-1]
+    df_latest = df_et.loc[df_et.index.date == latest_date]
     pm_open = config.PREMARKET_START
     market_open = config.MARKET_OPEN
-    mask = [pm_open <= ts.time() < market_open for ts in df_et.index]
-    return df_et.loc[mask]
+    mask = [pm_open <= ts.time() < market_open for ts in df_latest.index]
+    return df_latest.loc[mask]
 
 
 def _regular_session_bars(df: pd.DataFrame, symbol: str = "UNKNOWN") -> pd.DataFrame:
-    """Return 09:30-16:00 ET bars from an intraday DataFrame."""
+    """Return 09:30-16:00 ET bars for the latest session date from an intraday DataFrame."""
     df_et = _as_et_index(df, symbol)
     if df_et.empty:
         return pd.DataFrame()
-    mask = [config.MARKET_OPEN <= ts.time() <= config.MARKET_CLOSE for ts in df_et.index]
-    return df_et.loc[mask]
+    latest_date = df_et.index.date[-1]
+    df_latest = df_et.loc[df_et.index.date == latest_date]
+    mask = [config.MARKET_OPEN <= ts.time() <= config.MARKET_CLOSE for ts in df_latest.index]
+    return df_latest.loc[mask]
 
 
 def _relative_volume(symbol: str, volume: int) -> float:
@@ -185,12 +202,37 @@ def _score(gap_pct: float, relative_volume: float, volume: int, sentiment_score:
     return base_score + max(sentiment_bonus, 0)
 
 
+def _average_daily_volume(symbol: str) -> float:
+    daily = fetch_daily(symbol, lookback_days=30)
+    if daily.empty or len(daily) < config.VOLUME_MA_PERIOD:
+        return 0.0
+    return float(daily["volume"].tail(config.VOLUME_MA_PERIOD).mean())
+
+
+def _passes_spread_filter(symbol: str, is_premarket: bool = True, quote_dict: dict = None) -> bool:
+    max_spread = getattr(config, "SCAN_PREMARKET_MAX_SPREAD_PCT", 0.015) if is_premarket else getattr(config, "SCAN_REGULAR_MAX_SPREAD_PCT", 0.005)
+    if not quote_dict or symbol not in quote_dict:
+        return True
+    q = quote_dict[symbol]
+    bid = float(getattr(q, "bid_price", 0) or 0)
+    ask = float(getattr(q, "ask_price", 0) or 0)
+    mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else (ask or bid or 0.0)
+    if mid <= 0:
+        return True
+    spread_pct = (ask - bid) / mid
+    if spread_pct > max_spread:
+        logger.debug("%s skipped: spread %.4f exceeds max %.4f (premarket=%s)", symbol, spread_pct, max_spread, is_premarket)
+        return False
+    return True
+
+
 def _passes_premarket_filters(
     symbol: str,
     gap_pct: float,
     current_price: float,
     volume: int,
     relative_volume: float,
+    quote_dict: dict = None,
 ) -> bool:
     allow_short = getattr(config, "ALLOW_SHORT", False)
     if gap_pct < 0 and not allow_short:
@@ -212,6 +254,16 @@ def _passes_premarket_filters(
     if relative_volume < config.SCAN_MIN_RELATIVE_VOLUME:
         logger.debug("%s skipped: rvol %.2f below %.2f", symbol, relative_volume, config.SCAN_MIN_RELATIVE_VOLUME)
         return False
+
+    min_avg_vol = getattr(config, "SCAN_MIN_AVG_DAILY_VOLUME", 750_000)
+    avg_vol = _average_daily_volume(symbol)
+    if avg_vol > 0 and avg_vol < min_avg_vol:
+        logger.debug("%s skipped: avg daily vol %.0f below %d", symbol, avg_vol, min_avg_vol)
+        return False
+
+    if not _passes_spread_filter(symbol, is_premarket=True, quote_dict=quote_dict):
+        return False
+
     return True
 
 
@@ -221,6 +273,7 @@ def _passes_open_filters(
     current_price: float,
     volume: int,
     relative_volume: float,
+    quote_dict: dict = None,
 ) -> bool:
     allow_short = getattr(config, "ALLOW_SHORT", False)
     if move_pct < 0 and not allow_short:
@@ -238,10 +291,20 @@ def _passes_open_filters(
     if relative_volume < getattr(config, "SCAN_OPEN_MIN_RELATIVE_VOLUME", 0.05):
         logger.debug("%s skipped: session rvol %.2f too small", symbol, relative_volume)
         return False
+
+    min_avg_vol = getattr(config, "SCAN_MIN_AVG_DAILY_VOLUME", 750_000)
+    avg_vol = _average_daily_volume(symbol)
+    if avg_vol > 0 and avg_vol < min_avg_vol:
+        logger.debug("%s skipped: avg daily vol %.0f below %d", symbol, avg_vol, min_avg_vol)
+        return False
+
+    if not _passes_spread_filter(symbol, is_premarket=False, quote_dict=quote_dict):
+        return False
+
     return True
 
 
-def _compute_premarket_candidate(symbol: str) -> Optional[ScanCandidate]:
+def _compute_premarket_candidate(symbol: str, quote_dict: dict = None) -> Optional[ScanCandidate]:
     prev = previous_close(symbol)
     if prev is None or prev <= 0:
         return None
@@ -265,7 +328,7 @@ def _compute_premarket_candidate(symbol: str) -> Optional[ScanCandidate]:
     gap_pct = ((current - prev) / prev) * 100.0
     rel_vol = _relative_volume(symbol, volume)
 
-    if not _passes_premarket_filters(symbol, gap_pct, current, volume, rel_vol):
+    if not _passes_premarket_filters(symbol, gap_pct, current, volume, rel_vol, quote_dict=quote_dict):
         return None
 
     score = _score(gap_pct, rel_vol, volume)
@@ -275,7 +338,7 @@ def _compute_premarket_candidate(symbol: str) -> Optional[ScanCandidate]:
     return ScanCandidate(symbol, prev, current, gap_pct, volume, rel_vol, score, reason)
 
 
-def _compute_open_candidate(symbol: str) -> Optional[ScanCandidate]:
+def _compute_open_candidate(symbol: str, quote_dict: dict = None) -> Optional[ScanCandidate]:
     prev = previous_close(symbol)
     if prev is None or prev <= 0:
         return None
@@ -300,7 +363,7 @@ def _compute_open_candidate(symbol: str) -> Optional[ScanCandidate]:
     gap_pct = ((current - prev) / prev) * 100.0
     rel_vol = _relative_volume(symbol, volume)
 
-    if not _passes_open_filters(symbol, move_pct, current, volume, rel_vol):
+    if not _passes_open_filters(symbol, move_pct, current, volume, rel_vol, quote_dict=quote_dict):
         return None
 
     score = _score(move_pct, rel_vol, volume)
@@ -319,23 +382,39 @@ def scan(symbols: List[str] = None, max_candidates: int = None) -> List[ScanCand
     max_candidates = max_candidates or config.SCAN_MAX_CANDIDATES
     mode = "OPEN" if is_market_open() else "PREMARKET"
 
-    candidates = []
-    for i in range(0, len(symbols), config.SCAN_CHUNK_SIZE):
-        chunk = symbols[i : i + config.SCAN_CHUNK_SIZE]
-        for sym in chunk:
-            symbol = str(sym).upper()
-            try:
-                if is_market_open():
-                    cand = _compute_open_candidate(symbol)
-                else:
-                    cand = _compute_premarket_candidate(symbol)
-                if cand is not None:
-                    candidates.append(cand)
-            except Exception:
-                logger.warning("Scan error for %s", symbol, exc_info=True)
+    quote_dict = {}
+    try:
+        api_key = os.environ.get("APCA_API_KEY_ID", "")
+        secret_key = os.environ.get("APCA_API_SECRET_KEY", "")
+        if api_key and secret_key:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockLatestQuoteRequest
+            data_client = StockHistoricalDataClient(api_key, secret_key)
+            # Batch fetch quotes for chunk
+            quote_dict = data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbols[:100], feed="iex"))
+    except Exception as exc:
+        logger.debug("Failed batch fetching quotes for scan: %s", exc)
 
-        if i + config.SCAN_CHUNK_SIZE < len(symbols):
-            _time.sleep(config.SCAN_SLEEP_SECONDS)
+    candidates = []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _eval_sym(sym: str) -> Optional[ScanCandidate]:
+        symbol = str(sym).upper()
+        try:
+            if is_market_open():
+                return _compute_open_candidate(symbol, quote_dict=quote_dict)
+            else:
+                return _compute_premarket_candidate(symbol, quote_dict=quote_dict)
+        except Exception:
+            logger.warning("Scan error for %s", symbol, exc_info=True)
+            return None
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(_eval_sym, sym): sym for sym in symbols}
+        for future in as_completed(futures):
+            res = future.result()
+            if res is not None:
+                candidates.append(res)
 
     candidates.sort(key=lambda c: c.score, reverse=True)
     top = candidates[:max_candidates * 2]
