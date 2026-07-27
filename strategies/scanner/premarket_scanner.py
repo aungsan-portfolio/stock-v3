@@ -72,9 +72,7 @@ def _load_universe() -> List[str]:
                     sym = sym.upper().strip()
                     if "." in sym or "-" in sym or "/" in sym or "+" in sym:
                         return False
-                    if len(sym) > 4 and sym.endswith(("W", "WS", "RT", "WW", "U", "WT", "R", "Z", "C")):
-                        return False
-                    if len(sym) >= 5 and not sym.startswith("QQQ"):
+                    if len(sym) > 4 and sym.endswith(("WS", "RT", "WW", "WT")):
                         return False
                     return True
 
@@ -436,10 +434,16 @@ def scan(symbols: List[str] = None, max_candidates: int = None) -> List[ScanCand
     top = top[:max_candidates]
 
     _save_results(top)
-    logger.info(
-        "Scanner mode=%s session=%s found %d candidates (top %d from %d symbols)",
-        mode, session_status(), len(top), max_candidates, len(symbols),
-    )
+    if not top:
+        logger.warning(
+            "⚠️ Scanner Health Guard: 0 candidates found from dynamic universe (%d symbols tested). Fallback watchlist active.",
+            len(symbols),
+        )
+    else:
+        logger.info(
+            "Scanner mode=%s session=%s found %d candidates (top %d from %d symbols)",
+            mode, session_status(), len(top), max_candidates, len(symbols),
+        )
     return top
 
 

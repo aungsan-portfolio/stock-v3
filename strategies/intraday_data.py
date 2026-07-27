@@ -44,7 +44,8 @@ def _cache_key(
 ) -> str:
     session = "prepost" if prepost else "regular"
     lookback = lookback_days if lookback_days is not None else "default"
-    return f"{source}_{symbol.upper()}_{interval}_{lookback}_{session}"
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    return f"{source}_{symbol.upper()}_{interval}_{lookback}_{session}_{today_str}"
 
 
 def _get_cache_file(key: str) -> str:
@@ -224,21 +225,21 @@ def fetch_intraday_alpaca(
                 symbol_or_symbols=symbol.upper(),
                 timeframe=tf,
                 start=start,
-                feed="sip",
+                feed="iex",
             )
             bars_dict = client.get_stock_bars(req)
-        except Exception as sip_err:
-            logger.debug("Alpaca SIP feed error for %s (%s). Falling back to IEX feed.", symbol, sip_err)
+        except Exception as iex_err:
+            logger.debug("Alpaca IEX feed error for %s (%s). Trying SIP feed.", symbol, iex_err)
             try:
                 req = StockBarsRequest(
                     symbol_or_symbols=symbol.upper(),
                     timeframe=tf,
                     start=start,
-                    feed="iex",
+                    feed="sip",
                 )
                 bars_dict = client.get_stock_bars(req)
-            except Exception as iex_err:
-                logger.warning("Alpaca IEX feed error for %s (%s).", symbol, iex_err)
+            except Exception as sip_err:
+                logger.warning("Alpaca SIP/IEX feed error for %s (%s).", symbol, sip_err)
                 return pd.DataFrame()
 
         if not hasattr(bars_dict, "df") or bars_dict.df.empty:
@@ -456,12 +457,26 @@ def fetch_daily_alpaca(symbol: str, lookback_days: int = None) -> pd.DataFrame:
 
         client = StockHistoricalDataClient(api_key, secret_key)
         start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-        req = StockBarsRequest(
-            symbol_or_symbols=symbol.upper().strip(),
-            timeframe=TimeFrame.Day,
-            start=start,
-        )
-        bars_dict = client.get_stock_bars(req)
+        bars_dict = None
+        try:
+            req = StockBarsRequest(
+                symbol_or_symbols=symbol.upper().strip(),
+                timeframe=TimeFrame.Day,
+                start=start,
+                feed="iex",
+            )
+            bars_dict = client.get_stock_bars(req)
+        except Exception:
+            try:
+                req = StockBarsRequest(
+                    symbol_or_symbols=symbol.upper().strip(),
+                    timeframe=TimeFrame.Day,
+                    start=start,
+                    feed="sip",
+                )
+                bars_dict = client.get_stock_bars(req)
+            except Exception:
+                return pd.DataFrame()
         if not hasattr(bars_dict, "df") or bars_dict.df.empty:
             return pd.DataFrame()
 
