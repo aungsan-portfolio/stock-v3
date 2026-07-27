@@ -335,21 +335,63 @@ def _place_paper_orders(signals, broker: str = "ibkr") -> int:
     return 0
 
 
-def cmd_paper(args) -> int:
-    signals = Predictor().predict_all()
-
+def _print_paper_signals_table(signals):
     print(f"\n{'Symbol':<8} {'Action':<6} {'Conf':>6} {'Price':>10}")
-    print("â”€" * 40)
+    print("─" * 40)
     for s in signals:
-        icon = "ðŸŸ¢" if s.action == "BUY" else "ðŸ”´" if s.action == "SELL" else "âšª"
+        icon = "🟢" if s.action == "BUY" else "🔴" if s.action == "SELL" else "⚪"
         print(f"{icon} {s.symbol:<6}  {s.action:<6}  {s.confidence:>5.2f}  ${s.price:>9.2f}")
 
-    if args.dry_run:
-        print("\nâš ï¸   Dry-run mode â€” no orders placed.")
-        return 0
 
+def cmd_paper(args) -> int:
+    loop_mode = bool(getattr(args, "loop", False))
+    interval = int(getattr(args, "interval", 1800))
     broker = getattr(args, "broker", "ibkr")
-    return _place_paper_orders(signals, broker=broker)
+
+    if not loop_mode:
+        signals = Predictor().predict_all()
+        _print_paper_signals_table(signals)
+        if args.dry_run:
+            print("\n⚠️   Dry-run mode — no orders placed.")
+            return 0
+        return _place_paper_orders(signals, broker=broker)
+
+    print(f"\n{'='*65}")
+    print(f"  SWING TRADING ENGINE — CONTINUOUS SCHEDULER LOOP")
+    print(f"  Scan Interval: {interval//60} minutes | Broker: {broker.upper()}")
+    print(f"{'='*65}\n")
+
+    import time
+    from strategies.session import is_market_open, now_eastern
+
+    cycle = 0
+    try:
+        while True:
+            cycle += 1
+            now_dt = now_eastern()
+            now_str = now_dt.strftime('%Y-%m-%d %H:%M:%S %Z')
+            print(f"\n--- [SWING SCAN CYCLE #{cycle}] {now_str} ---")
+
+            if not is_market_open():
+                print("  [MARKET CLOSED] US Stock Market is currently closed.")
+                print(f"  Sleeping for {interval//60} minutes ({interval}s) until next checkpoint...")
+            else:
+                print("  [MARKET OPEN] Running Swing ML Predictions & Rebalancing...")
+                try:
+                    signals = Predictor().predict_all()
+                    _print_paper_signals_table(signals)
+                    if not args.dry_run:
+                        _place_paper_orders(signals, broker=broker)
+                    else:
+                        print("\n⚠️   Dry-run mode — no orders placed.")
+                except Exception as cycle_err:
+                    print(f"  ERROR during swing scan cycle #{cycle}: {cycle_err}")
+
+            print(f"\n  Next Swing Scan in {interval//60} minutes ({interval}s). Press Ctrl+C to exit.\n")
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n\nSwing Trading Scheduler stopped by user. Exiting cleanly.")
+        return 0
 
 
 # â”€â”€ Full-market hot scanner commands â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -2891,6 +2933,8 @@ def main() -> int:
     pp = sub.add_parser("paper", help="Execute signals on paper trading broker")
     pp.add_argument("--dry-run", action="store_true", help="Preview signals without placing orders")
     pp.add_argument("--broker", choices=["ibkr", "alpaca"], default="ibkr", help="Broker for paper orders (default: ibkr)")
+    pp.add_argument("--loop", action="store_true", help="Run continuous scheduler loop during market hours")
+    pp.add_argument("--interval", type=int, default=1800, help="Interval in seconds between scan cycles in loop mode (default: 1800s / 30m)")
 
     # â”€â”€ Full-market hot scanner subcommands â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _add_hot_flags(p, with_execute: bool = False) -> None:

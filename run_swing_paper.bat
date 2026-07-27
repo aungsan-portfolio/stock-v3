@@ -17,5 +17,5 @@ echo =======================================================
 echo   Starting Swing Trading Engine (Alpaca Swing Sub-Account)
 echo =======================================================
 echo.
-python -X utf8 main.py paper --broker alpaca
+python -X utf8 main.py paper --broker alpaca --loop --interval 1800
 pause
