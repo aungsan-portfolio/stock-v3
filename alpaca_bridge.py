@@ -793,16 +793,20 @@ class AlpacaBridge:
                 logger.error("Startup: unprotected long %s with no valid avgCost -> HALT", symbol)
                 continue
 
-            # Submit limit and stop orders manually for protection on Alpaca
-            # In Phase 1, we place simple stop order at initial stop price
-            stop_price = self._initial_stop_price("SELL", basis)
+            # Submit stop order for protection on Alpaca
+            stop_price = self._initial_stop_price("BUY", basis)
+            mkt_price = self.market_price(symbol)
+            if mkt_price is not None and mkt_price > 0:
+                stop_price = min(stop_price, mkt_price * 0.995)
+            stop_price = round(stop_price, 2)
+
             try:
                 from alpaca.trading.requests import StopOrderRequest
                 self._client.submit_order(StopOrderRequest(
                     symbol=symbol, qty=qty,
                     side=OrderSide.SELL,
                     time_in_force=TimeInForce.GTC,
-                    stop_price=round(stop_price, 2)
+                    stop_price=stop_price
                 ))
                 report["repaired"].append(symbol)
                 logger.warning("Startup: repaired GTC protection stop for %s x%d at %.2f", symbol, qty, stop_price)
