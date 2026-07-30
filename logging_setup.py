@@ -15,7 +15,7 @@ def setup_logging() -> None:
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+        "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -46,5 +46,6 @@ def setup_logging() -> None:
     root.addHandler(file_handler)
 
     # Quiet noisy third-party libs.
-    for noisy in ("yfinance", "urllib3", "peewee", "ib_insync.wrapper", "ib_insync.client"):
+    for noisy in ("urllib3", "peewee", "ib_insync.wrapper", "ib_insync.client"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)

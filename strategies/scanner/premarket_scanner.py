@@ -72,6 +72,9 @@ def _load_universe() -> List[str]:
                     sym = sym.upper().strip()
                     if "." in sym or "-" in sym or "/" in sym or "+" in sym:
                         return False
+                    # Exclude 4 or 5-letter warrant/preferred share class suffixes (e.g. HUBCZ, CDIOW, TSIB)
+                    if len(sym) >= 4 and sym.endswith(("Z", "W", "R", "U", "C", "B")) and sym not in ("BAC", "UBER", "META", "AMZN", "AAPL", "MSFT", "GOOGL", "NVDA", "PLTR", "AVGO", "JPM", "NFLX", "COST", "XOM", "UNH", "QQQ", "SPY"):
+                        return False
                     if len(sym) > 4 and sym.endswith(("WS", "RT", "WW", "WT")):
                         return False
                     return True
