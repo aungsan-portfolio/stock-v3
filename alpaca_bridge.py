@@ -76,15 +76,25 @@ class MockPosition:
 
 
 class MockOrder:
-    def __init__(self, order_id: str, symbol: str, action: str, qty: float, order_type: str, limit_price: float, status: str, client_order_id: str):
-        self.id = order_id
+    def __init__(self, order_id: str, symbol: str, action: str, qty: float, order_type: str, limit_price: float, status: str, client_order_id: str, stop_price: Optional[float] = None, raw_type: Optional[str] = None, raw_side: Optional[str] = None):
+        self.id = str(order_id)
+        self.symbol = symbol
         self.contract = _Contract(symbol)
-        self.action = action
+        self.action = action.upper()
+        self.side = raw_side or action.lower()
         self.totalQuantity = qty
+        self.qty = qty
         self.orderType = order_type
+        self.order_type = order_type
+        self.type = raw_type or order_type.lower()
         self.lmtPrice = limit_price
+        self.limit_price = limit_price if (limit_price and limit_price > 0) else None
+        self.stopPrice = stop_price if (stop_price and stop_price > 0) else None
+        self.stop_price = stop_price if (stop_price and stop_price > 0) else None
         self.orderState = type("State", (), {"status": status})()
+        self.status = status
         self.orderRef = client_order_id
+        self.client_order_id = client_order_id
         self.order = self
         self.orderStatus = type("OrderStatus", (), {
             "status": status,
@@ -124,12 +134,39 @@ class MockIB:
                 raw_status = o.status.value if hasattr(o.status, "value") else str(o.status)
                 if raw_status.lower() not in active_statuses:
                     continue
-                action = "BUY" if o.side.value.upper() == "BUY" else "SELL"
+                raw_side = o.side.value if hasattr(o.side, "value") else str(o.side)
+                action = "BUY" if str(raw_side).upper() == "BUY" else "SELL"
                 qty = float(o.qty)
                 status = status_map.get(raw_status.lower(), "Submitted")
-                lmt_price = float(o.limit_price) if o.limit_price is not None else 0.0
-                order_type = "LMT" if o.type.value.upper() == "LIMIT" else "MKT"
-                res.append(MockOrder(str(o.id), o.symbol, action, qty, order_type, lmt_price, status, o.client_order_id))
+                lmt_price = float(o.limit_price) if getattr(o, "limit_price", None) is not None else 0.0
+                stp_price = float(o.stop_price) if getattr(o, "stop_price", None) is not None else None
+                
+                raw_type = o.type.value if hasattr(o.type, "value") else str(o.type)
+                raw_type_str = str(raw_type).upper().strip()
+                if raw_type_str in ("STOP", "STP"):
+                    order_type = "STP"
+                elif raw_type_str in ("STOP_LIMIT", "STP LMT", "STOPLIMIT"):
+                    order_type = "STP LMT"
+                elif raw_type_str in ("TRAILING_STOP", "TRAIL", "TRAILLIMIT", "TRAIL LIMIT"):
+                    order_type = "TRAIL"
+                elif raw_type_str in ("LIMIT", "LMT"):
+                    order_type = "LMT"
+                else:
+                    order_type = "MKT"
+
+                res.append(MockOrder(
+                    order_id=str(o.id),
+                    symbol=o.symbol,
+                    action=action,
+                    qty=qty,
+                    order_type=order_type,
+                    limit_price=lmt_price,
+                    status=status,
+                    client_order_id=o.client_order_id,
+                    stop_price=stp_price,
+                    raw_type=raw_type_str,
+                    raw_side=raw_side
+                ))
             return res
         except Exception as exc:
             logger.error("MockIB.openTrades() failed: %s", exc)
@@ -158,17 +195,30 @@ class ConnectionHealth:
 
 
 class EntryGateMock:
-    def __init__(self):
+    def __init__(self, bridge=None):
         self.halted = False
+        self.bridge = bridge
 
     def halt(self):
         self.halted = True
 
     def risk_sized_qty(self, symbol, signal, price, qty):
-        # By default, pass-through without Minervini stage resizing
+        if self.halted:
+            return 0
         return qty
 
     def entry_blocked(self, symbol, value, signal, price):
+        if self.halted:
+            return True, "Trading engine is halted"
+        if self.bridge is not None:
+            try:
+                daily_pnl = self.bridge.account_daily_pnl()
+                max_loss = float(getattr(config_module, "MAX_DAILY_LOSS_SWING", 1000.0))
+                if daily_pnl < -abs(max_loss):
+                    self.halt()
+                    return True, f"Max daily loss limit reached (${daily_pnl:.2f} < -${max_loss:.2f})"
+            except Exception as e:
+                logger.error("Error checking daily loss limit in EntryGateMock: %s", e)
         return False, ""
 
 
@@ -180,7 +230,7 @@ class AlpacaBridge:
         self._connected = False
         self._conn_health = ConnectionHealth()
         self.ib = MockIB(self)
-        self.entry_gate = EntryGateMock()
+        self.entry_gate = EntryGateMock(self)
 
     @property
     def is_connected(self) -> bool:
@@ -276,18 +326,15 @@ class AlpacaBridge:
     def _get_active_orders(self) -> list:
         self._require_connection()
         try:
-            after_time = getattr(self, "_session_start_time", None)
-            if after_time is None:
-                after_time = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=24)
             return self._client.get_orders(filter=GetOrdersRequest(
-                status=QueryOrderStatus.ALL,
-                after=after_time,
+                status=QueryOrderStatus.OPEN,
                 limit=500,
                 direction="desc"
             ))
         except Exception as exc:
             logger.error("Failed to query active orders from broker: %s", exc)
-            return []
+            self._conn_health.mark_unhealthy(str(exc))
+            raise RuntimeError(f"Failed to query active orders from broker (fail-closed): {exc}")
 
     # ── Account Services ─────────────────────────────────────────
     def get_cash(self) -> float:
@@ -328,7 +375,8 @@ class AlpacaBridge:
             if "position does not exist" in str(exc).lower() or "404" in str(exc):
                 return 0.0
             logger.error("get_position(%s) failed: %s", symbol, exc)
-            return 0.0
+            self._conn_health.mark_unhealthy(str(exc))
+            raise RuntimeError(f"get_position({symbol}) failed (fail-closed): {exc}")
 
     def working_order_symbols(self) -> set:
         try:
@@ -718,17 +766,45 @@ class AlpacaBridge:
                 raw_status = o.status.value if hasattr(o.status, "value") else str(o.status)
                 if raw_status.lower() not in active_statuses:
                     continue
-                action = "BUY" if o.side.value.upper() == "BUY" else "SELL"
+                raw_side = o.side.value if hasattr(o.side, "value") else str(o.side)
+                action = "BUY" if str(raw_side).upper() == "BUY" else "SELL"
                 status = status_map.get(raw_status.lower(), "Submitted")
-                order_type = "LMT" if o.type.value.upper() == "LIMIT" else "MKT"
+
+                raw_type = o.type.value if hasattr(o.type, "value") else str(o.type)
+                raw_type_str = str(raw_type).upper().strip()
+                if raw_type_str in ("STOP", "STP"):
+                    order_type = "STOP"
+                elif raw_type_str in ("STOP_LIMIT", "STP LMT", "STOPLIMIT"):
+                    order_type = "STOP_LIMIT"
+                elif raw_type_str in ("TRAILING_STOP", "TRAIL", "TRAILLIMIT", "TRAIL LIMIT"):
+                    order_type = "TRAILING_STOP"
+                elif raw_type_str in ("LIMIT", "LMT"):
+                    order_type = "LMT"
+                else:
+                    order_type = "MKT"
+
+                stp_price = float(o.stop_price) if getattr(o, "stop_price", None) is not None else None
+                lmt_price = float(o.limit_price) if getattr(o, "limit_price", None) is not None else None
+                raw_tif = getattr(o, "time_in_force", "GTC")
+                if hasattr(raw_tif, "_mock_name") or hasattr(raw_tif, "return_value"):
+                    tif = "GTC"
+                else:
+                    val = getattr(raw_tif, "value", raw_tif)
+                    s = str(val or "GTC").upper()
+                    tif = "GTC" if "GTC" in s else (s if s else "GTC")
+
                 res.append({
+                    "id": str(o.id),
                     "symbol": o.symbol,
                     "action": action,
+                    "side": raw_side.lower() if raw_side else action.lower(),
                     "order_type": order_type,
                     "order_ref": o.client_order_id,
                     "qty": float(o.qty),
                     "status": status,
-                    "tif": "GTC"
+                    "tif": tif,
+                    "stop_price": stp_price,
+                    "limit_price": lmt_price
                 })
             return res
         except Exception as exc:
@@ -1145,23 +1221,48 @@ class AlpacaBridge:
         allow_short = bool(self._c("ALLOW_SHORT", False))
         min_cash = float(self._c("MIN_TRADE_CASH", 100.0))
 
+    def _cancel_working_entry_orders(self, symbol: str) -> None:
+        try:
+            al_orders = self._get_active_orders()
+            active_statuses = {"new", "partially_filled", "submitted", "queued", "held", "accepted", "pending_new"}
+            for o in al_orders:
+                raw_status = o.status.value if hasattr(o.status, "value") else str(o.status)
+                if raw_status.lower() in active_statuses and o.symbol.upper().strip() == symbol.upper().strip():
+                    side = o.side.value if hasattr(o.side, "value") else str(o.side)
+                    if side.upper() == "BUY":
+                        logger.info("Cancelling stale working BUY entry order %s for %s", getattr(o, "id", ""), symbol)
+                        try:
+                            self._client.cancel_order_by_id(o.id)
+                        except Exception as ce:
+                            logger.warning("Could not cancel order %s for %s: %s", getattr(o, "id", ""), symbol, ce)
+        except Exception as exc:
+            logger.error("Failed to cancel working entry orders for %s: %s", symbol, exc)
+
+    def execute_signal(self, signal: Signal, coach: bool = False) -> bool:
+        symbol = signal.symbol.upper().strip()
+
+        action = signal.action.upper().strip()
+        allow_short = bool(self._c("ALLOW_SHORT", False))
+        min_cash = float(self._c("MIN_TRADE_CASH", 100.0))
+
         if action == "HOLD":
+            self._cancel_working_entry_orders(symbol)
             return False
         if action not in {"BUY", "SELL"}:
             logger.warning("Unsupported signal action: %s", signal.action)
             return False
 
-        if self.has_working_order(symbol):
-            logger.info("Working order already exists for %s — skipping %s", symbol, action)
-            return False
-
         position = self.get_position(symbol)
-        price = self.get_price(symbol, allow_historical=True)
+        allow_hist = bool(self._c("ALLOW_HISTORICAL_PRICE_FOR_ORDERS", False))
+        price = self.get_price(symbol, allow_historical=allow_hist)
         if price <= 0:
             logger.warning("Could not get valid order price for %s", symbol)
             return False
 
         if action == "BUY":
+            if self.has_working_order(symbol, action="BUY"):
+                logger.info("Working BUY order already exists for %s — skipping BUY", symbol)
+                return False
             if position > 0:
                 logger.info("Already long %s — skipping BUY", symbol)
                 return False
@@ -1199,6 +1300,7 @@ class AlpacaBridge:
 
         # SELL
         if position > 0:
+            self._cancel_working_entry_orders(symbol)
             qty = int(position)
             return self._close_position(symbol, "SELL", qty, price, "Close long").has_fill
         if position < 0:
@@ -1206,6 +1308,10 @@ class AlpacaBridge:
             return False
         if not allow_short:
             logger.info("No long in %s — skipping SELL (ALLOW_SHORT=False)", symbol)
+            return False
+
+        if self.has_working_order(symbol, action="SELL"):
+            logger.info("Working SELL order already exists for %s — skipping short SELL", symbol)
             return False
 
         cash = self.get_cash()
@@ -1237,15 +1343,22 @@ class AlpacaBridge:
             action = signal.action.upper().strip()
 
             if action == "HOLD":
-                skipped += 1
-                continue
-
-            if symbol in working_symbols:
-                logger.info("Working order already exists for %s — skipping", symbol)
+                self._cancel_working_entry_orders(symbol)
                 skipped += 1
                 continue
 
             current_position = self.get_position(symbol)
+
+            # Cancel stale entry BUY orders on SELL or HOLD
+            if action == "SELL":
+                self._cancel_working_entry_orders(symbol)
+
+            # Skip BUY if already working entry order
+            if action == "BUY" and self.has_working_order(symbol, action="BUY"):
+                logger.info("Working BUY entry order already exists for %s — skipping", symbol)
+                skipped += 1
+                continue
+
             opens_new = (
                 (action == "BUY" and current_position == 0)
                 or (action == "SELL" and current_position == 0 and allow_short)
@@ -1270,4 +1383,5 @@ class AlpacaBridge:
 
     @staticmethod
     def _today() -> str:
-        return _dt.date.today().strftime("%Y%m%d")
+        from strategies.session import now_eastern
+        return now_eastern().date().strftime("%Y%m%d")

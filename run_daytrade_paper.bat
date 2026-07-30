@@ -6,9 +6,9 @@ set PYTHONUTF8=1
 :: DAY TRADING ALPACA PAPER CREDENTIALS
 :: Replace YOUR_DAYTRADE_ALPACA_API_KEY and YOUR_DAYTRADE_ALPACA_SECRET_KEY below
 :: =========================================================
-set APCA_API_KEY_ID=PKMEKPN5QXHM5QRGKWMIQGDQDD
-set APCA_API_SECRET_KEY=Fnh7DDi3AV2spLCACm8CJh1ksjaworq7ig84oPReP4hn
-set APCA_API_BASE_URL=https://paper-api.alpaca.markets
+if not defined APCA_API_KEY_ID set APCA_API_KEY_ID=YOUR_DAYTRADE_ALPACA_API_KEY
+if not defined APCA_API_SECRET_KEY set APCA_API_SECRET_KEY=YOUR_DAYTRADE_ALPACA_SECRET_KEY
+if not defined APCA_API_BASE_URL set APCA_API_BASE_URL=https://paper-api.alpaca.markets
 
 cd /d "%~dp0"
 echo =======================================================

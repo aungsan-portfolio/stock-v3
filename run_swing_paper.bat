@@ -8,9 +8,9 @@ set PYTHONUTF8=1
 :: Multi-Account Safety Rule: Day Trading and Swing Trading MUST run on
 :: separate Alpaca Sub-accounts to keep positions isolated.
 :: =========================================================
-set APCA_API_KEY_ID=PKEYMQ2NYMXVAAXNZJST7JVZB4
-set APCA_API_SECRET_KEY=DrsC6QYwpvu67xDJG9o82swSGN3pBWgy7eRMHhkqbDwi
-set APCA_API_BASE_URL=https://paper-api.alpaca.markets
+if not defined APCA_API_KEY_ID set APCA_API_KEY_ID=YOUR_SWING_ALPACA_API_KEY
+if not defined APCA_API_SECRET_KEY set APCA_API_SECRET_KEY=YOUR_SWING_ALPACA_SECRET_KEY
+if not defined APCA_API_BASE_URL set APCA_API_BASE_URL=https://paper-api.alpaca.markets
 
 cd /d "%~dp0"
 echo =======================================================

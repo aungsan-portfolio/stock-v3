@@ -62,7 +62,7 @@ IPO_WATCH_SYMBOLS = ["SPCX"]
 PRICE_PERIOD        = "5y"
 PRICE_INTERVAL      = "1d"
 MIN_HISTORY_DAYS    = 252
-CACHE_TTL_SECONDS   = 3600
+CACHE_TTL_SECONDS   = 300
 
 # ── Technical Indicators ─────────────────────────
 SMA_SHORT           = 20

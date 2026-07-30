@@ -280,6 +280,14 @@ def _place_paper_orders(signals, broker: str = "ibkr") -> int:
             except Exception as e:
                 print(f"  Connected to Alpaca Paper Account | Equity fetch info: {e}\n")
 
+            # Run startup reconciliation & risk gate checks
+            recon = _run_paper_startup_checks(bridge)
+            _print_startup_reconciliation(recon)
+
+            if getattr(bridge.entry_gate, "halted", False):
+                print("⚠️ Trading halted by startup reconciliation / risk gate. Skipping signal execution.")
+                return 1
+
             result = bridge.execute_all(signals)
             print(f"\n✅ Orders accepted : {result.get('placed', 0)}")
             print(f"   Skipped         : {result.get('skipped', 0)}")
