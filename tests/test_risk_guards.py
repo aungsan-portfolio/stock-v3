@@ -68,6 +68,7 @@ def test_same_symbol_cooldown_active():
     with (
         patch("strategies.intraday_risk.get_recent_symbol_loss_time", return_value=last_loss),
         patch("strategies.intraday_risk.get_consecutive_losses", return_value=0),
+        patch("strategies.intraday_risk.get_symbol_consecutive_losses", return_value=0),
         patch("strategies.intraday_risk.config.REENTRY_COOLDOWN_MINUTES", 5),
         patch("strategies.intraday_risk.check_flatten_zone", return_value=True),
     ):
@@ -89,6 +90,7 @@ def test_same_symbol_cooldown_expired():
     with (
         patch("strategies.intraday_risk.get_recent_symbol_loss_time", return_value=last_loss),
         patch("strategies.intraday_risk.get_consecutive_losses", return_value=0),
+        patch("strategies.intraday_risk.get_symbol_consecutive_losses", return_value=0),
         patch("strategies.intraday_risk.config.REENTRY_COOLDOWN_MINUTES", 5),
         patch("strategies.intraday_risk.check_flatten_zone", return_value=True),
     ):
@@ -229,3 +231,40 @@ def test_emergency_flatten_cooldown_integration(tmp_path):
         )
         assert reason is not None
         assert "Re-entry cooldown active for AAPL" in reason
+
+
+def test_symbol_consecutive_loss_blacklist(tmp_path):
+    import json
+    from strategies.intraday_risk import pre_trade_check, get_symbol_consecutive_losses
+
+    journal = tmp_path / "trade_journal.jsonl"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    r1 = {"timestamp": now_iso, "symbol": "CLBK", "closed_at": now_iso, "realized_pnl": -15.0, "entry_order_id": "ORD1"}
+    r2 = {"timestamp": now_iso, "symbol": "CLBK", "closed_at": now_iso, "realized_pnl": -20.0, "entry_order_id": "ORD2"}
+    with open(journal, "w", encoding="utf-8") as f:
+        f.write(json.dumps(r1) + "\n")
+        f.write(json.dumps(r2) + "\n")
+
+    with (
+        patch("strategies.trade_journal.config.DAYTRADE_TRADE_JOURNAL_FILE", journal),
+        patch("strategies.intraday_risk.config.DAYTRADE_TRADE_JOURNAL_FILE", journal),
+        patch("strategies.intraday_risk.config.MAX_SYMBOL_CONSECUTIVE_LOSSES", 2),
+        patch("strategies.intraday_risk.get_consecutive_losses", return_value=0),
+        patch("strategies.intraday_risk.check_flatten_zone", return_value=True),
+        patch("strategies.trade_journal.now_eastern", return_value=datetime.now(timezone.utc).astimezone())
+    ):
+        losses = get_symbol_consecutive_losses("CLBK", journal_file=journal)
+        assert losses == 2
+
+        reason = pre_trade_check(
+            equity=100000.0,
+            current_pnl=-35.0,
+            trades_today=2,
+            open_positions=0,
+            day_trades_last_5_days=0,
+            risk_dollars=50.0,
+            symbol="CLBK"
+        )
+        assert reason is not None
+        assert "Symbol consecutive loss limit reached for CLBK" in reason
+

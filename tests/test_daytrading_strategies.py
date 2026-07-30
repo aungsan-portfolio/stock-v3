@@ -1081,6 +1081,150 @@ def test_regression_ensure_protective_stops_error_halts_entry_gate():
     assert bridge.entry_gate.halted is True
 
 
+def test_alpaca_order_type_mapping_and_plain_working_orders():
+    """Verify MockIB.openTrades and working_orders_plain preserve stop order types and stop prices."""
+    from unittest import mock
+    from alpaca.trading.enums import OrderSide, OrderType, OrderStatus
+    from alpaca_bridge import AlpacaBridge
+
+    bridge = AlpacaBridge()
+    bridge._connected = True
+
+    mock_stop_order = mock.MagicMock()
+    mock_stop_order.id = "8a181b13-7ac9-4d44-827f-e095c2b3622f"
+    mock_stop_order.symbol = "GOOGL"
+    mock_stop_order.side = OrderSide.SELL
+    mock_stop_order.qty = "15"
+    mock_stop_order.type = OrderType.STOP
+    mock_stop_order.status = OrderStatus.ACCEPTED
+    mock_stop_order.stop_price = 322.85
+    mock_stop_order.limit_price = None
+    mock_stop_order.client_order_id = "client-stop-123"
+
+    mock_limit_order = mock.MagicMock()
+    mock_limit_order.id = "13a65fec-e8e7-4e19-b4af-db4380147a7f"
+    mock_limit_order.symbol = "GOOGL"
+    mock_limit_order.side = OrderSide.SELL
+    mock_limit_order.qty = "15"
+    mock_limit_order.type = OrderType.LIMIT
+    mock_limit_order.status = OrderStatus.ACCEPTED
+    mock_limit_order.stop_price = None
+    mock_limit_order.limit_price = 350.00
+    mock_limit_order.client_order_id = "client-limit-456"
+
+    bridge._client = mock.MagicMock()
+    bridge._client.get_orders.return_value = [mock_stop_order, mock_limit_order]
+
+    # Test working_orders_plain
+    plain_orders = bridge.working_orders_plain()
+    assert len(plain_orders) == 2
+    
+    stop_plain = next(o for o in plain_orders if o["id"] == "8a181b13-7ac9-4d44-827f-e095c2b3622f")
+    assert stop_plain["order_type"] == "STOP"
+    assert stop_plain["stop_price"] == 322.85
+    assert stop_plain["action"] == "SELL"
+
+    # Test MockIB.openTrades
+    open_trades = bridge.ib.openTrades()
+    assert len(open_trades) == 2
+    stop_trade = next(o for o in open_trades if str(o.id) == "8a181b13-7ac9-4d44-827f-e095c2b3622f")
+    assert stop_trade.orderType in ("STP", "STOP")
+    assert stop_trade.stop_price == 322.85
+
+
+def test_googl_existing_sell_limit_and_stop_adoption_regression(monkeypatch):
+    """Regression test for GOOGL: Given 15 shares + resting sell limit + resting sell stop 8a181b13,
+
+    verify that ensure_initialized across multiple cycles adopts the stop, places no new stop orders,
+    retains state.order_id, and keeps entry gate unhalted.
+    """
+    from unittest import mock
+    from alpaca.trading.enums import OrderSide, OrderType, OrderStatus
+    from alpaca_bridge import AlpacaBridge
+    from strategies.trailing_stop import manager, TrailingStopState
+
+    manager.reset("GOOGL")
+
+    bridge = AlpacaBridge()
+    bridge._connected = True
+    bridge._client = mock.MagicMock()
+
+    mock_pos = mock.MagicMock()
+    mock_pos.symbol = "GOOGL"
+    mock_pos.qty = "15"
+    mock_pos.avg_entry_price = "325.00"
+    mock_pos.market_value = "4950.00"
+    mock_pos.unrealized_pl = "-25.00"
+    bridge._client.get_all_positions.return_value = [mock_pos]
+
+    from alpaca.trading.enums import OrderSide, OrderType, OrderStatus, TimeInForce
+
+    mock_stop_order = mock.MagicMock()
+    mock_stop_order.id = "8a181b13-7ac9-4d44-827f-e095c2b3622f"
+    mock_stop_order.symbol = "GOOGL"
+    mock_stop_order.side = OrderSide.SELL
+    mock_stop_order.qty = "15"
+    mock_stop_order.type = OrderType.STOP
+    mock_stop_order.status = OrderStatus.ACCEPTED
+    mock_stop_order.stop_price = 322.85
+    mock_stop_order.limit_price = None
+    mock_stop_order.client_order_id = "client-stop-123"
+    mock_stop_order.time_in_force = TimeInForce.GTC
+
+    mock_limit_order = mock.MagicMock()
+    mock_limit_order.id = "13a65fec-e8e7-4e19-b4af-db4380147a7f"
+    mock_limit_order.symbol = "GOOGL"
+    mock_limit_order.side = OrderSide.SELL
+    mock_limit_order.qty = "15"
+    mock_limit_order.type = OrderType.LIMIT
+    mock_limit_order.status = OrderStatus.ACCEPTED
+    mock_limit_order.stop_price = None
+    mock_limit_order.limit_price = 350.00
+    mock_limit_order.client_order_id = "client-limit-456"
+    mock_limit_order.time_in_force = TimeInForce.GTC
+
+    bridge._client.get_orders.return_value = [mock_stop_order, mock_limit_order]
+
+    # Step 1: Startup reconciliation should identify GOOGL as protected
+    recon = bridge.reconcile_startup_state()
+    assert "GOOGL" not in recon["snapshot"]["unprotected_longs"]
+    assert bridge.entry_gate.halted is False
+
+    # Step 2: Run ensure_initialized across multiple trading cycles
+    open_orders = bridge.ib.openTrades()
+    
+    # Cycle 1
+    state1 = manager.ensure_initialized(
+        symbol="GOOGL",
+        side="BUY",
+        avg_cost=325.00,
+        open_orders=open_orders,
+        current_price=330.00,
+        qty=15.0
+    )
+    assert state1.order_id == "8a181b13-7ac9-4d44-827f-e095c2b3622f"
+
+    # Cycle 2
+    state2 = manager.ensure_initialized(
+        symbol="GOOGL",
+        side="BUY",
+        avg_cost=325.00,
+        open_orders=open_orders,
+        current_price=331.00,
+        qty=15.0
+    )
+    assert state2.order_id == "8a181b13-7ac9-4d44-827f-e095c2b3622f"
+
+    # Cycle 3: handle_naked_position should adopt and not place new orders
+    bridge._client.submit_order.reset_mock()
+    manager.handle_naked_position("GOOGL", 15.0, bridge, dry_run=False)
+    
+    # Verify no new orders were submitted to Alpaca
+    bridge._client.submit_order.assert_not_called()
+    assert bridge.entry_gate.halted is False
+
+
+
 
 
 

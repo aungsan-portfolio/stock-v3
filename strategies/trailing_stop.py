@@ -42,6 +42,72 @@ class TrailingStopState:
     strategy: str = "UNKNOWN"
     signal_id: Optional[str] = None
 
+
+def normalize_order_type(order_type: object) -> str:
+    if not order_type:
+        return ""
+    val = getattr(order_type, "value", order_type)
+    s = str(val).lower().strip()
+    s = s.replace("ordertype.", "")
+    return s
+
+
+def is_stop_order_type(order_type_str: str, has_stop_price: bool = False) -> bool:
+    s = order_type_str.lower().strip()
+    if has_stop_price:
+        return True
+    return s in {
+        "stop", "stp", "stop_limit", "stp lmt", "stoplimit",
+        "trail", "trailing_stop", "traillimit", "trail limit", "mkt prt"
+    }
+
+
+def _extract_order_info(o: object) -> dict:
+    if isinstance(o, dict):
+        o_id = str(o.get("id") or o.get("order_id") or "")
+        o_sym = str(o.get("symbol") or "")
+        raw_side = str(o.get("side") or o.get("action") or "").lower()
+        raw_type = o.get("order_type") or o.get("type") or o.get("orderType")
+        o_stop = o.get("stop_price") if o.get("stop_price") is not None else o.get("stopPrice")
+        o_status = str(o.get("status") or "").lower()
+    else:
+        o_id = str(getattr(o, "id", getattr(o, "order_id", "")) or "")
+        contract = getattr(o, "contract", None)
+        o_sym = getattr(o, "symbol", None)
+        if not o_sym and contract:
+            o_sym = getattr(contract, "symbol", "")
+        o_sym = str(o_sym or "").upper().strip()
+
+        raw_side = getattr(o, "side", getattr(o, "action", ""))
+        raw_side = getattr(raw_side, "value", raw_side) or ""
+
+        raw_type = getattr(o, "order_type", getattr(o, "type", getattr(o, "orderType", "")))
+        o_stop = getattr(o, "stop_price", getattr(o, "stopPrice", None))
+
+        o_status_obj = getattr(o, "status", getattr(getattr(o, "orderState", None), "status", getattr(getattr(o, "orderStatus", None), "status", None)))
+        o_status = str(getattr(o_status_obj, "value", o_status_obj) or "").lower()
+
+    s_side = str(raw_side).lower().strip()
+    if s_side in {"buy"}:
+        norm_side = "buy"
+    elif s_side in {"sell"}:
+        norm_side = "sell"
+    else:
+        norm_side = s_side
+
+    o_type = normalize_order_type(raw_type)
+    stop_val = float(o_stop) if o_stop is not None else None
+
+    return {
+        "id": o_id,
+        "symbol": o_sym,
+        "side": norm_side,
+        "type": o_type,
+        "stop_price": stop_val,
+        "status": o_status
+    }
+
+
 class DynamicTrailingStopManager:
     def __init__(self):
         self._lock = threading.Lock()
@@ -214,7 +280,7 @@ class DynamicTrailingStopManager:
             if state and state.active:
                 if state.order_id is not None:
                     all_open_orders = self._extract_all_orders_including_legs(open_orders)
-                    open_order_ids = {str(getattr(o, "id", "")) for o in all_open_orders}
+                    open_order_ids = {_extract_order_info(o)["id"] for o in all_open_orders if _extract_order_info(o)["id"]}
                     if str(state.order_id) not in open_order_ids:
                         logger.warning(
                             f"Stop order {state.order_id} for {symbol} is no longer open in active legs. "
@@ -231,22 +297,12 @@ class DynamicTrailingStopManager:
             target_side = "sell" if side == "BUY" else "buy"
             
             for o in open_orders:
-                o_sym = getattr(o, "symbol", None)
-                if not o_sym:
-                    contract = getattr(o, "contract", None)
-                    if contract:
-                        o_sym = getattr(contract, "symbol", "")
-                o_sym = str(o_sym).upper().strip() if o_sym else ""
-                o_side = getattr(o, "side", "")
-                o_side_str = getattr(o_side, "value", o_side)
-                o_side_str = str(o_side_str).lower() if o_side_str else ""
-                
-                if o_sym == symbol.upper().strip() and o_side_str == target_side:
-                    o_stop = getattr(o, "stop_price", None)
-                    if o_stop is not None:
-                        broker_stop_price = float(o_stop)
-                        stop_order_id = str(o.id)
-                        break
+                info = _extract_order_info(o)
+                if info["symbol"] == symbol.upper().strip() and self._is_valid_stop_order(o, target_side):
+                    if info["stop_price"] is not None:
+                        broker_stop_price = info["stop_price"]
+                    stop_order_id = info["id"]
+                    break
 
             fallback_pct = getattr(config, "TRAILING_STOP_FALLBACK_PCT", 0.02)
             if side == "BUY":
@@ -297,40 +353,26 @@ class DynamicTrailingStopManager:
             return state
 
     def _is_valid_stop_order(self, o: object, target_side: str) -> bool:
-        """Verify that an order object or dict is a valid stop loss order on the target side."""
+        """Verify order is a valid active stop loss order for target side."""
         if not o:
             return False
-        if isinstance(o, dict):
-            o_side = o.get("side", "")
-    def _is_valid_stop_order(self, o: object, target_side: str) -> bool:
-        """Verify order is a valid active stop loss order for target side."""
-        if isinstance(o, dict):
-            o_id = o.get("id", "")
-            o_side = o.get("side", "")
-            o_type = str(o.get("order_type") or o.get("type") or "").lower()
-            o_stop = o.get("stop_price")
-            o_status = o.get("status")
-        else:
-            o_id = getattr(o, "id", "")
-            o_side = getattr(o, "side", "")
-            o_type = str(getattr(o, "order_type", getattr(o, "type", ""))).lower()
-            o_stop = getattr(o, "stop_price", None)
-            o_status = getattr(o, "status", None)
+        info = _extract_order_info(o)
+        o_id = info["id"]
+        o_side = info["side"]
+        o_type = info["type"]
+        o_stop = info["stop_price"]
+        o_status = info["status"]
 
-        if o_status is not None:
-            o_status_str = str(getattr(o_status, "value", o_status)).lower()
-            if o_status_str in {"canceled", "cancelled", "filled", "expired", "rejected"}:
-                logger.info(f"[RECONCILE EVAL] Order ID {o_id}: status '{o_status_str}' is CLOSED/DEAD -> Rejecting candidate.")
-                return False
+        if o_status in {"canceled", "cancelled", "filled", "expired", "rejected"}:
+            logger.info(f"[RECONCILE EVAL] Order ID {o_id}: status '{o_status}' is CLOSED/DEAD -> Rejecting candidate.")
+            return False
 
-        o_side_str = getattr(o_side, "value", o_side)
-        o_side_str = str(o_side_str).lower() if o_side_str else ""
-        
-        is_side_match = (o_side_str == target_side.lower())
-        is_stop_type = (o_stop is not None or "stop" in o_type)
+        target_side_norm = target_side.lower().strip()
+        is_side_match = (o_side == target_side_norm)
+        is_stop_type = is_stop_order_type(o_type, has_stop_price=(o_stop is not None))
 
         logger.info(
-            f"[RECONCILE EVAL] Order ID {o_id}: side='{o_side_str}' (target='{target_side.lower()}'), "
+            f"[RECONCILE EVAL] Order ID {o_id}: side='{o_side}' (target='{target_side_norm}'), "
             f"type='{o_type}', stop_price={o_stop} -> side_match={is_side_match}, stop_type={is_stop_type}"
         )
 
@@ -352,18 +394,12 @@ class DynamicTrailingStopManager:
         target_side = "sell" if state.side == "BUY" else "buy"
         all_orders = self._extract_all_orders_including_legs(open_orders)
         for o in all_orders:
-            o_sym = getattr(o, "symbol", None)
-            if not o_sym:
-                contract = getattr(o, "contract", None)
-                if contract:
-                    o_sym = getattr(contract, "symbol", "")
-            o_sym = str(o_sym).upper().strip() if o_sym else ""
-            
-            if o_sym == state.symbol.upper().strip() and self._is_valid_stop_order(o, target_side):
-                o_stop = getattr(o, "stop_price", None)
-                o_type = str(getattr(o, "order_type", getattr(o, "type", ""))).lower()
+            info = _extract_order_info(o)
+            if info["symbol"] == state.symbol.upper().strip() and self._is_valid_stop_order(o, target_side):
+                o_stop = info["stop_price"]
+                o_type = info["type"]
                 broker_stop_price = float(o_stop) if o_stop is not None else state.stop_price
-                state.order_id = str(getattr(o, "id", ""))
+                state.order_id = info["id"]
                 state.remediation_attempts = 0
                 state.escalation_alerted = False
                 state.remediation_in_progress = False
@@ -607,6 +643,21 @@ class DynamicTrailingStopManager:
 
         if protection_method == "replace":
             try:
+                open_orders = []
+                if hasattr(bridge, "ib") and hasattr(bridge.ib, "openTrades"):
+                    try:
+                        open_orders = bridge.ib.openTrades()
+                    except Exception:
+                        open_orders = []
+                elif hasattr(bridge, "working_orders_plain"):
+                    try:
+                        open_orders = bridge.working_orders_plain()
+                    except Exception:
+                        open_orders = []
+
+                if open_orders:
+                    self._reconcile_broker_order(state, open_orders)
+
                 current_price = None
                 if hasattr(bridge, "market_price"):
                     current_price = bridge.market_price(symbol)
@@ -621,6 +672,10 @@ class DynamicTrailingStopManager:
                     if is_invalid:
                         logger.warning(f"Tracked stop price ${state.stop_price:.2f} is stale/invalid for {symbol} (current price ${current_price:.2f}). Falling back to flatten.")
                         protection_method = "flatten"
+
+                if state.order_id is not None and protection_method != "flatten":
+                    logger.info(f"Adopted existing valid broker stop order {state.order_id} for {symbol} inside handle_naked_position - skipping new submission")
+                    return
 
                 if protection_method == "replace":
                     logger.warning(f"Naked position detected for {symbol} ({position_qty} shares). Attempting to re-place stop order at ${state.stop_price:.2f}.")

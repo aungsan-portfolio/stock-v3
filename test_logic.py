@@ -255,6 +255,12 @@ class TestMinHoldGuard(unittest.TestCase):
 # ── 4 & 5. Ensemble: model availability → action ─────────────────────
 class TestEnsembleModelAvailability(unittest.TestCase):
     def setUp(self):
+        cfg = config.get_settings()
+        cfg.WEIGHT_LSTM = 0.0
+        cfg.WEIGHT_XGB = 0.0
+        cfg.WEIGHT_TRANSFORMER = 0.0
+        mock.patch.object(config, "get_settings", return_value=cfg).start()
+        mock.patch.object(config, "WEIGHT_LSTM", 0.0).start()
         from predictor import (
             enough_ml_models, ml_model_count, weighted_blend, _safe_score,
         )
@@ -262,6 +268,9 @@ class TestEnsembleModelAvailability(unittest.TestCase):
         self.count = ml_model_count
         self.blend = weighted_blend
         self.safe = _safe_score
+
+    def tearDown(self):
+        mock.patch.stopall()
 
     # --- building blocks ---
     def test_both_missing_not_enough(self):
@@ -414,6 +423,10 @@ class TestBacktestReportWrite(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.reports = Path(self.tmp.name)
+        cfg = config.get_settings()
+        cfg.REPORTS_DIR = self.reports
+        mock.patch.object(config, "get_settings", return_value=cfg).start()
+        mock.patch.object(config, "REPORTS_DIR", self.reports).start()
 
     def tearDown(self):
         mock.patch.stopall()
@@ -421,7 +434,6 @@ class TestBacktestReportWrite(unittest.TestCase):
 
     def test_writes_empty_report_when_no_symbol_has_data(self):
         from backtest import run_backtest
-        mock.patch.object(config, "REPORTS_DIR", self.reports).start()
         mock.patch(
             "backtest.fetch_ohlcv",
             side_effect=ValueError("no data"),
@@ -445,6 +457,7 @@ class TestBacktestReportWrite(unittest.TestCase):
         from backtest import run_backtest
         df = make_ohlcv(n=600, seed=11)
         mock.patch.object(config, "REPORTS_DIR", self.reports).start()
+        mock.patch.object(config, "BUY_THRESHOLD", 0.50).start()
         mock.patch("backtest.fetch_ohlcv", return_value=df).start()
 
         result = run_backtest(

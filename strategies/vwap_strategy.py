@@ -25,7 +25,8 @@ class VWAPBounceStrategy(BaseStrategy):
         if len(df) < 30:
             return None
 
-        df = add_all_indicators(df)
+        if "atr" not in df.columns:
+            df = add_all_indicators(df)
 
         if "vwap" not in df.columns or df["vwap"].isna().all():
             return None

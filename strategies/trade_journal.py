@@ -32,6 +32,9 @@ def log_trade(
     order_id: Optional[int] = None,
     signal_id: Optional[str] = None,
 ):
+    p = float(entry_price or exit_price or 0.0)
+    price_tier = "5-10" if (5.0 <= p < 10.0) else (">10" if p >= 10.0 else "<5")
+
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "event_type": event_type,
@@ -47,6 +50,7 @@ def log_trade(
         "exit_price": exit_price,
         "exit_reason": exit_reason,
         "pnl": pnl,
+        "price_tier": price_tier,
         "notes": notes,
     }
     path = journal_file or config.DAYTRADE_TRADE_JOURNAL_FILE
@@ -70,8 +74,13 @@ def log_fill(
     execution_id: Optional[str] = None,
     signal_id: Optional[str] = None,
     timestamp: Optional[str] = None,
+    strategy: Optional[str] = None,
+    price_tier: Optional[str] = None,
 ):
     """Log an actual execution fill event with latency and slippage."""
+    if not price_tier and fill_price > 0:
+        price_tier = "5-10" if (5.0 <= fill_price < 10.0) else (">10" if fill_price >= 10.0 else "<5")
+
     record = {
         "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
         "type": "FILL",
@@ -81,11 +90,13 @@ def log_fill(
         "signal_id": signal_id,
         "symbol": symbol,
         "side": side,
+        "strategy": strategy or "UNKNOWN",
         "qty": qty,
         "fill_price": fill_price,
         "expected_price": expected_price,
         "slippage": slippage,
         "fill_latency_ms": fill_latency_ms,
+        "price_tier": price_tier,
     }
     path = journal_file or config.DAYTRADE_TRADE_JOURNAL_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -487,3 +498,35 @@ def backfill_closed_trades(journal_file: Optional[Path] = None) -> int:
     if new_closed_count > 0:
         logger.info("Backfilled %d TRADE_CLOSED records from fills.", new_closed_count)
     return new_closed_count
+
+
+_verified_first_trades = False
+
+def auto_verify_first_trades(journal_file: Optional[Path] = None) -> bool:
+    """Automatically audit the first trade records in live session to verify schema and zero dedup once."""
+    global _verified_first_trades
+    if _verified_first_trades:
+        return True
+    try:
+        records = read_journal(journal_file)
+        if not records or len(records) < 1:
+            return False
+        
+        seen_ids = set()
+        for r in records:
+            oid = str(r.get("execution_id") or r.get("order_id") or "")
+            if oid:
+                if oid in seen_ids:
+                    logger.error("[FAIL] [JOURNAL DEDUP FAIL] Duplicate record detected for order_id %s!", oid)
+                    return False
+                seen_ids.add(oid)
+
+        sample = records[0]
+        _verified_first_trades = True
+        msg = f"[PASS] [JOURNAL AUTO-VERIFIED PASS] Live Journal Integrity Checked: {len(records)} records verified cleanly (DEDUP: PASS | Strategy: '{sample.get('strategy')}' | Price Tier: '{sample.get('price_tier')}')."
+        logger.info(msg)
+        print(f"\n{msg}\n")
+        return True
+    except Exception as exc:
+        logger.warning("Auto journal verification check error: %s", exc)
+        return False

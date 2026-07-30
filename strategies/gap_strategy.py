@@ -39,7 +39,8 @@ class GapAndGoStrategy(BaseStrategy):
         if prev is None or prev <= 0:
             return None
 
-        df = add_all_indicators(df)
+        if "atr" not in df.columns:
+            df = add_all_indicators(df)
 
         open_price = float(df["open"].iloc[0])
         gap_pct = ((open_price - prev) / prev) * 100.0

@@ -25,7 +25,8 @@ class MomentumScalpStrategy(BaseStrategy):
         if len(df) < 30:
             return None
 
-        df = add_all_indicators(df)
+        if "atr" not in df.columns:
+            df = add_all_indicators(df)
 
         last = df.iloc[-1]
         prev = df.iloc[-2]
