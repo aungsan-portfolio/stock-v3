@@ -889,13 +889,26 @@ class AlpacaBridge:
                 logger.warning("Startup: repaired GTC protection stop for %s x%d at %.2f", symbol, qty, stop_price)
             except Exception as exc:
                 err_str = str(exc)
+                has_stop_protection = False
                 if "insufficient qty" in err_str.lower() or "held_for_orders" in err_str.lower() or "40310000" in err_str:
-                    logger.info("Startup: %s shares are held for active orders by broker (held_for_orders). Treating position as protected.", symbol)
+                    # Parse related orders and check if any open order is an actual STOP leg
+                    for wo in working:
+                        w_info = getattr(wo, "order", wo)
+                        w_sym = getattr(w_info, "symbol", "")
+                        if str(w_sym).upper().strip() == symbol:
+                            w_type = str(getattr(w_info, "order_type", getattr(w_info, "type", ""))).lower()
+                            w_stop = getattr(w_info, "stop_price", None)
+                            if "stop" in w_type or w_stop is not None:
+                                has_stop_protection = True
+                                break
+
+                if has_stop_protection:
+                    logger.info("Startup: %s shares are held for active STOP orders by broker. Position is confirmed protected.", symbol)
                     report["repaired"].append(symbol)
                 else:
                     self.entry_gate.halt()
                     report["failed"].append(symbol)
-                    logger.error("Startup: could not protect long %s -> HALT: %s", symbol, exc)
+                    logger.error("Startup: long %s is held by orders without a downside stop loss leg -> HALT for safety: %s", symbol, exc)
         return report
 
     def flatten_all(self, confirm: bool = False) -> dict:
