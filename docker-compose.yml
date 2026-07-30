@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  # 1. Web Dashboard App (accessible via phone/browser on port 5050)
+  dashboard:
+    build: .
+    container_name: stock_engine_dashboard
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "5050:5050"
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./reports:/app/reports
+      - ./logs:/app/logs
+    command: python -X utf8 dashboard.py
+
+  # 2. Automated Daytrade Bot (runs premarket & regular intraday session)
+  daytrade_bot:
+    build: .
+    container_name: stock_engine_daytrade
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./reports:/app/reports
+      - ./logs:/app/logs
+    command: python -X utf8 main.py daytrade-bot --live-paper
+    depends_on:
+      - dashboard
+
+  # 3. Automated Swing Trade Bot (runs 30-min loop for ML swing predictions)
+  swing_bot:
+    build: .
+    container_name: stock_engine_swing
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./reports:/app/reports
+      - ./logs:/app/logs
+    command: python -X utf8 main.py paper --broker alpaca --loop --interval 1800
+    depends_on:
+      - dashboard
