@@ -1545,14 +1545,22 @@ def cmd_expectancy_report(args) -> int:
                         config.REPORTS_DIR / "expectancy_metrics.json")
     md_path = getattr(config, "EXPECTANCY_REPORT_MD",
                       config.REPORTS_DIR / "expectancy_report.md")
-    enable_proxy = bool(getattr(args, "proxy_risk", False)) or \
-        bool(getattr(config, "EXPECTANCY_ENABLE_PROXY_RISK", False))
+    proxy_arg = getattr(args, "proxy_risk", False)
+    if proxy_arg == "atr":
+        enable_proxy = True
+        proxy_mode = "atr"
+    elif proxy_arg == "hard_stop" or proxy_arg is True:
+        enable_proxy = True
+        proxy_mode = "hard_stop"
+    else:
+        enable_proxy = bool(getattr(config, "EXPECTANCY_ENABLE_PROXY_RISK", False))
+        proxy_mode = "hard_stop"
 
     if not trades_path.exists():
         print(f"No backtest ledger found at {trades_path} (continuing with an empty report).")
         print("Run `python main.py backtest` first to generate reports/backtest_trades.csv.")
 
-    report = expectancy.generate_report(trades_path, enable_proxy_risk=enable_proxy)
+    report = expectancy.generate_report(trades_path, enable_proxy_risk=enable_proxy, proxy_mode=proxy_mode)
     jp, mp = expectancy.write_report(report, json_path=json_path, md_path=md_path, lang=lang)
 
     # DISPLAY-ONLY localization (M5A): labels are translated; numbers, file paths,

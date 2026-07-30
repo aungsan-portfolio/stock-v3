@@ -284,14 +284,19 @@ def reconstruct_closed_trades(rows: List[dict]) -> List[ClosedTrade]:
 
 
 # ── Step 3: attach the risk model ────────────────────────────────────────────
+RISK_SOURCE_ATR = "atr"
 def apply_risk_model(trades: List[ClosedTrade], *, enable_proxy_risk: bool = False,
-                     proxy_pct: Optional[float] = None) -> List[ClosedTrade]:
+                     proxy_pct: Optional[float] = None,
+                     proxy_mode: str = "hard_stop") -> List[ClosedTrade]:
     """Assign ``risk_source`` / R-multiple to each PnL-included trade.
 
     Default: if true initial risk exists (from initial_stop_price), use it.
-    If unavailable and proxy on: a fixed hard-stop fraction is used as initial risk.
+    If unavailable and proxy on: a fixed hard-stop or ATR fraction is used as initial risk.
     """
     out: List[ClosedTrade] = []
+    risk_src = RISK_SOURCE_ATR if (enable_proxy_risk and proxy_mode == "atr") else (
+        RISK_SOURCE_HARD_STOP if enable_proxy_risk else RISK_SOURCE_UNAVAILABLE
+    )
     for t in trades:
         if not t.pnl_included:
             out.append(t)
@@ -305,7 +310,7 @@ def apply_risk_model(trades: List[ClosedTrade], *, enable_proxy_risk: bool = Fal
         if enable_proxy_risk:
             rv = r_multiple(t.realized_pnl, proxy_pct)
             if rv is not None:
-                out.append(replace(t, risk_source=RISK_SOURCE_HARD_STOP,
+                out.append(replace(t, risk_source=risk_src,
                                    initial_risk=float(proxy_pct), r_multiple=rv,
                                    r_included=True, r_exclusion_reason=""))
             else:
@@ -413,22 +418,28 @@ def _build_notes(enable_proxy_risk: bool) -> List[str]:
     return notes
 
 
-# ── Orchestration ────────────────────────────────────────────────────────────
 def generate_report(trades_csv_path, *, enable_proxy_risk: bool = False,
-                    proxy_pct: Optional[float] = None) -> dict:
+                    proxy_pct: Optional[float] = None,
+                    proxy_mode: str = "hard_stop") -> dict:
     """Build the full report dict from the backtest ledger. Read-only (reads CSV)."""
     rows = load_backtest_rows(trades_csv_path)
     trades = reconstruct_closed_trades(rows)
     if enable_proxy_risk and proxy_pct is None:
-        proxy_pct = getattr(config, "HARD_STOP_LOSS_PCT", None)
-    trades = apply_risk_model(trades, enable_proxy_risk=enable_proxy_risk, proxy_pct=proxy_pct)
+        if proxy_mode == "atr":
+            atr_mult = float(getattr(config, "DEFAULT_STOP_ATR_MULTIPLE", 1.5))
+            proxy_pct = atr_mult * 0.015  # 1.5x 1.5% ATR proxy (2.25%)
+        else:
+            proxy_pct = getattr(config, "HARD_STOP_LOSS_PCT", 0.03)
+
+    risk_mode_name = f"proxy_{proxy_mode}" if enable_proxy_risk else "none"
+    trades = apply_risk_model(trades, enable_proxy_risk=enable_proxy_risk, proxy_pct=proxy_pct, proxy_mode=proxy_mode)
     metrics = compute_metrics(trades)
     return {
         "source": "backtest_ledger",
         "source_file": str(trades_csv_path),
         "n_rows_read": len(rows),
         "pnl_units": "return_fraction",
-        "risk_mode": "proxy_hard_stop" if enable_proxy_risk else "none",
+        "risk_mode": risk_mode_name,
         "proxy_pct": (proxy_pct if enable_proxy_risk else None),
         "metrics": metrics,
         "trades": [t.as_dict() for t in trades],
