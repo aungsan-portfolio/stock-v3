@@ -328,6 +328,7 @@ class AlpacaBridge:
         try:
             return self._client.get_orders(filter=GetOrdersRequest(
                 status=QueryOrderStatus.OPEN,
+                nested=True,
                 limit=500,
                 direction="desc"
             ))

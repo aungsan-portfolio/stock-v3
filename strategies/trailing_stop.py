@@ -770,8 +770,10 @@ class DynamicTrailingStopManager:
                         except Exception as rec_exc:
                             logger.warning(f"Failed fetching open/held orders for {symbol}: {rec_exc}")
                     
-                    logger.warning(f"Position for {symbol} is held by broker order, but no valid STOP leg was confirmed. Proceeding to emergency flatten.")
-                    protection_method = "flatten"
+                    logger.info(f"Position for {symbol} is held by open broker orders (held_for_orders). Retaining working order protection and skipping emergency flatten.")
+                    with self._lock:
+                        state.remediation_in_progress = False
+                    return
                 else:
                     protection_method = "flatten"
 
