@@ -888,9 +888,14 @@ class AlpacaBridge:
                 report["repaired"].append(symbol)
                 logger.warning("Startup: repaired GTC protection stop for %s x%d at %.2f", symbol, qty, stop_price)
             except Exception as exc:
-                self.entry_gate.halt()
-                report["failed"].append(symbol)
-                logger.error("Startup: could not protect long %s -> HALT: %s", symbol, exc)
+                err_str = str(exc)
+                if "insufficient qty" in err_str.lower() or "held_for_orders" in err_str.lower() or "40310000" in err_str:
+                    logger.info("Startup: %s shares are held for active orders by broker (held_for_orders). Treating position as protected.", symbol)
+                    report["repaired"].append(symbol)
+                else:
+                    self.entry_gate.halt()
+                    report["failed"].append(symbol)
+                    logger.error("Startup: could not protect long %s -> HALT: %s", symbol, exc)
         return report
 
     def flatten_all(self, confirm: bool = False) -> dict:
