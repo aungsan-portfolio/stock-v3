@@ -2915,10 +2915,10 @@ def main() -> int:
              "(no backtest, no IBKR, no orders)",
     )
     er.add_argument(
-        "--proxy-risk", action="store_true",
-        help="Compute a clearly-LABELED hard-stop PROXY R-multiple/expectancy "
-             "(default off). This is NOT true Minervini 1R; backtest trades have "
-             "no real setup stop.",
+        "--proxy-risk", nargs="?", const="hard_stop", choices=["hard_stop", "atr"],
+        default=False,
+        help="Compute a clearly-LABELED hard-stop or ATR PROXY R-multiple/expectancy "
+             "(default off). Optional mode: 'hard_stop' or 'atr'.",
     )
     _add_language_flag(er)  # display-only; JSON/metrics/paths unchanged
 
