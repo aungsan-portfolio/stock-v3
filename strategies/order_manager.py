@@ -147,6 +147,7 @@ def execute_signal(
     dry_run: bool = None,
     requested_shares: Optional[int] = None,
     entry_limit_price: Optional[float] = None,
+    regime_result: Optional[object] = None,
 ) -> dict:
     """Execute a trade signal through the full pipeline."""
     if dry_run is None:
@@ -182,12 +183,18 @@ def execute_signal(
         return result
 
     min_confidence = _min_confidence_for(signal)
+    if regime_result and getattr(regime_result, "confidence_boost", 0.0) > 0:
+        min_confidence += float(regime_result.confidence_boost)
+
     if signal.confidence < min_confidence:
         result["reason"] = f"Confidence {signal.confidence:.2f} < {min_confidence:.2f} ({signal.strategy})"
         logger.info("Skipped %s: %s", signal.symbol, result["reason"])
         return result
 
     shares = calculate_shares(executable_signal, equity)
+    if regime_result and getattr(regime_result, "position_scale", 1.0) < 1.0:
+        shares = math.floor(shares * float(regime_result.position_scale))
+
     if requested_shares is not None:
         if requested_shares <= 0:
             result["reason"] = "Requested share count must be positive"
@@ -238,6 +245,15 @@ def execute_signal(
     # Macro ETF Overlap Safety (Prevent holding SPY and QQQ simultaneously)
     if signal.symbol in {"SPY", "QQQ"} and any(s in {"SPY", "QQQ"} for s in open_syms):
         result["reason"] = f"Macro ETF Overlap: Cannot hold SPY and QQQ simultaneously"
+        logger.info("Blocked %s: %s", signal.symbol, result["reason"])
+        return result
+
+    effective_max_trades = getattr(config, "MAX_DAILY_TRADES", 15)
+    if regime_result and getattr(regime_result, "mode", "") == "CAUTION":
+        effective_max_trades = min(effective_max_trades, 5)
+
+    if trades_today >= effective_max_trades:
+        result["reason"] = f"Max trades/day reached ({trades_today}/{effective_max_trades})"
         logger.info("Blocked %s: %s", signal.symbol, result["reason"])
         return result
 

@@ -168,3 +168,15 @@ def orb_end_time() -> time:
 def is_orb_window() -> bool:
     t = current_session_time()
     return config.MARKET_OPEN <= t < orb_end_time()
+
+
+def is_past_opening_buffer(buffer_minutes: int = 15, now: Optional[datetime] = None) -> bool:
+    """Returns True if local US Eastern time (America/New_York) is at or past buffer_minutes after MARKET_OPEN (e.g. 09:45 ET)."""
+    if now is not None:
+        t = now.time()
+    else:
+        t = current_session_time()
+    open_mins = config.MARKET_OPEN.hour * 60 + config.MARKET_OPEN.minute
+    cutoff_mins = open_mins + buffer_minutes
+    cutoff_time = time(cutoff_mins // 60, cutoff_mins % 60)
+    return t >= cutoff_time
