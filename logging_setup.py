@@ -47,4 +47,4 @@ def setup_logging() -> None:
 
     # Quiet noisy third-party libs.
     for noisy in ("yfinance", "urllib3", "peewee", "ib_insync.wrapper", "ib_insync.client"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+        logging.getLogger(noisy).setLevel(logging.CRITICAL)

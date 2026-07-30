@@ -418,7 +418,7 @@ def fetch_intraday_yfinance(
         df_alpaca = fetch_intraday_alpaca(symbol, interval, lookback_days, prepost)
         if not df_alpaca.empty:
             return df_alpaca
-        logger.warning(
+        logger.debug(
             "yfinance EMPTY intraday %s (period=%s, interval=%s).",
             symbol, period, interval,
         )
