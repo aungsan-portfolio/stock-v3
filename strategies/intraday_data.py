@@ -363,6 +363,7 @@ def fetch_intraday_yfinance(
     if cached_df is not None:
         return cached_df.copy()
 
+    yf_symbol = symbol.strip().upper().replace(".", "-")
     period = f"{lookback_days}d"
     df = pd.DataFrame()
     try:
@@ -379,7 +380,7 @@ def fetch_intraday_yfinance(
                 end_str = current_end.strftime("%Y-%m-%d")
                 
                 chunk_df = yf.download(
-                    symbol,
+                    yf_symbol,
                     start=start_str,
                     end=end_str,
                     interval=interval,
@@ -397,7 +398,7 @@ def fetch_intraday_yfinance(
                 df = df.sort_index()
         else:
             df = yf.download(
-                symbol,
+                yf_symbol,
                 period=period,
                 interval=interval,
                 progress=False,
@@ -409,9 +410,14 @@ def fetch_intraday_yfinance(
             "yfinance intraday error for %s (period=%s, interval=%s): %s",
             symbol, period, interval, str(e),
         )
-        return pd.DataFrame()
+        # Attempt Alpaca fallback on yfinance exception
+        return fetch_intraday_alpaca(symbol, interval, lookback_days, prepost)
 
     if df.empty:
+        # Fallback to Alpaca data feed if yfinance is empty or rate-limited
+        df_alpaca = fetch_intraday_alpaca(symbol, interval, lookback_days, prepost)
+        if not df_alpaca.empty:
+            return df_alpaca
         logger.warning(
             "yfinance EMPTY intraday %s (period=%s, interval=%s).",
             symbol, period, interval,
@@ -581,10 +587,11 @@ def fetch_daily_yfinance(symbol: str, lookback_days: int = None) -> pd.DataFrame
     if cached_df is not None:
         return cached_df.copy()
 
+    yf_symbol = symbol.strip().upper().replace(".", "-")
     period = f"{lookback_days}d"
     try:
         df = yf.download(
-            symbol, period=period, interval="1d",
+            yf_symbol, period=period, interval="1d",
             progress=False, auto_adjust=True,
         )
     except Exception as e:
@@ -592,9 +599,12 @@ def fetch_daily_yfinance(symbol: str, lookback_days: int = None) -> pd.DataFrame
             "yfinance daily error for %s (period=%s): %s",
             symbol, period, str(e),
         )
-        return pd.DataFrame()
+        return fetch_daily_alpaca(symbol, lookback_days)
 
     if df.empty:
+        df_alpaca = fetch_daily_alpaca(symbol, lookback_days)
+        if not df_alpaca.empty:
+            return df_alpaca
         logger.warning(
             "yfinance EMPTY daily %s (period=%s).",
             symbol, period,
