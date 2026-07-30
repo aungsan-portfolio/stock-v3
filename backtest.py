@@ -266,9 +266,15 @@ def run_backtest(
             n_lstm_folds = 0
             hard_stop_pct = float(cfg.HARD_STOP_LOSS_PCT)
 
+            train_window = int(getattr(cfg, "BACKTEST_TRAIN_WINDOW", 0))
             for start in range(train_min, len(X_all) - step + 1, step):
-                X_tr = X_all[:start]
-                y_tr = y_all[:start]
+                if train_window > 0:
+                    tr_start = max(0, start - train_window)
+                    X_tr = X_all[tr_start:start]
+                    y_tr = y_all[tr_start:start]
+                else:
+                    X_tr = X_all[:start]
+                    y_tr = y_all[:start]
                 X_te = X_all[start:start + step]
                 ret_te = next_ret_all[start:start + step]
                 idx_te = idx_all[start:start + step]

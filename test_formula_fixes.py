@@ -83,6 +83,33 @@ class TestFormulaFixes(unittest.TestCase):
         self.assertTrue(exec_)
         self.assertTrue(note.startswith("hard-stop"))
 
+    def test_entry_gate_symbol_exposure_with_existing_position(self):
+        from entry_gate_service import EntryGateService
+
+        # Equity $10,000, Max Symbol Exposure 20% = $2,000
+        # Existing AAPL position = $1,800. New intended AAPL = $500. Total = $2,300 -> Should block!
+        gate = EntryGateService(
+            net_liq_fn=lambda: 10000.0,
+            symbol_exposure_fn=lambda sym: 1800.0 if sym == "AAPL" else 0.0
+        )
+        gate.market_hours_ok = lambda: True
+
+        blocked, reason = gate.entry_blocked("AAPL", intended_value=500.0)
+        self.assertTrue(blocked)
+        self.assertEqual(reason, "symbol_exposure")
+
+    def test_risk_sized_qty_fail_closed_setting(self):
+        from entry_gate_service import EntryGateService
+
+        gate = EntryGateService()
+        gate._c = lambda name, default=None: True if name in (
+            "MINERVINI_OVERLAY_ENABLED", "MINERVINI_SIZING_ENABLED", "MINERVINI_SIZING_FAIL_CLOSED"
+        ) else default
+
+        # Invalid entry/stop -> should return 0 (fail-closed) when MINERVINI_SIZING_FAIL_CLOSED is True
+        qty = gate.risk_sized_qty("AAPL", signal=type("Signal", (), {"action": "BUY"})(), entry_price=0.0, notional_qty=100)
+        self.assertEqual(qty, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

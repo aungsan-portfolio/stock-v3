@@ -18,10 +18,12 @@ class EntryGateService:
     """Read-only gates that check whether a NEW entry is allowed.
     Moves together so ibkr_bridge's execute_signal shrinks."""
 
-    def __init__(self, cfg=None, net_liq_fn=None):
+    def __init__(self, cfg=None, net_liq_fn=None, symbol_exposure_fn=None):
         self._cfg = cfg or config_module.get_settings()
         # net_liq_fn: callable returning current NetLiquidation
         self._net_liq_fn = net_liq_fn or (lambda: 0.0)
+        # symbol_exposure_fn: callable(symbol) returning current market value of open position in symbol
+        self._symbol_exposure_fn = symbol_exposure_fn or (lambda symbol: 0.0)
         self._halt = False
 
     def _c(self, name, default=None):
@@ -66,7 +68,8 @@ class EntryGateService:
         start = risk_state.start_of_day_equity()
         if risk_engine.drawdown_halt_breached(start, equity):
             return True, "drawdown_halt"
-        if risk_engine.symbol_exposure_exceeded(intended_value, 0.0, equity):
+        existing_value = self._symbol_exposure_fn(symbol)
+        if risk_engine.symbol_exposure_exceeded(intended_value, existing_value, equity):
             return True, "symbol_exposure"
         if self._minervini_stage2_blocks(symbol, signal):
             return True, "stage2_filter"
@@ -112,33 +115,36 @@ class EntryGateService:
         action = str(getattr(signal, "action", "")).upper().strip()
         if action != "BUY":
             return notional_qty
+        fail_closed = bool(self._c("MINERVINI_SIZING_FAIL_CLOSED", False))
+        fallback = 0 if fail_closed else notional_qty
+
         try:
             entry = float(entry_price)
             if not math.isfinite(entry) or entry <= 0:
-                return notional_qty
+                return fallback
             import minervini
             from data_manager import fetch_ohlcv
             df = fetch_ohlcv(symbol)
             verdict = minervini.evaluate_entry(df)
             stop = minervini.minervini_stop_price(getattr(verdict, "pivot_low", None))
             if stop is None:
-                return notional_qty
+                return fallback
             stop = float(stop)
             if not math.isfinite(stop) or stop <= 0:
-                return notional_qty
+                return fallback
             if stop >= entry:
-                return notional_qty
+                return fallback
             risk_per_share = entry - stop
             if not math.isfinite(risk_per_share) or risk_per_share <= 0:
-                return notional_qty
+                return fallback
             max_dist = float(self._c("MINERVINI_MAX_STOP_DISTANCE_PCT", 0.10))
             if max_dist > 0 and risk_per_share > entry * max_dist:
-                return notional_qty
+                return fallback
             risk_budget = float(self._c("MINERVINI_RISK_PER_TRADE_USD", 0.0))
             if not math.isfinite(risk_budget) or risk_budget <= 0:
-                return notional_qty
+                return fallback
             risk_qty = int(risk_budget / risk_per_share)
             return max(0, min(notional_qty, risk_qty))
         except Exception:
-            logger.debug("Minervini 1R sizing unavailable for %s -> fail open", symbol, exc_info=True)
-            return notional_qty
+            logger.debug("Minervini 1R sizing unavailable for %s -> fallback=%d", symbol, fallback, exc_info=True)
+            return fallback
