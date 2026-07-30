@@ -192,14 +192,19 @@ def detect_vcp_like(df: pd.DataFrame, closed_bar: bool = True):
     low = window["Low"].astype(float)
 
     ranges: List[float] = []
+    vol_means: List[float] = []
+    vol = window["Volume"].astype(float) if "Volume" in window.columns else pd.Series(1.0, index=window.index)
     for i in range(n_seg):
         seg_hi = high.iloc[i * seg_len:(i + 1) * seg_len]
         seg_lo = low.iloc[i * seg_len:(i + 1) * seg_len]
+        seg_vo = vol.iloc[i * seg_len:(i + 1) * seg_len]
         top = float(seg_hi.max())
         bot = float(seg_lo.min())
         ranges.append(((top - bot) / top) if top > 0 else 0.0)
+        vol_means.append(float(seg_vo.mean()))
 
     contractions = sum(1 for i in range(1, n_seg) if ranges[i] < ranges[i - 1])
+    volume_dry_up = bool(vol_means[-1] < vol_means[-2]) if len(vol_means) >= 2 else True
 
     base_top = float(high.max())
     base_bot = float(low.min())
@@ -210,6 +215,8 @@ def detect_vcp_like(df: pd.DataFrame, closed_bar: bool = True):
 
     detail = {
         "segment_ranges": ranges,
+        "segment_vol_means": vol_means,
+        "volume_dry_up": volume_dry_up,
         "contractions": contractions,
         "base_depth": base_depth,
         "pivot_low": last_seg_low,
@@ -246,7 +253,7 @@ def detect_pocket_pivot(df: pd.DataFrame, closed_bar: bool = True):
     return is_pp, detail
 
 
-# ── Relative strength (SPY-relative, None-tolerant) ──────────────────────────
+# ── Relative strength (SPY-relative proxy & Cross-sectional Universe helper) ─
 def relative_strength_rank(df: Optional[pd.DataFrame],
                            benchmark_df: Optional[pd.DataFrame]) -> Optional[float]:
     """Approximate SPY-relative relative-strength percentile in [0, 100].
@@ -282,6 +289,19 @@ def relative_strength_rank(df: Optional[pd.DataFrame],
         return max(0.0, min(100.0, rank))
     except Exception:
         return None
+
+
+def cross_sectional_rs_rank(performance_dict: Dict[str, float]) -> Dict[str, float]:
+    """Calculate true cross-sectional relative strength percentile ranks [0, 100]
+    across a universe of symbols for a given lookback performance dictionary.
+    """
+    if not performance_dict:
+        return {}
+    s = pd.Series(performance_dict)
+    if len(s) == 1:
+        return {k: 50.0 for k in s.index}
+    ranks = s.rank(pct=True) * 100.0
+    return {k: float(v) for k, v in ranks.items()}
 
 
 # ── Dedicated Minervini stop (1R anchor) ─────────────────────────────────────

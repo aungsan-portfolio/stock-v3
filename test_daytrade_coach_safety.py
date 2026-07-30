@@ -46,8 +46,9 @@ class DaytradeCoachSafetyTests(unittest.TestCase):
             ohlcv=ohlcv(),
         )
         self.assertTrue(preview["tradeable"])
-        self.assertEqual(preview["quantity"], 5)  # existing IBKRBridge cap mirror
-        self.assertGreater(preview["suggested_shares_by_risk"], 0)
+        self.assertEqual(preview["quantity_by_cap"], 20)  # existing IBKRBridge cap mirror (2% of $100k @ $100 = 20 shares)
+        self.assertEqual(preview["suggested_shares_by_risk"], 20)
+        self.assertEqual(preview["quantity"], 20)  # aligned primary risk-based quantity
         self.assertAlmostEqual(preview["rr_2r"], 2.0)
         self.assertIn("existing IBKRBridge sizing still applies", preview["daytrade_formula_note"])
         self.assertIsNotNone(preview["previous_day_pivot_levels"])
@@ -71,7 +72,7 @@ class DaytradeCoachSafetyTests(unittest.TestCase):
 
     def test_default_daytrade_cap_is_one(self):
         self.assertEqual(config.DAYTRADE_MAX_PAPER_TRADES_PER_RUN, 1)
-        self.assertEqual(config.COACH_MAX_PAPER_TRADES_PER_RUN, 1)
+        self.assertEqual(config.COACH_MAX_PAPER_TRADES_PER_RUN, 2)
 
 
 if __name__ == "__main__":

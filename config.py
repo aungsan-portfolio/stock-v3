@@ -69,6 +69,7 @@ SMA_SHORT           = 20
 SMA_LONG            = 50
 EMA_PERIOD          = 21
 RSI_PERIOD          = 14
+RSI_SMOOTHING       = "wilder"  # "wilder" (TradingView default) or "simple" (legacy SMA)
 MACD_FAST           = 12
 MACD_SLOW           = 26
 MACD_SIGNAL         = 9
@@ -544,6 +545,7 @@ class Settings:
     SMA_LONG: int = SMA_LONG
     EMA_PERIOD: int = EMA_PERIOD
     RSI_PERIOD: int = RSI_PERIOD
+    RSI_SMOOTHING: str = RSI_SMOOTHING
     MACD_FAST: int = MACD_FAST
     MACD_SLOW: int = MACD_SLOW
     MACD_SIGNAL: int = MACD_SIGNAL

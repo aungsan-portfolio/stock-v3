@@ -222,7 +222,7 @@ def run_backtest(
     allow_short = bool(cfg.ALLOW_SHORT)
     min_hold = int(cfg.MIN_HOLD_BARS)
     horizon = int(cfg.ML_HORIZON)
-    cost_per_order = float(cfg.BACKTEST_TRANSACTION_COST_PCT) + float(cfg.BACKTEST_SLIPPAGE_PCT)
+    cost_per_order = float(cfg.BACKTEST_TRANSACTION_COST_PCT) + float(getattr(cfg, 'BACKTEST_SLIPPAGE_FRAC', cfg.BACKTEST_SLIPPAGE_PCT))
 
     all_rows: list = []
     symbol_metrics: dict = {}
@@ -244,6 +244,7 @@ def run_backtest(
             y_all = labels.loc[valid_idx].values.astype(int)
             next_ret_all = next_ret.loc[valid_idx].values.astype(float)
             close_all = feat.loc[valid_idx, "Close"].values.astype(float)
+            low_all = feat.loc[valid_idx, "Low"].values.astype(float)
             idx_all = list(valid_idx)
             tech_all = np.asarray(
                 [technical_score_from_feature_row(feat.loc[i]) for i in valid_idx],
@@ -273,6 +274,7 @@ def run_backtest(
                 idx_te = idx_all[start:start + step]
                 tech_te = tech_all[start:start + step]
                 close_te = close_all[start:start + step]
+                low_te = low_all[start:start + step]
 
                 if len(np.unique(y_tr)) < 2:
                     logger.debug("Only one class in train window: %s start=%d", symbol, start)
@@ -296,8 +298,8 @@ def run_backtest(
                     lstm_scores = np.full(len(X_te), 0.5, dtype=float)
                     lstm_ok = False
 
-                for dt, rf_score, lstm_score, tech_score, market_ret, close_px in zip(
-                    idx_te, rf_scores, lstm_scores, tech_te, ret_te, close_te
+                for dt, rf_score, lstm_score, tech_score, market_ret, close_px, low_px in zip(
+                    idx_te, rf_scores, lstm_scores, tech_te, ret_te, close_te, low_te
                 ):
                     conf = weighted_blend(
                         float(rf_score), rf_ok,
@@ -308,14 +310,14 @@ def run_backtest(
                     old_position = position
 
                     # ── horizon-aware position update (shared helper) ──
-                    # entry_price/current_price/hard_stop_pct let the helper apply
-                    # the worst-case hard-stop backstop on open longs, bypassing
-                    # min_hold — identical logic to the live bridge.
+                    # entry_price/current_price/hard_stop_pct/low_price let the helper apply
+                    # the worst-case hard-stop backstop on open longs using intraday Low.
                     position, executed, exec_note, bars_held = apply_position_rule_with_hold(
                         position, signal, allow_short, bars_held, min_hold,
                         entry_price=entry_price,
                         current_price=float(close_px),
                         hard_stop_pct=hard_stop_pct,
+                        low_price=float(low_px),
                     )
                     if executed:
                         n_orders += 1
@@ -339,13 +341,42 @@ def run_backtest(
                         if exec_note.startswith("hard-stop")
                         else entry_price
                     )
+                    stop_px = (
+                        row_entry_price * (1.0 - abs(hard_stop_pct))
+                        if row_entry_price is not None
+                        else None
+                    )
 
                     # Decision at close[t], position after the order earns close[t]→close[t+1].
-                    gross_pnl = float(position) * float(market_ret)
+                    # On hard-stop exit, cap loss at stop price rather than close return.
+                    if exec_note.startswith("hard-stop") and row_entry_price and stop_px is not None:
+                        stop_ret = (stop_px - float(close_px)) / float(close_px)
+                        gross_pnl = float(stop_ret)
+                    else:
+                        gross_pnl = float(position) * float(market_ret)
+
                     cost = cost_per_order if executed else 0.0
                     net_pnl = gross_pnl - cost
                     equity.append(equity[-1] * (1.0 + net_pnl))
                     daily_pnls.append(net_pnl)
+
+                    initial_stop_price = (
+                        round(float(stop_px), 6)
+                        if stop_px is not None
+                        else None
+                    )
+                    risk_per_share = (
+                        round(float(row_entry_price) - float(initial_stop_price), 6)
+                        if (row_entry_price is not None and initial_stop_price is not None)
+                        else ""
+                    )
+                    exit_price = (
+                        round(float(stop_px), 6)
+                        if (exec_note.startswith("hard-stop") and stop_px is not None)
+                        else (round(float(close_px), 6) if (executed and position == 0) else "")
+                    )
+                    exit_reason = exec_note if (executed and position == 0) else ""
+                    risk_source = "hard_stop" if (row_entry_price is not None and hard_stop_pct) else ""
 
                     rows.append({
                         "symbol": symbol,
@@ -362,9 +393,15 @@ def run_backtest(
                         "bars_held": int(bars_held),
                         "order_executed": bool(executed),
                         "execution_note": exec_note,
+                        "exit_reason": exit_reason,
                         "hard_stop_exit": bool(exec_note.startswith("hard-stop")),
                         "entry_price": round(float(row_entry_price), 6) if row_entry_price is not None else "",
+                        "initial_stop_price": initial_stop_price if initial_stop_price is not None else "",
+                        "risk_per_share": risk_per_share,
+                        "risk_source": risk_source,
                         "close_price": round(float(close_px), 6),
+                        "low_price": round(float(low_px), 6),
+                        "exit_price": exit_price,
                         "next_day_return": round(float(market_ret), 8),
                         "gross_pnl": round(float(gross_pnl), 8),
                         "cost": round(float(cost), 8),

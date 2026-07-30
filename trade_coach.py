@@ -597,12 +597,19 @@ def build_trade_preview(
             "quantity": 0, "estimated_cost": 0.0, "price": price, "confidence": confidence,
         }
 
-    # Mirror IBKRBridge._calc_quantity exactly (no actual order is placed).
+    # Cap-based sizing (position cap / trade value cap)
     max_value = float(cash) * float(config.MAX_POSITION_PCT)
     cap = getattr(config, "MAX_TRADE_VALUE", None)
     if cap is not None:
         max_value = min(max_value, float(cap))
-    qty = max(int(max_value / price), 0) if price > 0 else 0
+    qty_by_cap = max(int(max_value / price), 0) if price > 0 else 0
+
+    formula_fields = _daytrade_formula_fields(signal, cash, ohlcv=ohlcv)
+    qty_by_risk = int(formula_fields.get("suggested_shares_by_risk", 0))
+
+    # For beginner safety & alignment, use risk-based quantity as primary when valid,
+    # keeping qty_by_cap available as a diagnostic field.
+    qty = qty_by_risk if qty_by_risk > 0 else qty_by_cap
 
     # Commission breakeven check (mirrors ibkr_bridge._breakeven_pct).
     _com_per_side = max(
@@ -641,14 +648,14 @@ def build_trade_preview(
         )
         stop_explanation += _breakeven_note
 
-    formula_fields = _daytrade_formula_fields(signal, cash, ohlcv=ohlcv)
-
     return {
         "symbol": symbol,
         "action": action,
         "tradeable": True,
         "skip_reason": None,
         "quantity": qty,
+        "quantity_by_risk": qty_by_risk,
+        "quantity_by_cap": qty_by_cap,
         "estimated_cost": est_cost,
         "avg_cost_if_adding": avg_cost,
         "price": price,
@@ -1136,7 +1143,9 @@ def print_trade_preview(preview: Dict[str, Any]) -> None:
         print(f"  Skip reason         : {preview.get('skip_reason', 'not tradeable')}")
         print("───────────────────────────────────────────────────────────────")
         return
-    print(f"  Quantity (proposed) : {preview['quantity']} shares")
+    print(f"  Quantity (risk-primary): {preview['quantity']} shares")
+    if preview.get("quantity_by_cap") is not None:
+        print(f"  Quantity (cap-max)     : {preview['quantity_by_cap']} shares (diagnostic max)")
     print(f"  Estimated cost      : {_format_money(preview['estimated_cost'])}")
     print(f"  Avg cost if adding  : {_format_money(preview['avg_cost_if_adding'])}")
     print(f"  Stop price          : {_format_money(preview['stop_price'])}")
@@ -1209,8 +1218,9 @@ def write_trade_note(
     lines.append(f"- **Why / Why not**  : {lesson['candidate_reason']}")
     lines.append("")
     if preview is not None and preview.get("tradeable"):
-        lines.append("### Proposed trade (preview math)")
-        lines.append(f"- **Quantity**         : {preview['quantity']} shares")
+        lines.append(f"- **Quantity (risk-primary)** : {preview['quantity']} shares")
+        if preview.get("quantity_by_cap") is not None:
+            lines.append(f"- **Quantity (cap-max)**      : {preview['quantity_by_cap']} shares (diagnostic max)")
         lines.append(f"- **Estimated cost**   : {_format_money(preview['estimated_cost'])}")
         lines.append(f"- **Avg cost (entry)** : {_format_money(preview['avg_cost_if_adding'])}")
         lines.append(f"- **Stop price**       : {_format_money(preview['stop_price'])}")

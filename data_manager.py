@@ -179,8 +179,14 @@ def build_features(df: pd.DataFrame, market_df: Optional[pd.DataFrame] = None, c
     f["dist_ema"] = (close - f["ema"]) / close
 
     delta = close.diff()
-    gain = delta.clip(lower=0).rolling(cfg.RSI_PERIOD).mean()
-    loss = (-delta.clip(upper=0)).rolling(cfg.RSI_PERIOD).mean()
+    rsi_smoothing = str(getattr(cfg, "RSI_SMOOTHING", "wilder")).lower().strip()
+    if rsi_smoothing == "simple":
+        gain = delta.clip(lower=0).rolling(cfg.RSI_PERIOD).mean()
+        loss = (-delta.clip(upper=0)).rolling(cfg.RSI_PERIOD).mean()
+    else:
+        # Wilder's exponential smoothing (default, matches TradingView)
+        gain = delta.clip(lower=0).ewm(alpha=1.0 / cfg.RSI_PERIOD, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1.0 / cfg.RSI_PERIOD, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
     f["rsi"] = 100 - (100 / (1 + rs))
 
@@ -589,9 +595,9 @@ def _add_micro_features(f: pd.DataFrame, close: pd.Series, high: pd.Series, low:
     # Overnight gap
     f["gap_pct"] = open_ / close.shift(1) - 1.0
 
-    # Rolling efficiency ratio: net move / total path
+    # Rolling efficiency ratio: net pct move / total 10-bar path
     ret = close.pct_change(1).abs()
-    eff_num = (close - close.shift(10)).abs()
+    eff_num = close.pct_change(10).abs()
     eff_den = ret.rolling(10).sum().replace(0, np.nan)
     f["rolling_efficiency"] = eff_num / eff_den
 
@@ -600,10 +606,11 @@ def _add_micro_features(f: pd.DataFrame, close: pd.Series, high: pd.Series, low:
     atr_pct = atr / close
     f["atr_slope"] = atr_pct.pct_change(5)
 
-    # Volume shock z-score: how unusual is today's volume ratio
+    # Volume shock z-score: trailing rolling mean (no future leakage)
     vr = volume / volume.rolling(20).mean().replace(0, np.nan)
+    vr_mean = vr.rolling(40).mean().replace(0, np.nan)
     vr_std = vr.rolling(40).std().replace(0, np.nan)
-    f["volume_shock"] = (vr - vr.mean()) / vr_std
+    f["volume_shock"] = (vr - vr_mean) / vr_std
 
     # Close rank in trailing 20 bars
     f["close_rank_20"] = close.rolling(20).apply(

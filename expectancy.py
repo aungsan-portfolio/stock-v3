@@ -180,8 +180,8 @@ def _build_long_trade(symbol: str, fold: str, entry: dict, exit_: dict) -> Close
     """
     entry_eq = _f(entry.get("equity"))
     exit_eq = _f(exit_.get("equity"))
-    entry_price = _f(entry.get("close_price"))
-    exit_price = _f(exit_.get("close_price"))
+    entry_price = _f(entry.get("close_price")) or _f(entry.get("entry_price"))
+    exit_price = _f(exit_.get("close_price")) or _f(exit_.get("exit_price"))
     entry_date = (str(entry.get("date", "")).strip() or None)
     exit_date = (str(exit_.get("date", "")).strip() or None)
 
@@ -197,11 +197,29 @@ def _build_long_trade(symbol: str, fold: str, entry: dict, exit_: dict) -> Close
                            r_exclusion_reason=R_REASON_NO_PNL)
 
     realized = (exit_eq / entry_eq) - 1.0
+
+    initial_stop = _f(entry.get("initial_stop_price"))
+    initial_risk = None
+    risk_source = RISK_SOURCE_UNAVAILABLE
+    r_inc = False
+    r_reason = R_REASON_UNAVAILABLE_RISK
+    r_mult = None
+
+    if initial_stop is not None and entry_price is not None and entry_price > 0 and initial_stop < entry_price:
+        initial_risk = (entry_price - initial_stop) / entry_price
+        risk_source = "initial_stop"
+        r_mult = r_multiple(realized, initial_risk)
+        if r_mult is not None:
+            r_inc = True
+            r_reason = ""
+
     return ClosedTrade(symbol, fold, "long", entry_date, exit_date,
                        entry_price, exit_price,
-                       realized_pnl=realized, pnl_included=True,
-                       risk_source=RISK_SOURCE_UNAVAILABLE, r_included=False,
-                       r_exclusion_reason=R_REASON_UNAVAILABLE_RISK)
+                       realized_pnl=realized, initial_risk=initial_risk,
+                       r_multiple=r_mult,
+                       pnl_included=True,
+                       risk_source=risk_source, r_included=r_inc,
+                       r_exclusion_reason=r_reason)
 
 
 def _excluded_trade(symbol: str, fold: str, row: dict, side: str, reason: str) -> ClosedTrade:
@@ -213,70 +231,51 @@ def _excluded_trade(symbol: str, fold: str, row: dict, side: str, reason: str) -
 
 
 def reconstruct_closed_trades(rows: List[dict]) -> List[ClosedTrade]:
-    """Reconstruct LONG round-trips from the per-bar ledger.
-
-    Grouped by ``(symbol, fold_start)`` and paired by a CHRONOLOGICAL state
-    machine over each group's executed rows in file/date order (the ledger is
-    already date-ordered; we never reorder). A single ``pending_entry`` tracks
-    the currently-open long: an executed ``old_position==0 -> new_position==1``
-    row opens it, and the next executed ``1 -> 0`` row closes THAT entry only.
-
-    This guarantees an entry is never paired with an EARLIER exit. In particular
-    a position carried in from a previous fold shows up as a ``1 -> 0`` exit at
-    the top of the group with no pending entry; it is classified as an orphan
-    exit instead of being mis-paired backwards with a later entry (the bug in the
-    prior index-based ``long_entries[i] / long_exits[i]`` pairing).
-
-    Anything that does not fit is EXCLUDED with a reason (never silently dropped):
-      * unclosed entry at end of group -> ``open_at_period_end``
-      * exit with no pending entry      -> ``orphan_exit`` (e.g. carried-in position)
-      * short opens                     -> ``short_unsupported`` (M4-core is long-only)
-      * other executed moves            -> ``unmodeled_transition``
-    """
     trades: List[ClosedTrade] = []
-    groups: "OrderedDict[tuple, List[dict]]" = OrderedDict()
+    groups: Dict[Tuple[str, str], List[dict]] = {}
+
     for r in rows:
-        key = (str(r.get("symbol", "")), str(r.get("fold_start", "")))
+        sym = str(r.get("symbol", "")).upper().strip()
+        fold = str(r.get("fold_start", ""))
+        key = (sym, fold)
         groups.setdefault(key, []).append(r)
 
-    for (symbol, fold), grp in groups.items():
-        # `pending_entry` is the currently-open long entry row (None when flat).
-        # Processing in arrival order means a 1->0 exit can only ever close an
-        # entry that was opened BEFORE it within this same (symbol, fold) group.
+    for (symbol, fold), group_rows in groups.items():
         pending_entry: Optional[dict] = None
-        for r in grp:
+        for r in group_rows:
             if not _is_true(r.get("order_executed")):
                 continue
-            old = _int(r.get("old_position"))
-            new = _int(r.get("new_position"))
-            if old == 0 and new == 1:
-                # Open a long. A still-pending entry here means the prior open
-                # never closed inside this group -> flush it as open_at_period_end
-                # before starting the new one (defensive; valid long-only data
-                # never re-opens while already long).
+            old_pos = _int(r.get("old_position"), 0)
+            new_pos = _int(r.get("new_position"), 0)
+
+            # Open a long position (flat -> long)
+            if old_pos == 0 and new_pos > 0:
                 if pending_entry is not None:
                     trades.append(_excluded_trade(symbol, fold, pending_entry, "long",
                                                   REASON_OPEN_AT_PERIOD_END))
                 pending_entry = r
-            elif old == 1 and new == 0:
-                if pending_entry is not None:
+                continue
+
+            # Close a long position (long -> flat)
+            if old_pos > 0 and new_pos == 0:
+                if pending_entry is None:
+                    trades.append(_excluded_trade(symbol, fold, r, "long",
+                                                  REASON_ORPHAN_EXIT))
+                else:
                     trades.append(_build_long_trade(symbol, fold, pending_entry, r))
                     pending_entry = None
-                else:
-                    # Exit before any pending entry: the position was carried in
-                    # from a previous fold (or the ledger is inconsistent). It is
-                    # NEVER paired backwards with a later entry.
-                    trades.append(_excluded_trade(symbol, fold, r, "long", REASON_ORPHAN_EXIT))
-            elif new is not None and new < 0:
-                # Opening (or flipping into) a short: not modeled in M4-core.
-                trades.append(_excluded_trade(symbol, fold, r, "short", REASON_SHORT_UNSUPPORTED))
-            elif old is not None and old < 0 and new == 0:
-                # Covering a short we already excluded at open; nothing to add.
                 continue
-            else:
-                trades.append(_excluded_trade(symbol, fold, r, "unknown", REASON_UNMODELED_TRANSITION))
 
-        # An entry still open at the end of the group never closed in-period.
+            # Open a short position (flat -> short)
+            if old_pos == 0 and new_pos < 0:
+                trades.append(_excluded_trade(symbol, fold, r, "short",
+                                              REASON_SHORT_UNSUPPORTED))
+                continue
+
+            # Any other transition while holding or scaling
+            trades.append(_excluded_trade(symbol, fold, r, "unknown",
+                                          REASON_UNMODELED_TRANSITION))
+
         if pending_entry is not None:
             trades.append(_excluded_trade(symbol, fold, pending_entry, "long",
                                           REASON_OPEN_AT_PERIOD_END))
@@ -289,15 +288,20 @@ def apply_risk_model(trades: List[ClosedTrade], *, enable_proxy_risk: bool = Fal
                      proxy_pct: Optional[float] = None) -> List[ClosedTrade]:
     """Assign ``risk_source`` / R-multiple to each PnL-included trade.
 
-    Default (proxy off): risk is ``unavailable`` -> excluded from R. Proxy on:
-    a fixed hard-stop fraction is used as initial risk, clearly labeled
-    ``hard_stop`` (never true Minervini R). Excluded (no-PnL) trades pass through.
+    Default: if true initial risk exists (from initial_stop_price), use it.
+    If unavailable and proxy on: a fixed hard-stop fraction is used as initial risk.
     """
     out: List[ClosedTrade] = []
     for t in trades:
         if not t.pnl_included:
             out.append(t)
             continue
+
+        # Preserve true initial risk if reconstructed during trade building
+        if t.r_included and t.initial_risk is not None:
+            out.append(t)
+            continue
+
         if enable_proxy_risk:
             rv = r_multiple(t.realized_pnl, proxy_pct)
             if rv is not None:

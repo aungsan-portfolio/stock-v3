@@ -17,7 +17,13 @@ This package includes the production-safety fixes requested after the v2 review.
 | `ibkr_bridge.py` | Fixed `marketPrice()` handling; it is called as a method. |
 | `ibkr_bridge.py` | Orders are counted as placed only when status is accepted, not rejected/inactive/cancelled. |
 | `ai_engine.py` | RF model is evaluated on chronological holdout, then final production model is refit on all valid history. |
-| `main.py` | Training returns non-zero exit codes if RF or LSTM produces no models. |
+| `data_manager.py` | Fixed `volume_shock` lookahead leakage, `rolling_efficiency` unit mismatch, and upgraded default RSI to Wilder's exponential smoothing. |
+| `trade_coach.py` | Aligned primary preview `quantity` with risk-based sizing (`quantity_by_risk`), retaining `quantity_by_cap` as diagnostic field. |
+| `backtest.py` | Evaluates candle Low for intraday hard stop triggers and records initial stop/risk fields (`initial_stop_price`, `risk_per_share`, `risk_source`, `exit_price`, `exit_reason`) in ledger CSV output. |
+| `expectancy.py` | Automatically computes true trade-level R-multiples when initial stop prices are present. |
+
+> [!IMPORTANT]
+> **Model Retraining Required**: Default RSI now uses Wilder's exponential smoothing (`RSI_SMOOTHING="wilder"`). Run `python main.py train` to retrain models on updated feature distributions. (Set `RSI_SMOOTHING="simple"` in `config.py` if legacy SMA RSI feature alignment is needed).
 
 ## Install
 

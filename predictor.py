@@ -156,6 +156,7 @@ def apply_position_rule_with_hold(
     entry_price: Optional[float] = None,
     current_price: Optional[float] = None,
     hard_stop_pct: Optional[float] = None,
+    low_price: Optional[float] = None,
 ) -> Tuple[int, bool, str, int]:
     """Advance a unit position by one bar according to a broker-like rule."""
     signal = signal.upper()
@@ -166,12 +167,13 @@ def apply_position_rule_with_hold(
         position > 0
         and hard_stop_pct is not None
         and entry_price is not None
-        and current_price is not None
         and entry_price > 0
     ):
-        current_return = float(current_price) / float(entry_price) - 1.0
-        if current_return < -abs(float(hard_stop_pct)):
-            return 0, True, f"hard-stop ({current_return:.4f})", 0
+        eval_price = low_price if low_price is not None else current_price
+        if eval_price is not None:
+            current_return = float(eval_price) / float(entry_price) - 1.0
+            if current_return < -abs(float(hard_stop_pct)):
+                return 0, True, f"hard-stop ({current_return:.4f})", 0
 
     if signal == "BUY":
         if position > 0:
