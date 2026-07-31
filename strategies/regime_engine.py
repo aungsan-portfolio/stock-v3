@@ -56,7 +56,16 @@ def _get_premarket_pct_change(symbol: str, bridge=None) -> tuple[Optional[float]
     try:
         if hasattr(bridge, "get_price"):
             price = bridge.get_price(symbol, allow_historical=True)
-            daily_bars = getattr(bridge, "fetch_historical_data", lambda s, l: [])(symbol, 2)
+            fetch_fn = getattr(bridge, "fetch_historical_data", None)
+            daily_bars = []
+            if callable(fetch_fn):
+                try:
+                    daily_bars = fetch_fn(symbol, "5 D", "1 day")
+                except Exception:
+                    try:
+                        daily_bars = fetch_fn(symbol, 2)
+                    except Exception:
+                        daily_bars = []
             if price > 0 and len(daily_bars) >= 2:
                 prev_close = float(getattr(daily_bars[-2], "close", 0.0) or 0.0)
                 if prev_close > 0:

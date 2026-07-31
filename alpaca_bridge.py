@@ -462,8 +462,10 @@ class AlpacaBridge:
                 "1 min": TimeFrame(1, TimeFrameUnit.Minute)
             }
             tf = tf_map.get(barSizeSetting.lower(), TimeFrame(1, TimeFrameUnit.Day))
-            parts = durationStr.split()
-            n = int(parts[0]) if parts else 5
+            if isinstance(durationStr, int):
+                durationStr = f"{durationStr} D"
+            parts = str(durationStr).split()
+            n = int(parts[0]) if parts and parts[0].isdigit() else 5
             unit = parts[1].upper() if len(parts) > 1 else "D"
             days = n * {"D": 1, "W": 7, "M": 30, "Y": 365}.get(unit[0], 1)
 

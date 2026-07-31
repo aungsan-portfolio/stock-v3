@@ -25,7 +25,7 @@ class TestRegimeEngine(unittest.TestCase):
         mock_soxx_bar1 = MagicMock(close=299.8)
         mock_soxx_bar2 = MagicMock(close=300.0)
 
-        def mock_fetch(sym, lookback):
+        def mock_fetch(sym, *args, **kwargs):
             if sym == "SPY":
                 return [mock_spy_bar1, mock_spy_bar2]
             elif sym == "QQQ":
@@ -46,7 +46,7 @@ class TestRegimeEngine(unittest.TestCase):
         """Test that candidate_count=0 applies -2 penalty, whereas None applies 0 penalty."""
         bridge = MagicMock()
         bridge.get_price.side_effect = lambda s, allow_historical=True: 100.0
-        bridge.fetch_historical_data = lambda s, l: [MagicMock(close=100.0), MagicMock(close=100.0)]
+        bridge.fetch_historical_data = lambda s, *a, **k: [MagicMock(close=100.0), MagicMock(close=100.0)]
 
         # candidate_count = 0 -> -2 penalty
         res_zero = evaluate_market_regime(bridge=bridge, scanner_candidate_count=0)
@@ -71,7 +71,7 @@ class TestRegimeEngine(unittest.TestCase):
         mock_soxx_bar1 = MagicMock(close=300.0)
         mock_soxx_bar2 = MagicMock(close=290.0)
 
-        def mock_fetch(sym, lookback):
+        def mock_fetch(sym, *args, **kwargs):
             if sym == "SPY":
                 return [mock_spy_bar1, mock_spy_bar2]
             elif sym == "QQQ":
@@ -99,7 +99,7 @@ class TestRegimeEngine(unittest.TestCase):
         mock_qqq_bar1 = MagicMock(close=200.0)
         mock_qqq_bar2 = MagicMock(close=199.0)
 
-        def mock_fetch(sym, lookback):
+        def mock_fetch(sym, *args, **kwargs):
             if sym == "SPY":
                 return [mock_spy_bar1, mock_spy_bar2]
             else:
