@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 def check_daily_loss(current_pnl: float, equity: float) -> bool:
     if current_pnl is None:
         return False
-    if current_pnl <= -config.MAX_DAILY_LOSS_DOLLARS:
+    dollar_limit = float(getattr(config, "MAX_DAILY_LOSS_DAYTRADE", getattr(config, "MAX_DAILY_LOSS_DOLLARS", 250.0)))
+    if current_pnl <= -dollar_limit:
         return False
     if equity > 0:
         loss_pct = abs(current_pnl) / equity * 100.0
