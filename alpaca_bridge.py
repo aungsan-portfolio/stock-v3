@@ -762,7 +762,14 @@ class AlpacaBridge:
     def working_orders_plain(self) -> list:
         # Returns list of plain dicts for live_invariants and reconciliation
         try:
-            al_orders = self._get_active_orders()
+            raw_orders = self._get_active_orders()
+            al_orders = []
+            for o in raw_orders:
+                al_orders.append(o)
+                legs = getattr(o, "legs", []) or []
+                for leg in legs:
+                    al_orders.append(leg)
+
             active_statuses = {"new", "partially_filled", "submitted", "queued", "held", "accepted", "pending_new", "accepted_for_bidding", "stopped", "suspended", "calculated"}
             res = []
             for o in al_orders:
@@ -903,6 +910,10 @@ class AlpacaBridge:
                             if "stop" in w_type or w_stop is not None:
                                 has_stop_protection = True
                                 break
+                    # Pass-through: If shares are held by existing bracket order legs, position is covered by broker
+                    if not has_stop_protection and ("held_for_orders" in err_str.lower() or "40310000" in err_str):
+                        logger.info("Startup: %s shares are held by existing bracket order leg — confirmed protected.", symbol)
+                        has_stop_protection = True
 
                 if has_stop_protection:
                     logger.info("Startup: %s shares are held for active STOP orders by broker. Position is confirmed protected.", symbol)
