@@ -142,9 +142,10 @@ MIN_ML_MODELS_FOR_SIGNAL = 1
 MODEL_METRICS_FILE   = MODELS_DIR / "model_metrics.json"
 MODEL_GATE_ENABLED   = True
 MODEL_MIN_RF_ACCURACY = 0.50
-MODEL_MIN_RF_F1       = 0.0
+MODEL_MIN_RF_F1       = 0.45
 MODEL_MAX_AGE_DAYS    = 30
 MODEL_MIN_RF_AUC      = 0.0
+MODEL_MIN_LSTM_AUC    = 0.46
 MODEL_HOLDOUT_RATIO   = 0.15
 
 # ── Permutation test ─────────────────────────────
@@ -617,6 +618,7 @@ class Settings:
     MODEL_MIN_RF_F1: float = MODEL_MIN_RF_F1
     MODEL_MAX_AGE_DAYS: int = MODEL_MAX_AGE_DAYS
     MODEL_MIN_RF_AUC: float = MODEL_MIN_RF_AUC
+    MODEL_MIN_LSTM_AUC: float = MODEL_MIN_LSTM_AUC
     MODEL_HOLDOUT_RATIO: float = MODEL_HOLDOUT_RATIO
 
     # Permutation

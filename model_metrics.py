@@ -211,6 +211,19 @@ def evaluate_gate(symbol: str, now: "_dt.date | None" = None) -> GateResult:
                     False, f"{sym} RF AUC {auc} < floor {auc_floor:.3f}", "below_threshold"
                 )
 
+    # -- LSTM AUC floor (optional, default 0.0 = disabled) --
+    if lstm is not None:
+        lstm_auc_floor = float(getattr(config, "MODEL_MIN_LSTM_AUC", 0.0))
+        if lstm_auc_floor > 0:
+            lstm_auc = lstm.get("best_val_auc")
+            if lstm_auc is not None and not (isinstance(lstm_auc, float) and math.isnan(lstm_auc)):
+                if float(lstm_auc) < lstm_auc_floor:
+                    return GateResult(
+                        False,
+                        f"{sym} LSTM AUC {lstm_auc} < floor {lstm_auc_floor:.3f}",
+                        "below_threshold",
+                    )
+
     return GateResult(True, "ok", "ok")
 
 
