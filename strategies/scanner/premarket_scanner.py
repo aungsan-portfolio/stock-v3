@@ -210,7 +210,20 @@ def _average_daily_volume(symbol: str) -> float:
     return float(daily["volume"].tail(config.VOLUME_MA_PERIOD).mean())
 
 
-def _passes_spread_filter(symbol: str, is_premarket: bool = True, quote_dict: dict = None) -> bool:
+def _record_rejection(reason: str, symbol: str, reject_dict: dict = None, reject_lock: threading.Lock = None):
+    logger.debug("%s skipped: %s", symbol, reason)
+    if reject_dict is not None and reject_lock is not None:
+        with reject_lock:
+            reject_dict[reason] = reject_dict.get(reason, 0) + 1
+
+
+def _passes_spread_filter(
+    symbol: str,
+    is_premarket: bool = True,
+    quote_dict: dict = None,
+    reject_dict: dict = None,
+    reject_lock: threading.Lock = None,
+) -> bool:
     max_spread = getattr(config, "SCAN_PREMARKET_MAX_SPREAD_PCT", 0.015) if is_premarket else getattr(config, "SCAN_REGULAR_MAX_SPREAD_PCT", 0.005)
     if not quote_dict or symbol not in quote_dict:
         return True
@@ -222,7 +235,7 @@ def _passes_spread_filter(symbol: str, is_premarket: bool = True, quote_dict: di
         return True
     spread_pct = (ask - bid) / mid
     if spread_pct > max_spread:
-        logger.debug("%s skipped: spread %.4f exceeds max %.4f (premarket=%s)", symbol, spread_pct, max_spread, is_premarket)
+        _record_rejection(f"spread_exceeds_max ({spread_pct:.4f} > {max_spread:.4f})", symbol, reject_dict, reject_lock)
         return False
     return True
 
@@ -234,35 +247,37 @@ def _passes_premarket_filters(
     volume: int,
     relative_volume: float,
     quote_dict: dict = None,
+    reject_dict: dict = None,
+    reject_lock: threading.Lock = None,
 ) -> bool:
     allow_short = getattr(config, "ALLOW_SHORT", False)
     if gap_pct < 0 and not allow_short:
-        logger.debug("%s skipped: gap-down with ALLOW_SHORT=False", symbol)
+        _record_rejection("gap_down (ALLOW_SHORT=False)", symbol, reject_dict, reject_lock)
         return False
 
     if current_price < config.SCAN_MIN_PRICE or current_price > config.SCAN_MAX_PRICE:
-        logger.debug("%s skipped: price %.2f outside scan range", symbol, current_price)
+        _record_rejection(f"price_outside_scan_range (${current_price:.2f})", symbol, reject_dict, reject_lock)
         return False
     if abs(gap_pct) < config.SCAN_MIN_GAP_PCT:
-        logger.debug("%s skipped: gap %.2f%% below %.2f%%", symbol, gap_pct, config.SCAN_MIN_GAP_PCT)
+        _record_rejection(f"gap_below_min ({gap_pct:.2f}% < {config.SCAN_MIN_GAP_PCT}%)", symbol, reject_dict, reject_lock)
         return False
     if abs(gap_pct) > config.SCAN_MAX_GAP_PCT:
-        logger.debug("%s skipped: gap %.2f%% above %.2f%%", symbol, gap_pct, config.SCAN_MAX_GAP_PCT)
+        _record_rejection(f"gap_above_max ({gap_pct:.2f}% > {config.SCAN_MAX_GAP_PCT}%)", symbol, reject_dict, reject_lock)
         return False
     if volume < config.SCAN_MIN_PREMARKET_VOLUME:
-        logger.debug("%s skipped: PM volume %d below %d", symbol, volume, config.SCAN_MIN_PREMARKET_VOLUME)
+        _record_rejection(f"volume_below_min ({volume} < {config.SCAN_MIN_PREMARKET_VOLUME})", symbol, reject_dict, reject_lock)
         return False
     if relative_volume < config.SCAN_MIN_RELATIVE_VOLUME:
-        logger.debug("%s skipped: rvol %.2f below %.2f", symbol, relative_volume, config.SCAN_MIN_RELATIVE_VOLUME)
+        _record_rejection(f"rvol_below_min ({relative_volume:.2f} < {config.SCAN_MIN_RELATIVE_VOLUME})", symbol, reject_dict, reject_lock)
         return False
 
     min_avg_vol = getattr(config, "SCAN_MIN_AVG_DAILY_VOLUME", 750_000)
     avg_vol = _average_daily_volume(symbol)
     if avg_vol > 0 and avg_vol < min_avg_vol:
-        logger.debug("%s skipped: avg daily vol %.0f below %d", symbol, avg_vol, min_avg_vol)
+        _record_rejection(f"avg_daily_vol_below_min ({avg_vol:.0f} < {min_avg_vol})", symbol, reject_dict, reject_lock)
         return False
 
-    if not _passes_spread_filter(symbol, is_premarket=True, quote_dict=quote_dict):
+    if not _passes_spread_filter(symbol, is_premarket=True, quote_dict=quote_dict, reject_dict=reject_dict, reject_lock=reject_lock):
         return False
 
     return True
@@ -275,39 +290,50 @@ def _passes_open_filters(
     volume: int,
     relative_volume: float,
     quote_dict: dict = None,
+    reject_dict: dict = None,
+    reject_lock: threading.Lock = None,
 ) -> bool:
     allow_short = getattr(config, "ALLOW_SHORT", False)
     if move_pct < 0 and not allow_short:
-        logger.debug("%s skipped: down move with ALLOW_SHORT=False", symbol)
+        _record_rejection("down_move (ALLOW_SHORT=False)", symbol, reject_dict, reject_lock)
         return False
     if current_price < config.SCAN_MIN_PRICE or current_price > config.SCAN_MAX_PRICE:
-        logger.debug("%s skipped: price %.2f outside scan range", symbol, current_price)
+        _record_rejection(f"price_outside_scan_range (${current_price:.2f})", symbol, reject_dict, reject_lock)
         return False
-    if abs(move_pct) < getattr(config, "SCAN_OPEN_MIN_MOVE_PCT", 0.25):
-        logger.debug("%s skipped: open move %.2f%% too small", symbol, move_pct)
+    min_move = getattr(config, "SCAN_OPEN_MIN_MOVE_PCT", 0.25)
+    if abs(move_pct) < min_move:
+        _record_rejection(f"open_move_too_small ({move_pct:.2f}% < {min_move}%)", symbol, reject_dict, reject_lock)
         return False
-    if volume < getattr(config, "SCAN_OPEN_MIN_VOLUME", 100_000):
-        logger.debug("%s skipped: session volume %d too small", symbol, volume)
+    min_vol = getattr(config, "SCAN_OPEN_MIN_VOLUME", 100_000)
+    if volume < min_vol:
+        _record_rejection(f"volume_too_small ({volume} < {min_vol})", symbol, reject_dict, reject_lock)
         return False
-    if relative_volume < getattr(config, "SCAN_OPEN_MIN_RELATIVE_VOLUME", 0.05):
-        logger.debug("%s skipped: session rvol %.2f too small", symbol, relative_volume)
+    min_rvol = getattr(config, "SCAN_OPEN_MIN_RELATIVE_VOLUME", 0.05)
+    if relative_volume < min_rvol:
+        _record_rejection(f"rvol_too_small ({relative_volume:.2f} < {min_rvol})", symbol, reject_dict, reject_lock)
         return False
 
     min_avg_vol = getattr(config, "SCAN_MIN_AVG_DAILY_VOLUME", 750_000)
     avg_vol = _average_daily_volume(symbol)
     if avg_vol > 0 and avg_vol < min_avg_vol:
-        logger.debug("%s skipped: avg daily vol %.0f below %d", symbol, avg_vol, min_avg_vol)
+        _record_rejection(f"avg_daily_vol_too_small ({avg_vol:.0f} < {min_avg_vol})", symbol, reject_dict, reject_lock)
         return False
 
-    if not _passes_spread_filter(symbol, is_premarket=False, quote_dict=quote_dict):
+    if not _passes_spread_filter(symbol, is_premarket=False, quote_dict=quote_dict, reject_dict=reject_dict, reject_lock=reject_lock):
         return False
 
     return True
 
 
-def _compute_premarket_candidate(symbol: str, quote_dict: dict = None) -> Optional[ScanCandidate]:
+def _compute_premarket_candidate(
+    symbol: str,
+    quote_dict: dict = None,
+    reject_dict: dict = None,
+    reject_lock: threading.Lock = None,
+) -> Optional[ScanCandidate]:
     prev = previous_close(symbol)
     if prev is None or prev <= 0:
+        _record_rejection("invalid_prev_close", symbol, reject_dict, reject_lock)
         return None
 
     df = fetch_intraday(
@@ -317,11 +343,12 @@ def _compute_premarket_candidate(symbol: str, quote_dict: dict = None) -> Option
         prepost=True,
     )
     if df.empty:
+        _record_rejection("empty_intraday_data", symbol, reject_dict, reject_lock)
         return None
 
     pm_df = _premarket_bars(df, symbol)
     if pm_df.empty:
-        logger.debug("No premarket bars for %s", symbol)
+        _record_rejection("no_premarket_bars", symbol, reject_dict, reject_lock)
         return None
 
     current = float(pm_df["close"].iloc[-1])
@@ -329,7 +356,9 @@ def _compute_premarket_candidate(symbol: str, quote_dict: dict = None) -> Option
     gap_pct = ((current - prev) / prev) * 100.0
     rel_vol = _relative_volume(symbol, volume)
 
-    if not _passes_premarket_filters(symbol, gap_pct, current, volume, rel_vol, quote_dict=quote_dict):
+    if not _passes_premarket_filters(
+        symbol, gap_pct, current, volume, rel_vol, quote_dict=quote_dict, reject_dict=reject_dict, reject_lock=reject_lock
+    ):
         return None
 
     score = _score(gap_pct, rel_vol, volume)
@@ -339,9 +368,15 @@ def _compute_premarket_candidate(symbol: str, quote_dict: dict = None) -> Option
     return ScanCandidate(symbol, prev, current, gap_pct, volume, rel_vol, score, reason)
 
 
-def _compute_open_candidate(symbol: str, quote_dict: dict = None) -> Optional[ScanCandidate]:
+def _compute_open_candidate(
+    symbol: str,
+    quote_dict: dict = None,
+    reject_dict: dict = None,
+    reject_lock: threading.Lock = None,
+) -> Optional[ScanCandidate]:
     prev = previous_close(symbol)
     if prev is None or prev <= 0:
+        _record_rejection("invalid_prev_close", symbol, reject_dict, reject_lock)
         return None
 
     df = fetch_intraday(
@@ -350,11 +385,12 @@ def _compute_open_candidate(symbol: str, quote_dict: dict = None) -> Optional[Sc
         lookback_days=1,
     )
     if df.empty:
+        _record_rejection("empty_intraday_data", symbol, reject_dict, reject_lock)
         return None
 
     reg_df = _regular_session_bars(df, symbol)
     if reg_df.empty:
-        logger.debug("No regular-session bars for %s", symbol)
+        _record_rejection("no_regular_session_bars", symbol, reject_dict, reject_lock)
         return None
 
     current = float(reg_df["close"].iloc[-1])
@@ -364,7 +400,9 @@ def _compute_open_candidate(symbol: str, quote_dict: dict = None) -> Optional[Sc
     gap_pct = ((current - prev) / prev) * 100.0
     rel_vol = _relative_volume(symbol, volume)
 
-    if not _passes_open_filters(symbol, move_pct, current, volume, rel_vol, quote_dict=quote_dict):
+    if not _passes_open_filters(
+        symbol, move_pct, current, volume, rel_vol, quote_dict=quote_dict, reject_dict=reject_dict, reject_lock=reject_lock
+    ):
         return None
 
     score = _score(move_pct, rel_vol, volume)
@@ -398,14 +436,18 @@ def scan(symbols: List[str] = None, max_candidates: int = None) -> List[ScanCand
 
     candidates = []
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
+    reject_dict = {}
+    reject_lock = threading.Lock()
 
     def _eval_sym(sym: str) -> Optional[ScanCandidate]:
         symbol = str(sym).upper()
         try:
             if is_market_open():
-                return _compute_open_candidate(symbol, quote_dict=quote_dict)
+                return _compute_open_candidate(symbol, quote_dict=quote_dict, reject_dict=reject_dict, reject_lock=reject_lock)
             else:
-                return _compute_premarket_candidate(symbol, quote_dict=quote_dict)
+                return _compute_premarket_candidate(symbol, quote_dict=quote_dict, reject_dict=reject_dict, reject_lock=reject_lock)
         except Exception:
             logger.warning("Scan error for %s", symbol, exc_info=True)
             return None
@@ -439,8 +481,9 @@ def scan(symbols: List[str] = None, max_candidates: int = None) -> List[ScanCand
     _save_results(top)
     if not top:
         logger.warning(
-            "⚠️ Scanner Health Guard: 0 candidates found from dynamic universe (%d symbols tested). Fallback watchlist active.",
+            "⚠️ Scanner Health Guard: 0 candidates found from dynamic universe (%d symbols tested). Rejection reasons breakdown: %s. Fallback watchlist active.",
             len(symbols),
+            dict(sorted(reject_dict.items(), key=lambda x: x[1], reverse=True)),
         )
     else:
         logger.info(
