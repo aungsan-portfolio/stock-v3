@@ -269,19 +269,20 @@ class AlpacaBridge:
                 self._conn_health.mark_unhealthy("Account blocked")
                 return False
 
-            logger.info("Connected to Alpaca Paper Account | Status: %s | Equity: %s", acct.status, acct.equity)
+            self._account_id = str(getattr(acct, "account_number", "") or getattr(acct, "id", "") or "default")
+            logger.info("Connected to Alpaca Paper Account (%s) | Status: %s | Equity: %s", self._account_id, acct.status, acct.equity)
             from strategies.session import now_eastern
             et_date = str(now_eastern().date())
-            state = self._load_daytrade_risk_state()
-            if state.get("date") == et_date:
+            state = self._load_daytrade_risk_state(self._account_id)
+            if state.get("date") == et_date and state.get("account_id") == self._account_id:
                 self._start_of_day_equity = float(state.get("start_of_day_equity", acct.equity))
                 self._daytrade_suspended = bool(state.get("suspended", False))
-                logger.info("Restored start-of-day equity: $%.2f, suspended: %s", self._start_of_day_equity, self._daytrade_suspended)
+                logger.info("[%s] Restored start-of-day equity: $%.2f, suspended: %s", self._account_id, self._start_of_day_equity, self._daytrade_suspended)
             else:
                 self._start_of_day_equity = float(acct.equity)
                 self._daytrade_suspended = False
-                self._save_daytrade_risk_state(et_date, self._start_of_day_equity, False)
-                logger.info("Initialized new day start-of-day equity: $%.2f", self._start_of_day_equity)
+                self._save_daytrade_risk_state(et_date, self._start_of_day_equity, False, account_id=self._account_id)
+                logger.info("[%s] Initialized new day start-of-day equity: $%.2f", self._account_id, self._start_of_day_equity)
             self._session_start_time = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=24)
             self._connected = True
             self._conn_health.mark_healthy()
@@ -297,10 +298,22 @@ class AlpacaBridge:
         self._connected = False
         logger.info("Disconnected from Alpaca")
 
-    def _load_daytrade_risk_state(self) -> dict:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'daytrade_risk_state.json')
+    def _load_daytrade_risk_state(self, account_id: str = None) -> dict:
+        acct_id = account_id or getattr(self, "_account_id", "default")
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', f'daytrade_risk_state_{acct_id}.json')
         if not os.path.exists(path):
-            return {}
+            legacy_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'daytrade_risk_state.json')
+            if not os.path.exists(legacy_path):
+                return {}
+            try:
+                with open(legacy_path, "r") as f:
+                    import json
+                    data = json.load(f)
+                    if data.get("account_id") == acct_id:
+                        return data
+                    return {}
+            except Exception:
+                return {}
         try:
             with open(path, "r") as f:
                 import json
@@ -309,13 +322,15 @@ class AlpacaBridge:
             logger.error("Failed to load daytrade risk state: %s", e)
             return {}
 
-    def _save_daytrade_risk_state(self, date_str: str, equity: float, suspended: bool):
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'daytrade_risk_state.json')
+    def _save_daytrade_risk_state(self, date_str: str, equity: float, suspended: bool, account_id: str = None):
+        acct_id = account_id or getattr(self, "_account_id", "default")
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', f'daytrade_risk_state_{acct_id}.json')
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w") as f:
                 import json
                 json.dump({
+                    "account_id": acct_id,
                     "date": date_str,
                     "start_of_day_equity": equity,
                     "suspended": suspended
