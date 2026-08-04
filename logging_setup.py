@@ -11,6 +11,16 @@ from logging.handlers import RotatingFileHandler
 import config
 
 
+class SafeRotatingFileHandler(RotatingFileHandler):
+    """Windows-safe RotatingFileHandler that catches PermissionError during rollover."""
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except PermissionError:
+            pass
+        except Exception:
+            pass
+
 def setup_logging() -> None:
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -32,7 +42,7 @@ def setup_logging() -> None:
     console.setLevel(logging.INFO)
     console.setFormatter(fmt)
 
-    file_handler = RotatingFileHandler(
+    file_handler = SafeRotatingFileHandler(
         config.LOG_FILE,
         maxBytes=config.LOG_MAX_BYTES,
         backupCount=config.LOG_BACKUP_COUNT,
