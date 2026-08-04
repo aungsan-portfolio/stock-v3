@@ -689,6 +689,20 @@ class DynamicTrailingStopManager:
                     return
 
                 if protection_method == "replace":
+                    # Pre-check: try to adopt existing nested broker stop order first before attempting new order placement
+                    if hasattr(bridge, "_client") and hasattr(bridge._client, "get_orders"):
+                        try:
+                            from alpaca.trading.requests import GetOrdersRequest
+                            from alpaca.trading.enums import QueryOrderStatus
+                            req = GetOrdersRequest(status=QueryOrderStatus.ALL, nested=True, symbols=[symbol])
+                            fetched_orders = bridge._client.get_orders(req) or []
+                            with self._lock:
+                                if self._reconcile_broker_order(state, fetched_orders):
+                                    logger.info(f"Reconciled active broker stop order {state.order_id} for {symbol} — skipping new submission.")
+                                    return
+                        except Exception as rec_exc:
+                            logger.debug(f"Pre-reconcile failed for {symbol}: {rec_exc}")
+
                     logger.warning(f"Naked position detected for {symbol} ({position_qty} shares). Attempting to re-place stop order at ${state.stop_price:.2f}.")
                     stop_side = "SELL" if state.side == "BUY" else "BUY"
                     
