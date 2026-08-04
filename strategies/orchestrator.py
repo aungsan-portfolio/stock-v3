@@ -542,6 +542,7 @@ def evaluate_and_execute(
                 current_pnl=current_pnl,
                 day_trades_last_5_days=day_trades_in_last_5_days(),
                 dry_run=not live_paper,
+                regime_result=regime_res,
             )
             if result["status"] in {"PLACED", "DRY_RUN"}:
                 error_handler.reset()
