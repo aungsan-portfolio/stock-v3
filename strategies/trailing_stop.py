@@ -41,6 +41,7 @@ class TrailingStopState:
     qty: float = 0.0
     strategy: str = "UNKNOWN"
     signal_id: Optional[str] = None
+    target_price: Optional[float] = None
 
 
 def normalize_order_type(order_type: object) -> str:
@@ -889,7 +890,7 @@ class DynamicTrailingStopManager:
                                         qty=int(qty_closed),
                                         entry_price=current_state.entry_price,
                                         stop_price=current_state.stop_price,
-                                        target_price=exit_price,
+                                        target_price=getattr(current_state, "target_price", None) or exit_price,
                                         exit_price=exit_price,
                                         exit_reason="EMERGENCY_FLATTEN",
                                         pnl=pnl_val,
