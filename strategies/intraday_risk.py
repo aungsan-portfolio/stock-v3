@@ -34,8 +34,9 @@ def check_daily_loss(current_pnl: float, equity: float) -> bool:
     return True
 
 
-def check_max_trades(trades_today: int) -> bool:
-    return trades_today < config.MAX_TRADES_PER_DAY
+def check_max_trades(trades_today: int, max_trades: Optional[int] = None) -> bool:
+    limit = max_trades if max_trades is not None else getattr(config, "MAX_DAILY_TRADES", getattr(config, "MAX_TRADES_PER_DAY", 15))
+    return trades_today < limit
 
 
 def check_max_positions(open_positions: int) -> bool:
@@ -171,6 +172,7 @@ def pre_trade_check(
     symbol: Optional[str] = None,
     max_risk_pct: float = 1.0,
     open_symbols: Optional[list] = None,
+    max_trades: Optional[int] = None,
 ) -> str:
     """Run all risk checks before placing a trade."""
     if current_pnl is None:
@@ -189,8 +191,9 @@ def pre_trade_check(
     if consecutive_losses >= max_consecutive_losses:
         return f"Consecutive loss limit reached ({consecutive_losses}/{max_consecutive_losses})"
 
-    if not check_max_trades(trades_today):
-        return f"Max trades/day reached ({trades_today}/{config.MAX_TRADES_PER_DAY})"
+    effective_limit = max_trades if max_trades is not None else getattr(config, "MAX_DAILY_TRADES", getattr(config, "MAX_TRADES_PER_DAY", 15))
+    if not check_max_trades(trades_today, max_trades=effective_limit):
+        return f"Max trades/day reached ({trades_today}/{effective_limit})"
 
     if not check_max_positions(open_positions):
         return f"Max open positions reached ({open_positions}/{config.MAX_OPEN_POSITIONS})"

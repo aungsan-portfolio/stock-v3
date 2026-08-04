@@ -252,6 +252,14 @@ def execute_signal(
     if regime_result and getattr(regime_result, "mode", "") == "CAUTION":
         effective_max_trades = min(effective_max_trades, 5)
 
+    logger.debug(
+        "[TRADE LIMIT DEBUG] regime=%s today_fills=%d configured_max=%d effective_max=%d",
+        getattr(regime_result, "mode", None) if regime_result else "UNKNOWN",
+        trades_today,
+        getattr(config, "MAX_DAILY_TRADES", 15),
+        effective_max_trades,
+    )
+
     if trades_today >= effective_max_trades:
         result["reason"] = f"Max trades/day reached ({trades_today}/{effective_max_trades})"
         logger.info("Blocked %s: %s", signal.symbol, result["reason"])
@@ -267,6 +275,7 @@ def execute_signal(
         symbol=signal.symbol,
         max_risk_pct=risk_pct,
         open_symbols=open_syms,
+        max_trades=effective_max_trades,
     )
 
     if risk_reason:

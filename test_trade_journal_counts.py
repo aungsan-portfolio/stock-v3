@@ -72,5 +72,45 @@ class TestTradeJournalCounts(unittest.TestCase):
         trades = today_trades()
         self.assertEqual(len(trades), 1)
 
+    def test_pre_trade_check_caution_5_limit(self):
+        from strategies.intraday_risk import pre_trade_check, check_max_trades
+        
+        # 4 trades today < 5 max trades -> allowed
+        self.assertTrue(check_max_trades(trades_today=4, max_trades=5))
+        
+        # 5 trades today >= 5 max trades -> blocked
+        self.assertFalse(check_max_trades(trades_today=5, max_trades=5))
+        
+        # Check formatted error string in pre_trade_check
+        err = pre_trade_check(
+            equity=100000.0,
+            current_pnl=100.0,
+            trades_today=5,
+            open_positions=1,
+            day_trades_last_5_days=0,
+            risk_dollars=50.0,
+            symbol="MSFT",
+            max_trades=5
+        )
+        self.assertEqual(err, "Max trades/day reached (5/5)")
+
+    def test_pre_trade_check_risk_on_15_limit(self):
+        from strategies.intraday_risk import pre_trade_check, check_max_trades
+        
+        self.assertTrue(check_max_trades(trades_today=14, max_trades=15))
+        self.assertFalse(check_max_trades(trades_today=15, max_trades=15))
+        
+        err = pre_trade_check(
+            equity=100000.0,
+            current_pnl=100.0,
+            trades_today=15,
+            open_positions=1,
+            day_trades_last_5_days=0,
+            risk_dollars=50.0,
+            symbol="MSFT",
+            max_trades=15
+        )
+        self.assertEqual(err, "Max trades/day reached (15/15)")
+
 if __name__ == "__main__":
     unittest.main()
