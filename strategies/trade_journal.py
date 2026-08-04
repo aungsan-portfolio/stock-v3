@@ -151,7 +151,7 @@ def today_trades(journal_file: Optional[Path] = None):
             if oid not in seen_orders:
                 seen_orders.add(oid)
                 entry_trades.append(r)
-        elif not is_fill and r.get("event_type") == "ORDER_SUBMITTED":
+        elif not is_fill and r.get("event_type") == "ORDER_SUBMITTED" and side == "BUY":
             # Fallback for paper mode if fill record missing
             oid = r.get("order_id") or f"{r.get('symbol')}_{r.get('timestamp')}"
             if oid not in seen_orders:
