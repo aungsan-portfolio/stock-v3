@@ -138,19 +138,26 @@ def today_trades(journal_file: Optional[Path] = None):
     current_eastern = now_eastern()
     eastern_timezone = current_eastern.tzinfo
     today_date = current_eastern.date()
-    return [
-        r for r in read_journal(journal_file)
-        if _is_today_record(r.get("timestamp", ""), today_date, eastern_timezone)
-        and (
-            r.get("event_type") == "ORDER_SUBMITTED"
-            or (
-                r.get("event_type") is None
-                and r.get("type") != "FILL"
-                and r.get("strategy") != "EXEC_HOOK"
-                and float(r.get("entry_price", 0) or 0) > 0
-            )
-        )
-    ]
+    seen_orders = set()
+    entry_trades = []
+    for r in read_journal(journal_file):
+        if not _is_today_record(r.get("timestamp", ""), today_date, eastern_timezone):
+            continue
+        # Count actual executed BUY fills or valid trade entries
+        is_fill = (r.get("event_type") == "FILL" or r.get("type") == "FILL")
+        side = str(r.get("side", "")).upper()
+        if is_fill and side == "BUY":
+            oid = r.get("order_id") or r.get("execution_id") or f"{r.get('symbol')}_{r.get('timestamp')}"
+            if oid not in seen_orders:
+                seen_orders.add(oid)
+                entry_trades.append(r)
+        elif not is_fill and r.get("event_type") == "ORDER_SUBMITTED":
+            # Fallback for paper mode if fill record missing
+            oid = r.get("order_id") or f"{r.get('symbol')}_{r.get('timestamp')}"
+            if oid not in seen_orders:
+                seen_orders.add(oid)
+                entry_trades.append(r)
+    return entry_trades
 
 def today_trade_count(journal_file: Optional[Path] = None) -> int:
     return len(today_trades(journal_file))
