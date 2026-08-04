@@ -112,5 +112,61 @@ class TestTradeJournalCounts(unittest.TestCase):
         )
         self.assertEqual(err, "Max trades/day reached (15/15)")
 
+    @patch("strategies.order_manager.today_trade_count")
+    def test_execute_signal_regime_propagation(self, mock_today_count):
+        from strategies.order_manager import execute_signal
+        from strategies.base import TradeSignal, StrategyName
+        from dataclasses import dataclass
+
+        @dataclass
+        class MockRegime:
+            mode: str = "CAUTION"
+            position_scale: float = 0.5
+            confidence_boost: float = 0.0
+
+        mock_bridge = MagicMock()
+        mock_bridge.is_connected = True
+        mock_bridge.open_position_count.return_value = 0
+        mock_bridge.get_positions.return_value = []
+
+        sig = TradeSignal(
+            symbol="AAPL",
+            strategy=StrategyName.VWAP_BOUNCE,
+            side="BUY",
+            entry_price=200.0,
+            stop_price=190.0,
+            target_price=220.0,
+            confidence=0.80,
+            atr=2.0,
+            risk_per_share=10.0,
+            reason="test"
+        )
+
+        # Case 1: CAUTION mode with 5 trades today -> blocked (5/5)
+        mock_today_count.return_value = 5
+        regime_caution = MockRegime(mode="CAUTION", position_scale=0.5)
+        res_caution = execute_signal(
+            signal=sig,
+            bridge=mock_bridge,
+            equity=100000.0,
+            current_pnl=0.0,
+            dry_run=True,
+            regime_result=regime_caution
+        )
+        self.assertEqual(res_caution["status"], "REJECTED")
+        self.assertIn("Max trades/day reached (5/5)", res_caution["reason"])
+
+        # Case 2: regime_result=None with 5 trades today -> allowed through trade limit check (falls back to configured max 18)
+        mock_today_count.return_value = 5
+        res_none = execute_signal(
+            signal=sig,
+            bridge=mock_bridge,
+            equity=100000.0,
+            current_pnl=0.0,
+            dry_run=True,
+            regime_result=None
+        )
+        self.assertNotIn("Max trades/day reached", res_none.get("reason", ""))
+
 if __name__ == "__main__":
     unittest.main()
