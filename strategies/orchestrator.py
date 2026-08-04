@@ -357,19 +357,15 @@ def evaluate_and_execute(
         scanner_count = getattr(bridge, "_last_scanner_candidate_count", 0) if bridge else 0
         regime_res = evaluate_market_regime(bridge=bridge, scanner_candidate_count=scanner_count)
 
-        if scanner_count == 0 and regime_res.mode in (MODE_CAUTION, MODE_RISK_OFF):
-            allow_new_entries = False
-            logger.warning(
-                "No scanner candidates + regime=%s → skipping fallback entries today.",
-                regime_res.mode,
-            )
-        elif regime_res.mode == MODE_RISK_OFF or not regime_res.allow_new_longs:
+        if regime_res.mode == MODE_RISK_OFF or not regime_res.allow_new_longs:
             allow_new_entries = False
             logger.warning("[MARKET REGIME RISK_OFF] New long day trades disabled (Score: %d <= -4). Summary: %s", regime_res.score, regime_res.summary())
         elif regime_res.mode == MODE_CAUTION:
             if not is_past_opening_buffer(15):
                 allow_new_entries = False
                 logger.info("[MARKET REGIME CAUTION] Enforcing 15-minute opening entry buffer (No BUY before 09:45 EST). Summary: %s", regime_res.summary())
+            else:
+                logger.info("[MARKET REGIME CAUTION] Fallback watchlist active after 09:45 EST buffer (50%% sizing). Summary: %s", regime_res.summary())
     except Exception as r_exc:
         logger.error("Market regime evaluation failed: %s", r_exc)
 
