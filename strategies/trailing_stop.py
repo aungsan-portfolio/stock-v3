@@ -282,11 +282,22 @@ class DynamicTrailingStopManager:
                     all_open_orders = self._extract_all_orders_including_legs(open_orders)
                     open_order_ids = {_extract_order_info(o)["id"] for o in all_open_orders if _extract_order_info(o)["id"]}
                     if str(state.order_id) not in open_order_ids:
-                        logger.warning(
-                            f"Stop order {state.order_id} for {symbol} is no longer open in active legs. "
-                            f"Reconciling broker open orders before marking naked..."
-                        )
-                        state.order_id = None
+                        # Check if a valid active stop order for symbol already exists on broker
+                        target_side = "sell" if state.side == "BUY" else "buy"
+                        matching_stop_id = None
+                        matching_stop_price = None
+                        for o in all_open_orders:
+                            info = _extract_order_info(o)
+                            if info["symbol"] == symbol.upper().strip() and self._is_valid_stop_order(o, target_side):
+                                matching_stop_id = info["id"]
+                                matching_stop_price = info["stop_price"]
+                                break
+                        if matching_stop_id:
+                            state.order_id = str(matching_stop_id)
+                            if matching_stop_price is not None:
+                                state.stop_price = float(matching_stop_price)
+                        else:
+                            state.order_id = None
 
                 if state.order_id is None:
                     self._reconcile_broker_order(state, open_orders)
@@ -561,7 +572,7 @@ class DynamicTrailingStopManager:
                         qty=int(qty_closed),
                         entry_price=state.entry_price,
                         stop_price=state.stop_price,
-                        target_price=exit_price,
+                        target_price=getattr(state, "target_price", None) or exit_price,
                         exit_price=exit_price,
                         exit_reason="STOP_OUT",
                         pnl=pnl_val,
