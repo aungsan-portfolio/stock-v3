@@ -93,8 +93,15 @@ def _load_universe() -> List[str]:
                 for r in gainers.losers:
                     if _is_valid_equity(r.symbol):
                         symbols_pool.add(r.symbol)
+
+                # Seed symbols_pool with Large-Cap / Mid-Cap Pivot Leaders
+                pivot_leaders = getattr(config, "LARGE_CAP_PIVOT_SYMBOLS", ["PLTR", "NVDA", "AMD", "TSLA", "MSFT", "AMZN", "META", "MUU", "FIGS", "MARA"])
+                for leader in pivot_leaders:
+                    if _is_valid_equity(leader):
+                        symbols_pool.add(leader)
                     
-                final_symbols = list(symbols_pool)
+                denylist = set(getattr(config, "SYMBOL_DENYLIST", []))
+                final_symbols = [s for s in symbols_pool if s not in denylist]
                 if final_symbols:
                     logger.info("Fetched dynamic symbol universe from Alpaca (%d unique symbols)", len(final_symbols))
                     _screener_cache["data"] = final_symbols
@@ -106,10 +113,11 @@ def _load_universe() -> List[str]:
                 logger.warning(f"Dynamic screener failed: {e}. Falling back to SYMBOL_UNIVERSE_FILE.")
 
     # 2nd -> static watchlist & core symbols fallback (prevents yfinance spam on delisted symbols)
+    denylist = set(getattr(config, "SYMBOL_DENYLIST", []))
     core_syms = getattr(config, "FULL_MARKET_CORE_SYMBOLS", []) or getattr(config, "WATCHLIST", [])
     if core_syms:
         logger.info("Falling back to core symbols/watchlist universe (%d symbols)", len(core_syms))
-        return list(dict.fromkeys(core_syms))
+        return [s for s in list(dict.fromkeys(core_syms)) if s not in denylist]
 
     # 3rd -> SYMBOL_UNIVERSE_FILE (CSV)
     path = config.SYMBOL_UNIVERSE_FILE
@@ -211,7 +219,7 @@ def _average_daily_volume(symbol: str) -> float:
 
 
 def _record_rejection(reason: str, symbol: str, reject_dict: dict = None, reject_lock: threading.Lock = None):
-    logger.debug("%s skipped: %s", symbol, reason)
+    logger.debug("SCAN REJECT [%s]: %s", symbol, reason)
     if reject_dict is not None and reject_lock is not None:
         with reject_lock:
             reject_dict[reason] = reject_dict.get(reason, 0) + 1
@@ -297,8 +305,10 @@ def _passes_open_filters(
     if move_pct < 0 and not allow_short:
         _record_rejection("down_move (ALLOW_SHORT=False)", symbol, reject_dict, reject_lock)
         return False
-    if current_price < config.SCAN_MIN_PRICE or current_price > config.SCAN_MAX_PRICE:
-        _record_rejection(f"price_outside_scan_range (${current_price:.2f})", symbol, reject_dict, reject_lock)
+
+    min_price = getattr(config, "SCAN_MIN_PRICE", 10.0)
+    if current_price < min_price or current_price > config.SCAN_MAX_PRICE:
+        _record_rejection(f"price_outside_scan_range (${current_price:.2f} < ${min_price:.2f})", symbol, reject_dict, reject_lock)
         return False
     min_move = getattr(config, "SCAN_OPEN_MIN_MOVE_PCT", 0.25)
     if abs(move_pct) < min_move:
@@ -418,6 +428,10 @@ def _compute_open_candidate(
 def scan(symbols: List[str] = None, max_candidates: int = None) -> List[ScanCandidate]:
     from strategies.scanner.news_sentiment import analyze_news_sentiment
     symbols = symbols or _load_universe()
+    blacklist = set(getattr(config, "SYMBOL_STALE_QUOTE_BLACKLIST", []))
+    denylist = set(getattr(config, "SYMBOL_DENYLIST", []))
+    if blacklist or denylist:
+        symbols = [s for s in symbols if s not in blacklist and s not in denylist]
     max_candidates = max_candidates or config.SCAN_MAX_CANDIDATES
     mode = "OPEN" if is_market_open() else "PREMARKET"
 
@@ -479,16 +493,24 @@ def scan(symbols: List[str] = None, max_candidates: int = None) -> List[ScanCand
     top = top[:max_candidates]
 
     _save_results(top)
+    top5_reasons = dict(sorted(reject_dict.items(), key=lambda x: x[1], reverse=True)[:5])
+    top5_str = " | ".join(f"{r}x{c}" for r, c in top5_reasons.items()) or "none"
+    
     if not top:
         logger.warning(
-            "⚠️ Scanner Health Guard: 0 candidates found from dynamic universe (%d symbols tested). Rejection reasons breakdown: %s. Fallback watchlist active.",
+            "⚠️ Scanner Health: 0 candidates from %d symbols. Top rejection reasons: %s | Fallback watchlist active",
             len(symbols),
-            dict(sorted(reject_dict.items(), key=lambda x: x[1], reverse=True)),
+            top5_str,
         )
     else:
         logger.info(
-            "Scanner mode=%s session=%s found %d candidates (top %d from %d symbols)",
-            mode, session_status(), len(top), max_candidates, len(symbols),
+            "Scanner mode=%s session=%s found %d candidates (%d/%d symbols passed) | Rejections: [%s]",
+            mode,
+            session_status(),
+            len(top),
+            len(top),
+            len(symbols),
+            top5_str,
         )
     return top
 

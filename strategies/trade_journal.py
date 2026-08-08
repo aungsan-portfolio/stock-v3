@@ -233,10 +233,34 @@ def count_day_trades_in_records(records: list[dict], current_date) -> int:
 
     return round_trips
 
-def day_trades_in_last_5_days(journal_file: Optional[Path] = None) -> int:
-    """Count completed intraday round trips across the last five market days."""
+def day_trades_in_last_5_days(journal_file: Optional[Path] = None, bridge: Optional[object] = None) -> int:
+    """Count completed intraday round trips across the last five market days.
+    
+    Cross-verifies local DB count with Alpaca broker account daytrade_count
+    and returns max(local, alpaca) for fail-closed PDT compliance.
+    """
     records = read_journal(journal_file)
-    return count_day_trades_in_records(records, now_eastern().date())
+    local_count = count_day_trades_in_records(records, now_eastern().date())
+    alpaca_count = 0
+    if bridge is not None:
+        try:
+            acct = None
+            if hasattr(bridge, "get_account"):
+                acct = bridge.get_account()
+            elif hasattr(bridge, "_client") and hasattr(bridge._client, "get_account"):
+                acct = bridge._client.get_account()
+            if acct:
+                alpaca_count = int(getattr(acct, "daytrade_count", 0) or 0)
+        except Exception as exc:
+            logger.warning("[PDT GUARD] Failed to fetch Alpaca daytrade_count: %s. Using local count (%d).", exc, local_count)
+
+    effective_count = max(local_count, alpaca_count)
+    if alpaca_count > 0 and alpaca_count != local_count:
+        logger.warning(
+            "[PDT GUARD] Count mismatch! Local=%d, Alpaca=%d. Using max=%d (fail-closed).",
+            local_count, alpaca_count, effective_count
+        )
+    return effective_count
 
 def get_today_closed_trades(journal_file: Optional[Path] = None):
     """Reconstruct today's closed trades from fill events."""

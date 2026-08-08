@@ -12,14 +12,24 @@ import config
 
 
 class SafeRotatingFileHandler(RotatingFileHandler):
-    """Windows-safe RotatingFileHandler that catches PermissionError during rollover."""
+    """Windows-safe RotatingFileHandler that catches PermissionError during rollover
+    and suppresses Python 3.14 reentrant signal logging errors cleanly."""
     def doRollover(self):
         try:
             super().doRollover()
-        except PermissionError:
+        except (PermissionError, Exception):
             pass
+
+    def emit(self, record):
+        try:
+            super().emit(record)
+        except RuntimeError as e:
+            if "reentrant" in str(e):
+                pass
+            else:
+                raise
         except Exception:
-            pass
+            self.handleError(record)
 
 def setup_logging() -> None:
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)

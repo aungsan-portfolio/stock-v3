@@ -132,8 +132,18 @@ def fetch_ohlcv(
         return df.copy()
 
     # Default: legacy yfinance-only path (byte-identical to original behaviour).
-    ticker = yf.Ticker(symbol)
-    df = ticker.history(period=period, interval=interval, auto_adjust=True)
+    df = pd.DataFrame()
+    for attempt in range(1, 4):
+        try:
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period=period, interval=interval, auto_adjust=True)
+            if not df.empty:
+                break
+        except Exception:
+            pass
+        if attempt < 3:
+            time.sleep(attempt * 1.5)
+
     if df.empty:
         raise ValueError(f"No data returned for {symbol}")
 

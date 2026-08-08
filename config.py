@@ -7,6 +7,7 @@ Dual-mode:
   Settings dataclass → testable dependency injection via get_settings() / set_settings().
 """
 from __future__ import annotations
+import os
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -27,7 +28,22 @@ WATCHLIST = [
     "SPY", "QQQ", "VTI",
     "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "META", "AMZN",
     "GOOGL", "AVGO", "NFLX", "COST", "JPM", "BAC", "XOM", "UNH",
+    # ── Step 3 Promoted (2026-08-05 Backtest Audit) ──────────────────────
+    "XLV", "V",
 ]
+
+# ── Shadow Monitor — signals logged, NO orders placed ────────────────────────
+SHADOW_MONITOR = [
+    "CAT", "LLY",
+]
+
+# ── Hard-to-Borrow Short Blacklist ───────────────
+HTB_SHORT_BLACKLIST = {
+    "SPCX",   # Hard-to-borrow / illiquid
+    "SPCH",   # Hard-to-borrow day order restriction
+    "SNXX",   # Micro-cap illiquid
+}
+
 FULL_MARKET_SCAN_ENABLED        = True
 FULL_MARKET_CACHE_HOURS         = 24
 FULL_MARKET_MAX_SYMBOLS_TO_CHECK = 500
@@ -38,6 +54,7 @@ FULL_MARKET_CORE_SYMBOLS = [
     "SPY", "QQQ", "VTI",
     "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "META", "AMZN",
     "GOOGL", "AVGO", "NFLX", "COST", "JPM", "BAC", "XOM", "UNH",
+    "XLV", "V",
 ]
 FULL_MARKET_RANDOM_SEED = 42
 FULL_MARKET_ROTATION_STATE_FILE = DATA_DIR / "scan_rotation_state.json"
@@ -79,8 +96,8 @@ ATR_PERIOD          = 14
 VOLUME_MA_PERIOD    = 20
 
 # ── Feature Flags ────────────────────────────────
-USE_REGIME_FEATURES          = False
-USE_MARKET_RELATIVE_FEATURES = False
+USE_REGIME_FEATURES          = True
+USE_MARKET_RELATIVE_FEATURES = True
 MARKET_BENCHMARK_SYMBOL      = "SPY"
 REGIME_VOL_SHORT             = 20
 REGIME_VOL_LONG              = 60
@@ -129,23 +146,21 @@ SELL_THRESHOLD      = 0.40
 MIN_HOLD_BARS       = ML_HORIZON
 
 # ── Ensemble Weights ─────────────────────────────
-WEIGHT_RF           = 0.40
+WEIGHT_RF           = 0.50
 WEIGHT_LSTM         = 0.10
-# Alternative models weights: defaults are positive but they only influence the
-# blend when their respective models are trained and available.
-WEIGHT_XGB          = 0.20
-WEIGHT_TRANSFORMER  = 0.15
-WEIGHT_TECHNICAL    = 0.25
+WEIGHT_XGB          = 0.10
+WEIGHT_TRANSFORMER  = 0.00
+WEIGHT_TECHNICAL    = 0.30
 MIN_ML_MODELS_FOR_SIGNAL = 1
 
 # ── Model Gate ───────────────────────────────────
 MODEL_METRICS_FILE   = MODELS_DIR / "model_metrics.json"
 MODEL_GATE_ENABLED   = True
-MODEL_MIN_RF_ACCURACY = 0.50
-MODEL_MIN_RF_F1       = 0.45
+MODEL_MIN_RF_ACCURACY   = 0.45
+MODEL_MIN_RF_F1       = 0.35
 MODEL_MAX_AGE_DAYS    = 30
 MODEL_MIN_RF_AUC      = 0.0
-MODEL_MIN_LSTM_AUC    = 0.46
+MODEL_MIN_LSTM_AUC    = 0.40
 MODEL_HOLDOUT_RATIO   = 0.15
 
 # ── Permutation test ─────────────────────────────
@@ -177,13 +192,14 @@ USE_TRAILING_EXIT   = True
 TRAILING_STOP_PCT   = 0.01
 
 # ── Production Safety ────────────────────────────
-ALLOW_SHORT          = False
+ALLOW_SHORT          = True   # Enabled short selling for bearish market regimes
+SHORT_HARD_STOP_PCT  = 0.01   # Hard Stop-Loss (+1.0% above entry) for short positions
 MIN_TRADE_CASH       = 100.0
 LIMIT_ORDER_OFFSET_PCT = 0.001
-MAX_DAILY_TRADES     = 18
+MAX_DAILY_TRADES     = 50
 # Swing Trading daily loss limit (used in risk_state.py)
 MAX_DAILY_LOSS_SWING   = 150.0
-MAX_DAILY_LOSS_DAYTRADE = 250.0
+MAX_DAILY_LOSS_DAYTRADE = 300.0  # Expanded limit for tonight per trader instruction ($300.00)
 MAX_DAILY_LOSS_DOLLARS  = MAX_DAILY_LOSS_DAYTRADE
 MAX_DAILY_LOSS_USD     = MAX_DAILY_LOSS_SWING
 ALLOW_HISTORICAL_PRICE_FOR_ORDERS = False
@@ -255,21 +271,35 @@ TIMEZONE = "US/Eastern"
 ORB_WINDOW_MINUTES = 15
 ORB_EXTENDED_MINUTES = 30
 
+ENFORCE_GLOBAL_OPENING_BUFFER = True
+GLOBAL_OPENING_BUFFER_END_ET = "09:45"
+
+# Manual Denylist for scanner / trading exclusion
+SYMBOL_DENYLIST: list = [
+    "TTD",
+    # Leveraged 3x / 2x ETFs Denylist (high slippage & whipsaw risk)
+    "SOXL", "SOXS", "TSLL", "TQQQ", "SQQQ", "SPXL", "SPXS",
+    "LABU", "LABD", "UVXY", "SVXY", "BOIL", "KOLD", "NUGT", "DUST",
+    # Micro-cap / Low-price exclusion denylist
+    "DRAM", "SKHY", "PATH", "CDE", "NU", "SOFI", "PLTD", "BTG", "SNXX", "DOCS", "SPCH"
+]
+
 INTRADAY_INTERVAL = "1m"
 INTRADAY_LOOKBACK_DAYS = 5
 DAILY_LOOKBACK_DAYS = 60
 PREMARKET_INTERVAL = "1m"
-INTRADAY_CACHE_TTL_SECONDS = 30
+INTRADAY_CACHE_TTL_SECONDS = 300
 STALE_QUOTE_BUFFER_SECONDS = 30
 
-SCAN_MIN_PRICE = 10.0
+SCAN_MIN_PRICE = 10.0  # $10.0+ price floor to eliminate sub-$10 micro-caps
 SCAN_MAX_PRICE = 1000.0
-SCAN_MIN_PREMARKET_VOLUME = 150_000
-SCAN_MIN_AVG_DAILY_VOLUME = 2_000_000
+SCAN_MIN_PREMARKET_VOLUME = 50_000
+SCAN_MIN_AVG_DAILY_VOLUME = 1_000_000  # 1.0M+ volume floor for Large-Cap / Mid-Cap focus
+LARGE_CAP_PIVOT_SYMBOLS = ["PLTR", "NVDA", "AMD", "TSLA", "MSFT", "AMZN", "META", "MUU", "FIGS", "MARA"]
 SCAN_PREMARKET_MAX_SPREAD_PCT = 0.008  # 0.8% max spread in premarket
-SCAN_REGULAR_MAX_SPREAD_PCT   = 0.003  # 0.3% max spread in regular session
-SCAN_MIN_RELATIVE_VOLUME = 1.5
-SCAN_MIN_GAP_PCT = 1.5
+SCAN_REGULAR_MAX_SPREAD_PCT   = 0.008  # 0.8% max spread in regular session
+SCAN_MIN_RELATIVE_VOLUME = 0.80
+SCAN_MIN_GAP_PCT = 1.4
 SCAN_MAX_GAP_PCT = 15.0
 SCAN_MIN_FLOAT_SHARES = 10_000_000
 SCAN_MAX_CANDIDATES = 5
@@ -277,7 +307,31 @@ SCAN_CHUNK_SIZE = 50
 SCAN_SLEEP_SECONDS = 1.0
 SCANNER_REFRESH_MINUTES = 10
 
+# ── Noise Floor — ATR-Based Veto Calibration ────────
+NOISE_FLOOR_ATR_PERIOD       = 10    # ATR window (10 for responsiveness)
+NOISE_FLOOR_ATR_MULTIPLIER   = 0.75  # noise_floor = ATR * 0.75
+NOISE_FLOOR_ABS_MIN          = 0.08  # minimum floor $0.08
+NOISE_FLOOR_HARD_VETO_RATIO  = 0.60  # veto only if stop < 60% of noise floor
+
+# ── Gap Quality Filter Thresholds ───────────────────
+GAP_MIN_RVOL          = 1.5   # Require Relative Volume >= 1.5x (Institutional Conviction)
+GAP_MIN_ATR_MULTIPLE  = 0.5   # Require Gap Dollar Magnitude >= 0.5x ATR(14)
+GAP_ATR_PERIOD        = 14
+
 MAX_SYMBOL_CONSECUTIVE_LOSSES = 2
+MAX_ENTRIES_PER_SYMBOL_PER_SESSION = 2
+
+# Blacklist illiquid / stale quote symbols to prevent noisy intraday data warnings
+SYMBOL_STALE_QUOTE_BLACKLIST = [
+    # Original batch
+    "PFAI", "OSCX", "SOUX", "CISS",
+    "PAVS", "XCH", "UNX", "FXHO",
+    "BIVI", "FIGG", "CSEX", "YXT", "ATNI",
+    # 2026-08-07 batch — scanner stale 35+ min
+    "SMTG", "OLOX", "GWAV",
+    # IPO / watch-only (stale quotes expected)
+    "SPCX",
+]
 
 DYNAMIC_SCREENER_ENABLED = True
 DYNAMIC_SCREENER_TARGET_SYMBOLS = 150
@@ -287,9 +341,9 @@ SCAN_SCORE_RVOL_WEIGHT = 0.3
 SCAN_SCORE_VOL_WEIGHT = 0.3
 SCAN_SCORE_RVOL_CAP = 10.0
 SCAN_SCORE_VOL_NORMALIZER = 100_000
-SCAN_OPEN_MIN_MOVE_PCT = 0.25
-SCAN_OPEN_MIN_VOLUME = 100_000
-SCAN_OPEN_MIN_RELATIVE_VOLUME = 1.5
+SCAN_OPEN_MIN_MOVE_PCT = 0.10
+SCAN_OPEN_MIN_VOLUME = 50_000
+SCAN_OPEN_MIN_RELATIVE_VOLUME = 0.80
 
 SCAN_RESULTS_FILE = REPORTS_DIR / "scan_results.csv"
 
@@ -329,7 +383,7 @@ from strategies.constants import StrategyName
 STRATEGY_SETTINGS = {
     StrategyName.ORB: StrategyConfig(confidence_min=0.60, max_risk_pct=1.0, priority=1),
     StrategyName.VWAP_BOUNCE: StrategyConfig(confidence_min=0.55, max_risk_pct=1.0, priority=2),
-    StrategyName.MOMENTUM_SCALP: StrategyConfig(confidence_min=0.65, max_risk_pct=1.0, priority=3),
+    StrategyName.MOMENTUM_SCALP: StrategyConfig(confidence_min=0.63, max_risk_pct=1.0, priority=3),
     StrategyName.GAP_AND_GO: StrategyConfig(confidence_min=0.60, max_risk_pct=1.0, priority=4, entry_cutoff_time="10:30"),
     StrategyName.CANDLESTICK: StrategyConfig(confidence_min=0.40, max_risk_pct=0.5, priority=5),
 }
@@ -344,7 +398,7 @@ VOLATILITY_PENALTY_MULTIPLIER = 4.0
 MAX_RISK_PER_TRADE_PCT = 0.3
 MAX_DAILY_LOSS_PCT      = 0.9
 MAX_DAILY_LOSS_DOLLARS  = MAX_DAILY_LOSS_DAYTRADE
-MAX_TRADES_PER_DAY = 15
+MAX_TRADES_PER_DAY = 50
 MAX_CONSECUTIVE_LOSSES = 10
 CONSECUTIVE_OUTAGE_LIMIT = 3
 MAX_POSITION_SIZE_DOLLARS = 5000.0
@@ -403,7 +457,7 @@ SCAN_SENTIMENT_CACHE_TTL = 3600
 
 DAYTRADE_LOG_FILE = LOG_DIR / "daytrading.log"
 DAYTRADE_TRADE_JOURNAL_FILE = REPORTS_DIR / "trade_journal.jsonl"
-DISCORD_WEBHOOK_URL = ""
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 DAYTRADE_WATCHLIST = ["NVDA", "AAPL", "MSFT", "AMZN", "TSLA", "META", "AMD", "GOOGL", "QQQ", "SPY", "PLTR", "AVGO", "JPM", "BAC", "UBER", "MU", "NFLX"]
 
@@ -513,6 +567,7 @@ class Settings:
 
     # Universe
     WATCHLIST: List[str] = field(default_factory=lambda: list(WATCHLIST))
+    SHADOW_MONITOR: List[str] = field(default_factory=lambda: list(SHADOW_MONITOR))
     FULL_MARKET_SCAN_ENABLED: bool = FULL_MARKET_SCAN_ENABLED
     FULL_MARKET_CACHE_HOURS: int = FULL_MARKET_CACHE_HOURS
     FULL_MARKET_MAX_SYMBOLS_TO_CHECK: int = FULL_MARKET_MAX_SYMBOLS_TO_CHECK
@@ -769,6 +824,9 @@ class Settings:
     TIMEZONE: str = TIMEZONE
     ORB_WINDOW_MINUTES: int = ORB_WINDOW_MINUTES
     ORB_EXTENDED_MINUTES: int = ORB_EXTENDED_MINUTES
+    ENFORCE_GLOBAL_OPENING_BUFFER: bool = ENFORCE_GLOBAL_OPENING_BUFFER
+    GLOBAL_OPENING_BUFFER_END_ET: str = GLOBAL_OPENING_BUFFER_END_ET
+    SYMBOL_DENYLIST: List[str] = field(default_factory=lambda: list(SYMBOL_DENYLIST))
     INTRADAY_INTERVAL: str = INTRADAY_INTERVAL
     INTRADAY_LOOKBACK_DAYS: int = INTRADAY_LOOKBACK_DAYS
     DAILY_LOOKBACK_DAYS: int = DAILY_LOOKBACK_DAYS

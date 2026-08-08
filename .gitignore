@@ -2,20 +2,35 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Credentials & Environment
+.env
+.env.*
+*.env
+
+# Logs & Runtime Output
 logs/
 reports/
 models/
-
-.env
-.env.*
 *.log
 
-.DS_Store
-.idea/
-.vscode/
-
+# Data & Storage
 data/
+scratch/
 models_backup_before_train_hot/
+models_backup_before_candlestick_*/
+models_backup_before_fullmarket_*/
+models_backup_before_edge_*/
+
+# Database Files
+*.db
+*.sqlite
+*.sqlite3
+
+# Machine Learning & Binary Artifacts
+*.joblib
+*.pkl
+*.pt
+*.pth
 
 # Local backup / checkpoint artifacts
 *.bak
@@ -36,7 +51,9 @@ _pdf_raw_ch1.txt
 ai_engine.py.orig
 alternative_models.py.orig
 main.py.orig
-models_backup_before_candlestick_*/
-models_backup_before_fullmarket_*/
-models_backup_before_edge_*/
 
+# IDE & OS Exclusions
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

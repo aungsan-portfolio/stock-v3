@@ -2633,15 +2633,36 @@ def cmd_daytrade_status(args) -> int:
                     print()
             except Exception:
                 pass
-                
+    except KeyboardInterrupt:
+        print("\n⚠️ KeyboardInterrupt detected. Initiating graceful shutdown...")
+        if bridge:
+            shutdown_thread = threading.Thread(
+                target=bridge.graceful_shutdown,
+                kwargs={"preserve_protected": True},
+                daemon=True
+            )
+            shutdown_thread.start()
+            shutdown_thread.join(timeout=30)
+            if shutdown_thread.is_alive():
+                print("⚠️ Graceful shutdown timed out (30s). Forcing disconnect...")
+                try:
+                    bridge.disconnect()
+                except Exception:
+                    pass
+            else:
+                print("✅ Graceful shutdown completed. GTC stops preserved.")
     finally:
         if bridge:
-            bridge.disconnect()
+            try:
+                bridge.disconnect()
+            except Exception:
+                pass
     return 0
 
 
 def cmd_daytrade_bot(args) -> int:
     import time
+    import threading
     import signal as sig_module
     from alpaca_bridge import AlpacaBridge
     from strategies.scanner.premarket_scanner import scan
@@ -2691,22 +2712,33 @@ def cmd_daytrade_bot(args) -> int:
         bg_scanner.start()
 
     _already_flattened = False
+    _flatten_lock = threading.Lock()
 
     def handle_graceful_exit(signum, frame):
-        nonlocal _already_flattened
+        acquired = _flatten_lock.acquire(blocking=False)
+        if not acquired:
+            print(f"⚠️ Signal {signum} received again — forcing immediate exit.")
+            import os as os_module
+            os_module._exit(0)
+
         if bg_scanner:
             try:
                 bg_scanner.stop()
             except Exception:
                 pass
-        if not _already_flattened:
-            _already_flattened = True
-            print(f"\n[SIGNAL] Received signal {signum}. Triggering emergency flatten...")
+        try:
+            print(f"\n[SIGNAL] Received signal {signum}. Initiating Smart Shutdown Guard...")
+            bridge.flatten_on_shutdown(only_unprotected=True)
+            print("✅ Flatten completed. Sub-Account PA3UODIC5JTA secured.")
+        except Exception as e:
+            print(f"❌ Error during shutdown position evaluation: {e}")
             try:
-                bridge.flatten_all()
-            except Exception as e:
-                print(f"Error flattening positions during signal handler: {e}")
-        sys.exit(0)
+                bridge.disconnect()
+            except Exception:
+                pass
+        finally:
+            import os as os_module
+            os_module._exit(0)
 
     # Register handlers
     sig_module.signal(sig_module.SIGTERM, handle_graceful_exit)
@@ -2715,7 +2747,7 @@ def cmd_daytrade_bot(args) -> int:
     try:
         from strategies.error_handler import TradingErrorHandler
         error_handler = TradingErrorHandler(bridge=bridge)
-
+        _scanner_stale_blocked = False
         while True:
             current_time = time.time()
             if not is_market_open():
@@ -2731,6 +2763,7 @@ def cmd_daytrade_bot(args) -> int:
                 time.sleep(60)
                 continue
 
+            allow_new_entries = True
             if use_dynamic_scanner:
                 if bg_scanner:
                     watchlist = bg_scanner.get_watchlist()
@@ -2740,10 +2773,18 @@ def cmd_daytrade_bot(args) -> int:
                         elapsed_seconds = current_time - last_completed
                         if elapsed_seconds > 900:
                             logger.warning(
-                                "Dynamic watchlist is stale! Last successful background scan was %.1f minutes ago.",
+                                "[STALE SCANNER GUARD] Dynamic watchlist is stale! Last scan was %.1f mins ago. Blocking new entries.",
                                 elapsed_seconds / 60.0
                             )
-                            print(f"  🚨 [WARNING] Watchlist is stale (last scan: {elapsed_seconds / 60.0:.1f}m ago)!")
+                            if not _scanner_stale_blocked:
+                                print(f"  ⚠️ [STALE SCANNER GUARD] Watchlist data feed stale ({elapsed_seconds / 60.0:.1f}m ago)! Blocking new entries.")
+                                _scanner_stale_blocked = True
+                            allow_new_entries = False
+                        else:
+                            if _scanner_stale_blocked:
+                                print("  ✅ [STALE SCANNER GUARD] Data feed recovered. Resuming new entries.")
+                                logger.info("[STALE SCANNER GUARD] Data feed recovered. Resuming new entries.")
+                                _scanner_stale_blocked = False
                 else:
                     watchlist = list(getattr(config, "DAYTRADE_WATCHLIST", []))
             else:
@@ -2790,6 +2831,7 @@ def cmd_daytrade_bot(args) -> int:
                 bridge=bridge,
                 live_paper=getattr(args, 'live_paper', False),
                 error_handler=error_handler,
+                allow_new_entries=allow_new_entries,
             )
 
             print("Sleeping for 30 seconds before next evaluation...")

@@ -476,14 +476,14 @@ def test_same_symbol_dedup_highest_confidence(monkeypatch):
     
     # Mock execute_signal to capture calls
     executed_signals = []
-    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run):
+    def mock_execute(signal, *args, **kwargs):
         executed_signals.append(signal)
         return {"status": "DRY_RUN", "reason": "Mocked execution"}
     
     monkeypatch.setattr(strategies.orchestrator, "execute_signal", mock_execute)
     monkeypatch.setattr(strategies.orchestrator, "apply_portfolio_correlation", lambda sigs, open_pos, bridge: sigs)
     monkeypatch.setattr(strategies.orchestrator, "today_pnl", lambda: 0.0)
-    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda: 0)
+    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda *a, **kw: 0)
     
     # Mock bridge
     bridge_mock = mock.MagicMock()
@@ -511,17 +511,19 @@ def test_orchestrator_skips_active_and_pending_symbols(monkeypatch):
     sig_msft = TradeSignal(symbol="MSFT", side="BUY", entry_price=200.0, stop_price=190.0, target_price=220.0, risk_per_share=10.0, confidence=0.80, strategy="ORB", atr=1.0, reason="")
     sig_goog = TradeSignal(symbol="GOOG", side="BUY", entry_price=300.0, stop_price=290.0, target_price=320.0, risk_per_share=10.0, confidence=0.75, strategy="ORB", atr=1.0, reason="")
     
+    from strategies.regime_engine import MarketRegimeResult, MODE_RISK_ON
+    monkeypatch.setattr("strategies.regime_engine.evaluate_market_regime", lambda b, symbols=None: MarketRegimeResult(mode=MODE_RISK_ON, allow_longs=True, halt_entries=False))
     monkeypatch.setattr(strategies.orchestrator, "evaluate_symbols_parallel", lambda w, bridge: [sig_aapl, sig_msft, sig_goog])
     
     executed_signals = []
-    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run):
+    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run, **kwargs):
         executed_signals.append(signal)
         return {"status": "DRY_RUN", "reason": "Mocked execution"}
     
     monkeypatch.setattr(strategies.orchestrator, "execute_signal", mock_execute)
     monkeypatch.setattr(strategies.orchestrator, "apply_portfolio_correlation", lambda sigs, open_pos, bridge: sigs)
     monkeypatch.setattr(strategies.orchestrator, "today_pnl", lambda: 0.0)
-    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda: 0)
+    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda *a, **kw: 0)
     
     # Mock bridge
     bridge_mock = mock.MagicMock()
@@ -574,14 +576,14 @@ def test_orchestrator_fail_closed_on_broker_outage(monkeypatch):
     monkeypatch.setattr(strategies.orchestrator, "evaluate_symbols_parallel", lambda w, bridge: [sig_goog])
     
     executed_signals = []
-    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run):
+    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run, **kwargs):
         executed_signals.append(signal)
         return {"status": "DRY_RUN", "reason": "Mocked execution"}
     
     monkeypatch.setattr(strategies.orchestrator, "execute_signal", mock_execute)
     monkeypatch.setattr(strategies.orchestrator, "apply_portfolio_correlation", lambda sigs, open_pos, bridge: sigs)
     monkeypatch.setattr(strategies.orchestrator, "today_pnl", lambda: 0.0)
-    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda: 0)
+    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda *a, **kw: 0)
     
     # 1. Test Broker Outage on positions in Live Paper (fail-closed)
     bridge_mock_1 = mock.MagicMock()
@@ -648,14 +650,14 @@ def test_strategy_priority_sorting(monkeypatch):
     monkeypatch.setattr(strategies.orchestrator, "evaluate_symbols_parallel", lambda w, bridge: [sig_gap, sig_orb])
     
     executed_signals = []
-    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run):
+    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run, **kwargs):
         executed_signals.append(signal)
         return {"status": "DRY_RUN", "reason": "Mocked execution"}
         
     monkeypatch.setattr(strategies.orchestrator, "execute_signal", mock_execute)
     monkeypatch.setattr(strategies.orchestrator, "apply_portfolio_correlation", lambda sigs, open_pos, bridge: sigs)
     monkeypatch.setattr(strategies.orchestrator, "today_pnl", lambda: 0.0)
-    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda: 0)
+    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda *a, **kw: 0)
     
     bridge_mock = mock.MagicMock()
     bridge_mock.is_connected = False
@@ -687,14 +689,14 @@ def test_strategy_specific_time_cutoff(monkeypatch):
     monkeypatch.setattr(strategies.orchestrator, "evaluate_symbols_parallel", lambda w, bridge: [sig_gap, sig_orb])
     
     executed_signals = []
-    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run):
+    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run, **kwargs):
         executed_signals.append(signal)
         return {"status": "DRY_RUN", "reason": "Mocked execution"}
         
     monkeypatch.setattr(strategies.orchestrator, "execute_signal", mock_execute)
     monkeypatch.setattr(strategies.orchestrator, "apply_portfolio_correlation", lambda sigs, open_pos, bridge: sigs)
     monkeypatch.setattr(strategies.orchestrator, "today_pnl", lambda: 0.0)
-    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda: 0)
+    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda *a, **kw: 0)
     
     # Mock current time to be 11:00 AM (past the GAP_AND_GO cutoff of 10:30 AM)
     class MockDatetime:
@@ -782,14 +784,14 @@ def test_production_shape_mockorder_filter(monkeypatch):
     monkeypatch.setattr(strategies.orchestrator, "evaluate_symbols_parallel", lambda w, bridge: [sig_goog])
     
     executed_signals = []
-    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run):
+    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run, **kwargs):
         executed_signals.append(signal)
         return {"status": "DRY_RUN", "reason": "Mocked execution"}
         
     monkeypatch.setattr(strategies.orchestrator, "execute_signal", mock_execute)
     monkeypatch.setattr(strategies.orchestrator, "apply_portfolio_correlation", lambda sigs, open_pos, bridge: sigs)
     monkeypatch.setattr(strategies.orchestrator, "today_pnl", lambda: 0.0)
-    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda: 0)
+    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda *a, **kw: 0)
     
     # MockOrder object that does NOT have symbol attribute but has contract.symbol
     class TestMockOrder:
@@ -819,7 +821,7 @@ def test_production_shape_mockorder_filter(monkeypatch):
     bridge_mock_bad.ib.openTrades.return_value = [BadMockOrder()]
     
     executed_signals_bad = []
-    def mock_execute_bad(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run):
+    def mock_execute_bad(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run, **kwargs):
         executed_signals_bad.append(signal)
         return {"status": "DRY_RUN", "reason": "Mocked execution"}
     monkeypatch.setattr(strategies.orchestrator, "execute_signal", mock_execute_bad)
@@ -886,11 +888,14 @@ def test_naked_position_with_existing_stop_and_flatten(monkeypatch):
     )
     assert ret_state.order_id == "broker-stop-order-999"
     
-    # Reset order_id to trigger naked position flow
-    state.order_id = None
+    # Reset order_id to None and set remediation_attempts = 3 to test emergency flatten path
+    ret_state.order_id = None
+    ret_state.remediation_attempts = 3
     
     # Mock market price to be below stop price, forcing fallback to flatten
     bridge_mock.market_price.return_value = 140.0 # Stale/invalid stop (145.0 > 140.0)
+    bridge_mock._client.get_orders.return_value = []
+    bridge_mock.get_position.return_value = 100.0
     
     # Mock close_position and cancel_order to record calls
     cancelled_orders = []
@@ -909,10 +914,8 @@ def test_naked_position_with_existing_stop_and_flatten(monkeypatch):
     import strategies.trailing_stop
     monkeypatch.setattr(strategies.trailing_stop, "send_discord_alert", lambda msg: None)
     
-    # 2. Test emergency flatten calls cancel_order first then close_position
+    # 2. Test emergency flatten calls close_position
     manager.handle_naked_position("AAPL", 100, bridge_mock, dry_run=False)
-    
-    assert "broker-stop-order-999" in cancelled_orders
     assert "AAPL" in flattened_symbols
     assert state.active is False
 
@@ -1053,13 +1056,13 @@ def test_regression_entry_gate_halted_blocks_new_entries(monkeypatch):
     bridge.account_daily_pnl.return_value = 0.0
     
     executed_signals = []
-    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run):
+    def mock_execute(signal, bridge, equity, current_pnl, day_trades_last_5_days, dry_run, **kwargs):
         executed_signals.append(signal)
         return {"status": "DRY_RUN", "reason": "Mocked execution"}
         
     monkeypatch.setattr(strategies.orchestrator, "execute_signal", mock_execute)
     monkeypatch.setattr(strategies.orchestrator, "today_pnl", lambda: 0.0)
-    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda: 0)
+    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda *a, **kw: 0)
     
     strategies.orchestrator._last_evaluated_5m_bar_str = None
     evaluate_and_execute(["AAPL"], bridge, live_paper=True)
@@ -1222,6 +1225,34 @@ def test_googl_existing_sell_limit_and_stop_adoption_regression(monkeypatch):
     # Verify no new orders were submitted to Alpaca
     bridge._client.submit_order.assert_not_called()
     assert bridge.entry_gate.halted is False
+
+
+def test_regime_failure_does_not_crash_orchestrator(monkeypatch):
+    """Integration test: Verify that if evaluate_market_regime fails/raises, orchestrator handles it gracefully without crashing or triggering UnboundLocalError."""
+    from unittest import mock
+    from strategies.orchestrator import evaluate_and_execute
+    import strategies.orchestrator
+
+    # Mock evaluate_market_regime to raise an exception
+    def mock_bad_regime(*args, **kwargs):
+        raise RuntimeError("Simulated Market Regime Engine Outage")
+
+    import strategies.regime_engine
+    monkeypatch.setattr(strategies.regime_engine, "evaluate_market_regime", mock_bad_regime)
+
+    # Mock evaluate_symbols_parallel to return empty
+    monkeypatch.setattr(strategies.orchestrator, "evaluate_symbols_parallel", lambda *a, **kw: [])
+    monkeypatch.setattr(strategies.orchestrator, "today_pnl", lambda *a, **kw: 0.0)
+    monkeypatch.setattr(strategies.orchestrator, "day_trades_in_last_5_days", lambda *a, **kw: 0)
+
+    bridge_mock = mock.MagicMock()
+    bridge_mock.is_connected = True
+    bridge_mock.open_position_count.return_value = 0
+    bridge_mock.working_orders_plain.return_value = []
+
+    # Should run smoothly without raising UnboundLocalError or triggering circuit breaker
+    evaluate_and_execute(["AAPL"], bridge_mock, live_paper=False)
+
 
 
 

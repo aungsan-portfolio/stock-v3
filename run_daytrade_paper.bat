@@ -12,7 +12,10 @@ if exist .env (
         if "%%A"=="DAYTRADE_APCA_API_SECRET_KEY" set APCA_API_SECRET_KEY=%%B
         if "%%A"=="DAYTRADE_APCA_API_BASE_URL" set APCA_API_BASE_URL=%%B
     )
+) else (
+    echo [NOTICE] .env file not found. Loading credentials from environment...
 )
+
 if not defined APCA_API_KEY_ID set APCA_API_KEY_ID=YOUR_DAYTRADE_ALPACA_API_KEY
 if not defined APCA_API_SECRET_KEY set APCA_API_SECRET_KEY=YOUR_DAYTRADE_ALPACA_SECRET_KEY
 if not defined APCA_API_BASE_URL set APCA_API_BASE_URL=https://paper-api.alpaca.markets

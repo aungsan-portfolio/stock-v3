@@ -23,6 +23,77 @@ _recent_orders = {}
 IDEMPOTENCY_TTL = 60  # seconds
 
 
+def _compute_noise_floor(signal: TradeSignal, df: Optional[object] = None) -> float:
+    """
+    Calculate noise floor based on 10-period ATR (Average True Range).
+    Returns max(0.08, ATR10 * 0.75) to ensure minimum stop distance.
+    """
+    import pandas as pd
+    atr_period = getattr(config, "NOISE_FLOOR_ATR_PERIOD", 10)
+    atr_multiplier = getattr(config, "NOISE_FLOOR_ATR_MULTIPLIER", 0.75)
+    abs_min = getattr(config, "NOISE_FLOOR_ABS_MIN", 0.08)
+
+    try:
+        if df is not None and hasattr(df, "empty") and not df.empty and len(df) >= atr_period:
+            high = df["high"].tail(atr_period + 1)
+            low  = df["low"].tail(atr_period + 1)
+            close_prev = df["close"].shift(1).tail(atr_period + 1)
+
+            tr = pd.concat([
+                high - low,
+                (high - close_prev).abs(),
+                (low  - close_prev).abs(),
+            ], axis=1).max(axis=1)
+
+            atr = float(tr.tail(atr_period).mean())
+            noise_floor = max(abs_min, atr * atr_multiplier)
+            logger.debug(
+                "[NOISE FLOOR] %s: ATR(%d)=%.4f x %.2f = %.4f (abs_min=%.2f)",
+                signal.symbol, atr_period, atr, atr_multiplier, noise_floor, abs_min
+            )
+            return noise_floor
+    except Exception as e:
+        logger.debug("[NOISE FLOOR] ATR calc failed for %s: %s. Using fallback.", signal.symbol, e)
+
+    # Fallback: entry price * 0.25%
+    fallback = max(abs_min, signal.entry_price * 0.0025)
+    logger.debug("[NOISE FLOOR] %s: Fallback noise floor = %.4f", signal.symbol, fallback)
+    return fallback
+
+
+def _pre_submission_veto(signal: TradeSignal, df: Optional[object] = None) -> tuple:
+    """
+    ATR-based pre-submission veto.
+    Hard Veto:  stop_distance < noise_floor * 0.60  -> block entry
+    Soft Warn:  stop_distance < noise_floor          -> warn, allow entry
+    Returns: (should_skip: bool, reason: str)
+    """
+    stop_distance   = abs(signal.entry_price - signal.stop_price)
+    noise_floor     = _compute_noise_floor(signal, df)
+    hard_veto_ratio = getattr(config, "NOISE_FLOOR_HARD_VETO_RATIO", 0.60)
+    hard_veto_line  = noise_floor * hard_veto_ratio
+
+    if stop_distance < hard_veto_line:
+        reason = (
+            f"Pre-submission Veto: Stop distance ${stop_distance:.4f} critically tight "
+            f"(< {hard_veto_ratio*100:.0f}% of ATR noise floor ${noise_floor:.4f}). "
+            f"Hard veto line: ${hard_veto_line:.4f}"
+        )
+        return True, reason
+
+    if stop_distance < noise_floor:
+        logger.debug(
+            "[SOFT-WARN] %s: Stop $%.4f slightly below noise floor $%.4f "
+            "(%.1f%% of floor) -- allowing entry",
+            signal.symbol,
+            stop_distance,
+            noise_floor,
+            (stop_distance / noise_floor) * 100 if noise_floor > 0 else 100
+        )
+
+    return False, ""
+
+
 def _validate_signal_prices(signal: TradeSignal) -> str:
     """Return a rejection reason when entry/stop/target geometry is invalid."""
     side = signal.side.upper()
@@ -49,13 +120,17 @@ def _validate_signal_prices(signal: TradeSignal) -> str:
     if stop_dist <= tick_size:
         return f"Stop distance {stop_dist:.5f} is less than or equal to tick size {tick_size:.5f} (invalid geometry)"
 
-    # Phase 3: Pre-submission Veto for Too-Tight Signals (< max(0.05, entry * 0.002))
-    min_required_dist = max(0.05, signal.entry_price * 0.002)
-    if stop_dist < min_required_dist:
-        return (
-            f"Pre-submission Veto: Stop distance ${stop_dist:.4f} is too tight "
-            f"(< min required noise floor ${min_required_dist:.4f})"
-        )
+    # Phase 3: Pre-submission Veto for Too-Tight Signals using ATR-based Noise Floor
+    df_history = None
+    try:
+        from strategies.intraday_data import fetch_intraday
+        df_history = fetch_intraday(signal.symbol)
+    except Exception:
+        pass
+
+    should_skip, veto_reason = _pre_submission_veto(signal, df_history)
+    if should_skip:
+        return veto_reason
 
     if side == "BUY":
         if signal.stop_price >= signal.entry_price:
@@ -130,12 +205,32 @@ def _executable_signal(signal: TradeSignal, entry_limit_price: Optional[float]) 
     )
 
 
-def _min_confidence_for(signal: TradeSignal) -> float:
-    """Return the configured confidence gate for this strategy."""
+def _min_confidence_for(signal: TradeSignal, regime_result: Optional[object] = None) -> float:
+    """Return the configured confidence gate for this strategy, dynamically calibrated by regime and trade direction."""
     strat_cfg = getattr(config, "STRATEGY_SETTINGS", {}).get(signal.strategy)
     if isinstance(strat_cfg, dict):
-        return float(strat_cfg.get("confidence_min", 0.65))
-    return float(getattr(strat_cfg, "confidence_min", 0.65) if strat_cfg else 0.65)
+        base_conf = float(strat_cfg.get("confidence_min", 0.65))
+    else:
+        base_conf = float(getattr(strat_cfg, "confidence_min", 0.65) if strat_cfg else 0.65)
+
+    mode = getattr(regime_result, "mode", "NEUTRAL") if regime_result else "NEUTRAL"
+    side = signal.side.upper()
+    gate = get_confidence_gate(mode, side)
+    return max(base_conf, gate) if side in ("SELL", "BUY") else base_conf
+
+
+def get_confidence_gate(regime_mode: str, signal_side: str) -> float:
+    """Dynamic confidence gate helper function based on regime mode and signal side."""
+    side = signal_side.upper()
+    if regime_mode == "RISK_ON":
+        if side in ("SELL", "SHORT"):
+            return 0.78
+        return 0.60
+    elif regime_mode == "RISK_OFF":
+        if side in ("BUY", "LONG"):
+            return 0.72
+        return 0.60
+    return 0.63
 
 
 def execute_signal(
@@ -182,13 +277,39 @@ def execute_signal(
         logger.info("Skipped %s: %s", signal.symbol, result["reason"])
         return result
 
-    min_confidence = _min_confidence_for(signal)
+    min_confidence = _min_confidence_for(signal, regime_result=regime_result)
     if regime_result and getattr(regime_result, "confidence_boost", 0.0) > 0:
         min_confidence += float(regime_result.confidence_boost)
 
     if signal.confidence < min_confidence:
         result["reason"] = f"Confidence {signal.confidence:.2f} < {min_confidence:.2f} ({signal.strategy})"
         logger.info("Skipped %s: %s", signal.symbol, result["reason"])
+        return result
+
+    # Mega-Cap Counter-Trend SHORT Veto Guard in RISK_ON Regime
+    from strategies.mega_cap_guard import should_veto_mega_cap_short
+    regime_mode = getattr(regime_result, "mode", "NEUTRAL") if regime_result else "NEUTRAL"
+    veto_mega, veto_reason = should_veto_mega_cap_short(
+        symbol=signal.symbol,
+        regime_mode=regime_mode,
+        rsi_5m=getattr(signal, "rsi", 50.0),
+        price_vs_vwap=getattr(signal, "price_vs_vwap", 0.0),
+    )
+    if signal.side.upper() in ("SELL", "SHORT") and veto_mega:
+        result["reason"] = f"Mega-Cap Counter-Trend Veto: {veto_reason}"
+        logger.info("[MEGA-CAP SHORT VETO] Blocked %s: %s", signal.symbol, result["reason"])
+        return result
+
+    # Commodity Correlation Guard (GDX/GLD, etc.)
+    from strategies.correlation_guards import get_commodity_direction_bias
+    bias = get_commodity_direction_bias(signal.symbol)
+    if bias == "LONG_ONLY" and signal.side.upper() in ("SELL", "SHORT"):
+        result["reason"] = f"Commodity Correlation Veto: {signal.symbol} SHORT blocked (bias=LONG_ONLY)"
+        logger.info("[COMMODITY CORRELATION VETO] Blocked %s SHORT", signal.symbol)
+        return result
+    elif bias == "SHORT_ONLY" and signal.side.upper() in ("BUY", "LONG"):
+        result["reason"] = f"Commodity Correlation Veto: {signal.symbol} LONG blocked (bias=SHORT_ONLY)"
+        logger.info("[COMMODITY CORRELATION VETO] Blocked %s LONG", signal.symbol)
         return result
 
     shares = calculate_shares(executable_signal, equity)
@@ -242,6 +363,40 @@ def execute_signal(
             result["reason"] = err_msg
             return result
 
+    # Shadow Monitor Safety Gate (Prevent ordering for monitor-only symbols)
+    if getattr(signal, "shadow_mode", False) or signal.symbol in getattr(config, "SHADOW_MONITOR", []):
+        result["reason"] = f"Shadow Monitor: {signal.symbol} is in monitor-only mode (no orders placed)"
+        logger.info("[SHADOW GATE] Blocked %s: %s", signal.symbol, result["reason"])
+        return result
+
+    # Hard-to-Borrow (HTB) Short Blacklist Safety Gate
+    HTB_SHORT_BLACKLIST = getattr(config, "HTB_SHORT_BLACKLIST", {"SPCX"})
+    if signal.side.upper() == "SELL" and signal.symbol in HTB_SHORT_BLACKLIST:
+        result["reason"] = f"HTB Short Blacklist: {signal.symbol} is hard-to-borrow (short blocked)"
+        logger.info("[HTB GATE] Blocked %s: %s", signal.symbol, result["reason"])
+        return result
+
+    # Daily Net Loss Circuit Breaker Gate (-$150.00 Limit)
+    max_daily_loss = getattr(config, "MAX_DAILY_LOSS_DAYTRADE", 150.0)
+    if current_pnl is not None and current_pnl <= -max_daily_loss:
+        result["reason"] = f"Daily Loss Circuit Breaker: Current PnL (${current_pnl:.2f}) reached drawdown limit (-${max_daily_loss:.2f})"
+        logger.info("[DAILY LOSS GATE] Blocked %s: %s", signal.symbol, result["reason"])
+        return result
+
+    # Symbol Max Entries Per Session Gate (Max 2 entries per symbol per session)
+    max_entries_per_symbol = getattr(config, "MAX_ENTRIES_PER_SYMBOL_PER_SESSION", 2)
+    try:
+        from strategies.trade_journal import get_journal_summary
+        summary = get_journal_summary()
+        recent_trades = summary.get("recent_trades", []) if isinstance(summary, dict) else []
+        symbol_entries = sum(1 for t in recent_trades if isinstance(t, dict) and t.get("symbol") == signal.symbol)
+        if symbol_entries >= max_entries_per_symbol:
+            result["reason"] = f"Max Symbol Entries Gate: {signal.symbol} reached session limit of {max_entries_per_symbol} entries"
+            logger.info("[SYMBOL ENTRY GATE] Blocked %s: %s", signal.symbol, result["reason"])
+            return result
+    except Exception:
+        pass
+
     # Macro ETF Overlap Safety (Prevent holding SPY and QQQ simultaneously)
     if signal.symbol in {"SPY", "QQQ"} and any(s in {"SPY", "QQQ"} for s in open_syms):
         result["reason"] = f"Macro ETF Overlap: Cannot hold SPY and QQQ simultaneously"
@@ -249,8 +404,35 @@ def execute_signal(
         return result
 
     effective_max_trades = getattr(config, "MAX_DAILY_TRADES", 15)
-    if regime_result and getattr(regime_result, "mode", "") == "CAUTION":
-        effective_max_trades = min(effective_max_trades, 5)
+    if regime_result:
+        is_short_entry = (getattr(signal, "side", "BUY").upper() == "SELL")
+        if is_short_entry:
+            # Strategy Alignment Guard: Dynamic Scanner candidates are bullish gap/breakout setups. Never short dynamic scanner candidates!
+            try:
+                from strategies.scanner.premarket_scanner import get_latest_candidates
+                scanner_cands = get_latest_candidates() or []
+                scanner_syms = {c.symbol for c in scanner_cands} if scanner_cands else set()
+                if signal.symbol in scanner_syms:
+                    result["reason"] = f"Strategy Alignment: {signal.symbol} is a bullish dynamic scanner candidate (SHORT blocked)"
+                    logger.info("Blocked %s: %s", signal.symbol, result["reason"])
+                    return result
+            except Exception:
+                pass
+
+            if not getattr(regime_result, "allow_new_shorts", False) and not getattr(config, "ALLOW_SHORT", False):
+                result["reason"] = "Short selling disabled by config or regime mode"
+                logger.info("Blocked %s: %s", signal.symbol, result["reason"])
+                return result
+        else:
+            if getattr(regime_result, "halt_new_entries", False) or not getattr(regime_result, "allow_new_longs", True):
+                result["reason"] = f"Regime score {getattr(regime_result, 'score', 0)} <= -3 → No new long entries allowed"
+                logger.info("Blocked %s: %s", signal.symbol, result["reason"])
+                return result
+
+        if hasattr(regime_result, "max_trades_day") and regime_result.max_trades_day is not None:
+            effective_max_trades = min(effective_max_trades, regime_result.max_trades_day)
+        elif getattr(regime_result, "mode", "") == "CAUTION":
+            effective_max_trades = min(effective_max_trades, 50)
 
     logger.debug(
         "[TRADE LIMIT DEBUG] regime=%s today_fills=%d configured_max=%d effective_max=%d",

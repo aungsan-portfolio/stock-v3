@@ -35,6 +35,22 @@ def _ensure_asyncio_event_loop() -> None:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
 
+_alpaca_client = None
+_client_lock = threading.Lock()
+
+def _get_alpaca_client():
+    global _alpaca_client
+    if _alpaca_client is None:
+        with _client_lock:
+            if _alpaca_client is None:
+                api_key = os.environ.get("APCA_API_KEY_ID", "")
+                secret_key = os.environ.get("APCA_API_SECRET_KEY", "")
+                if api_key and secret_key:
+                    from alpaca.data.historical import StockHistoricalDataClient
+                    _alpaca_client = StockHistoricalDataClient(api_key, secret_key)
+    return _alpaca_client
+
+
 def _cache_key(
     symbol: str,
     interval: str,
@@ -44,7 +60,12 @@ def _cache_key(
 ) -> str:
     session = "prepost" if prepost else "regular"
     lookback = lookback_days if lookback_days is not None else "default"
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    if interval in ("5m", "5Min"):
+        bar_minute = (now.minute // 5) * 5
+        bar_time = now.replace(minute=bar_minute, second=0, microsecond=0)
+        today_str = f"{today_str}_{bar_time.strftime('%H%M')}"
     return f"{source}_{symbol.upper()}_{interval}_{lookback}_{session}_{today_str}"
 
 
@@ -101,6 +122,15 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _in_market_open_transition() -> bool:
+    try:
+        from strategies.session import current_session_time
+        t = current_session_time()
+        return t.hour == 9 and 30 <= t.minute < 35
+    except Exception:
+        return False
+
+
 def _validate_intraday_data(df: pd.DataFrame, symbol: str, interval: str, validate_staleness: bool = True) -> pd.DataFrame:
     """
     Validates intraday DataFrame for zero/negative prices, frozen feeds, and stale quotes.
@@ -149,11 +179,11 @@ def _validate_intraday_data(df: pd.DataFrame, symbol: str, interval: str, valida
                 max_stale = getattr(config, "STALE_QUOTE_MAX_SECONDS", 1200)
 
                 if staleness_seconds > max_stale:
-                    logger.warning(
-                        "Data validation failed for %s: Stale quote. "
-                        "Last bar was %ss ago (Limit: %ss).",
-                        symbol, staleness_seconds, max_stale
-                    )
+                    msg = f"Data validation failed for {symbol}: Stale quote. Last bar was {staleness_seconds}s ago (Limit: {max_stale}s)."
+                    if _in_market_open_transition() or staleness_seconds > 1800:
+                        logger.debug("[STALE-QUOTE] %s", msg)
+                    else:
+                        logger.warning("%s", msg)
                     return pd.DataFrame()
     except Exception as e:
         logger.error("Error checking validation for %s: %s", symbol, e)
@@ -209,7 +239,9 @@ def fetch_intraday_alpaca(
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
         from datetime import timezone
 
-        client = StockHistoricalDataClient(api_key, secret_key)
+        client = _get_alpaca_client()
+        if client is None:
+            return pd.DataFrame()
         start = datetime.now(timezone.utc) - timedelta(days=lookback_days or 1)
         tf = TimeFrame.Minute
         if interval == "5m":
@@ -225,21 +257,21 @@ def fetch_intraday_alpaca(
                 symbol_or_symbols=symbol.upper(),
                 timeframe=tf,
                 start=start,
-                feed="iex",
+                feed="sip",
             )
             bars_dict = client.get_stock_bars(req)
-        except Exception as iex_err:
-            logger.debug("Alpaca IEX feed error for %s (%s). Trying SIP feed.", symbol, iex_err)
+        except Exception as sip_err:
+            logger.debug("Alpaca SIP feed error for %s (%s). Trying IEX feed.", symbol, sip_err)
             try:
                 req = StockBarsRequest(
                     symbol_or_symbols=symbol.upper(),
                     timeframe=tf,
                     start=start,
-                    feed="sip",
+                    feed="iex",
                 )
                 bars_dict = client.get_stock_bars(req)
-            except Exception as sip_err:
-                logger.warning("Alpaca SIP/IEX feed error for %s (%s).", symbol, sip_err)
+            except Exception as iex_err:
+                logger.warning("Alpaca feed error for %s (%s).", symbol, iex_err)
                 return pd.DataFrame()
 
         if not hasattr(bars_dict, "df") or bars_dict.df.empty:

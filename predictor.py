@@ -40,6 +40,7 @@ class Signal:
     tech_score: float
     price: float
     reason: str
+    shadow_mode: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -219,6 +220,17 @@ class Predictor:
         symbols = symbols or self.cfg.WATCHLIST
         signals: List[Signal] = []
 
+        # Market Close Buffer Guard: Avoid running swing rebalances in final 15 mins (stale/unstable data)
+        try:
+            import zoneinfo
+            now_et = datetime.now(zoneinfo.ZoneInfo("US/Eastern"))
+            if now_et.hour == 15 and now_et.minute >= 45:
+                logger.info("[MARKET CLOSE BUFFER] Within 15 mins of market close (> 15:45 EDT). Skipping swing rebalancing cycle.")
+                return []
+        except Exception:
+            pass
+
+        failed_count = 0
         for symbol in symbols:
             try:
                 df = fetch_ohlcv(symbol)
@@ -263,6 +275,9 @@ class Predictor:
                         reason = f"{reason} → BLOCKED[{gate.status}]: {gate.reason} → HOLD"
 
                 price = float(df["Close"].iloc[-1])
+                is_shadow = symbol in getattr(self.cfg, "SHADOW_MONITOR", [])
+                if is_shadow:
+                    reason = f"[SHADOW MONITOR] {reason} (monitor-only, no order)"
                 signals.append(Signal(
                     symbol=symbol,
                     action=action,
@@ -274,13 +289,31 @@ class Predictor:
                     tech_score=round(tech_score, 4),
                     price=round(price, 2),
                     reason=reason,
+                    shadow_mode=is_shadow,
                 ))
-                logger.info(
-                    "%-6s %s conf=%.2f price=%.2f | %s",
-                    symbol, action, confidence, price, reason,
-                )
+                if is_shadow:
+                    logger.info(
+                        "👁️ %-6s [SHADOW] %s conf=%.2f price=%.2f | %s",
+                        symbol, action, confidence, price, reason,
+                    )
+                else:
+                    logger.info(
+                        "%-6s %s conf=%.2f price=%.2f | %s",
+                        symbol, action, confidence, price, reason,
+                    )
             except Exception:
+                failed_count += 1
                 logger.exception("Prediction failed for %s", symbol)
 
+        if failed_count > 5:
+            logger.warning(
+                "[PARTIAL SCAN GUARD] Data fetch failed for %d/%d symbols. Aborting rebalance cycle to prevent partial universe bias.",
+                failed_count, len(symbols)
+            )
+            return []
+
         signals.sort(key=lambda s: s.confidence, reverse=True)
+        xgb_fallback_count = sum(1 for s in signals if "XGB=0.50?" in s.reason)
+        if xgb_fallback_count > 0:
+            logger.info("[ML PREDICTOR] %d/%d symbols used XGBoost 0.50 fallback", xgb_fallback_count, len(signals))
         return signals

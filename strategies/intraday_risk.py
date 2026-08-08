@@ -186,10 +186,16 @@ def pre_trade_check(
     if not check_daily_loss(current_pnl, equity):
         return f"Daily loss limit reached (PnL ${current_pnl:.2f})"
 
-    consecutive_losses = get_consecutive_losses()
-    max_consecutive_losses = getattr(config, "MAX_CONSECUTIVE_LOSSES", 3)
-    if consecutive_losses >= max_consecutive_losses:
-        return f"Consecutive loss limit reached ({consecutive_losses}/{max_consecutive_losses})"
+    if symbol:
+        symbol_losses = get_symbol_consecutive_losses(symbol)
+        max_symbol_losses = getattr(config, "MAX_SYMBOL_CONSECUTIVE_LOSSES", 2)
+        if symbol_losses >= max_symbol_losses:
+            return f"Consecutive loss limit reached for {symbol} ({symbol_losses}/{max_symbol_losses})"
+    else:
+        consecutive_losses = get_consecutive_losses()
+        max_consecutive_losses = getattr(config, "MAX_CONSECUTIVE_LOSSES", 10)
+        if consecutive_losses >= max_consecutive_losses:
+            return f"Consecutive loss limit reached ({consecutive_losses}/{max_consecutive_losses})"
 
     effective_limit = max_trades if max_trades is not None else getattr(config, "MAX_DAILY_TRADES", getattr(config, "MAX_TRADES_PER_DAY", 15))
     if not check_max_trades(trades_today, max_trades=effective_limit):

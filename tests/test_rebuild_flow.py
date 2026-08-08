@@ -60,5 +60,46 @@ def test_rebuild_flow_and_broker_replace():
     assert recon_state.order_id == "new_broker_stop_999"
     print(f"[PASS F3 Part 2] Reconcile Order ID Adoption Verified: order_id={recon_state.order_id}")
 
+def test_rebuild_flow_short_position():
+    mgr = DynamicTrailingStopManager()
+
+    # Valid SHORT scenario: SELL NVDA fill @ 220.27, initial stop was 221.35 (above fill!)
+    signal = TradeSignal(
+        symbol="NVDA",
+        side="SELL",
+        strategy="MOMENTUM_SCALP",
+        entry_price=220.32,
+        stop_price=221.35,
+        target_price=218.27,
+        risk_per_share=1.03,
+        atr=1.5,
+        confidence=0.89,
+        reason="Short momentum scalp"
+    )
+
+    state = mgr.initialize_position(
+        signal=signal,
+        fill_price=220.27, # Valid for short! Stop 221.35 > Fill 220.27
+        qty=11,
+        stop_order_id="short_stop_111",
+        tp_order_id="short_tp_222"
+    )
+
+    # Assert stop price is accepted without invalid rebuild
+    assert state.stop_price == 221.35
+    assert state.stop_price > 220.27
+
+    # Inverted SHORT scenario: fill @ 222.00, but initial stop was 221.00 (below fill!)
+    state_inv = mgr.initialize_position(
+        signal=signal,
+        fill_price=222.00, # Inverted! Fill 222.00 > Stop 221.00
+        qty=11,
+        stop_order_id="short_stop_333"
+    )
+    # Rebuilt stop price for short must be > fill_price (222.00)
+    assert state_inv.stop_price > 222.00
+
 if __name__ == "__main__":
     test_rebuild_flow_and_broker_replace()
+    test_rebuild_flow_short_position()
+

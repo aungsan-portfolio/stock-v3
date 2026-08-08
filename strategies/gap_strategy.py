@@ -63,6 +63,23 @@ class GapAndGoStrategy(BaseStrategy):
 
         rel_vol = volume / vol_ma if vol_ma > 0 else 0
 
+        # ── Gap Quality Filter (Wall-Street Institutional Conviction Gates) ──
+        # 1. RVOL Gate: Require relative volume >= config.GAP_MIN_RVOL (default 1.5x)
+        min_rvol = getattr(config, "GAP_MIN_RVOL", 1.5)
+        if rel_vol < min_rvol:
+            logger.debug("[GAP QUALITY VETO] %s rel_vol %.2fx < required min %.2fx", symbol, rel_vol, min_rvol)
+            return None
+
+        # 2. ATR Dollar Magnitude Gate: Require gap dollar size >= 0.5x ATR(14)
+        min_atr_mult = getattr(config, "GAP_MIN_ATR_MULTIPLE", 0.5)
+        gap_dollars = abs(open_price - prev)
+        required_gap_dollars = min_atr_mult * atr
+        if gap_dollars < required_gap_dollars:
+            logger.debug("[GAP QUALITY VETO] %s gap dollar $%.2f < required 0.5x ATR $%.2f", symbol, gap_dollars, required_gap_dollars)
+            return None
+
+        logger.info("[GAP QUALITY PASS] %s: gap $%.2f (>=0.5x ATR $%.2f), rvol %.2fx (>=1.5x)", symbol, gap_dollars, required_gap_dollars, rel_vol)
+
         if gap_pct > 0 and price > vwap and price >= open_price:
             hold_bars = config.GAP_CONTINUATION_MIN_HOLD_BARS
             recent = df.tail(hold_bars)

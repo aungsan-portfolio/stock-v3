@@ -20,6 +20,37 @@ from strategies.webhook import send_discord_alert
 
 logger = logging.getLogger(__name__)
 
+MAX_REMEDIATION_STRIKES: int = 2
+
+_STOP_ORDER_TYPES = frozenset([
+    "stop",
+    "stop_limit",
+    "trailing_stop",
+])
+
+
+def _classify_held_order(order) -> str:
+    """
+    Return one of:
+      'stop'       -- a protective stop order (safe, keep waiting)
+      'exit'       -- a market/limit exit already in-flight (safe, keep waiting)
+      'unrelated'  -- something else entirely (unsafe, must flatten)
+    """
+    if order is None:
+        return "unrelated"
+    order_type = str(getattr(order, "order_type", getattr(order, "type", ""))).lower().replace("ordertype.", "")
+    if order_type in _STOP_ORDER_TYPES:
+        return "stop"
+
+    client_id = str(getattr(order, "client_order_id", getattr(order, "orderRef", "")) or "")
+    if order_type in ("market", "limit") and (
+        client_id.startswith(("dt_", "exit_", "flatten_", "close_", "sell_", "buy_")) or ":" in client_id
+    ):
+        return "exit"
+
+    return "unrelated"
+
+
 STATE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'trailing_state.json')
 
 @dataclass
@@ -120,13 +151,17 @@ class DynamicTrailingStopManager:
         if not os.path.exists(STATE_FILE):
             return
         try:
+            if os.path.getsize(STATE_FILE) == 0:
+                logger.warning(f"Trailing stop state file {STATE_FILE} is empty. Initializing empty state.")
+                return
             with open(STATE_FILE, "r") as f:
                 data = json.load(f)
-                for sym, state_dict in data.items():
-                    if state_dict.get('active'):
-                        self.states[sym] = TrailingStopState(**state_dict)
+                if isinstance(data, dict):
+                    for sym, state_dict in data.items():
+                        if state_dict.get('active'):
+                            self.states[sym] = TrailingStopState(**state_dict)
             logger.info(f"Loaded {len(self.states)} active trailing stops.")
-        except Exception as e:
+        except (json.JSONDecodeError, OSError) as e:
             logger.error(f"Failed to load trailing stop state: {e}")
 
     def _save_state(self):
@@ -164,6 +199,7 @@ class DynamicTrailingStopManager:
                 bridge=bridge,
                 stop_order_id=stop_order_id,
                 tp_order_id=tp_order_id,
+                side=signal.side,
             )
 
             state = TrailingStopState(
@@ -173,6 +209,7 @@ class DynamicTrailingStopManager:
                 peak_price=fill_price,
                 atr=atr,
                 stop_price=initial_stop,
+                target_price=target_price,
                 trail_multiple=mult,
                 last_updated=time.time(),
                 order_id=stop_order_id,
@@ -186,62 +223,103 @@ class DynamicTrailingStopManager:
             logger.info(f"Initialized Trailing Stop for {signal.symbol}: Entry ${fill_price:.2f}, Stop ${initial_stop:.2f}")
             return state
 
-    def validate_and_rebuild_geometry(self, symbol: str, signal_price: float, fill_price: float, initial_stop: float, target_price: Optional[float] = None, bridge: Optional[object] = None, stop_order_id: Optional[str] = None, tp_order_id: Optional[str] = None) -> float:
+    def validate_and_rebuild_geometry(
+        self,
+        symbol: str,
+        signal_price: float,
+        fill_price: float,
+        initial_stop: float,
+        target_price: Optional[float] = None,
+        bridge: Optional[object] = None,
+        stop_order_id: Optional[str] = None,
+        tp_order_id: Optional[str] = None,
+        side: str = "BUY",
+    ) -> float:
         """
         Validate bracket order stop geometry against actual fill price.
         Ensure for LONG position: stop_price < actual_avg_fill < target_price.
-        If stop_price >= actual_avg_fill, rebuild child stop leg & TP leg to ensure valid geometry.
+        Ensure for SHORT position: target_price < actual_avg_fill < stop_price.
+        If stop_price is invalid relative to actual_avg_fill, rebuild child stop leg & TP leg to ensure valid geometry.
         """
+        is_short = (side.upper() == "SELL")
         decimals = 4 if fill_price < 1.0 else 2
-        stop_distance = fill_price - initial_stop
-        min_required_distance = max(0.05, fill_price * 0.002)  # At least $0.05 or 0.2%
+        stop_distance = (initial_stop - fill_price) if is_short else (fill_price - initial_stop)
+        # Fix A: +15% rebuild buffer to prevent rounding errors
+        min_required_distance = max(0.05, fill_price * 0.002)
+        min_rebuild_distance  = round(min_required_distance * 1.15, decimals)
         
-        is_valid = (initial_stop < fill_price) and (stop_distance >= min_required_distance)
-        if target_price and target_price > 0:
-            is_valid = is_valid and (fill_price < target_price)
+        if is_short:
+            is_valid = (initial_stop > fill_price) and (stop_distance >= min_required_distance)
+            if target_price and target_price > 0:
+                is_valid = is_valid and (fill_price > target_price)
+        else:
+            is_valid = (initial_stop < fill_price) and (stop_distance >= min_required_distance)
+            if target_price and target_price > 0:
+                is_valid = is_valid and (fill_price < target_price)
 
         action = "ACCEPTED" if is_valid else "REBUILD_CHILD_LEGS"
 
         logger.info(
-            f"[POST-FILL GEOMETRY] symbol={symbol} signal_price={signal_price:.{decimals}f} actual_avg_fill={fill_price:.4f} "
+            f"[POST-FILL GEOMETRY] symbol={symbol} side={side.upper()} signal_price={signal_price:.{decimals}f} actual_avg_fill={fill_price:.4f} "
             f"stop_price={initial_stop:.{decimals}f} target_price={target_price or 0.0:.{decimals}f} stop_distance={stop_distance:.4f} "
             f"valid={is_valid} action={action}"
         )
 
         if not is_valid:
-            if initial_stop >= fill_price:
-                # Inverted Stop Case
-                stop_offset = fill_price * 0.005 # 0.5% offset
+            # Fix B: min_rebuild_distance (with 15% buffer) for safe offset
+            stop_offset = max(fill_price * 0.005, min_rebuild_distance)
+
+            if is_short:
+                new_stop_price = round(fill_price + stop_offset, decimals)
+                new_target_price = None
+                if target_price and target_price < signal_price:
+                    tp_offset = signal_price - target_price
+                    new_target_price = round(max(0.01, fill_price - tp_offset), decimals)
             else:
-                # Too-Tight Stop Case: enforce min_required_distance
-                stop_offset = min_required_distance
-            
-            new_stop_price = round(max(0.01, fill_price - stop_offset), decimals)
-            
-            # Preserve Take-Profit R:R offset relative to actual fill if target_price is provided
-            new_target_price = None
-            if target_price and target_price > signal_price:
-                tp_offset = target_price - signal_price
-                new_target_price = round(fill_price + tp_offset, decimals)
+                new_stop_price = round(max(0.01, fill_price - stop_offset), decimals)
+                new_target_price = None
+                if target_price and target_price > signal_price:
+                    tp_offset = target_price - signal_price
+                    new_target_price = round(fill_price + tp_offset, decimals)
 
             logger.warning(
-                f"[POST-FILL GEOMETRY REBUILD] {symbol}: Adjusted invalid stop price from ${initial_stop:.{decimals}f} "
+                f"[POST-FILL GEOMETRY REBUILD] {symbol} ({side.upper()}): Adjusted invalid stop price from ${initial_stop:.{decimals}f} "
                 f"to ${new_stop_price:.{decimals}f} (new_target=${new_target_price or 0.0:.{decimals}f}) relative to actual fill ${fill_price:.4f}"
             )
             
             # Post-Rebuild Re-Validation Assertion
-            rebuilt_stop_dist = fill_price - new_stop_price
-            rebuilt_valid = (new_stop_price < fill_price) and (rebuilt_stop_dist >= min_required_distance)
-            if target_price and target_price > 0:
-                rebuilt_valid = rebuilt_valid and (fill_price < (new_target_price or target_price))
+            rebuilt_stop_dist = (new_stop_price - fill_price) if is_short else (fill_price - new_stop_price)
+            if is_short:
+                rebuilt_valid = (new_stop_price > fill_price) and (rebuilt_stop_dist >= min_required_distance)
+                if target_price and target_price > 0:
+                    rebuilt_valid = rebuilt_valid and (fill_price > (new_target_price or target_price))
+            else:
+                rebuilt_valid = (new_stop_price < fill_price) and (rebuilt_stop_dist >= min_required_distance)
+                if target_price and target_price > 0:
+                    rebuilt_valid = rebuilt_valid and (fill_price < (new_target_price or target_price))
 
             if not rebuilt_valid:
                 logger.error(
-                    f"[POST-FILL GEOMETRY REBUILD FAILED] {symbol}: Rebuilt stop price ${new_stop_price:.{decimals}f} "
-                    f"is still invalid relative to fill ${fill_price:.4f} (min_dist=${min_required_distance:.4f})"
+                    f"[POST-FILL GEOMETRY REBUILD FAILED] {symbol} ({side.upper()}): "
+                    f"Rebuilt stop ${new_stop_price:.{decimals}f} still invalid "
+                    f"(min_dist=${min_rebuild_distance:.4f}). "
+                    f"Triggering fail-safe position close."
                 )
+                # Fix C: Fail-safe: close position immediately to prevent naked exposure
+                if bridge and hasattr(bridge, "close_position"):
+                    try:
+                        bridge.close_position(symbol)
+                        logger.warning(
+                            f"[GEOMETRY FAIL-SAFE] {symbol} position closed immediately "
+                            f"-- unresolvable stop geometry."
+                        )
+                    except Exception as close_err:
+                        logger.error(
+                            f"[GEOMETRY FAIL-SAFE] Failed to close {symbol}: {close_err}"
+                        )
+                return new_stop_price  # best-effort return
             else:
-                logger.info(f"[POST-FILL GEOMETRY REBUILD SUCCESS] {symbol}: Re-validation valid=True for new stop ${new_stop_price:.{decimals}f}")
+                logger.info(f"[POST-FILL GEOMETRY REBUILD SUCCESS] {symbol} ({side.upper()}): Re-validation valid=True for new stop ${new_stop_price:.{decimals}f}")
 
             if bridge:
                 replace_fn = getattr(bridge, "replace_order_by_id", None)
@@ -376,14 +454,14 @@ class DynamicTrailingStopManager:
         o_status = info["status"]
 
         if o_status in {"canceled", "cancelled", "filled", "expired", "rejected"}:
-            logger.info(f"[RECONCILE EVAL] Order ID {o_id}: status '{o_status}' is CLOSED/DEAD -> Rejecting candidate.")
+            logger.debug(f"[RECONCILE EVAL] Order ID {o_id}: status '{o_status}' is CLOSED/DEAD -> Rejecting candidate.")
             return False
 
         target_side_norm = target_side.lower().strip()
         is_side_match = (o_side == target_side_norm)
         is_stop_type = is_stop_order_type(o_type, has_stop_price=(o_stop is not None))
 
-        logger.info(
+        logger.debug(
             f"[RECONCILE EVAL] Order ID {o_id}: side='{o_side}' (target='{target_side_norm}'), "
             f"type='{o_type}', stop_price={o_stop} -> side_match={is_side_match}, stop_type={is_stop_type}"
         )
@@ -403,6 +481,19 @@ class DynamicTrailingStopManager:
 
     def _reconcile_broker_order(self, state: TrailingStopState, open_orders: list) -> bool:
         """Adopt stop_order_id from active open orders and perform direction-aware price merge."""
+        # P0 Fix 1: Check tracked stop_order_id fill status if order_id is present
+        if state.order_id:
+            for o in self._extract_all_orders_including_legs(open_orders):
+                info = _extract_order_info(o)
+                if info["id"] == str(state.order_id):
+                    status = info.get("status", "").lower()
+                    if status in ("filled", "partially_filled", "cancelled", "expired"):
+                        logger.info(f"[RECONCILE P0] {state.symbol}: Stop order {state.order_id} status='{status}' -> Stop leg executed/closed by broker. Marking inactive cleanly.")
+                        state.active = False
+                        state.order_id = None
+                        self._save_state()
+                        return True
+
         target_side = "sell" if state.side == "BUY" else "buy"
         all_orders = self._extract_all_orders_including_legs(open_orders)
         for o in all_orders:
@@ -421,7 +512,7 @@ class DynamicTrailingStopManager:
                     else:
                         state.stop_price = min(state.stop_price, broker_stop_price)
                 self._save_state()
-                logger.info(f"Reconciled active STOP order for {state.symbol}: Adopted Order ID {state.order_id} (type={o_type}), stop_price ${state.stop_price:.2f}")
+                logger.info(f"Reconciled active STOP order for {state.symbol} ({state.side}): Adopted Order ID {state.order_id} (type={o_type}), stop_price ${state.stop_price:.2f}")
                 return True
         return False
 
@@ -526,6 +617,16 @@ class DynamicTrailingStopManager:
 
     def handle_naked_position(self, symbol: str, position_qty: float, bridge: object, dry_run: bool = False) -> None:
         """Remediate a naked position by either re-placing the stop order or flattening the position."""
+        # Safety Gate: Never attempt remediation on IPO/watch-only symbols
+        ipo_watch = set(getattr(config, "IPO_WATCH_SYMBOLS", []))
+        shadow_watch = set(getattr(config, "SHADOW_MONITOR", []))
+        if symbol in ipo_watch or symbol in shadow_watch:
+            logger.info(
+                f"[NAKED GUARD] Skipping naked position remediation for watch-only symbol {symbol}. "
+                f"No orders will be placed."
+            )
+            return
+
         should_alert_escalation = False
         should_alert_resolved = False
         resolved_order_id = None
@@ -538,7 +639,13 @@ class DynamicTrailingStopManager:
 
             # Query broker fresh to make sure position still exists and is non-zero
             fresh_qty = 0.0
-            if hasattr(bridge, "ib") and hasattr(bridge.ib, "positions"):
+            if hasattr(bridge, "get_position"):
+                try:
+                    fresh_qty = float(bridge.get_position(symbol) or 0.0)
+                except Exception as p_exc:
+                    logger.warning(f"Failed to query fresh position via get_position for {symbol}: {p_exc}")
+                    fresh_qty = float(position_qty)
+            elif hasattr(bridge, "ib") and hasattr(bridge.ib, "positions"):
                 try:
                     positions = bridge.ib.positions()
                     for p in positions:
@@ -623,7 +730,7 @@ class DynamicTrailingStopManager:
                 return
 
             attempts = getattr(state, "remediation_attempts", 0)
-            if attempts >= 3:
+            if attempts >= MAX_REMEDIATION_STRIKES:
                 protection_method = "flatten"
                 if not getattr(state, "escalation_alerted", False):
                     should_alert_escalation = True
@@ -670,88 +777,91 @@ class DynamicTrailingStopManager:
                 if open_orders:
                     self._reconcile_broker_order(state, open_orders)
 
+                # Pre-check: try to fetch all broker orders (active & closed) to adopt existing stop order or detect partial fills FIRST
+                if hasattr(bridge, "_client") and hasattr(bridge._client, "get_orders"):
+                    try:
+                        from alpaca.trading.requests import GetOrdersRequest
+                        from alpaca.trading.enums import QueryOrderStatus
+                        req = GetOrdersRequest(status=QueryOrderStatus.ALL, nested=True, symbols=[symbol])
+                        fetched_orders = bridge._client.get_orders(req) or []
+                        with self._lock:
+                            if self._reconcile_broker_order(state, fetched_orders):
+                                logger.info(f"Reconciled active broker stop order {state.order_id} for {symbol} — skipping new submission.")
+                                return
+                    except Exception as rec_exc:
+                        logger.debug(f"Pre-reconcile failed for {symbol}: {rec_exc}")
+
+                # CRITICAL SAFETY GUARANTEE: If an active broker stop order exists on Alpaca, position is PROTECTED.
+                if state.order_id is not None:
+                    logger.info(f"Adopted existing valid broker stop order {state.order_id} for {symbol} inside handle_naked_position - skipping panic flatten.")
+                    return
+
+                # Step 2: Gap-Through Check SECOND for truly naked positions
                 current_price = None
                 if hasattr(bridge, "market_price"):
                     current_price = bridge.market_price(symbol)
-                
-                if current_price:
-                    is_invalid = False
-                    if state.side == "BUY" and state.stop_price >= current_price:
-                        is_invalid = True
-                    elif state.side == "SELL" and state.stop_price <= current_price:
-                        is_invalid = True
-                    
-                    if is_invalid:
-                        logger.warning(f"Tracked stop price ${state.stop_price:.2f} is stale/invalid for {symbol} (current price ${current_price:.2f}). Falling back to flatten.")
-                        protection_method = "flatten"
 
-                if state.order_id is not None and protection_method != "flatten":
-                    logger.info(f"Adopted existing valid broker stop order {state.order_id} for {symbol} inside handle_naked_position - skipping new submission")
-                    return
+                if current_price and state.order_id is None:
+                    is_gap_breach = False
+                    if state.side == "BUY" and current_price < (state.stop_price - 0.05):
+                        is_gap_breach = True
+                    elif state.side == "SELL" and current_price > (state.stop_price + 0.05):
+                        is_gap_breach = True
 
-                if protection_method == "replace":
-                    # Pre-check: try to adopt existing nested broker stop order first before attempting new order placement
-                    if hasattr(bridge, "_client") and hasattr(bridge._client, "get_orders"):
-                        try:
-                            from alpaca.trading.requests import GetOrdersRequest
-                            from alpaca.trading.enums import QueryOrderStatus
-                            req = GetOrdersRequest(status=QueryOrderStatus.ALL, nested=True, symbols=[symbol])
-                            fetched_orders = bridge._client.get_orders(req) or []
-                            with self._lock:
-                                if self._reconcile_broker_order(state, fetched_orders):
-                                    logger.info(f"Reconciled active broker stop order {state.order_id} for {symbol} — skipping new submission.")
-                                    return
-                        except Exception as rec_exc:
-                            logger.debug(f"Pre-reconcile failed for {symbol}: {rec_exc}")
+                    if is_gap_breach:
+                        logger.warning(f"[GAP-THROUGH] Truly naked position {symbol} breached stop price ${state.stop_price:.2f} (current price ${current_price:.2f}). Triggering immediate emergency flatten.")
+                        self.emergency_flatten(symbol, position_qty, bridge, dry_run=dry_run)
+                        return
 
-                    logger.warning(f"Naked position detected for {symbol} ({position_qty} shares). Attempting to re-place stop order at ${state.stop_price:.2f}.")
-                    stop_side = "SELL" if state.side == "BUY" else "BUY"
-                    
-                    if hasattr(bridge, "place_stop_order"):
-                        res = bridge.place_stop_order(
-                            symbol=symbol,
-                            side=stop_side,
-                            qty=abs(position_qty),
-                            stop_price=state.stop_price
-                        )
-                        new_order_id = res.get("order_id") if res else None
-                        if new_order_id:
-                            with self._lock:
-                                current_state = self.states.get(symbol)
-                                if current_state is state and state.active:
-                                    state.order_id = str(new_order_id)
-                                    state.remediation_in_progress = False
-                                    state.remediation_attempts = 0
-                                    state.escalation_alerted = False
-                                    self._save_state()
-                                    should_alert_resolved = True
-                                    resolved_order_id = new_order_id
-                                else:
-                                    logger.warning(f"State mismatch for {symbol}. Cancelling orphan order {new_order_id}.")
-                                    if hasattr(bridge, "cancel_order"):
-                                        try:
-                                            bridge.cancel_order(new_order_id)
-                                        except Exception as cancel_exc:
-                                            logger.error(f"Failed to cancel orphan order {new_order_id}: {cancel_exc}")
-                                    protection_method = "flatten"
-                            
-                            if should_alert_resolved:
-                                logger.info(f"Successfully re-placed stop order for {symbol}. New Order ID: {new_order_id}")
-                                try:
-                                    send_discord_alert(
-                                        f"⚠️ **NAKED POSITION RESOLVED** ⚠️\n"
-                                        f"**Symbol**: {symbol}\n"
-                                        f"**Remediation**: Replaced Stop Loss order at ${state.stop_price:.2f}\n"
-                                        f"**Order ID**: {new_order_id}"
-                                    )
-                                except Exception as alert_exc:
-                                    logger.error(f"Failed to send Discord alert: {alert_exc}")
-                                return
-                        else:
-                            protection_method = "flatten"
+                # Step 3: Re-place Stop Order THIRD (if position is naked and price not breached)
+                logger.warning(f"Naked position detected for {symbol} ({position_qty} shares). Attempting to re-place stop order at ${state.stop_price:.2f}.")
+                stop_side = "SELL" if state.side == "BUY" else "BUY"
+
+                if hasattr(bridge, "place_stop_order"):
+                    res = bridge.place_stop_order(
+                        symbol=symbol,
+                        side=stop_side,
+                        qty=abs(position_qty),
+                        stop_price=state.stop_price
+                    )
+                    new_order_id = res.get("order_id") if res else None
+                    if new_order_id:
+                        with self._lock:
+                            current_state = self.states.get(symbol)
+                            if current_state is state and state.active:
+                                state.order_id = str(new_order_id)
+                                state.remediation_in_progress = False
+                                state.remediation_attempts = 0
+                                state.escalation_alerted = False
+                                self._save_state()
+                                should_alert_resolved = True
+                                resolved_order_id = new_order_id
+                            else:
+                                logger.warning(f"State mismatch for {symbol}. Cancelling orphan order {new_order_id}.")
+                                if hasattr(bridge, "cancel_order"):
+                                    try:
+                                        bridge.cancel_order(new_order_id)
+                                    except Exception as cancel_exc:
+                                        logger.error(f"Failed to cancel orphan order {new_order_id}: {cancel_exc}")
+                                protection_method = "flatten"
+                        
+                        if should_alert_resolved:
+                            logger.info(f"Successfully re-placed stop order for {symbol}. New Order ID: {new_order_id}")
+                            try:
+                                send_discord_alert(
+                                    f"⚠️ **NAKED POSITION RESOLVED** ⚠️\n"
+                                    f"**Symbol**: {symbol}\n"
+                                    f"**Remediation**: Replaced Stop Loss order at ${state.stop_price:.2f}\n"
+                                    f"**Order ID**: {new_order_id}"
+                                )
+                            except Exception as alert_exc:
+                                logger.error(f"Failed to send Discord alert: {alert_exc}")
+                            return
                     else:
-                        logger.error(f"Bridge {bridge.__class__.__name__} does not support standalone stop orders.")
                         protection_method = "flatten"
+                else:
+                    logger.error(f"Bridge {bridge.__class__.__name__} does not support standalone stop orders.")
+                    protection_method = "flatten"
             except Exception as e:
                 err_msg = str(e)
                 import re
@@ -769,7 +879,8 @@ class DynamicTrailingStopManager:
                                     rel_o = bridge._client.get_order_by_id(rel_id, GetOrderByIdRequest(nested=True))
                                     candidates = [rel_o] + (getattr(rel_o, "legs", []) or [])
                                     for candidate in candidates:
-                                        if self._is_valid_stop_order(candidate, target_side):
+                                        classification = _classify_held_order(candidate)
+                                        if classification == "stop" or self._is_valid_stop_order(candidate, target_side):
                                             cand_id = str(getattr(candidate, "id", rel_id))
                                             o_type = str(getattr(candidate, "order_type", getattr(candidate, "type", ""))).lower()
                                             with self._lock:
@@ -779,8 +890,13 @@ class DynamicTrailingStopManager:
                                                 self._save_state()
                                             logger.info(f"Adopted confirmed Stop Loss leg {cand_id} (type={o_type}) for {symbol} from broker bracket response.")
                                             return
+                                        elif classification == "exit":
+                                            logger.info(f"Exit market/limit order {getattr(candidate, 'id', rel_id)} is in-flight for {symbol}. Retaining working order protection, skipping emergency flatten.")
+                                            with self._lock:
+                                                state.remediation_in_progress = False
+                                            return
                                         else:
-                                            logger.warning(f"Candidate order {getattr(candidate, 'id', rel_id)} for {symbol} is NOT a stop order (type={getattr(candidate, 'order_type', getattr(candidate, 'type', None))}). Checking next candidate...")
+                                            logger.warning(f"Candidate order {getattr(candidate, 'id', rel_id)} for {symbol} is NOT a stop order (type={getattr(candidate, 'order_type', getattr(candidate, 'type', None))}, client_id='{getattr(candidate, 'client_order_id', '')}'). Checking next candidate...")
                                 except Exception as rel_exc:
                                     logger.debug(f"Could not verify related order {rel_id}: {rel_exc}")
 
@@ -804,6 +920,37 @@ class DynamicTrailingStopManager:
                     protection_method = "flatten"
 
         if protection_method == "flatten":
+            # Safety Gate: Before issuing a panic market order, check if Alpaca already filled a stop order for this symbol.
+            if hasattr(bridge, "_client") and hasattr(bridge._client, "get_orders"):
+                try:
+                    from alpaca.trading.requests import GetOrdersRequest
+                    from alpaca.trading.enums import QueryOrderStatus
+                    req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, nested=True, symbols=[symbol], limit=10)
+                    recent_closed = bridge._client.get_orders(req) or []
+                    for o in recent_closed:
+                        o_type = str(getattr(o, "order_type", getattr(o, "type", ""))).lower()
+                        o_status = str(getattr(o, "status", "")).lower()
+                        if "stop" in o_type and "filled" in o_status:
+                            filled_qty = float(getattr(o, "filled_qty", 0.0) or position_qty)
+                            filled_price = float(getattr(o, "filled_avg_price", state.stop_price) or state.stop_price)
+                            pos_abs = abs(float(position_qty))
+                            if filled_qty > 0 and filled_qty < pos_abs:
+                                remaining_qty = pos_abs - filled_qty
+                                logger.info(f"Broker stop order {o.id} for {symbol} partially FILLED on Alpaca ({filled_qty}/{pos_abs} shares @ ${filled_price}). Updating remaining tracked position to {remaining_qty} shares.")
+                                with self._lock:
+                                    state.qty = remaining_qty
+                                    state.remediation_in_progress = False
+                                    state.remediation_attempts = 0
+                                    self._save_state()
+                                return
+                            else:
+                                logger.info(f"Broker stop order {o.id} for {symbol} was already FILLED on Alpaca ({filled_qty} shares @ ${filled_price}). Cleaning up trailing stop state cleanly without emergency market order.")
+                                with self._lock:
+                                    self.reset(symbol)
+                                return
+                except Exception as check_exc:
+                    logger.debug(f"Broker closed order verification failed for {symbol}: {check_exc}")
+
             logger.critical(f"CRITICAL: Naked position detected for {symbol} ({position_qty} shares) with no stop order protection. EMERGENCY FLATTENING POSITION!")
             try:
                 send_discord_alert(

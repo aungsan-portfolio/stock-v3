@@ -542,11 +542,12 @@ class AlpacaBridge:
             qty=qty, limit_price=limit_price, confidence=confidence, order_ref=client_order_id,
         )
 
+        tif = TimeInForce.DAY if action == "SELL" else TimeInForce.GTC
         try:
             order = self._client.submit_order(LimitOrderRequest(
                 symbol=symbol, qty=qty,
                 side=OrderSide.BUY if action == "BUY" else OrderSide.SELL,
-                time_in_force=TimeInForce.GTC,
+                time_in_force=tif,
                 limit_price=round(limit_price, 2),
                 order_class=OrderClass.BRACKET,
                 client_order_id=client_order_id,
@@ -857,11 +858,30 @@ class AlpacaBridge:
         if snapshot["unprotected_longs"]:
             protect = self.ensure_protective_stops()
 
+        # Auto-clean orphaned working exit orders
+        auto_cleaned_orphans = []
+        if snapshot["orphan_exits"]:
+            for orphan_order in snapshot["orphan_exits"]:
+                oid = orphan_order.get("id") if isinstance(orphan_order, dict) else getattr(orphan_order, "id", None)
+                orphan_symbol = orphan_order.get("symbol") if isinstance(orphan_order, dict) else getattr(orphan_order, "symbol", "")
+                if oid:
+                    try:
+                        self._client.cancel_order_by_id(oid)
+                        auto_cleaned_orphans.append(oid)
+                        logger.info("Startup reconciliation: Auto-cancelled orphaned working exit order %s for %s", oid, orphan_symbol)
+                    except Exception as c_exc:
+                        logger.warning("Failed auto-cancelling orphaned working exit order %s for %s: %s", oid, orphan_symbol, c_exc)
+            if auto_cleaned_orphans:
+                # Re-build snapshot after auto-clean
+                working = self.working_orders_plain()
+                snapshot = reconciliation.build_snapshot(positions, working)
+
         return {
             "snapshot": snapshot,
             "protect": protect,
             "halt_new_entries": bool(self.entry_gate.halted),
             "clean": bool(snapshot["clean"]),
+            "auto_cleaned_orphans": auto_cleaned_orphans,
         }
 
     def ensure_protective_stops(self) -> dict:
@@ -987,7 +1007,8 @@ class AlpacaBridge:
                     failed_symbols.append(symbol)
                     logger.error("CRITICAL: Failed to close position %s after 3 attempts", symbol)
 
-            # 3. Verification scan
+            # 3. Verification scan (brief pause to allow broker fill processing)
+            time.sleep(1.0)
             remaining_positions = []
             try:
                 remaining_positions = [p for p in self._client.get_all_positions() if float(p.qty) != 0]
@@ -1009,11 +1030,82 @@ class AlpacaBridge:
             logger.error("flatten_all failed: %s", exc)
             return {"status": "error", "message": str(exc), "positions_closed": closed_count}
 
-    def graceful_shutdown(self) -> dict:
+    def flatten_on_shutdown(self, only_unprotected: bool = True) -> dict:
+        """
+        Smart shutdown handler:
+        If only_unprotected=True, leaves positions with active broker stop loss orders untouched
+        so they remain protected on Alpaca's servers and can be adopted cleanly on restart.
+        Only liquidates positions that lack active broker stop loss protection.
+        """
         self._require_connection()
-        logger.info("Graceful shutdown initiated")
+        if not only_unprotected:
+            return self.flatten_all()
+
+        logger.info("[SHUTDOWN GUARD] Evaluating open positions before graceful exit...")
+        positions = []
         try:
-            self.flatten_all()
+            positions = [p for p in self._client.get_all_positions() if float(p.qty) != 0]
+        except Exception as p_err:
+            logger.error("[SHUTDOWN GUARD] Failed to fetch positions: %s. Falling back to full flatten_all()", p_err)
+            return self.flatten_all()
+
+        if not positions:
+            logger.info("[SHUTDOWN GUARD] No open positions. Shutdown clean.")
+            return {"status": "clean", "positions_closed": 0}
+
+        working = self.working_orders_plain()
+        closed_count = 0
+        preserved_count = 0
+
+        for p in positions:
+            symbol = p.symbol.upper().strip()
+            qty = abs(float(p.qty))
+            if qty == 0:
+                continue
+
+            has_stop = False
+            symbol_orders = []
+            for w in working:
+                w_sym = (w.get("symbol") if isinstance(w, dict) else getattr(w, "symbol", "") or "").upper().strip()
+                if w_sym == symbol:
+                    symbol_orders.append(w)
+                    w_type = str(w.get("order_type") or w.get("type") if isinstance(w, dict) else getattr(w, "order_type", getattr(w, "type", "")) or "").lower()
+                    if "stop" in w_type:
+                        has_stop = True
+
+            if has_stop or order_exec.has_gtc_protective_stop(symbol, qty, working):
+                logger.info(f"[SHUTDOWN GUARD] Preserving protected position {symbol} ({qty} shares). Active broker stop order exists.")
+                preserved_count += 1
+            else:
+                logger.warning(f"[SHUTDOWN GUARD] Unprotected position detected for {symbol} ({qty} shares). Canceling working orders and liquidating for safety.")
+                # Cancel open working orders for symbol to release held_for_orders lock
+                try:
+                    for o in symbol_orders:
+                        o_id = str(o.get("id") if isinstance(o, dict) else getattr(o, "id", ""))
+                        if o_id:
+                            self._client.cancel_order_by_id(o_id)
+                    if symbol_orders:
+                        time.sleep(0.2)
+                except Exception as cancel_err:
+                    logger.warning(f"Could not cancel working orders for {symbol} before close: {cancel_err}")
+
+                for attempt in range(3):
+                    try:
+                        self._client.close_position(symbol)
+                        closed_count += 1
+                        logger.info(f"Successfully closed unprotected position {symbol}")
+                        break
+                    except Exception as c_err:
+                        logger.warning(f"Attempt {attempt+1} to close unprotected position {symbol} failed: {c_err}")
+                        time.sleep(0.5)
+
+        return {"status": "success", "preserved_protected": preserved_count, "closed_unprotected": closed_count}
+
+    def graceful_shutdown(self, preserve_protected: bool = True) -> dict:
+        self._require_connection()
+        logger.info("Graceful shutdown initiated (preserve_protected=%s)", preserve_protected)
+        try:
+            self.flatten_on_shutdown(only_unprotected=preserve_protected)
             self.disconnect()
             return {"disconnected": True}
         except Exception as exc:
@@ -1069,17 +1161,27 @@ class AlpacaBridge:
         ))
         return {"order_id": str(order.id)}
 
-    def modify_stop_order(self, order_id: str, new_stop: float) -> Optional[str]:
+    def modify_stop_order(self, order_id: str, new_stop: float, symbol: Optional[str] = None) -> Optional[str]:
         self._require_connection()
+        if symbol:
+            try:
+                price = self.get_latest_price(symbol)
+                if price and price > 0:
+                    if new_stop >= price:
+                        logger.warning(f"[MODIFY STOP P3] {symbol}: new_stop=${new_stop:.2f} >= current price ${price:.2f}. Skipping invalid stop update.")
+                        return None
+            except Exception as q_exc:
+                logger.debug(f"[MODIFY STOP P3] Quote check skipped for {symbol}: {q_exc}")
+
         try:
             from alpaca.trading.requests import ReplaceOrderRequest
             req = ReplaceOrderRequest(stop_price=round(new_stop, 2))
             new_order = self._client.replace_order_by_id(order_id, req)
             new_id = str(getattr(new_order, "id", order_id))
-            logger.info(f"Replaced stop order {order_id} -> new order ID {new_id} at stop price ${new_stop:.2f}")
+            logger.info(f"[MODIFY STOP P3] Replaced stop order {order_id} -> new order ID {new_id} at stop price ${new_stop:.2f} (Atomic PATCH)")
             return new_id
         except Exception as exc:
-            logger.error("Failed to modify stop order %s: %s", order_id, exc)
+            logger.error(f"[MODIFY STOP P3] Failed to modify stop order {order_id}: {exc}")
             return None
 
     def cancel_order(self, order_id: str) -> bool:
