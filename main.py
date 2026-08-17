@@ -265,7 +265,7 @@ def _place_paper_orders(signals, broker: str = "ibkr") -> int:
     """Place signals on the PAPER account via IBKRBridge or AlpacaBridge."""
     if str(broker).lower() == "alpaca":
         from alpaca_bridge import AlpacaBridge
-        bridge = AlpacaBridge()
+        bridge = AlpacaBridge(mode="swing")
         print(f"\n{'='*60}")
         print("  SWING TRADING ENGINE (ALPACA SWING SUB-ACCOUNT)")
         print(f"{'='*60}\n")

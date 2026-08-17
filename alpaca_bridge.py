@@ -1947,8 +1947,16 @@ class AlpacaBridge:
             strat_name = getattr(signal, "strategy", getattr(signal, "strategy_name", ""))
             stop_price = getattr(signal, "stop_price", getattr(signal, "stop_loss", None))
             target_price = getattr(signal, "target_price", getattr(signal, "take_profit", None))
-            if stop_price is None or target_price is None or stop_price <= 0 or target_price <= 0:
-                logger.warning("Rejecting execute_signal for %s: missing explicit stop_loss/target_price geometry (fail-closed)", symbol)
+            if stop_price is None or target_price is None:
+                stop_loss_pct = float(self._c("STOP_LOSS_PCT", 0.05))
+                take_profit_pct = float(self._c("TAKE_PROFIT_PCT", 0.10))
+                if stop_price is None:
+                    stop_price = round(price * (1.0 - stop_loss_pct), 2)
+                if target_price is None:
+                    target_price = round(price * (1.0 + take_profit_pct), 2)
+
+            if stop_price <= 0 or target_price <= 0 or stop_price >= price or target_price <= price:
+                logger.warning("Rejecting execute_signal for %s: invalid stop_loss/target_price geometry (stop=%s, target=%s, price=%.2f)", symbol, stop_price, target_price, price)
                 return False
 
             # Risk-based sizing with account equity
@@ -2007,8 +2015,16 @@ class AlpacaBridge:
         strat_name = getattr(signal, "strategy", getattr(signal, "strategy_name", ""))
         stop_price = getattr(signal, "stop_price", getattr(signal, "stop_loss", None))
         target_price = getattr(signal, "target_price", getattr(signal, "take_profit", None))
-        if stop_price is None or target_price is None or stop_price <= 0 or target_price <= 0:
-            logger.warning("Rejecting short SELL for %s: missing explicit stop_loss/target_price geometry (fail-closed)", symbol)
+        if stop_price is None or target_price is None:
+            stop_loss_pct = float(self._c("STOP_LOSS_PCT", 0.05))
+            take_profit_pct = float(self._c("TAKE_PROFIT_PCT", 0.10))
+            if stop_price is None:
+                stop_price = round(price * (1.0 + stop_loss_pct), 2)
+            if target_price is None:
+                target_price = round(price * (1.0 - take_profit_pct), 2)
+
+        if stop_price <= 0 or target_price <= 0 or stop_price <= price or target_price >= price:
+            logger.warning("Rejecting short SELL for %s: invalid stop_loss/target_price geometry (stop=%s, target=%s, price=%.2f)", symbol, stop_price, target_price, price)
             return False
 
         risk_per_share = max(stop_price - price, 0.01)
