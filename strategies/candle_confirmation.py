@@ -13,7 +13,9 @@ def _calc_vwap(df: pd.DataFrame) -> pd.Series:
     typical = (df["high"] + df["low"] + df["close"]) / 3.0
     vol = df["volume"].astype(float)
 
-    if hasattr(df.index, "date"):
+    if hasattr(df.index, "tz") and df.index.tz is not None:
+        dates = df.index.tz_convert("America/New_York").date
+    elif hasattr(df.index, "date"):
         dates = df.index.date
     else:
         dates = pd.Series([0] * len(df), index=df.index)
@@ -26,7 +28,7 @@ def _calc_vwap(df: pd.DataFrame) -> pd.Series:
     return vwap.fillna(typical)
 
 
-def confirm_candle(df: pd.DataFrame, confidence: float) -> dict:
+def confirm_candle(df: pd.DataFrame, confidence: float, min_confidence: float = 0.60) -> dict:
     """
     Evaluate the most recent candle(s) and return a confirmation verdict.
     """
@@ -96,15 +98,18 @@ def confirm_candle(df: pd.DataFrame, confidence: float) -> dict:
     else:
         reasons.append("close <= prev high")
 
-    # Decision rules
-    if 0.60 <= confidence < 0.65:
+    # Dynamic decision rules calibrated to strategy minimum confidence
+    tier1_threshold = max(float(min_confidence), 0.30)
+    tier2_threshold = tier1_threshold + 0.05
+
+    if tier1_threshold <= confidence < tier2_threshold:
         if score >= 3:
             action = "ALLOW"
         elif score == 2:
             action = "REDUCE"
         else:
             action = "SKIP"
-    elif confidence >= 0.65:
+    elif confidence >= tier2_threshold:
         if score >= 2:
             action = "ALLOW"
         else:

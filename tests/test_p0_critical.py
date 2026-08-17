@@ -538,6 +538,20 @@ def test_is_regular_hours_timezone_aware_enforced():
     assert di.regular_hours_reason(aware_dt) == "open"
 
 
+def test_settings_mirror_is_complete():
+    """Verify Settings dataclass dynamically mirrors 100% of module-level config constants."""
+    import re
+    import config
+
+    with open(config.__file__, encoding="utf-8") as f:
+        src = f.read()
+    mod_constants = {m.group(1) for m in re.finditer(r'^([A-Z_][A-Z0-9_]*)\s*=', src, re.M)}
+    s = config.get_settings()
+    missing = sorted(k for k in mod_constants if not hasattr(s, k))
+    assert not missing, f"Settings mirror missing constants: {missing}"
+
+
+
 
 
 

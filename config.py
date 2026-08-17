@@ -519,7 +519,7 @@ TRAILING_STOP_UPDATE_COOLDOWN_SECONDS = 30
 TRAILING_STOP_ENABLE_SHORT = True
 TRAILING_STOP_USE_ATR = True
 TRAILING_STOP_MIN_PROFIT_PCT = 0.01
-TRAILING_STOP_MIN_TRAIL_PCT = 0.015
+TRAILING_STOP_MIN_TRAIL_PCT = 0.005
 NAKED_LIMIT_PROTECTION = "replace"
 
 DEFAULT_STOP_ATR_MULTIPLE = 1.5
@@ -1077,6 +1077,22 @@ class Settings:
     FORWARD_TEST_REPORT_JSON: Path = FORWARD_TEST_REPORT_JSON
     FORWARD_TEST_REPORT_MD: Path = FORWARD_TEST_REPORT_MD
     FORWARD_TEST_SESSION: Optional[str] = FORWARD_TEST_SESSION
+
+    def __post_init__(self):
+        # Dynamically mirror all uppercase module-level constants to guarantee zero sync drift
+        import sys
+        mod = sys.modules.get(__name__)
+        if mod:
+            for k, v in mod.__dict__.items():
+                if k.isupper() and not k.startswith("_") and not hasattr(self, k):
+                    setattr(self, k, v)
+
+    def __getattr__(self, name: str):
+        import sys
+        mod = sys.modules.get(__name__)
+        if mod and hasattr(mod, name):
+            return getattr(mod, name)
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
 
 # Default instance — mutate only in tests via set_config().

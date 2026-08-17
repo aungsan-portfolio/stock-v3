@@ -1659,10 +1659,17 @@ class AlpacaBridge:
         if symbol:
             try:
                 price = self.get_price(symbol)
+                pos = self.get_position(symbol)
+                is_short = pos < 0
                 if price and price > 0:
-                    if new_stop >= price:
-                        logger.warning(f"[MODIFY STOP P3] {symbol}: new_stop=${new_stop:.2f} >= current price ${price:.2f}. Skipping invalid stop update.")
-                        return None
+                    if is_short:
+                        if new_stop <= price:
+                            logger.warning(f"[MODIFY STOP P3] {symbol} (SHORT): new_stop=${new_stop:.2f} <= current price ${price:.2f}. Skipping invalid stop update.")
+                            return None
+                    else:
+                        if new_stop >= price:
+                            logger.warning(f"[MODIFY STOP P3] {symbol} (LONG): new_stop=${new_stop:.2f} >= current price ${price:.2f}. Skipping invalid stop update.")
+                            return None
             except Exception as q_exc:
                 logger.debug(f"[MODIFY STOP P3] Quote check skipped for {symbol}: {q_exc}")
 
