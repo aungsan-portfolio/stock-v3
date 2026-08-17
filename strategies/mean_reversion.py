@@ -130,6 +130,17 @@ class MeanReversionStrategy:
             reward_per_share = target_price - close
             rr_ratio = reward_per_share / risk_per_share if risk_per_share > 0 else 0.0
 
+            # Noise floor consistency check at signal generation layer
+            abs_min_noise = getattr(config, "NOISE_FLOOR_ABS_MIN", 0.08)
+            hard_veto_ratio = getattr(config, "NOISE_FLOOR_HARD_VETO_RATIO", 0.50)
+            min_allowable_stop = abs_min_noise * hard_veto_ratio
+            if risk_per_share < min_allowable_stop:
+                logger.debug(
+                    "[MEAN REVERSION] %s: Rejection Noise Floor (Stop distance $%.4f < Min allowable $%.4f)",
+                    symbol, risk_per_share, min_allowable_stop
+                )
+                return None
+
             if rr_ratio < 1.2:
                 logger.debug("[MEAN REVERSION] %s: Rejection Geometry (RR %.2f < 1.2)", symbol, rr_ratio)
                 return None
