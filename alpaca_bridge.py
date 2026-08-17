@@ -237,7 +237,8 @@ class EntryGateMock:
 
 
 class AlpacaBridge:
-    def __init__(self, cfg=None) -> None:
+    def __init__(self, cfg=None, mode: str = "daytrade") -> None:
+        self.mode = str(mode or "daytrade").lower()
         self._cfg = cfg or config_module.get_settings()
         self._client: Optional[TradingClient] = None
         self._data_client: Optional[StockHistoricalDataClient] = None

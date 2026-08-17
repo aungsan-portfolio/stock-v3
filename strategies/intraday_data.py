@@ -180,6 +180,13 @@ def _validate_intraday_data(df: pd.DataFrame, symbol: str, interval: str, valida
                 logger.warning("Data validation failed for %s: High < Low inverted price detected.", symbol)
                 return pd.DataFrame()
 
+        # 1.6. Price Sanity & Discontinuity Guard (Single-bar jump/crash > 50%)
+        if 'close' in df.columns and len(df) >= 2:
+            pct_change = df['close'].pct_change().dropna()
+            if (pct_change.abs() > 0.50).any():
+                logger.warning("Data validation failed for %s: Extreme single-bar price discontinuity (>50%%) detected.", symbol)
+                return pd.DataFrame()
+
         # 2. Frozen Feed Check (Constant close prices)
         if 'close' in df.columns and len(df) >= 10:
             recent_closes = df['close'].tail(10)
