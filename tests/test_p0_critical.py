@@ -239,7 +239,7 @@ def test_execute_signal_quote_veto_releases_idempotency():
         def has_working_order(self, sym): return False
 
     sig = TradeSignal(
-        symbol="AAPL",
+        symbol="TESTSYM",
         strategy=StrategyName.MEAN_REVERSION,
         side="BUY",
         confidence=0.85,
@@ -257,10 +257,12 @@ def test_execute_signal_quote_veto_releases_idempotency():
     orig_validate = eq.validate_execution_quote
     try:
         eq.validate_execution_quote = lambda **kwargs: eq.ExecutionQuoteResult(valid=False, reason="Mock Stale Quote")
-        res = execute_signal(signal=sig, bridge=b, equity=10000.0, current_pnl=0.0, dry_run=False)
+        from unittest.mock import patch
+        with patch.object(config, "SPY_TREND_GUARD_ENABLED", False):
+            res = execute_signal(signal=sig, bridge=b, equity=100000.0, current_pnl=0.0, dry_run=False)
         assert res.get("status") == "VETOED"
         # Idempotency reservation should be released
-        assert "AAPL_BUY" not in idempotency_manager.reservations
+        assert "TESTSYM_BUY" not in idempotency_manager.reservations
     finally:
         eq.validate_execution_quote = orig_validate
 

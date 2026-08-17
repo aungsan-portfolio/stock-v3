@@ -77,12 +77,12 @@ class TestRiskParitySizing(unittest.TestCase):
             side="BUY",
             strategy="MOMENTUM_SCALP",
             entry_price=175.0,
-            stop_price=174.5,
-            target_price=176.0,
+            stop_price=174.0,
+            target_price=177.0,
             confidence=0.85,
             reason="Test",
-            risk_per_share=0.50,
-            atr=0.80
+            risk_per_share=1.00,
+            atr=0.50
         )
 
         mock_trades = [

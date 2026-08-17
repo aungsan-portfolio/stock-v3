@@ -416,7 +416,8 @@ def execute_signal(
         logger.info("Skipped %s: %s", signal.symbol, supp_reason)
         return result
 
-    if bridge and getattr(bridge, "entry_gate", None) and getattr(bridge.entry_gate, "halted", False):
+    gate = getattr(bridge, "entry_gate", None)
+    if gate is not None and getattr(gate, "halted", False) is True:
         result["reason"] = "Entry gate is halted due to startup reconciliation/safety event"
         logger.warning("[ENTRY GATE HALT] Blocked %s: %s", signal.symbol, result["reason"])
         return result
@@ -643,7 +644,7 @@ def execute_signal(
         if hasattr(regime_result, "max_trades_day") and regime_result.max_trades_day is not None:
             effective_max_trades = min(effective_max_trades, regime_result.max_trades_day)
         elif getattr(regime_result, "mode", "") == "CAUTION":
-            effective_max_trades = min(effective_max_trades, 50)
+            effective_max_trades = min(effective_max_trades, 5)
 
     logger.debug(
         "[TRADE LIMIT DEBUG] regime=%s today_fills=%d configured_max=%d effective_max=%d",
