@@ -1,6 +1,6 @@
-@echo off
+﻿@echo off
 chcp 65001 >nul
-cd /d "%~dp0"
+cd /d "%~dp0\..\.."
 cls
 echo ═══════════════════════════════════════════
 echo   🔍 STOCK ENGINE — BUY SIGNAL CHECKER
@@ -51,3 +51,4 @@ echo   ✅ Done! Share output with Claude.
 echo ═══════════════════════════════════════════
 echo.
 pause
+

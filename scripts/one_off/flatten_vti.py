@@ -1,3 +1,8 @@
+﻿import os
+import sys
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 """flatten_vti.py — Market-sell the open VTI position to flatten it on Alpaca."""
 from ibkr_bridge import IBKRBridge
 
@@ -29,3 +34,4 @@ for p in bridge.ib.positions():
     print(f"  {p.contract.symbol}: {p.position}")
 
 bridge.disconnect()
+

@@ -1,3 +1,11 @@
+from __future__ import annotations
+
+import os
+import sys
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
 """
 verify_full_market_scanner.py — Beginner-friendly safety check (READ-ONLY).
 
@@ -18,8 +26,6 @@ What it does (and just as importantly, what it does NOT do):
 This script imports zero trading code. It cannot connect to IBKR and cannot
 place an order, by construction.
 """
-from __future__ import annotations
-
 import sys
 
 import pandas as pd
@@ -164,3 +170,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

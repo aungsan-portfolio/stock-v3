@@ -1,3 +1,8 @@
+﻿import os
+import sys
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 """
 cancel_open_orders.py — Cancel all open/working orders on the Alpaca paper account.
 Use before re-running `paper` after a sizing change.
@@ -28,3 +33,4 @@ for t in remaining:
     print(f"  still open: {t.contract.symbol} ref={t.order.orderRef} status={t.orderStatus.status}")
 
 bridge.disconnect()
+

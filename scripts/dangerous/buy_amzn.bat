@@ -1,6 +1,13 @@
 @echo off
 chcp 65001 >nul
-cd /d "%~dp0"
+cd /d "%~dp0\..\.."
+
+echo [WARNING] This script will modify config.py and execute paper orders.
+set /p CONFIRM="Type YES to continue (any other input aborts): "
+if /I not "%CONFIRM%"=="YES" (
+    echo [ABORTED] Execution cancelled by user.
+    exit /b 1
+)
 
 echo ═══════════════════════════════════════════════
 echo   🚀 BUY AMZN — Auto Setup
@@ -39,3 +46,4 @@ echo   ✅ Done! Check TWS for AMZN position.
 echo ═══════════════════════════════════════════════
 echo.
 pause
+

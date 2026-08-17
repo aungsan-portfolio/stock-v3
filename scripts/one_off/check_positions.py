@@ -1,3 +1,8 @@
+﻿import os
+import sys
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 """check_positions.py — Show current positions and any remaining open orders on Alpaca."""
 from ibkr_bridge import IBKRBridge
 
@@ -22,3 +27,4 @@ for t in ot:
           f"x{t.order.totalQuantity} ref={t.order.orderRef} status={t.orderStatus.status}")
 
 bridge.disconnect()
+
