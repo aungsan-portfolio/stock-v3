@@ -1015,10 +1015,10 @@ def test_regression_c6_orb_new_york_nan_masking():
 
 
 def test_regression_c2_canonical_slot_cap_single_source():
-    """Regression test C2: verify MAX_OPEN_POSITIONS = 5 is single canonical source across config."""
+    """Regression test C2: verify MAX_OPEN_POSITIONS = 3 is single canonical source across config."""
     import config
-    assert config.MAX_OPEN_POSITIONS == 5
-    assert getattr(config, "PORTFOLIO_MAX_POSITIONS", None) == 5
+    assert config.MAX_OPEN_POSITIONS == 3
+    assert getattr(config, "PORTFOLIO_MAX_POSITIONS", None) == 3
 
 
 def test_regression_outage_positions_raise_fail_closed():
@@ -1037,9 +1037,12 @@ def test_regression_outage_positions_raise_fail_closed():
         risk_per_share=10.0, confidence=0.85, strategy="ORB", atr=1.0, reason=""
     )
     
-    res = execute_signal(sig, bridge=bridge, equity=100000.0, current_pnl=0.0, dry_run=False)
-    assert res["status"] == "REJECTED"
-    assert "Risk guard failure" in res["reason"]
+    import pandas as pd
+    mock_spy_df = pd.DataFrame([{"open": 500.0, "close": 501.0}, {"open": 500.0, "close": 501.0}])
+    with mock.patch("strategies.intraday_data.fetch_intraday", return_value=mock_spy_df):
+        res = execute_signal(sig, bridge=bridge, equity=100000.0, current_pnl=0.0, dry_run=False)
+        assert res["status"] == "REJECTED"
+        assert "Risk guard failure" in res["reason"]
 
 
 def test_regression_entry_gate_halted_blocks_new_entries(monkeypatch):

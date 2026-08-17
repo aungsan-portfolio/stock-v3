@@ -6,6 +6,7 @@ __pycache__/
 .env
 .env.*
 *.env
+!.env.example
 
 # Logs & Runtime Output
 logs/
@@ -36,6 +37,7 @@ models_backup_before_edge_*/
 *.bak
 phase1_incomplete_checkpoint.diff
 models_backup_before_fullmarket_training/
+archive_cleanup_*/
 
 # Python and virtual environment exclusions
 .venv/
@@ -43,6 +45,7 @@ models_backup_before_fullmarket_training/
 .coverage
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 coverage.xml
 predict.pid
 predict_output.txt

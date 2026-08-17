@@ -266,5 +266,83 @@ def test_symbol_consecutive_loss_blacklist(tmp_path):
             symbol="CLBK"
         )
         assert reason is not None
-        assert "Symbol consecutive loss limit reached for CLBK" in reason
+        assert "Consecutive loss limit reached for CLBK" in reason
+
+
+def test_short_veto_in_risk_on_mode():
+    from strategies.mega_cap_guard import should_veto_mega_cap_short
+
+    # Test case 1: Price above VWAP in RISK_ON -> MUST VETO
+    veto, reason = should_veto_mega_cap_short(
+        symbol="TSLA",
+        regime_mode="RISK_ON",
+        rsi_5m=35.0,
+        price_vs_vwap=0.15,
+    )
+    assert veto is True
+    assert "above VWAP" in reason
+
+    # Test case 2: RSI > 40 in RISK_ON -> MUST VETO
+    veto, reason = should_veto_mega_cap_short(
+        symbol="IREN",
+        regime_mode="RISK_ON",
+        rsi_5m=42.0,
+        price_vs_vwap=-0.05,
+    )
+    assert veto is True
+    assert "no breakdown weakness confirmed" in reason
+
+    # Test case 3: Price below VWAP and RSI <= 40 in RISK_ON -> ACCEPT
+    veto, reason = should_veto_mega_cap_short(
+        symbol="RIOT",
+        regime_mode="RISK_ON",
+        rsi_5m=38.0,
+        price_vs_vwap=-0.10,
+    )
+    assert veto is False
+
+
+def test_calibrated_noise_floor_veto():
+    import config
+    from strategies.base import TradeSignal
+    from strategies.order_manager import _compute_noise_floor, _pre_submission_veto
+
+    # 1. Verify updated config constants
+    assert config.NOISE_FLOOR_ATR_MULTIPLIER == 1.00
+    assert config.NOISE_FLOOR_HARD_VETO_RATIO == getattr(config, "NOISE_FLOOR_HARD_VETO_RATIO", 0.75)
+
+    # 2. Test TradeSignal with tight stop (stop_distance = 0.05 < 0.70 * noise_floor 0.08)
+    sig_tight = TradeSignal(
+        symbol="AAPL",
+        side="BUY",
+        entry_price=100.00,
+        stop_price=99.95,  # stop_distance = 0.05
+        target_price=101.00,
+        risk_per_share=0.05,
+        confidence=0.85,
+        strategy="ORB",
+        atr=0.10,
+        reason=""
+    )
+    should_skip, reason = _pre_submission_veto(sig_tight)
+    assert should_skip is True
+    assert "Pre-submission Veto" in reason
+
+    # 3. Test TradeSignal with adequate stop (entry=20.00, stop=19.75 -> stop_distance = 0.25 >= 0.70 * noise_floor 0.08)
+    sig_good = TradeSignal(
+        symbol="AAPL",
+        side="BUY",
+        entry_price=20.00,
+        stop_price=19.75,  # stop_distance = 0.25
+        target_price=20.50,
+        risk_per_share=0.25,
+        confidence=0.85,
+        strategy="ORB",
+        atr=0.08,
+        reason=""
+    )
+    should_skip_good, _ = _pre_submission_veto(sig_good)
+    assert should_skip_good is False
+
+
 

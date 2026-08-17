@@ -42,7 +42,6 @@ except RuntimeError:
 import config              # noqa: E402
 import order_audit         # noqa: E402
 import alerts              # noqa: E402
-import reconnect_watchdog as rw  # noqa: E402
 import scheduler_runner as sr    # noqa: E402
 import ibkr_bridge         # noqa: E402
 

@@ -384,8 +384,20 @@ are placed. Every candidate that is not traded prints a skip reason.
 | `COACH_DEFAULT_PREVIEW_CANDIDATES` | `3` | How many top candidates the default (preview-only) run shows. |
 | `COACH_LIVE_TRADING_ENABLED` | `False` | Master live-trading kill switch. Must stay `False` — this bot is paper-only. |
 
+## Project Layout
+
+- **Root**: Production CLI entrypoints (`main.py`), central configuration (`config.py`), bridges, and main `.bat` runners.
+- **`strategies/`**: Intraday trading strategies (ORB, VWAP, Mean Reversion), Order Manager, and Trailing Stop engines.
+- **`tests/`**: Automated unit and integration test suite (~165+ tests).
+- **`tests/manual/`**: Manual experiment scripts and legacy test files excluded from automated test discovery.
+- **`scripts/one_off/`**: Utility scripts (e.g. portfolio and position inspection); include automated root path bootstrapping.
+- **`scripts/dangerous/`**: Ad-hoc scripts that mutate `config.py` or trigger manual order execution; review before running.
+- **`archive_cleanup_2026_08_17/`**: Preserved historical backups, diffs, logs, and checkpoints from cleanup; large artifacts ignored via `.gitignore`.
+- **`docs/`**: Project architecture, audit records, and cleanup documentation.
+
 ## Important Notes
 
 The default backtest is `RF_TECHNICAL_WALK_FORWARD` because fold-local LSTM training can be slow. To test RF + LSTM + Technical without leakage, use `--include-lstm`; it trains a small LSTM inside each walk-forward fold using only past rows.
 
 Paper trading only. Past performance does not guarantee future results.
+

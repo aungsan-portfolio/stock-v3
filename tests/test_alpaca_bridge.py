@@ -151,6 +151,22 @@ class TestAlpacaBridgeConnection(unittest.TestCase):
         self.assertTrue(br.connect())
         self.assertEqual(mock_trade.return_value.get_account.call_count, 2)
 
+    def test_call_with_retry_retries_transient_error(self):
+        br = alpaca_bridge.AlpacaBridge()
+        attempts = 0
+
+        def flaky_func():
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise Exception("HTTPSConnectionPool(host='paper-api.alpaca.markets'): Read timed out.")
+            return "SUCCESS"
+
+        with mock.patch("time.sleep", return_value=None):
+            result = br._call_with_retry(flaky_func, retries=3, backoff_factor=0.01)
+            self.assertEqual(result, "SUCCESS")
+            self.assertEqual(attempts, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -75,7 +75,9 @@ class TestGapThroughProtection(unittest.TestCase):
         mgr._reconcile_broker_order = MagicMock(return_value=False)
         mgr.emergency_flatten = MagicMock()
 
-        mgr.handle_naked_position("META", position_qty=4.0, bridge=bridge)
+        from unittest.mock import patch
+        with patch("strategies.trailing_stop.is_market_open", return_value=True):
+            mgr.handle_naked_position("META", position_qty=4.0, bridge=bridge)
 
         mgr.emergency_flatten.assert_called_once()
         self.assertEqual(mgr.emergency_flatten.call_args[0][0], "META")

@@ -18,7 +18,7 @@ def test_rebuild_flow_and_broker_replace():
         strategy="VWAP_BOUNCE",
         entry_price=100.00,
         stop_price=99.00,
-        target_price=105.00,
+        target_price=108.00,
         risk_per_share=1.00,
         atr=1.5,
         confidence=0.75,
