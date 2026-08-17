@@ -23,6 +23,10 @@ LOG_DIR         = BASE_DIR / "logs"
 ML_MODELS_FILE  = MODELS_DIR / "rf_models.joblib"
 LSTM_CKPT_FILE  = MODELS_DIR / "lstm_checkpoint.pt"
 
+# ── Kill Switch File Flags ────────────────────────
+HALT_LOCK_FILE    = DATA_DIR / "HALT.lock"
+FLATTEN_LOCK_FILE = DATA_DIR / "FLATTEN.lock"
+
 # ── Stock Universe ───────────────────────────────
 WATCHLIST = [
     "SPY", "QQQ", "VTI",
@@ -54,7 +58,7 @@ FULL_MARKET_CORE_SYMBOLS = [
     "SPY", "QQQ", "VTI",
     "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "META", "AMZN",
     "GOOGL", "AVGO", "NFLX", "COST", "JPM", "BAC", "XOM", "UNH",
-    "XLV", "V",
+    "XLV", "V", "PLTR",
 ]
 FULL_MARKET_RANDOM_SEED = 42
 FULL_MARKET_ROTATION_STATE_FILE = DATA_DIR / "scan_rotation_state.json"
@@ -141,7 +145,7 @@ LSTM_HYPEROPT_TRIALS   = 0
 LSTM_META_ENSEMBLE     = False
 
 # ── Signal Thresholds ────────────────────────────
-BUY_THRESHOLD       = 0.60
+BUY_THRESHOLD       = 0.55
 SELL_THRESHOLD      = 0.40
 MIN_HOLD_BARS       = ML_HORIZON
 
@@ -168,14 +172,49 @@ PERMUTATION_N_SHUFFLES     = 50
 PERMUTATION_SAMPLE_SYMBOLS = 20
 PERMUTATION_FDR_Q          = 0.05
 
+# ── Dynamic Market Texture Settings ────────────────
+MARKET_REGIME_SETTINGS = {
+    "TRENDING": {
+        "noise_floor_ratio": 0.75,
+        "confidence_min": 0.60,
+        "tp_atr_mult": 2.0,
+        "halt_new_entries": False,
+        "allowed_strategies": ["ORB", "VWAP_BOUNCE", "GAP_AND_GO", "MOMENTUM_SCALP", "CANDLESTICK"]
+    },
+
+    "SIDEWAYS": {
+        "noise_floor_ratio": 0.50,
+        "confidence_min": 0.55,
+        "tp_atr_mult": 0.9,
+        "halt_new_entries": False,
+        "allowed_strategies": ["MEAN_REVERSION", "VWAP_BOUNCE"]
+    },
+    "VOLATILE": {
+        "noise_floor_ratio": 0.85,
+        "confidence_min": 0.75,
+        "tp_atr_mult": 2.5,
+        "halt_new_entries": True,
+        "allowed_strategies": []
+    },
+    "TRANSITIONING": {
+        "noise_floor_ratio": 0.75,
+        "confidence_min": 0.70,
+        "tp_atr_mult": 1.5,
+        "halt_new_entries": True,
+        "allowed_strategies": []
+    }
+}
+
+
 # ── Risk Management ──────────────────────────────
 MAX_POSITION_PCT    = 0.02
 MAX_TRADE_VALUE     = 2000.0
-MAX_OPEN_POSITIONS  = 5
+MAX_OPEN_POSITIONS  = 5       # Capacity for up to 5 different stock symbols per trader instruction
 PORTFOLIO_MAX_POSITIONS = MAX_OPEN_POSITIONS
-MAX_CORRELATED_TECH_POSITIONS = 2
+MAX_CORRELATED_TECH_POSITIONS = 3
 STOP_LOSS_PCT       = 0.008
 TAKE_PROFIT_PCT     = 0.015
+
 MIN_PROFIT_MARGIN   = 0.003
 ESTIMATED_COMMISSION_PER_TRADE = 1.00
 MIN_COMMISSION_PER_TRADE       = 1.00
@@ -197,6 +236,15 @@ SHORT_HARD_STOP_PCT  = 0.01   # Hard Stop-Loss (+1.0% above entry) for short pos
 MIN_TRADE_CASH       = 100.0
 LIMIT_ORDER_OFFSET_PCT = 0.001
 MAX_DAILY_TRADES     = 50
+
+# ── Paper TradingStream Safety & Recovery ────────
+TRADE_STREAM_START_TIMEOUT_SECONDS        = 10.0
+TRADE_STREAM_STOP_TIMEOUT_SECONDS         = 5.0
+TRADE_STREAM_RECONNECT_MAX_ATTEMPTS        = 8
+TRADE_STREAM_RECONNECT_BASE_DELAY_SECONDS = 1.0
+TRADE_STREAM_RECONNECT_MAX_DELAY_SECONDS  = 30.0
+TRADE_STREAM_RECONNECT_JITTER_RATIO       = 0.20
+
 # Swing Trading daily loss limit (used in risk_state.py)
 MAX_DAILY_LOSS_SWING   = 150.0
 MAX_DAILY_LOSS_DAYTRADE = 300.0  # Expanded limit for tonight per trader instruction ($300.00)
@@ -206,6 +254,8 @@ ALLOW_HISTORICAL_PRICE_FOR_ORDERS = False
 COACH_ALLOW_HISTORICAL_PRICE = True
 
 # ── Order Execution ──────────────────────────────
+MIN_SHARE_COUNT            = 1      # Set to 1 per trader instruction (no 5-share minimum limit)
+MIN_ORDER_SHARES           = 1
 ORDER_FILL_TIMEOUT_SECONDS = 15.0
 ORDER_POLL_SECONDS         = 0.25
 CLOSE_MAX_ATTEMPTS         = 3
@@ -213,11 +263,26 @@ PROTECTIVE_TIF             = "GTC"
 ACCOUNT_MAX_DRAWDOWN_PCT   = 0.10
 MAX_SYMBOL_EXPOSURE_PCT    = 0.10
 
-# ── Data Integrity ───────────────────────────────
-REQUIRE_REALTIME_DATA_FOR_ORDERS = False
+
+# ── Data Integrity & Health ───────────────────────────
+REQUIRE_REALTIME_DATA_FOR_ORDERS = True
+PAPER_MODE_AUTO_CONFIRM_FILL     = False  # C-02: Only real Alpaca TradingStream fills initialize trailing/lifecycle state
 MAX_QUOTE_SPREAD_PCT             = 0.02
 DECISION_PRICE_MAX_DEVIATION_PCT = 0.05
+MAX_ACCEPTABLE_SPREAD_PCT        = 1.0    # 1.0% max spread
+MAX_DECISION_DEVIATION_PCT       = 1.5    # 1.5% max price deviation
+MAX_QUOTE_AGE_SECONDS            = 10.0   # 10 seconds max quote staleness
 MARKET_HOURS_GATE_ENABLED        = True
+
+DATA_HEALTH_SETTINGS = {
+    "critical_symbols": ["SPY", "QQQ"],
+    "stale_threshold_s": {
+        "SPY": 60.0,
+        "QQQ": 60.0,
+        "_default": 180.0,
+    },
+    "recovery_bars": 3,
+}
 
 # ── Backtest ─────────────────────────────────────
 BACKTEST_TRANSACTION_COST_PCT = 0.0005
@@ -309,9 +374,14 @@ SCANNER_REFRESH_MINUTES = 10
 
 # ── Noise Floor — ATR-Based Veto Calibration ────────
 NOISE_FLOOR_ATR_PERIOD       = 10    # ATR window (10 for responsiveness)
-NOISE_FLOOR_ATR_MULTIPLIER   = 0.75  # noise_floor = ATR * 0.75
+NOISE_FLOOR_ATR_MULTIPLIER   = 1.00  # noise_floor = ATR * 1.00 (Calibrated from 0.75)
 NOISE_FLOOR_ABS_MIN          = 0.08  # minimum floor $0.08
-NOISE_FLOOR_HARD_VETO_RATIO  = 0.60  # veto only if stop < 60% of noise floor
+NOISE_FLOOR_HARD_VETO_RATIO  = 0.75  # veto if stop < 80% of noise floor (Calibrated from 0.70)
+MAX_RISK_PER_TRADE_DOLLARS   = 25.0  # Max per-trade dollar risk cap (Volatility Risk Parity)
+
+# ── Short Counter-Trend Veto Rules in RISK_ON ──────
+APPLY_SHORT_VETO_TO_ALL_SYMBOLS = True
+SHORT_VETO_RSI_THRESHOLD        = 40.0
 
 # ── Gap Quality Filter Thresholds ───────────────────
 GAP_MIN_RVOL          = 1.5   # Require Relative Volume >= 1.5x (Institutional Conviction)
@@ -386,14 +456,39 @@ STRATEGY_SETTINGS = {
     StrategyName.MOMENTUM_SCALP: StrategyConfig(confidence_min=0.63, max_risk_pct=1.0, priority=3),
     StrategyName.GAP_AND_GO: StrategyConfig(confidence_min=0.60, max_risk_pct=1.0, priority=4, entry_cutoff_time="10:30"),
     StrategyName.CANDLESTICK: StrategyConfig(confidence_min=0.40, max_risk_pct=0.5, priority=5),
+    StrategyName.MEAN_REVERSION: StrategyConfig(confidence_min=0.55, max_risk_pct=1.0, priority=6),
 }
+
 
 ORB_MIN_VOLUME_RATIO = 1.5
 ORB_MIN_RANGE_ATR_RATIO = 0.5
 VWAP_RSI_OVERSOLD = 35
 VWAP_RSI_OVERBOUGHT = 65
+RSI_MAX_BUY_ENTRY = 65.0
+RSI_MIN_SHORT_ENTRY = 30.0
+MIN_RR_RATIO = 1.5
+BETA_HIGH_THRESHOLD = 1.5
+EARNINGS_BLOCK_DAYS = 1
+ATR_STOP_MULTIPLIER = 1.0
+ATR_STOP_HIGH_BETA = 1.5
+ATR_STOP_EARNINGS = 2.0
+SOXX_GATE_ENABLED = True
+SKIP_SUPPRESSOR_ENABLED = True
+HARD_VETO_SKIP_LIMIT = 5
+NEWS_HYGIENE_ENABLED = True
+TIME_EXIT_CHECK_ENABLED = True
+BREAKEVEN_BAND_PCT = 0.20
 GAP_CONTINUATION_MIN_HOLD_BARS = 3
 VOLATILITY_PENALTY_MULTIPLIER = 4.0
+
+# ── Breakeven Stop Lock ──────────────────────────────
+BREAKEVEN_LOCK_ENABLED          = True
+BREAKEVEN_LOCK_THRESHOLD_ATR    = 1.0   # Lock at +1.0x ATR unrealized profit
+BREAKEVEN_SLIPPAGE_CUSHION      = True  # Add $0.01 cushion above entry for BUY
+
+# ── SPY/QQQ Intraday Trend Guard ─────────────────────
+SPY_TREND_GUARD_ENABLED         = True
+SPY_TREND_GUARD_SYMBOL          = "SPY"
 
 MAX_RISK_PER_TRADE_PCT = 0.3
 MAX_DAILY_LOSS_PCT      = 0.9
@@ -433,7 +528,7 @@ DEFAULT_TARGET_RR_RATIO = 2.0
 FLATTEN_BEFORE_CLOSE_MINUTES = 5
 FLATTEN_WARNING_MINUTES = 15
 FLATTEN_ON_DAILY_LOSS = True
-REENTRY_COOLDOWN_MINUTES = 5
+REENTRY_COOLDOWN_MINUTES = 45
 
 PDT_ENABLED = True
 PDT_MIN_EQUITY = 25_000.0
@@ -719,8 +814,12 @@ class Settings:
 
     # Data integrity
     REQUIRE_REALTIME_DATA_FOR_ORDERS: bool = REQUIRE_REALTIME_DATA_FOR_ORDERS
+    PAPER_MODE_AUTO_CONFIRM_FILL: bool = PAPER_MODE_AUTO_CONFIRM_FILL
     MAX_QUOTE_SPREAD_PCT: float = MAX_QUOTE_SPREAD_PCT
     DECISION_PRICE_MAX_DEVIATION_PCT: float = DECISION_PRICE_MAX_DEVIATION_PCT
+    MAX_ACCEPTABLE_SPREAD_PCT: float = MAX_ACCEPTABLE_SPREAD_PCT
+    MAX_DECISION_DEVIATION_PCT: float = MAX_DECISION_DEVIATION_PCT
+    MAX_QUOTE_AGE_SECONDS: float = MAX_QUOTE_AGE_SECONDS
     MARKET_HOURS_GATE_ENABLED: bool = MARKET_HOURS_GATE_ENABLED
 
     # Backtest
@@ -745,6 +844,13 @@ class Settings:
 
     # Alpaca
     ALPACA_PAPER_BASE_URL: str = ALPACA_PAPER_BASE_URL
+    TRADE_STREAM_START_TIMEOUT_SECONDS: float = TRADE_STREAM_START_TIMEOUT_SECONDS
+    TRADE_STREAM_STOP_TIMEOUT_SECONDS: float = TRADE_STREAM_STOP_TIMEOUT_SECONDS
+    TRADE_STREAM_RECONNECT_MAX_ATTEMPTS: int = TRADE_STREAM_RECONNECT_MAX_ATTEMPTS
+    TRADE_STREAM_RECONNECT_BASE_DELAY_SECONDS: float = TRADE_STREAM_RECONNECT_BASE_DELAY_SECONDS
+    TRADE_STREAM_RECONNECT_MAX_DELAY_SECONDS: float = TRADE_STREAM_RECONNECT_MAX_DELAY_SECONDS
+    TRADE_STREAM_RECONNECT_JITTER_RATIO: float = TRADE_STREAM_RECONNECT_JITTER_RATIO
+
 
     # Logging
     LOG_FILE: Path = LOG_FILE
@@ -872,6 +978,17 @@ class Settings:
     ORB_MIN_RANGE_ATR_RATIO: float = ORB_MIN_RANGE_ATR_RATIO
     VWAP_RSI_OVERSOLD: float = VWAP_RSI_OVERSOLD
     VWAP_RSI_OVERBOUGHT: float = VWAP_RSI_OVERBOUGHT
+    RSI_MAX_BUY_ENTRY: float = RSI_MAX_BUY_ENTRY
+    BETA_HIGH_THRESHOLD: float = BETA_HIGH_THRESHOLD
+    EARNINGS_BLOCK_DAYS: int = EARNINGS_BLOCK_DAYS
+    ATR_STOP_MULTIPLIER: float = ATR_STOP_MULTIPLIER
+    ATR_STOP_HIGH_BETA: float = ATR_STOP_HIGH_BETA
+    ATR_STOP_EARNINGS: float = ATR_STOP_EARNINGS
+    SOXX_GATE_ENABLED: bool = SOXX_GATE_ENABLED
+    SKIP_SUPPRESSOR_ENABLED: bool = SKIP_SUPPRESSOR_ENABLED
+    NEWS_HYGIENE_ENABLED: bool = NEWS_HYGIENE_ENABLED
+    TIME_EXIT_CHECK_ENABLED: bool = TIME_EXIT_CHECK_ENABLED
+    BREAKEVEN_BAND_PCT: float = BREAKEVEN_BAND_PCT
     GAP_CONTINUATION_MIN_HOLD_BARS: int = GAP_CONTINUATION_MIN_HOLD_BARS
     VOLATILITY_PENALTY_MULTIPLIER: float = VOLATILITY_PENALTY_MULTIPLIER
     MAX_RISK_PER_TRADE_PCT: float = MAX_RISK_PER_TRADE_PCT
@@ -898,6 +1015,15 @@ class Settings:
     TRAILING_STOP_FALLBACK_PCT: float = TRAILING_STOP_FALLBACK_PCT
     TRAILING_STOP_MIN_UPDATE_DELTA: float = TRAILING_STOP_MIN_UPDATE_DELTA
     TRAILING_STOP_UPDATE_COOLDOWN_SECONDS: int = TRAILING_STOP_UPDATE_COOLDOWN_SECONDS
+
+    # Breakeven Lock
+    BREAKEVEN_LOCK_ENABLED:         bool  = BREAKEVEN_LOCK_ENABLED
+    BREAKEVEN_LOCK_THRESHOLD_ATR:   float = BREAKEVEN_LOCK_THRESHOLD_ATR
+    BREAKEVEN_SLIPPAGE_CUSHION:     bool  = BREAKEVEN_SLIPPAGE_CUSHION
+
+    # SPY Trend Guard
+    SPY_TREND_GUARD_ENABLED:        bool  = SPY_TREND_GUARD_ENABLED
+    SPY_TREND_GUARD_SYMBOL:         str   = SPY_TREND_GUARD_SYMBOL
     TRAILING_STOP_ENABLE_SHORT: bool = TRAILING_STOP_ENABLE_SHORT
     TRAILING_STOP_USE_ATR: bool = TRAILING_STOP_USE_ATR
     NAKED_LIMIT_PROTECTION: str = NAKED_LIMIT_PROTECTION

@@ -126,7 +126,9 @@ def shares_for_risk(
             raise ValueError(f"max_position_pct must be <= 1, got {max_position_pct!r}")
         caps.append(math.floor((equity * max_position_pct) / entry))
 
-    return max(int(min(caps)), 0)
+    res = max(int(min(caps)), 0)
+    return res
+
 
 
 def planned_risk_dollars(shares, entry_price, stop_price, side="LONG") -> float:

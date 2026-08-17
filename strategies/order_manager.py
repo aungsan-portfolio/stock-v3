@@ -7,7 +7,7 @@ Always paper-trading only.
 from dataclasses import replace
 import logging
 import math
-from typing import Optional
+from typing import Optional, Tuple
 import time
 
 import config
@@ -19,8 +19,83 @@ from strategies.webhook import send_discord_alert
 
 logger = logging.getLogger(__name__)
 
+from collections import defaultdict
+
 _recent_orders = {}
 IDEMPOTENCY_TTL = 60  # seconds
+
+_session_skip_counts = defaultdict(int)
+_session_suppressed = set()
+
+def _get_skip_limit() -> int:
+    return getattr(config, "HARD_VETO_SKIP_LIMIT", 5)
+
+
+def check_session_suppression(symbol: str) -> Tuple[bool, str]:
+    """Checks if a symbol has been hard-vetoed >= skip limit times in a session."""
+    if not getattr(config, "SKIP_SUPPRESSOR_ENABLED", True):
+        return False, ""
+    sym = symbol.upper().strip()
+    limit = _get_skip_limit()
+    if sym in _session_suppressed:
+        return True, f"[SESSION SUPPRESSED] {sym}: suppressed this session (skip count >= {limit})"
+    return False, ""
+
+
+_seen_veto_fingerprints = {}
+
+def record_hard_veto_skip(symbol: str, reason: str, bar_timestamp: str = ""):
+    """Increments skip counter when noise floor / tight stop hard vetoes occur, deduplicated per bar fingerprint."""
+    sym = symbol.upper().strip()
+    HARD_VETO_REASONS = ["critically tight", "noise floor", "atr", "veto line"]
+    if not any(r.lower() in reason.lower() for r in HARD_VETO_REASONS):
+        return
+
+    # Deduplicate repeat logs for identical geometry within 3600 seconds (session-level) across identical veto reasons
+    fingerprint = f"{sym}:{reason.strip()[:80]}"
+    now = time.time()
+    last_seen = _seen_veto_fingerprints.get(fingerprint, 0)
+    
+    if now - last_seen < 3600:
+        count = _session_skip_counts[sym]
+        limit = _get_skip_limit()
+        logger.debug("[SKIP COUNTER REPEAT] %s: Repeat hard veto skip #%d (deduplicated) — reason: %s", sym, count, reason)
+        return
+
+    _seen_veto_fingerprints[fingerprint] = now
+    _session_skip_counts[sym] += 1
+    count = _session_skip_counts[sym]
+    limit = _get_skip_limit()
+    logger.info("[SKIP COUNTER] %s: Hard veto skip #%d/%d — reason: %s", sym, count, limit, reason)
+
+    if count >= limit:
+        _session_suppressed.add(sym)
+        logger.warning("[SESSION SUPPRESS] %s: Suppressed for remainder of session after %d hard vetoes.", sym, count)
+
+
+def reset_session_skip_state():
+    """Resets session skip state for new trading sessions."""
+    global _session_skip_counts, _session_suppressed, _seen_veto_fingerprints
+    _session_skip_counts = defaultdict(int)
+    _session_suppressed = set()
+    _seen_veto_fingerprints = {}
+    _session_suppressed = set()
+    logger.info("[ORDER MANAGER] Session skip state reset.")
+
+
+def get_adaptive_stop_multiplier(symbol: str, beta: float = 1.0, earnings_near: bool = False, cfg=None) -> float:
+    """
+    High beta (+0.5x) or pre-earnings (+0.5x) auto-adjusts ATR stop multiplier up to max 2.0x ATR.
+    """
+    cfg = cfg or config
+    multiplier = getattr(cfg, "ATR_STOP_MULTIPLIER", 1.0)
+    beta_threshold = getattr(cfg, "BETA_HIGH_THRESHOLD", 1.5)
+
+    if beta >= beta_threshold:
+        multiplier += (getattr(cfg, "ATR_STOP_HIGH_BETA", 1.5) - 1.0)
+    if earnings_near:
+        multiplier += (getattr(cfg, "ATR_STOP_EARNINGS", 2.0) - getattr(cfg, "ATR_STOP_HIGH_BETA", 1.5))
+    return min(multiplier, getattr(cfg, "ATR_STOP_EARNINGS", 2.0))
 
 
 def _compute_noise_floor(signal: TradeSignal, df: Optional[object] = None) -> float:
@@ -33,6 +108,17 @@ def _compute_noise_floor(signal: TradeSignal, df: Optional[object] = None) -> fl
     atr_multiplier = getattr(config, "NOISE_FLOOR_ATR_MULTIPLIER", 0.75)
     abs_min = getattr(config, "NOISE_FLOOR_ABS_MIN", 0.08)
 
+    # 1. Check signal's explicit atr attribute first
+    if hasattr(signal, "atr") and getattr(signal, "atr", None) is not None:
+        try:
+            sig_atr = float(getattr(signal, "atr"))
+            if sig_atr > 0:
+                noise_floor = max(abs_min, sig_atr * atr_multiplier)
+                return noise_floor
+        except Exception:
+            pass
+
+    # 2. Check DataFrame ATR
     try:
         if df is not None and hasattr(df, "empty") and not df.empty and len(df) >= atr_period:
             high = df["high"].tail(atr_period + 1)
@@ -61,16 +147,24 @@ def _compute_noise_floor(signal: TradeSignal, df: Optional[object] = None) -> fl
     return fallback
 
 
-def _pre_submission_veto(signal: TradeSignal, df: Optional[object] = None) -> tuple:
+
+def _pre_submission_veto(signal: TradeSignal, df: Optional[object] = None, market_texture: Optional[str] = None) -> tuple:
     """
     ATR-based pre-submission veto.
-    Hard Veto:  stop_distance < noise_floor * 0.60  -> block entry
-    Soft Warn:  stop_distance < noise_floor          -> warn, allow entry
+    Hard Veto:  stop_distance < noise_floor * hard_veto_ratio -> block entry
+    Soft Warn:  stop_distance < noise_floor                   -> warn, allow entry
     Returns: (should_skip: bool, reason: str)
     """
-    stop_distance   = abs(signal.entry_price - signal.stop_price)
-    noise_floor     = _compute_noise_floor(signal, df)
-    hard_veto_ratio = getattr(config, "NOISE_FLOOR_HARD_VETO_RATIO", 0.60)
+    stop_distance = abs(signal.entry_price - signal.stop_price)
+    noise_floor   = _compute_noise_floor(signal, df)
+
+    # Dynamically select hard veto ratio based on active market texture
+    hard_veto_ratio = getattr(config, "NOISE_FLOOR_HARD_VETO_RATIO", 0.75)
+    if market_texture and hasattr(config, "MARKET_REGIME_SETTINGS"):
+        tex_cfg = config.MARKET_REGIME_SETTINGS.get(market_texture, {})
+        if "noise_floor_ratio" in tex_cfg:
+            hard_veto_ratio = float(tex_cfg["noise_floor_ratio"])
+
     hard_veto_line  = noise_floor * hard_veto_ratio
 
     if stop_distance < hard_veto_line:
@@ -94,7 +188,8 @@ def _pre_submission_veto(signal: TradeSignal, df: Optional[object] = None) -> tu
     return False, ""
 
 
-def _validate_signal_prices(signal: TradeSignal) -> str:
+
+def _validate_signal_prices(signal: TradeSignal, market_texture: Optional[str] = None, df_history: Optional[object] = None) -> str:
     """Return a rejection reason when entry/stop/target geometry is invalid."""
     side = signal.side.upper()
     if signal.entry_price <= 0:
@@ -121,16 +216,20 @@ def _validate_signal_prices(signal: TradeSignal) -> str:
         return f"Stop distance {stop_dist:.5f} is less than or equal to tick size {tick_size:.5f} (invalid geometry)"
 
     # Phase 3: Pre-submission Veto for Too-Tight Signals using ATR-based Noise Floor
-    df_history = None
-    try:
-        from strategies.intraday_data import fetch_intraday
-        df_history = fetch_intraday(signal.symbol)
-    except Exception:
-        pass
+    if df_history is None:
+        df_history = getattr(signal, "df", None)
+    if df_history is None and getattr(signal, "atr", None) is None:
+        try:
+            from strategies.intraday_data import fetch_intraday
+            df_history = fetch_intraday(signal.symbol)
+        except Exception:
+            pass
 
-    should_skip, veto_reason = _pre_submission_veto(signal, df_history)
+    should_skip, veto_reason = _pre_submission_veto(signal, df_history, market_texture)
     if should_skip:
         return veto_reason
+
+
 
     if side == "BUY":
         if signal.stop_price >= signal.entry_price:
@@ -144,6 +243,11 @@ def _validate_signal_prices(signal: TradeSignal) -> str:
             return "SELL target must be below entry"
     else:
         return f"Unknown side {signal.side!r}"
+
+    min_rr = getattr(config, "MIN_RR_RATIO", 1.0)
+    rr_ratio = target_dist / stop_dist if stop_dist > 0 else 0.0
+    if rr_ratio < min_rr:
+        return f"Risk:Reward ratio {rr_ratio:.2f} is below minimum threshold {min_rr:.2f}"
 
     return ""
 
@@ -233,6 +337,53 @@ def get_confidence_gate(regime_mode: str, signal_side: str) -> float:
     return 0.63
 
 
+_pending_order_contexts = {}
+
+
+def register_pending_order(parent_id: str, signal: TradeSignal, limit_price: float, qty: float, stop_id: Optional[str] = None, tp_id: Optional[str] = None):
+    """Register pending order before fill confirmation."""
+    if not parent_id:
+        return
+    _pending_order_contexts[parent_id] = {
+        "signal": signal,
+        "limit_price": limit_price,
+        "qty": qty,
+        "stop_id": stop_id,
+        "tp_id": tp_id,
+        "submitted_at": time.time(),
+    }
+
+
+def on_broker_fill_event(parent_id: str, fill_price: float, filled_qty: float, bridge: Optional[object] = None):
+    """Callback invoked when broker confirms execution fill for a pending order."""
+    ctx = _pending_order_contexts.pop(parent_id, None)
+    if not ctx:
+        logger.warning("Fill received for unknown/unregistered order ID %s", parent_id)
+        return
+
+    signal = ctx["signal"]
+    stop_id = ctx.get("stop_id")
+    tp_id = ctx.get("tp_id")
+
+    try:
+        from strategies.trailing_stop import manager
+        manager.initialize_position(
+            signal=signal,
+            fill_price=fill_price,
+            qty=filled_qty,
+            stop_order_id=stop_id,
+            bridge=bridge,
+            tp_order_id=tp_id,
+        )
+        logger.info(
+            "[FILL CONFIRMED] Initialized position state for %s: fill=$%.2f, qty=%d",
+            signal.symbol, fill_price, filled_qty
+        )
+    except Exception as e:
+        logger.error("Failed to initialize position state on fill event for %s: %s", signal.symbol, e)
+
+
+
 def execute_signal(
     signal: TradeSignal,
     bridge: object,
@@ -257,10 +408,25 @@ def execute_signal(
         "shares": 0,
         "order": None,
     }
+    cache_key = f"{signal.symbol.upper().strip()}_{signal.side.upper().strip()}"
 
-    price_reason = _validate_signal_prices(signal)
+    suppressed, supp_reason = check_session_suppression(signal.symbol)
+    if suppressed:
+        result["reason"] = supp_reason
+        logger.info("Skipped %s: %s", signal.symbol, supp_reason)
+        return result
+
+    if bridge and getattr(bridge, "entry_gate", None) and getattr(bridge.entry_gate, "halted", False):
+        result["reason"] = "Entry gate is halted due to startup reconciliation/safety event"
+        logger.warning("[ENTRY GATE HALT] Blocked %s: %s", signal.symbol, result["reason"])
+        return result
+
+    market_texture = getattr(regime_result, "market_texture", "TRENDING") if regime_result else "TRENDING"
+
+    price_reason = _validate_signal_prices(signal, market_texture=market_texture)
     if price_reason:
         result["reason"] = price_reason
+        record_hard_veto_skip(signal.symbol, price_reason)
         logger.info("Skipped %s: %s", signal.symbol, price_reason)
         return result
 
@@ -271,11 +437,12 @@ def execute_signal(
         return result
 
     executable_signal = _executable_signal(signal, entry_limit_price)
-    executable_price_reason = _validate_signal_prices(executable_signal)
+    executable_price_reason = _validate_signal_prices(executable_signal, market_texture=market_texture)
     if executable_price_reason:
         result["reason"] = f"Invalid executable limit: {executable_price_reason}"
         logger.info("Skipped %s: %s", signal.symbol, result["reason"])
         return result
+
 
     min_confidence = _min_confidence_for(signal, regime_result=regime_result)
     if regime_result and getattr(regime_result, "confidence_boost", 0.0) > 0:
@@ -286,7 +453,7 @@ def execute_signal(
         logger.info("Skipped %s: %s", signal.symbol, result["reason"])
         return result
 
-    # Mega-Cap Counter-Trend SHORT Veto Guard in RISK_ON Regime
+    # Counter-Trend SHORT Veto Guard in RISK_ON Regime
     from strategies.mega_cap_guard import should_veto_mega_cap_short
     regime_mode = getattr(regime_result, "mode", "NEUTRAL") if regime_result else "NEUTRAL"
     veto_mega, veto_reason = should_veto_mega_cap_short(
@@ -296,9 +463,32 @@ def execute_signal(
         price_vs_vwap=getattr(signal, "price_vs_vwap", 0.0),
     )
     if signal.side.upper() in ("SELL", "SHORT") and veto_mega:
-        result["reason"] = f"Mega-Cap Counter-Trend Veto: {veto_reason}"
-        logger.info("[MEGA-CAP SHORT VETO] Blocked %s: %s", signal.symbol, result["reason"])
+        result["reason"] = f"Counter-Trend SHORT Veto: {veto_reason}"
+        logger.info("[COUNTER-TREND SHORT VETO] Blocked %s: %s", signal.symbol, result["reason"])
         return result
+
+    # ── SPY/QQQ Intraday Trend Guard ───────────────────────────────────────
+    if signal.side.upper() == "BUY" and not dry_run and getattr(config, "SPY_TREND_GUARD_ENABLED", True):
+        try:
+            from strategies.intraday_data import fetch_intraday
+            guard_sym = getattr(config, "SPY_TREND_GUARD_SYMBOL", "SPY")
+            spy_df = fetch_intraday(guard_sym)
+            if spy_df is not None and not spy_df.empty and len(spy_df) >= 2:
+                last_close = float(spy_df["close"].iloc[-1])
+                last_open  = float(spy_df["open"].iloc[-1])
+                if last_close < last_open:
+                    guard_reason = (
+                        f"SPY Trend Guard: {guard_sym} 5m candle bearish "
+                        f"(Close ${last_close:.2f} < Open ${last_open:.2f}). "
+                        f"Blocking LONG entry."
+                    )
+                    logger.info("[SPY TREND GUARD] Blocked %s: %s", signal.symbol, guard_reason)
+                    result["reason"] = guard_reason
+                    return result
+        except Exception as spy_err:
+            # Fail-open: do not block trade if SPY data unavailable
+            logger.debug("[SPY TREND GUARD] Skipped for %s: %s", signal.symbol, spy_err)
+    # ────────────────────────────────────────────────────────────────────────
 
     # Commodity Correlation Guard (GDX/GLD, etc.)
     from strategies.correlation_guards import get_commodity_direction_bias
@@ -326,8 +516,14 @@ def execute_signal(
         logger.info("Skipped %s: %s", signal.symbol, result["reason"])
         return result
 
-    risk_dollars = estimated_risk(executable_signal, shares)
-    trades_today = today_trade_count()
+    try:
+        trades_today = today_trade_count()
+    except Exception as e:
+        err_msg = f"Journal check failed: {e}"
+        logger.error("[JOURNAL GATE] %s", err_msg)
+        result["reason"] = err_msg
+        return result
+
     
     is_connected = getattr(bridge, "is_connected", False) or getattr(bridge, "_connected", False)
     if not dry_run and not is_connected:
@@ -337,6 +533,10 @@ def execute_signal(
 
     strat_cfg = getattr(config, "STRATEGY_SETTINGS", {}).get(signal.strategy)
     risk_pct = strat_cfg.max_risk_pct if strat_cfg else 1.0
+    entry_p = entry_limit_price if entry_limit_price and entry_limit_price > 0 else executable_signal.entry_price
+    stop_p = executable_signal.stop_price
+    risk_dollars = shares * abs(entry_p - stop_p) if shares > 0 else (equity * (risk_pct / 100.0))
+
 
     open_syms = []
     if is_connected:
@@ -386,16 +586,27 @@ def execute_signal(
     # Symbol Max Entries Per Session Gate (Max 2 entries per symbol per session)
     max_entries_per_symbol = getattr(config, "MAX_ENTRIES_PER_SYMBOL_PER_SESSION", 2)
     try:
-        from strategies.trade_journal import get_journal_summary
-        summary = get_journal_summary()
-        recent_trades = summary.get("recent_trades", []) if isinstance(summary, dict) else []
-        symbol_entries = sum(1 for t in recent_trades if isinstance(t, dict) and t.get("symbol") == signal.symbol)
+        from strategies.trade_journal import today_trades
+        todays = today_trades() or []
+        symbol_entries = sum(
+            1 for t in todays
+            if isinstance(t, dict) and t.get("symbol") == signal.symbol
+        )
         if symbol_entries >= max_entries_per_symbol:
-            result["reason"] = f"Max Symbol Entries Gate: {signal.symbol} reached session limit of {max_entries_per_symbol} entries"
+            result["reason"] = (
+                f"Max Symbol Entries Gate: {signal.symbol} reached session "
+                f"limit of {max_entries_per_symbol} entries "
+                f"({symbol_entries} found)"
+            )
             logger.info("[SYMBOL ENTRY GATE] Blocked %s: %s", signal.symbol, result["reason"])
             return result
-    except Exception:
-        pass
+        logger.debug("[SYMBOL ENTRY GATE] %s: %d/%d entries today", signal.symbol, symbol_entries, max_entries_per_symbol)
+    except Exception as e:
+        err_msg = f"Symbol Entry Gate: Journal audit check failed ({e}) — entry blocked for safety (fail-closed)"
+        logger.error("[SYMBOL ENTRY GATE] %s", err_msg)
+        result["reason"] = err_msg
+        return result
+
 
     # Macro ETF Overlap Safety (Prevent holding SPY and QQQ simultaneously)
     if signal.symbol in {"SPY", "QQQ"} and any(s in {"SPY", "QQQ"} for s in open_syms):
@@ -458,7 +669,9 @@ def execute_signal(
         max_risk_pct=risk_pct,
         open_symbols=open_syms,
         max_trades=effective_max_trades,
+        side=signal.side,
     )
+
 
     if risk_reason:
         result["reason"] = risk_reason
@@ -475,13 +688,23 @@ def execute_signal(
         logger.info("Skipped %s: %s", signal.symbol, result["reason"])
         return result
 
-    # Idempotency Check
-    cache_key = f"{signal.symbol}_{signal.side}"
-    last_placed_time = _recent_orders.get(cache_key, 0)
-    if time.time() - last_placed_time < IDEMPOTENCY_TTL:
-        result["reason"] = f"Idempotency block: {signal.side} order placed within {IDEMPOTENCY_TTL}s"
+    # M-05 Durable Idempotency Check
+    from strategies.order_idempotency import build_client_order_id, idempotency_manager
+    bar_ts = getattr(signal, "bar_timestamp", "") or ""
+    sig_hash = getattr(signal, "signal_hash", "") or ""
+    client_order_id = build_client_order_id(
+        symbol=signal.symbol,
+        side=signal.side,
+        bar_timestamp_utc=bar_ts,
+        signal_hash=sig_hash,
+        attempt=0,
+    )
+    res_ok, res_reason = idempotency_manager.reserve(signal.symbol, side=signal.side)
+    if not res_ok:
+        result["reason"] = f"Durable idempotency reservation active: {res_reason}"
         logger.info("Blocked %s: %s", signal.symbol, result["reason"])
         return result
+
 
     result["shares"] = shares
     cost = estimated_cost(executable_signal, shares)
@@ -494,14 +717,15 @@ def execute_signal(
     )
 
     if dry_run:
+        idempotency_manager.release(signal.symbol, side=signal.side, reason="dry_run")
         result["status"] = "DRY_RUN"
         result["reason"] = "Dry run -- no order placed"
         logger.info("[DRY RUN] Would place: %s %d %s", signal.side, shares, signal.symbol)
-        # Update idempotency cache even in dry run to avoid repeating spams in dry-run logs
         _recent_orders[cache_key] = time.time()
         return result
 
     if not config.BRACKET_ORDER_ENABLED:
+        idempotency_manager.release(signal.symbol, side=signal.side, reason="bracket_disabled")
         result["reason"] = "Protective bracket orders are required for live paper entries"
         return result
 
@@ -510,44 +734,66 @@ def execute_signal(
         stop_price = signal.stop_price
         target_price = signal.target_price
 
-        # Fresh pre-submission quote check to minimize quote staleness
-        get_latest_p = getattr(bridge, "get_latest_price", None)
-        if callable(get_latest_p):
-            try:
-                fresh_p = get_latest_p(signal.symbol)
-                if fresh_p and fresh_p > 0:
-                    slippage = abs(fresh_p - executable_signal.entry_price) / executable_signal.entry_price
-                    if slippage > 0.003: # 0.3% threshold
-                        logger.warning(
-                            f"[PRE-SUBMISSION VETO] Signal quote stale for {signal.symbol}: "
-                            f"signal=${executable_signal.entry_price:.2f}, fresh=${fresh_p:.2f} "
-                            f"(slippage={slippage*100:.2f}% > 0.30%). Trade aborted for safety."
-                        )
-                        result["status"] = "VETOED"
-                        result["reason"] = f"Pre-submission quote slippage {slippage*100:.2f}% exceeded 0.3% threshold"
-                        return result
-
-                    offset_stop = executable_signal.entry_price - signal.stop_price
-                    offset_target = signal.target_price - executable_signal.entry_price
-                    limit_price = fresh_p
-                    stop_price = round(fresh_p - offset_stop, 2)
-                    target_price = round(fresh_p + offset_target, 2)
-                    logger.info(f"Refreshed pre-submission quote for {signal.symbol}: limit=${limit_price:.2f}, stop=${stop_price:.2f}, target=${target_price:.2f}")
-            except Exception as q_err:
-                logger.debug(f"Pre-submission quote refresh skipped for {signal.symbol}: {q_err}")
-
-        order = bridge.place_bracket_order(
-            symbol=signal.symbol,
-            side=signal.side,
-            qty=shares,
-            entry_price=limit_price,
-            stop_price=stop_price,
-            target_price=target_price,
-        )
+        # M-01 Fresh Execution Quote Gate
+        require_realtime = getattr(config, "REQUIRE_REALTIME_DATA_FOR_ORDERS", True)
+        if not dry_run and require_realtime and is_connected:
+            from strategies.execution_quote import validate_execution_quote
+            quote_res = validate_execution_quote(
+                bridge=bridge,
+                symbol=signal.symbol,
+                decision_price=executable_signal.entry_price,
+                max_spread_pct=getattr(config, "MAX_ACCEPTABLE_SPREAD_PCT", 1.0),
+                max_deviation_pct=getattr(config, "MAX_DECISION_DEVIATION_PCT", 1.5),
+                max_age_seconds=getattr(config, "MAX_QUOTE_AGE_SECONDS", 10.0),
+            )
+            if not quote_res.valid:
+                idempotency_manager.release(signal.symbol, side=signal.side, reason=f"quote_veto:{quote_res.reason}")
+                result["status"] = "VETOED"
+                result["reason"] = f"Execution Quote Gate: {quote_res.reason}"
+                logger.warning("[EXECUTION QUOTE VETO] %s: %s", signal.symbol, quote_res.reason)
+                return result
+            if quote_res.quote and quote_res.quote.last > 0:
+                offset_stop = executable_signal.entry_price - signal.stop_price
+                offset_target = signal.target_price - executable_signal.entry_price
+                limit_price = quote_res.quote.last
+                stop_price = round(limit_price - offset_stop, 2)
+                target_price = round(limit_price + offset_target, 2)
+        try:
+            order = bridge.place_bracket_order(
+                symbol=signal.symbol,
+                side=signal.side,
+                qty=shares,
+                entry_price=limit_price,
+                stop_price=stop_price,
+                target_price=target_price,
+                client_order_id=client_order_id,
+            )
+        except TypeError:
+            order = bridge.place_bracket_order(
+                symbol=signal.symbol,
+                side=signal.side,
+                qty=shares,
+                entry_price=limit_price,
+                stop_price=stop_price,
+                target_price=target_price,
+            )
         order_ids = order.get("order_ids") or []
         register_signal = getattr(bridge, "register_order_signal", None)
         if callable(register_signal):
             register_signal(order_ids, signal.signal_id)
+
+        parent_id = order_ids[0] if order_ids else order.get("order_id")
+        parent_order_id = str(parent_id) if parent_id else ""
+
+        # Attach parent order ID to durable idempotency manager
+        if parent_order_id:
+            idempotency_manager.attach_parent_order(signal.symbol, signal.side, parent_order_id)
+        else:
+            # H-2: Ambiguous submit - Keep idempotency lock and return AMBIGUOUS_SUBMIT for broker reconciliation
+            result["status"] = "AMBIGUOUS_SUBMIT"
+            result["reason"] = f"Broker submission returned no parent_order_id for {signal.symbol} -- keeping idempotency lock for broker reconciliation"
+            logger.error("[AMBIGUOUS SUBMIT] %s: %s", signal.symbol, result["reason"])
+            return result
 
         # Register expected prices for signed slippage and execution latency tracking
         try:
@@ -559,7 +805,7 @@ def execute_signal(
             exit_side = "SELL" if signal.side.upper() == "BUY" else "BUY"
 
             if parent_id:
-                register_order_expected_price(parent_id, expected_price=signal.entry_price, side=signal.side, order_type="ENTRY", submit_ts=now_ts, symbol=signal.symbol)
+                register_order_expected_price(parent_id, expected_price=limit_price, side=signal.side, order_type="ENTRY", submit_ts=now_ts, symbol=signal.symbol)
             if stop_id:
                 register_order_expected_price(stop_id, expected_price=stop_price, side=exit_side, order_type="STOP_LOSS", submit_ts=now_ts, symbol=signal.symbol)
             if tp_id and tp_id != stop_id:
@@ -567,40 +813,67 @@ def execute_signal(
         except Exception as reg_err:
             logger.debug(f"Failed to register order expected price: {reg_err}")
 
-        result["status"] = "PLACED"
-        result["reason"] = "Order placed"
-        result["order"] = order
-        
-        # In Alpaca, orders execute on exchange, and we handle fills asynchronously
-        # We also initialize trailing stop directly upon submission in paper-mode
+        parent_order_id = str(parent_id) if parent_id else ""
+        from strategies.entry_lifecycle import entry_lifecycle
         try:
-            from strategies.trailing_stop import manager
-            stop_order_id = order.get("stop_order_id") if isinstance(order, dict) else getattr(order, "stop_order_id", None)
-            if not stop_order_id:
-                stop_order_id = order_ids[2] if len(order_ids) >= 3 else (order_ids[1] if len(order_ids) >= 2 else None)
-            tp_order_id = order.get("tp_order_id") if isinstance(order, dict) else getattr(order, "tp_order_id", None)
-            if not tp_order_id and len(order_ids) >= 2:
-                tp_order_id = order_ids[1]
-            manager.initialize_position(signal, limit_price, qty=shares, stop_order_id=stop_order_id, bridge=bridge, tp_order_id=tp_order_id)
-        except Exception as e:
-            logger.error("Failed to init trailing stop for %s: %s", signal.symbol, e)
-        
+            register_pending_order(
+                parent_id=parent_order_id,
+                signal=signal,
+                limit_price=limit_price,
+                qty=shares,
+                stop_id=str(stop_id) if stop_id else None,
+                tp_id=str(tp_id) if tp_id else None,
+            )
+            if stop_id and tp_id and stop_id != tp_id:
+                entry_lifecycle.register_submission(
+                    parent_order_id=parent_order_id,
+                    signal=signal,
+                    requested_qty=shares,
+                    stop_order_id=str(stop_id),
+                    target_order_id=str(tp_id),
+                )
+            result["status"] = "PLACED"
+            result["reason"] = "Order placed"
+            result["order"] = order
+        except Exception as reg_exc:
+            # H-3: Lifecycle registration failure must be fail-closed (AMBIGUOUS_LIFECYCLE)
+            err_msg = f"Lifecycle registration failed: {reg_exc}"
+            logger.error("[AMBIGUOUS LIFECYCLE] %s: %s", signal.symbol, err_msg)
+            result["status"] = "AMBIGUOUS_LIFECYCLE"
+            result["reason"] = err_msg
+            return result
+
+        # C-02: Auto confirm fill default is False in production paper mode
+        auto_fill = getattr(config, "PAPER_MODE_AUTO_CONFIRM_FILL", False)
+        if auto_fill and parent_order_id:
+            on_broker_fill_event(parent_order_id, fill_price=limit_price, filled_qty=shares, bridge=bridge)
+            try:
+                if stop_id and tp_id and stop_id != tp_id:
+                    entry_lifecycle.on_parent_fill(
+                        bridge=bridge,
+                        parent_order_id=parent_order_id,
+                        cumulative_filled_qty=shares,
+                        average_fill_price=limit_price,
+                    )
+            except Exception as fill_exc:
+                logger.warning("Entry lifecycle fill confirmation: %s", fill_exc)
+
         # Update idempotency cache
         _recent_orders[cache_key] = time.time()
 
-        parent_order_id = order_ids[0] if order_ids else order.get("order_id")
         log_trade(
             symbol=signal.symbol,
             side=signal.side,
             strategy=signal.strategy,
             qty=shares,
             entry_price=limit_price,
-            stop_price=signal.stop_price,
-            target_price=signal.target_price,
-            notes=signal.reason,
-            event_type="ORDER_SUBMITTED",
+            stop_price=stop_price,
+            target_price=target_price,
+            order_type="BRACKET",
+            status="PLACED",
             order_id=parent_order_id,
-            signal_id=signal.signal_id,
+            equity=equity,
+            confidence=signal.confidence,
         )
 
         alert_msg = (
@@ -609,13 +882,15 @@ def execute_signal(
             f"**Side**: {signal.side} ({shares} shares)\n"
             f"**Strategy**: {signal.strategy}\n"
             f"**Entry**: ${limit_price:.2f}\n"
-            f"**Stop**: ${signal.stop_price:.2f}\n"
-            f"**Target**: ${signal.target_price:.2f}\n"
+            f"**Stop**: ${stop_price:.2f}\n"
+            f"**Target**: ${target_price:.2f}\n"
             f"**Reason**: {signal.reason}"
         )
         send_discord_alert(alert_msg)
+        return result
 
     except Exception as exc:
+        idempotency_manager.release(signal.symbol, side=signal.side, reason=f"submit_exception:{exc}")
         result["reason"] = f"Order failed: {exc}"
         logger.error("Order failed for %s: %s", signal.symbol, exc)
 

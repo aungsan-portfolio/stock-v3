@@ -27,6 +27,40 @@ from errors import ModelNotAvailableError
 
 logger = logging.getLogger(__name__)
 
+# ─── Confidence Threshold Configuration ───────────────────────────────────────
+MIN_SWING_CONFIDENCE = 0.45   # Below this → force HOLD regardless of signal
+MIN_SELL_CONFIDENCE  = 0.45   # Separate floor for SELL signals (can tune independently)
+MIN_BUY_CONFIDENCE   = 0.55   # Stricter floor for BUY/LONG entries
+
+
+def apply_confidence_filter(action: str, confidence: float, symbol: str) -> tuple[str, float]:
+    """
+    Noise-filter layer applied AFTER ensemble aggregation.
+
+    Rules:
+        BUY  signal  with conf < MIN_BUY_CONFIDENCE   → demoted to HOLD
+        SELL signal  with conf < MIN_SELL_CONFIDENCE   → demoted to HOLD
+        Any  signal  with conf < MIN_SWING_CONFIDENCE  → demoted to HOLD
+    """
+    original = action
+
+    # Global floor (catches everything below baseline)
+    if confidence < MIN_SWING_CONFIDENCE:
+        action = "HOLD"
+    elif action == "BUY" and confidence < MIN_BUY_CONFIDENCE:
+        action = "HOLD"
+    elif action == "SELL" and confidence < MIN_SELL_CONFIDENCE:
+        action = "HOLD"
+
+    if action != original:
+        logger.info(
+            "[CONF FILTER] %s %s→HOLD conf=%.2f (threshold=%.2f)",
+            symbol, original, confidence,
+            MIN_BUY_CONFIDENCE if original == "BUY" else MIN_SELL_CONFIDENCE
+        )
+
+    return action, confidence
+
 
 @dataclass
 class Signal:
@@ -257,6 +291,7 @@ class Predictor:
                         xgb_score, xgb_ok, trans_score, trans_ok, self.cfg
                     )
                     action = action_from_confidence(confidence, self.cfg)
+                    action, confidence = apply_confidence_filter(action, confidence, symbol)
                     reason = (
                         f"RF={rf_score:.2f}{'' if rf_ok else '?'} "
                         f"LSTM={lstm_score:.2f}{'' if lstm_ok else '?'} "

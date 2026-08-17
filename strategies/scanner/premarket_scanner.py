@@ -41,6 +41,115 @@ class ScanCandidate:
     top_headline: str = ""
 
 
+from datetime import date
+
+
+def is_earnings_near(symbol: str, within_days: int = 1) -> bool:
+    """
+    Returns True if symbol has an earnings release within `within_days` (default 1 day).
+    Blocks pre-earnings volatility traps.
+    """
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker(symbol)
+        cal = getattr(ticker, "calendar", None)
+        if cal is not None:
+            edates = None
+            if isinstance(cal, dict) and "Earnings Date" in cal:
+                edates = cal["Earnings Date"]
+            elif hasattr(cal, "get") and cal.get("Earnings Date") is not None:
+                edates = cal.get("Earnings Date")
+            
+            if edates is not None:
+                if hasattr(edates, "iloc") and len(edates) > 0:
+                    edate = edates.iloc[0]
+                    if hasattr(edate, "date"):
+                        edate = edate.date()
+                    days_to = (edate - date.today()).days
+                    return 0 <= days_to <= within_days
+                elif isinstance(edates, (list, tuple)) and len(edates) > 0:
+                    edate = edates[0]
+                    if hasattr(edate, "date"):
+                        edate = edate.date()
+                    days_to = (edate - date.today()).days
+                    return 0 <= days_to <= within_days
+    except Exception as e:
+        logger.debug("is_earnings_near(%s): %s", symbol, e)
+    return False
+
+
+from collections import defaultdict
+import json
+from pathlib import Path
+
+NEWS_FAIL_PERSIST_PATH = Path("data/news_fail_counts.json")
+
+
+def _load_news_fail_counts() -> defaultdict:
+    """Loads news fail counts from disk if date matches today."""
+    if NEWS_FAIL_PERSIST_PATH.exists():
+        try:
+            with open(NEWS_FAIL_PERSIST_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                saved_date = data.get("date", "")
+                today_str = date.today().strftime("%Y-%m-%d")
+                if saved_date == today_str:
+                    counts = defaultdict(int, data.get("counts", {}))
+                    logger.info("[NEWS PERSIST] Restored %d news fail count(s) for today (%s)", len(counts), today_str)
+                    return counts
+        except Exception as e:
+            logger.debug("[NEWS PERSIST] Load failed: %s", e)
+    return defaultdict(int)
+
+
+def _save_news_fail_counts():
+    """Saves news fail counts to disk."""
+    try:
+        NEWS_FAIL_PERSIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "date": date.today().strftime("%Y-%m-%d"),
+            "counts": dict(_news_fail_counts)
+        }
+        with open(NEWS_FAIL_PERSIST_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.debug("[NEWS PERSIST] Save failed: %s", e)
+
+
+_news_fail_counts = _load_news_fail_counts()
+NEWS_FETCH_FAIL_PENALTY = -0.10
+NEWS_FETCH_DROP_THRESHOLD = 2
+
+
+def apply_news_fetch_hygiene(symbol: str, candidate: Optional[ScanCandidate]) -> Optional[ScanCandidate]:
+    """
+    Applies score penalty (-0.10) if news fetch fails, and drops candidate if news fails >= 2 times.
+    """
+    if candidate is None or not getattr(config, "NEWS_HYGIENE_ENABLED", True):
+        return candidate
+    sym = symbol.upper().strip()
+    _news_fail_counts[sym] += 1
+    fail_count = _news_fail_counts[sym]
+    _save_news_fail_counts()
+
+    logger.warning("[NEWS HYGIENE] %s: News fetch failed (fail #%d/%d)", sym, fail_count, NEWS_FETCH_DROP_THRESHOLD)
+    if fail_count >= NEWS_FETCH_DROP_THRESHOLD:
+        logger.warning("[NEWS HYGIENE DROP] %s: Removed from candidates after %d news fetch failures.", sym, fail_count)
+        return None
+
+    candidate.score = round(candidate.score + NEWS_FETCH_FAIL_PENALTY, 4)
+    logger.info("[NEWS HYGIENE PENALTY] %s: Score adjusted to %.2f", sym, candidate.score)
+    return candidate
+
+
+def reset_news_fail_counts():
+    """Resets news fail counts per session."""
+    global _news_fail_counts
+    _news_fail_counts = defaultdict(int)
+    _save_news_fail_counts()
+    logger.info("[SCANNER] News fail counts reset for new session.")
+
+
 _screener_cache = {"data": None, "fetched_at": 0}
 _cache_lock = threading.Lock()
 
@@ -457,6 +566,11 @@ def scan(symbols: List[str] = None, max_candidates: int = None) -> List[ScanCand
 
     def _eval_sym(sym: str) -> Optional[ScanCandidate]:
         symbol = str(sym).upper()
+        if is_earnings_near(symbol, within_days=getattr(config, "EARNINGS_BLOCK_DAYS", 1)):
+            with reject_lock:
+                reject_dict["earnings_within_1_day"] = reject_dict.get("earnings_within_1_day", 0) + 1
+            logger.info("[EARNINGS BLOCK] Skipped %s: Earnings within %d day(s)", symbol, getattr(config, "EARNINGS_BLOCK_DAYS", 1))
+            return None
         try:
             if is_market_open():
                 return _compute_open_candidate(symbol, quote_dict=quote_dict, reject_dict=reject_dict, reject_lock=reject_lock)
@@ -466,12 +580,28 @@ def scan(symbols: List[str] = None, max_candidates: int = None) -> List[ScanCand
             logger.warning("Scan error for %s", symbol, exc_info=True)
             return None
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(_eval_sym, sym): sym for sym in symbols}
-        for future in as_completed(futures):
-            res = future.result()
-            if res is not None:
-                candidates.append(res)
+    max_workers = getattr(config, "SCANNER_MAX_WORKERS", 5)
+    symbol_timeout = getattr(config, "SCANNER_SYMBOL_TIMEOUT", 15.0)
+
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_eval_sym, sym): sym for sym in symbols}
+            for future in as_completed(futures):
+                try:
+                    res = future.result(timeout=symbol_timeout)
+                    if res is not None:
+                        candidates.append(res)
+                except TimeoutError:
+                    sym_name = futures.get(future, "UNKNOWN")
+                    logger.warning("[SCANNER TIMEOUT] Fetch timed out (%.1fs) for %s — skipping", symbol_timeout, sym_name)
+                    continue
+                except Exception as exc:
+                    sym_name = futures.get(future, "UNKNOWN")
+                    logger.warning("[SCANNER ERROR] Error evaluating %s: %s", sym_name, exc)
+                    continue
+    except KeyboardInterrupt:
+        logger.info("[SCANNER] Keyboard interrupt received — shutting down scanner cleanly.")
+        raise
 
     candidates.sort(key=lambda c: c.score, reverse=True)
     top = candidates[:max_candidates * 2]
@@ -562,16 +692,24 @@ class BackgroundScanner:
 
     def _run_loop(self):
         from strategies.session import is_market_open, is_premarket
+        was_market_open = False
         while self._running:
             # Sleep in small steps to be responsive to stop requests
             sleep_step = 5.0
             elapsed = 0.0
-            while elapsed < self.interval_seconds:
-                if not self._running:
-                    return
-                if self._stop_event.wait(timeout=sleep_step):
-                    return
-                elapsed += sleep_step
+            currently_open = is_market_open()
+            
+            # Force immediate scan on market open transition or if stale
+            force_scan = (currently_open and not was_market_open) or (_time.time() - self.last_scan_completed > self.interval_seconds)
+            was_market_open = currently_open
+
+            if not force_scan:
+                while elapsed < self.interval_seconds:
+                    if not self._running:
+                        return
+                    if self._stop_event.wait(timeout=sleep_step):
+                        return
+                    elapsed += sleep_step
 
             if is_market_open() or is_premarket():
                 logger.info("[BackgroundScanner] Starting periodic background scan...")

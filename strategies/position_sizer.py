@@ -63,11 +63,22 @@ def calculate_shares(signal: TradeSignal, equity: float) -> int:
         risk_budget = equity * (risk_pct / 100.0)
         raw = risk_budget / signal.risk_per_share
 
+    # Volatility Risk Parity Sizing (Cap per-trade dollar risk at MAX_RISK_PER_TRADE_DOLLARS)
+    max_risk_dollars = getattr(config, "MAX_RISK_PER_TRADE_DOLLARS", 25.0)
+    risk_per_share = abs(signal.entry_price - signal.stop_price)
+    if risk_per_share > 0:
+        risk_parity_shares = max_risk_dollars / risk_per_share
+    else:
+        risk_parity_shares = raw
+
     dollar_cap_shares = config.MAX_POSITION_SIZE_DOLLARS / signal.entry_price
     equity_cap_shares = (equity * config.MAX_POSITION_PCT_OF_EQUITY) / signal.entry_price
 
-    shares = int(min(raw, dollar_cap_shares, equity_cap_shares))
+    shares = int(min(raw, risk_parity_shares, dollar_cap_shares, equity_cap_shares))
     shares = max(shares, 0)
+    min_shares = getattr(config, "MIN_SHARE_COUNT", 1)
+    if shares > 0 and shares < min_shares:
+        shares = min_shares
 
     if shares == 0:
         logger.info(
@@ -76,6 +87,7 @@ def calculate_shares(signal: TradeSignal, equity: float) -> int:
         )
 
     return shares
+
 
 
 def estimated_cost(signal: TradeSignal, shares: int) -> float:

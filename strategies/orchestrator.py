@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 _consecutive_broker_failures = 0
 
+from strategies.regime_engine import RegimeStateTracker
+
+_regime_state_tracker = RegimeStateTracker()
+
 _ALL_STRATEGIES = [
     ORBStrategy(),
     VWAPBounceStrategy(),
@@ -29,6 +33,38 @@ _ALL_STRATEGIES = [
     CandlestickPatternStrategy(),
 ]
 
+import re
+
+
+def _extract_signal_rsi(sig: TradeSignal) -> float:
+    """Extracts numeric RSI value from signal attributes, metadata, or reason string."""
+    if hasattr(sig, "rsi") and getattr(sig, "rsi", None) is not None:
+        try:
+            return float(getattr(sig, "rsi"))
+        except Exception:
+            pass
+    if isinstance(getattr(sig, "metadata", None), dict) and "rsi" in sig.metadata:
+        try:
+            return float(sig.metadata["rsi"])
+        except Exception:
+            pass
+    reason_str = str(getattr(sig, "reason", ""))
+    match = re.search(r"RSI\s*([0-9]+(?:\.[0-9]+)?)", reason_str, re.IGNORECASE)
+    if match:
+        try:
+            return float(match.group(1))
+        except Exception:
+            pass
+    return 50.0
+
+
+def _prepare_closed_bars(df):
+    """Ensure only fully closed bars are evaluated (removes current open bar)."""
+    if df is not None and not df.empty and len(df) > 1:
+        return df.iloc[:-1]
+    return df
+
+
 def evaluate_symbol(symbol: str, bridge: object = None) -> List[TradeSignal]:
     """Evaluate one symbol through all strategies."""
     from strategies.intraday_data import fetch_intraday
@@ -36,15 +72,18 @@ def evaluate_symbol(symbol: str, bridge: object = None) -> List[TradeSignal]:
     if df.empty:
         logger.warning("No data for %s", symbol)
         return []
-    if len(df) > 1:
-        df = df.iloc[:-1]
     return _evaluate_on_df(symbol, df)
 
 
-def _evaluate_on_df(symbol: str, df) -> List[TradeSignal]:
+def _evaluate_on_df(symbol: str, df, market_texture: str = "TRENDING") -> List[TradeSignal]:
     """Internal sync implementation for one symbol given its DataFrame."""
     if df is None or df.empty:
         return []
+
+    df = _prepare_closed_bars(df)
+    if df is None or df.empty:
+        return []
+
 
     signals = []
     failures = []
@@ -69,6 +108,20 @@ def _evaluate_on_df(symbol: str, df) -> List[TradeSignal]:
         except Exception as e:
             logger.exception("Strategy %s crashed on %s", strategy.name, symbol)
             failures.append(f"{strategy.name}: CRASH ({e})")
+
+    # Evaluate MeanReversionStrategy when in SIDEWAYS market texture
+    if market_texture == "SIDEWAYS":
+        try:
+            from strategies.mean_reversion import MeanReversionStrategy
+            mr_strat = MeanReversionStrategy()
+            mr_signal = mr_strat.generate_signal(symbol, df, market_texture=market_texture)
+            if mr_signal is not None:
+                mr_signal.metadata['raw_confidence'] = mr_signal.confidence
+                mr_signal.confidence = scorer.calculate_risk_adjusted_confidence(mr_signal)
+                signals.append(mr_signal)
+        except Exception as mr_err:
+            logger.exception("MeanReversionStrategy failed for %s: %s", symbol, mr_err)
+
 
     if signals:
         # ML prediction layer
@@ -95,7 +148,7 @@ def _evaluate_on_df(symbol: str, df) -> List[TradeSignal]:
     return []
 
 
-def evaluate_symbols_parallel(symbols: List[str], bridge: object = None) -> List[TradeSignal]:
+def evaluate_symbols_parallel(symbols: List[str], bridge: object = None, market_texture: str = "TRENDING") -> List[TradeSignal]:
     """Evaluate many symbols in parallel when the batch is large enough."""
     if not symbols:
         return []
@@ -137,18 +190,18 @@ def evaluate_symbols_parallel(symbols: List[str], bridge: object = None) -> List
     if not parallel_enabled:
         out = []
         for sym, df in symbol_data.items():
-            out.extend(_evaluate_on_df(sym, df))
+            out.extend(_evaluate_on_df(sym, df, market_texture=market_texture))
         return out
 
     if len(symbol_data) < min_batch:
         out = []
         for sym, df in symbol_data.items():
-            out.extend(_evaluate_on_df(sym, df))
+            out.extend(_evaluate_on_df(sym, df, market_texture=market_texture))
         return out
 
     out = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_evaluate_on_df, sym, df): sym for sym, df in symbol_data.items()}
+        futures = {pool.submit(_evaluate_on_df, sym, df, market_texture): sym for sym, df in symbol_data.items()}
         for fut in as_completed(futures):
             sym = futures[fut]
             try:
@@ -157,11 +210,12 @@ def evaluate_symbols_parallel(symbols: List[str], bridge: object = None) -> List
                 logger.exception("Parallel evaluation failed for %s", sym)
                 fallback_serial = getattr(config, "DAYTRADE_PARALLEL_EVALUATION_FALLBACK_TO_SERIAL", True)
                 if fallback_serial:
-                    out.extend(_evaluate_on_df(sym, symbol_data[sym]))
+                    out.extend(_evaluate_on_df(sym, symbol_data[sym], market_texture=market_texture))
                 else:
                     raise e
 
     return out
+
 
 
 def apply_portfolio_correlation(signals: List[TradeSignal], open_positions: List, bridge: object = None) -> List[TradeSignal]:
@@ -244,8 +298,8 @@ def evaluate_and_execute(
     if not prime_broker_state:
         logger.debug("prime_broker_state=False is deprecated and ignored")
 
-    logger.info(f"Evaluating signals for {len(watchlist)} symbols...")
-    print(f"Evaluating signals for {len(watchlist)} symbols...")
+    logger.info(f"[ORCHESTRATOR POLL] Polling cycle started for {len(watchlist)} watchlist symbols | allow_new_entries={allow_new_entries}")
+    print(f"[ORCHESTRATOR POLL] Polling cycle started for {len(watchlist)} watchlist symbols | allow_new_entries={allow_new_entries}")
     
     global _consecutive_broker_failures
     broker_fetch_ok = True
@@ -253,12 +307,14 @@ def evaluate_and_execute(
     cached_open_positions = []
     open_orders = []
     equity = config.PDT_MIN_EQUITY
-    broker_pnl = None
-    broker_state_available = False
+    from strategies.halt_manager import halt_manager
+    # Sub-phase C.2: Poll HALT.lock file flag (<1ms OS check, fail-closed)
+    halt_manager.check_halt_lock()
+
     if not allow_new_entries:
         logger.warning("[ENTRY GUARD] New entries explicitly disabled for this evaluation cycle.")
-    if getattr(bridge, "_daytrade_suspended", False) is True:
-        logger.warning("Daytrading is suspended for the day due to daily loss limit breach.")
+    if not halt_manager.entries_allowed() or getattr(bridge, "_daytrade_suspended", False) is True:
+        logger.warning("[ENTRY GUARD] Active entry halts present: %s", halt_manager.summary())
         allow_new_entries = False
     
     is_connected = getattr(bridge, "is_connected", False) or getattr(bridge, "_connected", False)
@@ -269,14 +325,25 @@ def evaluate_and_execute(
         
     if bridge and is_connected:
         try:
-            cached_open_positions = bridge.ib.positions()
-            equity = float(bridge.get_net_liquidation())
-
-            if hasattr(bridge, "account_daily_pnl"):
-                broker_pnl = float(bridge.account_daily_pnl())
-            elif hasattr(bridge, "daily_pnl"):
-                broker_pnl = float(bridge.daily_pnl())
+            if hasattr(bridge, "ib") and hasattr(bridge.ib, "positions"):
+                cached_open_positions = bridge.ib.positions()
+            elif hasattr(bridge, "get_open_positions"):
+                cached_open_positions = bridge.get_open_positions()
             else:
+                cached_open_positions = []
+            try:
+                equity = float(bridge.get_net_liquidation())
+            except Exception:
+                equity = float(getattr(config, "PDT_MIN_EQUITY", 25000.0))
+
+            try:
+                if hasattr(bridge, "account_daily_pnl"):
+                    broker_pnl = float(bridge.account_daily_pnl())
+                elif hasattr(bridge, "daily_pnl"):
+                    broker_pnl = float(bridge.daily_pnl())
+                else:
+                    broker_pnl = today_pnl()
+            except Exception:
                 broker_pnl = today_pnl()
             if hasattr(bridge, "sync_today_trades_to_journal"):
                 try:
@@ -331,8 +398,10 @@ def evaluate_and_execute(
         
         if is_breached and getattr(bridge, "_daytrade_suspended", False) is not True:
             from strategies.session import now_eastern
+            from strategies.halt_manager import halt_manager, LATCHING_HALT_DAILY_LOSS_BREACH
             et_date = str(now_eastern().date())
             bridge._daytrade_suspended = True
+            halt_manager.add(LATCHING_HALT_DAILY_LOSS_BREACH)
             bridge._save_daytrade_risk_state(et_date, getattr(bridge, "_start_of_day_equity", equity), True)
             
             msg = f"🚨 **[CIRCUIT BREAKER] Daily loss limit breached!** 🚨\n**PnL**: ${current_pnl:.2f}\n**Governing Limit**: -${governing_limit:.2f}\nTriggering emergency flatten and suspending all new daytrade entries!"
@@ -348,13 +417,18 @@ def evaluate_and_execute(
             except Exception as exc:
                 logger.error("Flatten on daily loss failed: %s", exc)
                 
-        if getattr(bridge, "_daytrade_suspended", False) is True:
+        if getattr(bridge, "_daytrade_suspended", False) is True or not halt_manager.entries_allowed():
             allow_new_entries = False
 
     regime_res = None
     # Phase 4.5: Pre-Market Health Gate & Market Regime Check
     try:
-        from strategies.regime_engine import evaluate_market_regime, MODE_RISK_OFF, MODE_CAUTION
+        from strategies.halt_manager import (
+            halt_manager,
+            TRANSIENT_HALT_DATA_DEGRADED,
+            TRANSIENT_HALT_GLOBAL_OPENING_BUFFER,
+        )
+        from strategies.regime_engine import evaluate_market_regime, MODE_RISK_OFF, MODE_CAUTION, MODE_DATA_DEGRADED
         from strategies.session import is_past_opening_buffer
 
         scanner_count = getattr(bridge, "_last_scanner_candidate_count", None) if bridge else None
@@ -362,33 +436,51 @@ def evaluate_and_execute(
             scanner_count = len(watchlist) if watchlist else 0
         if not live_paper and scanner_count > 0 and scanner_count < 2:
             scanner_count = 5  # Unit test mock default
-        regime_res = evaluate_market_regime(bridge=bridge, scanner_candidate_count=scanner_count, symbols=watchlist)
+        raw_regime_res = evaluate_market_regime(bridge=bridge, scanner_candidate_count=scanner_count, symbols=watchlist)
+        regime_res = _regime_state_tracker.update(raw_regime_res)
 
+        # Synchronize transient DATA_DEGRADED halt
+        if regime_res.mode == MODE_DATA_DEGRADED:
+            halt_manager.add(TRANSIENT_HALT_DATA_DEGRADED)
+        else:
+            halt_manager.clear_transient(TRANSIENT_HALT_DATA_DEGRADED)
+
+        # Synchronize transient opening buffer
         enforce_buffer = getattr(config, "ENFORCE_GLOBAL_OPENING_BUFFER", True)
         if enforce_buffer and not is_past_opening_buffer(15):
+            halt_manager.add(TRANSIENT_HALT_GLOBAL_OPENING_BUFFER)
+        else:
+            halt_manager.clear_transient(TRANSIENT_HALT_GLOBAL_OPENING_BUFFER)
+
+        # Fail-closed gating: check halt_manager and regime boolean invariants
+        if not halt_manager.entries_allowed() or regime_res.halt_new_entries or not regime_res.allow_new_longs:
             allow_new_entries = False
-            logger.info("[GLOBAL OPENING BUFFER] Enforcing 15-minute opening entry buffer (No BUY before 09:45 EST). Summary: %s", regime_res.summary())
-        elif regime_res.mode == MODE_RISK_OFF or not regime_res.allow_new_longs:
-            allow_new_entries = False
-            logger.warning("[MARKET REGIME RISK_OFF] New long day trades disabled (Score: %d <= -4). Summary: %s", regime_res.score, regime_res.summary())
-        elif regime_res.mode == MODE_CAUTION:
-            if not is_past_opening_buffer(15):
-                allow_new_entries = False
-                logger.info("[MARKET REGIME CAUTION] Enforcing 15-minute opening entry buffer (No BUY before 09:45 EST). Summary: %s", regime_res.summary())
+            if not halt_manager.entries_allowed():
+                logger.warning("[ENTRY GATE HALT] %s", halt_manager.summary())
+            elif regime_res.mode == MODE_DATA_DEGRADED:
+                logger.critical("[DATA DEGRADED HALT] %s", regime_res.summary())
             else:
-                logger.info("[MARKET REGIME CAUTION] Fallback watchlist active after 09:45 EST buffer (50%% sizing). Summary: %s", regime_res.summary())
+                logger.warning("[MARKET REGIME RISK_OFF/HALT] New long day trades disabled (Score: %d). Summary: %s", regime_res.score, regime_res.summary())
+        elif regime_res.mode == MODE_CAUTION:
+            logger.info("[MARKET REGIME CAUTION] Fallback watchlist active after 09:45 EST buffer (50%% sizing). Summary: %s", regime_res.summary())
     except Exception as r_exc:
-        logger.error("Market regime evaluation failed: %s", r_exc)
-        from strategies.regime_engine import MarketRegimeResult, MODE_CAUTION
+        logger.critical("[REGIME FAILURE] Evaluation error -- halting all new entries (Fail-Closed). Error: %s", r_exc, exc_info=True)
+        from strategies.halt_manager import halt_manager, TRANSIENT_HALT_DATA_DEGRADED
+        from strategies.regime_engine import MarketRegimeResult, MODE_DATA_DEGRADED
+        halt_manager.add(TRANSIENT_HALT_DATA_DEGRADED)
         regime_res = MarketRegimeResult(
-            mode=MODE_CAUTION,
-            score=-1,
-            allow_new_longs=True,
+            mode=MODE_DATA_DEGRADED,
+            score=-99,
+            allow_new_longs=False,
+            allow_new_shorts=False,
+            halt_new_entries=True,
             requires_opening_buffer=True,
-            position_scale=0.5,
-            confidence_boost=0.15,
+            position_scale=0.0,
+            confidence_boost=0.0,
             reasons=[f"Fallback regime on evaluation exception: {r_exc}"]
         )
+        allow_new_entries = False
+
 
     try:
         from strategies.trailing_stop import manager
@@ -456,10 +548,14 @@ def evaluate_and_execute(
     
     # Phase 5: 5-Minute Bar Boundary Cadence Gate
     now_utc = datetime.now(timezone.utc)
-    # Determine current 5m bar boundary timestamp
+    # Determine current open 5m bar boundary timestamp
     current_5m_bar_ts = now_utc.replace(second=0, microsecond=0)
     current_5m_bar_ts = current_5m_bar_ts.replace(minute=(current_5m_bar_ts.minute // 5) * 5)
-    current_5m_bar_str = current_5m_bar_ts.isoformat()
+    
+    # Calculate last completed 5m bar boundary (bar_start -> bar_end)
+    from datetime import timedelta
+    completed_5m_bar_ts = current_5m_bar_ts - timedelta(minutes=5)
+    completed_5m_bar_str = completed_5m_bar_ts.isoformat()
 
     global _last_evaluated_5m_bar_str
     if "_last_evaluated_5m_bar_str" not in globals():
@@ -467,15 +563,31 @@ def evaluate_and_execute(
 
     should_evaluate_5m_bar = False
     if allow_new_entries:
-        if _last_evaluated_5m_bar_str != current_5m_bar_str:
+        if _last_evaluated_5m_bar_str != completed_5m_bar_str:
             should_evaluate_5m_bar = True
-            _last_evaluated_5m_bar_str = current_5m_bar_str
-            logger.info(f"[5M BAR CADENCE] New 5m bar boundary reached ({current_5m_bar_str}). Running strategy signal evaluation...")
+            _last_evaluated_5m_bar_str = completed_5m_bar_str
+            logger.info(
+                f"[5M BAR CADENCE] Completed 5m bar boundary reached "
+                f"[feature_bar_start: {completed_5m_bar_ts.strftime('%H:%M:%S')} UTC, "
+                f"feature_bar_end: {current_5m_bar_ts.strftime('%H:%M:%S')} UTC, "
+                f"is_closed=True, decision_ts: {now_utc.strftime('%H:%M:%S')} UTC]. "
+                f"Running strategy signal evaluation..."
+            )
         else:
-            logger.debug(f"[5M BAR CADENCE] Intra-bar tick ({now_utc.strftime('%H:%M:%S')}). Skipping signal evaluation (last evaluated bar: {current_5m_bar_str}).")
+            logger.debug(
+                f"[5M BAR CADENCE] Intra-bar poll tick ({now_utc.strftime('%H:%M:%S')} UTC). "
+                f"Skipping strategy evaluation (last completed bar: {completed_5m_bar_str})."
+            )
+    else:
+        logger.info(
+            f"[POLLING CYCLE] Intra-bar health check ({len(watchlist)} symbols); "
+            f"new entries disabled or waiting for 5m bar completion."
+        )
+
+    market_tex = getattr(regime_res, "market_texture", "TRENDING") if regime_res else "TRENDING"
 
     if allow_new_entries and should_evaluate_5m_bar:
-        all_signals = evaluate_symbols_parallel(watchlist, bridge=bridge)
+        all_signals = evaluate_symbols_parallel(watchlist, bridge=bridge, market_texture=market_tex)
     else:
         all_signals = []
     logger.debug("[HOOK] after fetch & evaluate_symbols_parallel")
@@ -517,6 +629,13 @@ def evaluate_and_execute(
 
     for sig in all_signals:
         sym = sig.symbol.upper().strip()
+
+        # Regime-aware strategy filtering
+        tex_cfg = getattr(config, "MARKET_REGIME_SETTINGS", {}).get(market_tex, {})
+        allowed_strats = tex_cfg.get("allowed_strategies", None)
+        if allowed_strats is not None and sig.strategy not in allowed_strats:
+            logger.info("Skipped %s: strategy %s not allowed in market texture '%s'", sig.symbol, sig.strategy, market_tex)
+            continue
         
         # Check strategy-specific time cutoff
         strat_cfg = getattr(config, "STRATEGY_SETTINGS", {}).get(sig.strategy)
@@ -532,6 +651,7 @@ def evaluate_and_execute(
                     strat_cfg.entry_cutoff_time
                 )
                 continue
+
                 
         if sym in active_symbols:
             logger.info("Skipped %s: active position already exists", sig.symbol)
@@ -539,9 +659,23 @@ def evaluate_and_execute(
         if sym in pending_symbols:
             logger.info("Skipped %s: working order already pending", sig.symbol)
             continue
-        if sym not in seen_symbols:
-            seen_symbols.add(sym)
-            deduped_signals.append(sig)
+
+        if sym in seen_symbols:
+            logger.debug("Skipped %s: duplicate signal in this cycle", sym)
+            continue
+        seen_symbols.add(sym)
+
+        rsi_max = getattr(config, "RSI_MAX_BUY_ENTRY", 70.0)
+        rsi_min = getattr(config, "RSI_MIN_SHORT_ENTRY", 30.0)
+        sig_rsi = _extract_signal_rsi(sig)
+        if sig.side.upper() in ("BUY", "LONG") and sig_rsi >= rsi_max:
+            logger.info("Skipped %s: RSI %.1f >= %.1f (Overbought BUY entry filter)", sig.symbol, sig_rsi, rsi_max)
+            continue
+        if sig.side.upper() in ("SELL", "SHORT") and sig_rsi <= rsi_min:
+            logger.info("Skipped %s: RSI %.1f <= %.1f (Oversold SHORT entry filter)", sig.symbol, sig_rsi, rsi_min)
+            continue
+
+        deduped_signals.append(sig)
     all_signals = deduped_signals
 
     current_pnl = broker_pnl if live_paper else today_pnl()

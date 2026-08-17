@@ -334,7 +334,15 @@ def is_regular_hours(now: _dt.datetime) -> bool:
     """True when ``now`` (a US/Eastern datetime) is inside the regular trading
     session: a trading day, at/after 09:30 and strictly before the close (16:00,
     or 13:00 on an early-close day). The bridge supplies ``now`` in ET; this
-    function never reads the clock so it is deterministic in tests."""
+    function never reads the clock so it is deterministic in tests.
+
+    P0.4 Hardening: Rejects naive datetimes fail-closed to prevent silent UTC/ET mismatch.
+    """
+    if now.tzinfo is None or now.tzinfo.utcoffset(now) is None:
+        raise ValueError(
+            "is_regular_hours requires a timezone-aware ET datetime; "
+            "got naive datetime (possible UTC/ET mismatch)"
+        )
     d = now.date()
     if not is_trading_day(d):
         return False
@@ -345,6 +353,11 @@ def is_regular_hours(now: _dt.datetime) -> bool:
 def regular_hours_reason(now: _dt.datetime) -> str:
     """Human-readable reason for is_regular_hours, for logs/audit:
     'open' / 'weekend' / 'holiday' / 'before_open' / 'after_close'."""
+    if now.tzinfo is None or now.tzinfo.utcoffset(now) is None:
+        raise ValueError(
+            "regular_hours_reason requires a timezone-aware ET datetime; "
+            "got naive datetime (possible UTC/ET mismatch)"
+        )
     d = now.date()
     if d.weekday() >= 5:
         return "weekend"

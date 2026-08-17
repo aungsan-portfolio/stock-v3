@@ -29,6 +29,37 @@ class TradeSignal:
     metadata: dict = field(default_factory=dict)
     signal_id: str = field(default_factory=lambda: uuid4().hex)
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    bar_timestamp: Optional[str] = None
+
+    @property
+    def signal_hash(self) -> str:
+        """Deterministic SHA-256 digest of core signal attributes.
+        Uses fixed 4-decimal formatting for floats and avoids wall-clock non-determinism.
+        """
+        import hashlib
+
+        def _fmt(val: Optional[float]) -> str:
+            if val is None:
+                return "NONE"
+            try:
+                return f"{round(float(val), 4):.4f}"
+            except (TypeError, ValueError):
+                return "0.0000"
+
+        strat = self.strategy.value if hasattr(self.strategy, "value") else str(self.strategy)
+        bar_ts = str(self.bar_timestamp or "").strip()
+        raw = "|".join([
+            strat.upper(),
+            self.symbol.upper().strip(),
+            self.side.upper().strip(),
+            bar_ts,
+            _fmt(self.entry_price),
+            _fmt(self.stop_price),
+            _fmt(self.target_price),
+            _fmt(self.atr),
+            _fmt(self.risk_per_share),
+        ])
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     @property
     def reward_risk_ratio(self) -> float:

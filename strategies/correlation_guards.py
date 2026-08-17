@@ -29,7 +29,9 @@ def get_commodity_direction_bias(symbol: str, market_data: Dict[str, Any] = None
     else:
         try:
             from strategies.regime_engine import _get_premarket_pct_change
-            ref_change = float(_get_premarket_pct_change(reference) or 0.0)
+            res = _get_premarket_pct_change(reference)
+            pct_val = res[0] if isinstance(res, tuple) else res
+            ref_change = float(pct_val or 0.0)
         except Exception:
             ref_change = 0.0
 

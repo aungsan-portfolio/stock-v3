@@ -31,6 +31,7 @@ def log_trade(
     event_type: str = "TRADE",
     order_id: Optional[int] = None,
     signal_id: Optional[str] = None,
+    **kwargs,
 ):
     p = float(entry_price or exit_price or 0.0)
     price_tier = "5-10" if (5.0 <= p < 10.0) else (">10" if p >= 10.0 else "<5")
@@ -52,6 +53,7 @@ def log_trade(
         "pnl": pnl,
         "price_tier": price_tier,
         "notes": notes,
+        **kwargs,
     }
     path = journal_file or config.DAYTRADE_TRADE_JOURNAL_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -72,20 +74,29 @@ def log_fill(
     journal_file: Optional[Path] = None,
     order_id: Optional[int] = None,
     execution_id: Optional[str] = None,
-    signal_id: Optional[str] = None,
+    client_order_id: Optional[str] = None,
+    broker_order_id: Optional[str] = None,
+    broker_position_before: Optional[int] = None,
+    broker_position_after: Optional[int] = None,
     timestamp: Optional[str] = None,
     strategy: Optional[str] = None,
     price_tier: Optional[str] = None,
+    signal_id: Optional[str] = None,
+    **kwargs,
 ):
     """Log an actual execution fill event with latency and slippage."""
+    now_utc_str = datetime.now(timezone.utc).isoformat()
     if not price_tier and fill_price > 0:
         price_tier = "5-10" if (5.0 <= fill_price < 10.0) else (">10" if fill_price >= 10.0 else "<5")
 
     record = {
-        "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
+        "timestamp": timestamp or now_utc_str,
+        "journal_write_timestamp_utc": now_utc_str,
         "type": "FILL",
         "event_type": "FILL",
-        "order_id": order_id,
+        "order_id": order_id or broker_order_id,
+        "client_order_id": client_order_id,
+        "broker_order_id": broker_order_id or str(order_id or ""),
         "execution_id": execution_id,
         "signal_id": signal_id,
         "symbol": symbol,
@@ -97,6 +108,8 @@ def log_fill(
         "slippage": slippage,
         "fill_latency_ms": fill_latency_ms,
         "price_tier": price_tier,
+        "broker_position_before": broker_position_before,
+        "broker_position_after": broker_position_after,
     }
     path = journal_file or config.DAYTRADE_TRADE_JOURNAL_FILE
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -2500,10 +2500,11 @@ def cmd_daytrade_status(args) -> int:
             
             if bridge:
                 try:
+                    bd = bridge.position_breakdown()
                     account_text += (
                         f"\nALPACA Equity:    ${bridge.get_net_liquidation():,.2f}\n"
-                        f"Open Positions: {bridge.open_position_count()}\n"
-                        f"Working Orders: {len(bridge.ib.openTrades())}\n"
+                        f"Open Positions: {bd['total']} (longs={bd['longs']}, shorts={bd['shorts']})\n"
+                        f"Working Orders: {bridge.working_order_count()}\n"
                     )
                 except Exception as exc:
                     account_text += f"\nALPACA state unavailable: {exc}\n"
@@ -2763,7 +2764,9 @@ def cmd_daytrade_bot(args) -> int:
                 time.sleep(60)
                 continue
 
-            allow_new_entries = True
+            allow_new_entries = not getattr(bridge.entry_gate, "halted", False)
+            if getattr(bridge.entry_gate, "halted", False):
+                logger.warning("[ENTRY GATE HALTED] Startup reconciliation or safety circuit breaker has halted new entries.")
             if use_dynamic_scanner:
                 if bg_scanner:
                     watchlist = bg_scanner.get_watchlist()

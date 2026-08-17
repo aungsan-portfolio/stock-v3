@@ -3,6 +3,7 @@ session.py -- Market session time helpers.
 """
 from calendar import monthrange
 from datetime import date, datetime, time, timedelta
+from typing import Optional
 
 import pytz
 

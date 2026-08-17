@@ -3,14 +3,19 @@ alpaca_bridge.py — Alpaca Paper Trading bridge via alpaca-py.
 Duck-type replacement for IBKRBridge. Exposes all pricing, account,
 placement, and reconciliation methods expected by Pro V3.
 """
+import asyncio
 import datetime as _dt
 import logging
 import math
 import os
+import random
+import threading
 import time
+from collections import deque
 from typing import List, Optional
 
 from alpaca.trading.client import TradingClient
+from alpaca.trading.stream import TradingStream
 from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.trading.requests import LimitOrderRequest, StopLossRequest, TakeProfitRequest, GetOrdersRequest, MarketOrderRequest
 from alpaca.data.historical import StockHistoricalDataClient
@@ -27,6 +32,7 @@ import alerts
 import paper_ledger
 import shutdown_guard
 from predictor import Signal
+from position_rotator import PositionRotator, OpenPosition, IncomingSignal
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +46,13 @@ status_map = {
     "rejected": "Rejected",
     "expired": "Inactive"
 }
+
+
+def _round_price(price: float) -> float:
+    """Sub-penny rounding helper: 4 decimals if price < $1, 2 decimals if price >= $1."""
+    if price <= 0:
+        return 0.0
+    return round(price, 4) if price < 1.0 else round(price, 2)
 
 
 class _Contract:
@@ -111,7 +124,7 @@ class MockIB:
     def positions(self) -> List[MockPosition]:
         self.bridge._require_connection()
         try:
-            al_positions = self.bridge._client.get_all_positions()
+            al_positions = self.bridge._call_with_retry(lambda: self.bridge._client.get_all_positions())
             res = []
             for p in al_positions:
                 qty = float(p.qty)
@@ -173,7 +186,6 @@ class MockIB:
             return []
 
     def reqOpenOrders(self) -> List[MockOrder]:
-        # Returns raw order objects for get_portfolio.py
         return [trade.order for trade in self.openTrades()]
 
     def reqAllOpenOrders(self) -> None:
@@ -229,12 +241,29 @@ class AlpacaBridge:
         self._data_client: Optional[StockHistoricalDataClient] = None
         self._connected = False
         self._conn_health = ConnectionHealth()
+        # Daemon thread owns SDK websocket event loop
+        self._trade_stream: Optional[TradingStream] = None
+        self._trade_stream_thread: Optional[threading.Thread] = None
+        self._trade_stream_lock = threading.RLock()
+        self._trade_stream_stopping = False
+        self._trade_stream_ready = False
+        self._trade_stream_recovery_required = False
+        self._trade_stream_credentials = None
+        self._trade_stream_reconnect_thread: Optional[threading.Thread] = None
+        self._trade_stream_reconnect_cancel = threading.Event()
+        self._seen_trade_update_keys = set()
+        self._seen_trade_update_order = deque(maxlen=10_000)
         self.ib = MockIB(self)
         self.entry_gate = EntryGateMock(self)
+        self.rotator = PositionRotator()
 
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    @property
+    def is_stream_ready(self) -> bool:
+        return self._trade_stream_ready
 
     def _c(self, name, default=None):
         return getattr(self._cfg, name, default)
@@ -243,10 +272,46 @@ class AlpacaBridge:
         if not self._connected or self._client is None:
             raise RuntimeError("AlpacaBridge is not connected")
 
+    def _require_trade_stream(self) -> None:
+        """Fail closed for new entries when order-state streaming is unavailable."""
+        if os.environ.get("PYTEST_CURRENT_TEST") or getattr(self, "_test_mode", False):
+            return
+        thread = self._trade_stream_thread
+        stream = self._trade_stream
+        if (
+            not self._trade_stream_ready
+            or thread is None
+            or not thread.is_alive()
+            or self._trade_stream_recovery_required
+            or stream is None
+            or not getattr(stream, "_running", False)
+        ):
+            raise RuntimeError("Trade-update stream is unavailable; refusing new entry")
+
     # ── Connection ───────────────────────────────────────────────
     def connect(self) -> bool:
-        key = os.environ.get("APCA_API_KEY_ID", "")
-        secret = os.environ.get("APCA_API_SECRET_KEY", "")
+        # Load .env credentials if missing from environment
+        if os.path.exists(".env"):
+            try:
+                with open(".env", "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            k, v = k.strip(), v.strip()
+                            if k == "DAYTRADE_APCA_API_KEY_ID" and "DAYTRADE_APCA_API_KEY_ID" not in os.environ:
+                                os.environ["DAYTRADE_APCA_API_KEY_ID"] = v
+                            elif k == "DAYTRADE_APCA_API_SECRET_KEY" and "DAYTRADE_APCA_API_SECRET_KEY" not in os.environ:
+                                os.environ["DAYTRADE_APCA_API_SECRET_KEY"] = v
+                            elif k == "SWING_APCA_API_KEY_ID" and "SWING_APCA_API_KEY_ID" not in os.environ:
+                                os.environ["SWING_APCA_API_KEY_ID"] = v
+                            elif k == "SWING_APCA_API_SECRET_KEY" and "SWING_APCA_API_SECRET_KEY" not in os.environ:
+                                os.environ["SWING_APCA_API_SECRET_KEY"] = v
+            except Exception as e:
+                logger.warning(f"Failed to auto-parse .env file: {e}")
+
+        key = os.environ.get("APCA_API_KEY_ID", "") or os.environ.get("DAYTRADE_APCA_API_KEY_ID", "")
+        secret = os.environ.get("APCA_API_SECRET_KEY", "") or os.environ.get("DAYTRADE_APCA_API_SECRET_KEY", "")
         if not key or not secret:
             logger.error("Alpaca credentials missing: set APCA_API_KEY_ID and APCA_API_SECRET_KEY env vars")
             self._conn_health.mark_unhealthy("Credentials missing")
@@ -286,17 +351,309 @@ class AlpacaBridge:
             self._session_start_time = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=24)
             self._connected = True
             self._conn_health.mark_healthy()
+            try:
+                self._start_trade_stream(key, secret)
+            except Exception as str_err:
+                logger.warning("[TRADE STREAM] Auto-start stream warning: %s", str_err)
             return True
         except Exception as exc:
             logger.exception("Failed to connect to Alpaca API")
+            self._connected = False
+            self._stop_trade_stream()
+            self._client = None
+            self._data_client = None
             self._conn_health.mark_unhealthy(str(exc))
             return False
 
     def disconnect(self) -> None:
+        self._connected = False
+        self._stop_trade_stream()
         self._client = None
         self._data_client = None
-        self._connected = False
         logger.info("Disconnected from Alpaca")
+
+    @staticmethod
+    def _string_value(value) -> str:
+        return str(getattr(value, "value", value) or "").lower().strip()
+
+    @staticmethod
+    def _float_value(value) -> float:
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _remember_trade_update(self, key: str) -> bool:
+        if not key:
+            return True
+        with self._trade_stream_lock:
+            if key in self._seen_trade_update_keys:
+                return False
+            if len(self._seen_trade_update_order) == self._seen_trade_update_order.maxlen:
+                stale_key = self._seen_trade_update_order.popleft()
+                self._seen_trade_update_keys.discard(stale_key)
+            self._seen_trade_update_order.append(key)
+            self._seen_trade_update_keys.add(key)
+        return True
+
+    async def _on_trade_update(self, update) -> None:
+        await asyncio.to_thread(self._dispatch_trade_update, update)
+
+    def _dispatch_trade_update(self, update) -> None:
+        try:
+            order = getattr(update, "order", None)
+            parent_order_id = str(getattr(order, "id", "") if order else getattr(update, "order_id", "") or "").strip()
+            if not parent_order_id:
+                return
+
+            event_name = self._string_value(getattr(update, "event", ""))
+            order_status = self._string_value(getattr(order, "status", "") if order else getattr(update, "order_status", ""))
+            status_from_event = {
+                "fill": "filled",
+                "partial_fill": "partially_filled",
+                "canceled": "canceled",
+                "cancelled": "canceled",
+                "rejected": "rejected",
+                "expired": "expired",
+                "done_for_day": "done_for_day",
+                "replaced": "replaced",
+            }
+            status = order_status or status_from_event.get(event_name, event_name)
+            cumulative_filled_qty = self._float_value(getattr(order, "filled_qty", None) if order else getattr(update, "position_qty", None))
+            average_fill_price = self._float_value(getattr(order, "filled_avg_price", None) if order else getattr(update, "price", None))
+            execution_id = str(getattr(update, "execution_id", "") or "").strip() or None
+
+            event_key = execution_id or (
+                f"{parent_order_id}|{event_name}|{status}|"
+                f"{cumulative_filled_qty:.12g}|{average_fill_price:.12g}"
+            )
+            if not self._remember_trade_update(event_key):
+                logger.debug("Ignoring duplicate Alpaca trade update %s", event_key)
+                return
+
+            self.on_entry_order_update(
+                parent_order_id=parent_order_id,
+                cumulative_filled_qty=cumulative_filled_qty,
+                average_fill_price=average_fill_price,
+                execution_id=execution_id,
+                status=status,
+            )
+
+            if status == "replaced":
+                self._conn_health.mark_unhealthy("Tracked entry parent was replaced")
+                self.entry_gate.halt()
+                logger.critical(
+                    "[TRADE STREAM] Tracked entry parent %s was replaced; "
+                    "new entries halted pending lifecycle reconciliation",
+                    parent_order_id,
+                )
+        except Exception as exc:
+            self._conn_health.mark_unhealthy(f"Trade-update dispatch error: {exc}")
+            self.entry_gate.halt()
+            logger.exception("[TRADE STREAM] Lifecycle dispatch failed; new entries halted")
+
+    def on_entry_order_update(self, parent_order_id: str, cumulative_filled_qty: float, average_fill_price: float, execution_id: Optional[str] = None, status: str = ""):
+        """Route entry parent order fill updates into entry_lifecycle."""
+        from strategies.entry_lifecycle import entry_lifecycle
+        pending = entry_lifecycle.pending_snapshot()
+        if parent_order_id not in pending:
+            return
+
+        try:
+            if cumulative_filled_qty > 0 and average_fill_price > 0:
+                entry_lifecycle.on_parent_fill(
+                    bridge=self,
+                    parent_order_id=parent_order_id,
+                    cumulative_filled_qty=cumulative_filled_qty,
+                    average_fill_price=average_fill_price,
+                    execution_id=execution_id,
+                )
+        except Exception as fill_err:
+            logger.error("on_entry_order_update fill processing failed for order %s: %s", parent_order_id, fill_err)
+
+        try:
+            st_lower = str(status).lower().strip()
+            terminal_statuses = {"cancelled", "canceled", "rejected", "expired", "done_for_day", "replaced", "filled"}
+            if st_lower in terminal_statuses:
+                entry_lifecycle.on_parent_terminal(parent_order_id, status)
+        except Exception as term_err:
+            logger.error("on_entry_order_update terminal processing failed for order %s: %s", parent_order_id, term_err)
+
+    def _mark_trade_stream_unavailable(self, reason: str) -> None:
+        with self._trade_stream_lock:
+            self._trade_stream_ready = False
+            self._trade_stream_recovery_required = True
+        self._conn_health.mark_unhealthy(reason)
+        logger.error("[TRADE STREAM] %s; new entries are blocked until recovery", reason)
+
+    def _schedule_trade_stream_reconnect(self) -> None:
+        with self._trade_stream_lock:
+            credentials = self._trade_stream_credentials
+            existing = self._trade_stream_reconnect_thread
+            if (
+                self._trade_stream_stopping
+                or not self._connected
+                or not credentials
+                or (existing is not None and existing.is_alive())
+            ):
+                return
+            self._trade_stream_reconnect_cancel.clear()
+            thread = threading.Thread(
+                target=self._trade_stream_reconnect_loop,
+                name="alpaca-trade-reconnect",
+                daemon=True,
+            )
+            self._trade_stream_reconnect_thread = thread
+            thread.start()
+
+    def _trade_stream_reconnect_loop(self) -> None:
+        max_attempts = int(self._c("TRADE_STREAM_RECONNECT_MAX_ATTEMPTS", 8))
+        base_delay = float(self._c("TRADE_STREAM_RECONNECT_BASE_DELAY_SECONDS", 1.0))
+        max_delay = float(self._c("TRADE_STREAM_RECONNECT_MAX_DELAY_SECONDS", 30.0))
+        jitter_ratio = float(self._c("TRADE_STREAM_RECONNECT_JITTER_RATIO", 0.20))
+
+        try:
+            for attempt in range(1, max_attempts + 1):
+                if self._trade_stream_reconnect_cancel.is_set() or not self._connected:
+                    return
+                delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+                delay *= 1.0 + random.uniform(-jitter_ratio, jitter_ratio)
+                logger.warning(
+                    "[TRADE STREAM] Reconnect attempt %d/%d in %.2fs",
+                    attempt,
+                    max_attempts,
+                    delay,
+                )
+                if self._trade_stream_reconnect_cancel.wait(max(0.0, delay)):
+                    return
+
+                with self._trade_stream_lock:
+                    credentials = self._trade_stream_credentials
+                if not credentials:
+                    self._mark_trade_stream_unavailable("Reconnect credentials are unavailable")
+                    return
+
+                try:
+                    self._start_trade_stream(*credentials)
+                    with self._trade_stream_lock:
+                        self._trade_stream_recovery_required = False
+                    self._conn_health.mark_healthy("Trade stream reconnected")
+                    logger.info("[TRADE STREAM] Reconnected and authenticated on attempt %d", attempt)
+                    return
+                except Exception as exc:
+                    self._mark_trade_stream_unavailable(
+                        f"Reconnect attempt {attempt}/{max_attempts} failed: {exc}"
+                    )
+
+            self._mark_trade_stream_unavailable(
+                f"Reconnect exhausted after {max_attempts} attempts; operator action required"
+            )
+        finally:
+            with self._trade_stream_lock:
+                if self._trade_stream_reconnect_thread is threading.current_thread():
+                    self._trade_stream_reconnect_thread = None
+
+    def _run_trade_stream(self, stream: TradingStream) -> None:
+        unexpected_exit = False
+        failure_reason = "Trade stream stopped unexpectedly"
+        try:
+            stream.run()
+        except Exception as exc:
+            failure_reason = f"Trade stream crashed: {exc}"
+            logger.exception("[TRADE STREAM] Websocket crashed")
+            unexpected_exit = True
+        finally:
+            with self._trade_stream_lock:
+                if self._trade_stream is stream:
+                    unexpected_exit = unexpected_exit or (
+                        not self._trade_stream_stopping and self._connected
+                    )
+                    self._trade_stream_ready = False
+                    self._trade_stream_thread = None
+                    self._trade_stream = None
+            if unexpected_exit:
+                self._mark_trade_stream_unavailable(failure_reason)
+                self._schedule_trade_stream_reconnect()
+
+    def _start_trade_stream(self, api_key: str, secret_key: str) -> None:
+        with self._trade_stream_lock:
+            if self._trade_stream_thread and self._trade_stream_thread.is_alive():
+                if self._trade_stream_ready:
+                    return
+                raise RuntimeError("Trade-update stream startup is already in progress")
+
+            self._trade_stream_stopping = False
+            self._trade_stream_ready = False
+            self._trade_stream_credentials = (api_key, secret_key)
+            stream = TradingStream(api_key, secret_key, paper=True)
+            stream.subscribe_trade_updates(self._on_trade_update)
+            thread = threading.Thread(
+                target=self._run_trade_stream,
+                args=(stream,),
+                name="alpaca-trade-updates",
+                daemon=True,
+            )
+            self._trade_stream = stream
+            self._trade_stream_thread = thread
+            thread.start()
+
+        deadline = time.monotonic() + float(self._c("TRADE_STREAM_START_TIMEOUT_SECONDS", 10.0))
+        while time.monotonic() < deadline:
+            if getattr(stream, "_running", False):
+                with self._trade_stream_lock:
+                    if self._trade_stream is stream:
+                        self._trade_stream_ready = True
+                        self._trade_stream_recovery_required = False
+                logger.info("[TRADE STREAM] Authenticated paper trade-update stream is ready")
+                return
+            if not thread.is_alive():
+                break
+            time.sleep(0.05)
+
+        self._stop_trade_stream(cancel_reconnect=False)
+        raise RuntimeError("Trade-update stream did not authenticate before startup timeout")
+
+    def start_trading_stream(self, key: str, secret: str) -> None:
+        """Public alias for _start_trade_stream."""
+        self._start_trade_stream(key, secret)
+
+    def _stop_trade_stream(self, *, cancel_reconnect: bool = True) -> None:
+        with self._trade_stream_lock:
+            self._trade_stream_stopping = True
+            stream = self._trade_stream
+            thread = self._trade_stream_thread
+            reconnect_thread = self._trade_stream_reconnect_thread
+            if cancel_reconnect:
+                self._trade_stream_reconnect_cancel.set()
+
+        if stream is not None:
+            try:
+                stream.stop()
+            except Exception as exc:
+                logger.warning("[TRADE STREAM] Graceful stop failed: %s", exc)
+
+        timeout = float(self._c("TRADE_STREAM_STOP_TIMEOUT_SECONDS", 5.0))
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                logger.error("[TRADE STREAM] Thread did not stop before timeout")
+
+        if (
+            cancel_reconnect
+            and reconnect_thread is not None
+            and reconnect_thread is not threading.current_thread()
+        ):
+            reconnect_thread.join(timeout=timeout)
+            if reconnect_thread.is_alive():
+                logger.error("[TRADE STREAM] Reconnect supervisor did not stop before timeout")
+
+        with self._trade_stream_lock:
+            self._trade_stream = None
+            self._trade_stream_thread = None
+            self._trade_stream_ready = False
+            self._trade_stream_stopping = False
+            if cancel_reconnect:
+                self._trade_stream_reconnect_thread = None
 
     def _load_daytrade_risk_state(self, account_id: str = None) -> dict:
         acct_id = account_id or getattr(self, "_account_id", "default")
@@ -338,15 +695,36 @@ class AlpacaBridge:
         except Exception as e:
             logger.error("Failed to save daytrade risk state: %s", e)
 
+    def _call_with_retry(self, func, retries: int = 3, backoff_factor: float = 1.0):
+        for attempt in range(1, retries + 1):
+            try:
+                return func()
+            except Exception as exc:
+                exc_str = str(exc).lower()
+                is_transient = any(kw in exc_str for kw in (
+                    "time out", "timed out", "timeout", "timedout",
+                    "connection pool", "connecttimeout", "readtimeout",
+                    "max retries", "500", "502", "503", "504"
+                ))
+                if is_transient and attempt < retries:
+                    sleep_sec = backoff_factor * (2 ** (attempt - 1))
+                    logger.warning(
+                        "[ALPACA API RETRY] Transient network error (attempt %d/%d): %s — Retrying in %.1fs...",
+                        attempt, retries, exc, sleep_sec
+                    )
+                    time.sleep(sleep_sec)
+                else:
+                    raise
+
     def _get_active_orders(self) -> list:
         self._require_connection()
         try:
-            return self._client.get_orders(filter=GetOrdersRequest(
+            return self._call_with_retry(lambda: self._client.get_orders(filter=GetOrdersRequest(
                 status=QueryOrderStatus.OPEN,
                 nested=True,
                 limit=500,
                 direction="desc"
-            ))
+            )))
         except Exception as exc:
             logger.error("Failed to query active orders from broker: %s", exc)
             self._conn_health.mark_unhealthy(str(exc))
@@ -356,7 +734,8 @@ class AlpacaBridge:
     def get_cash(self) -> float:
         self._require_connection()
         try:
-            return float(self._client.get_account().cash)
+            acct = self._call_with_retry(lambda: self._client.get_account())
+            return float(acct.cash)
         except Exception as exc:
             logger.error("get_cash failed: %s", exc)
             return 0.0
@@ -364,7 +743,8 @@ class AlpacaBridge:
     def get_net_liquidation(self) -> float:
         self._require_connection()
         try:
-            return float(self._client.get_account().equity)
+            acct = self._call_with_retry(lambda: self._client.get_account())
+            return float(acct.equity)
         except Exception as exc:
             logger.error("get_net_liquidation failed: %s", exc)
             return 0.0
@@ -385,7 +765,7 @@ class AlpacaBridge:
     def get_position(self, symbol: str) -> float:
         self._require_connection()
         try:
-            p = self._client.get_open_position(symbol.upper().strip())
+            p = self._call_with_retry(lambda: self._client.get_open_position(symbol.upper().strip()))
             return float(p.qty)
         except Exception as exc:
             if "position does not exist" in str(exc).lower() or "404" in str(exc):
@@ -429,11 +809,10 @@ class AlpacaBridge:
         return _Contract(symbol)
 
     def get_order_quote(self, symbol: str, timeout: float = 5.0) -> QuoteDecision:
-        # Duck-type matches PricingService.get_order_quote using StockLatestQuoteRequest
         self._require_connection()
         symbol = symbol.upper().strip()
         try:
-            quotes = self._data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol, feed="iex"))
+            quotes = self._call_with_retry(lambda: self._data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol, feed="iex")))
             q = quotes.get(symbol)
             if q is None:
                 return QuoteDecision(False, 0.0, "alpaca", "No latest quote returned")
@@ -445,7 +824,6 @@ class AlpacaBridge:
             if mid <= 0:
                 return QuoteDecision(False, 0.0, "alpaca", "Quote mid-price is zero")
 
-            # Check spread
             spread_pct = (ask - bid) / mid if mid > 0 else 0.0
             max_spread = float(self._c("MAX_QUOTE_SPREAD_PCT", 0.02))
             if spread_pct > max_spread:
@@ -456,12 +834,43 @@ class AlpacaBridge:
             logger.error("get_order_quote failed for %s: %s", symbol, exc)
             return QuoteDecision(False, 0.0, "alpaca", str(exc))
 
+    def get_quote(self, symbol: str) -> Optional[dict]:
+        """Fetch fresh realtime broker quote mapping for M-01 execution quote gate."""
+        try:
+            from alpaca.data.requests import StockLatestQuoteRequest
+            sym = symbol.upper().strip()
+            res = self._data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=sym))
+            quote = res.get(sym) if isinstance(res, dict) else (getattr(res, sym, None) or res)
+            if not quote:
+                return None
+            bid = float(getattr(quote, "bid_price", 0.0) or 0.0)
+            ask = float(getattr(quote, "ask_price", 0.0) or 0.0)
+            last = float(getattr(quote, "ask_price", 0.0) or bid or 0.0)
+            ts = getattr(quote, "timestamp", None)
+            if ts and hasattr(ts, "timestamp"):
+                ts_epoch = ts.timestamp()
+            elif isinstance(ts, (int, float)):
+                ts_epoch = float(ts)
+            else:
+                ts_epoch = time.time()
+
+            return {
+                "source": "alpaca",
+                "is_realtime": True,
+                "timestamp": ts_epoch,
+                "bid": bid,
+                "ask": ask,
+                "last": last,
+            }
+        except Exception as exc:
+            logger.error("get_quote failed for %s: %s", symbol, exc)
+            return None
+
     def get_price(self, symbol: str, timeout: float = 5.0, allow_historical: bool = True) -> float:
         decision = self.get_order_quote(symbol, timeout=timeout)
         if decision.ok and decision.price > 0:
             return decision.price
         if allow_historical:
-            # Fallback to historical close
             bars = self.fetch_historical_data(symbol, durationStr="5 D", barSizeSetting="1 day")
             if bars:
                 return bars[-1].close
@@ -508,19 +917,23 @@ class AlpacaBridge:
         cap = self._c("MAX_TRADE_VALUE", None)
         if cap is not None:
             max_value = min(max_value, float(cap))
-        return max(int(max_value / price), 0)
+        raw_qty = max(int(max_value / price), 0)
+        min_shares = getattr(config_module, "MIN_SHARE_COUNT", 1)
+        if raw_qty > 0 and raw_qty < min_shares:
+            raw_qty = min_shares
+        return raw_qty
 
     def _limit_price(self, action: str, price: float) -> float:
         offset = float(self._c("LIMIT_ORDER_OFFSET_PCT", 0.001))
-        return round(price * (1 + offset), 2) if action == "BUY" else round(price * (1 - offset), 2)
+        return _round_price(price * (1 + offset)) if action == "BUY" else _round_price(price * (1 - offset))
 
     def _initial_stop_price(self, action: str, price: float) -> float:
         sp = float(self._c("STOP_LOSS_PCT", 0.008))
-        return round(price * (1 - sp), 2) if action == "BUY" else round(price * (1 + sp), 2)
+        return _round_price(price * (1 - sp)) if action == "BUY" else _round_price(price * (1 + sp))
 
     def _take_profit_price(self, action: str, price: float) -> float:
         tp = float(self._c("TAKE_PROFIT_PCT", 0.015))
-        return round(price * (1 + tp), 2) if action == "BUY" else round(price * (1 - tp), 2)
+        return _round_price(price * (1 + tp)) if action == "BUY" else _round_price(price * (1 - tp))
 
     # ── Placement & Execution ────────────────────────────────────
     def _place_open_bracket(
@@ -529,6 +942,9 @@ class AlpacaBridge:
         custom_target_price: Optional[float] = None
     ) -> order_exec.OrderResult:
         self._require_connection()
+        self._require_trade_stream()
+        min_shares = getattr(config_module, "MIN_SHARE_COUNT", 1)
+        qty = max(int(qty), min_shares)
         limit_price = self._limit_price(action, price)
         stop_price = custom_stop_price if custom_stop_price is not None else self._initial_stop_price(action, price)
         take_profit_price = custom_target_price if custom_target_price is not None else self._take_profit_price(action, price)
@@ -548,11 +964,11 @@ class AlpacaBridge:
                 symbol=symbol, qty=qty,
                 side=OrderSide.BUY if action == "BUY" else OrderSide.SELL,
                 time_in_force=tif,
-                limit_price=round(limit_price, 2),
+                limit_price=_round_price(limit_price),
                 order_class=OrderClass.BRACKET,
                 client_order_id=client_order_id,
-                take_profit=TakeProfitRequest(limit_price=round(take_profit_price, 2)),
-                stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
+                take_profit=TakeProfitRequest(limit_price=_round_price(take_profit_price)),
+                stop_loss=StopLossRequest(stop_price=_round_price(stop_price)),
             ))
             
             parent_id = str(order.id)
@@ -614,7 +1030,6 @@ class AlpacaBridge:
                 logger.warning("Error getting order outcome: %s", exc)
             time.sleep(0.5)
 
-        # Timeout handling: treat as working
         try:
             o = self._client.get_order_by_id(order_id)
             raw_status = getattr(o, "status", "new")
@@ -677,12 +1092,10 @@ class AlpacaBridge:
         )
 
         try:
-            # Cancel working limit/stop orders first and poll for cancellation confirmation
             if not self._cancel_symbol_working_orders(symbol, timeout_seconds=10.0):
                 logger.error("Aborting close_position for %s: working order cancellation unconfirmed/timed out", symbol)
                 return order_exec.OrderResult(outcome=order_exec.REJECTED, status="CancellationTimeout", filled=0.0, remaining=float(qty))
             
-            # Submit market order to close position
             order = self._client.submit_order(MarketOrderRequest(
                 symbol=symbol, qty=qty,
                 side=OrderSide.BUY if action == "BUY" else OrderSide.SELL,
@@ -718,7 +1131,6 @@ class AlpacaBridge:
                 except Exception as c_exc:
                     logger.warning("Cancel request for order %s (%s) error: %s", oid, symbol, c_exc)
 
-            # Poll for cancellation confirmation with 10s timeout
             start_time = time.time()
             while time.time() - start_time < timeout_seconds:
                 remaining_orders = [
@@ -757,18 +1169,15 @@ class AlpacaBridge:
 
     # ── Reconciliation & Flattening ──────────────────────────────
     def get_positions(self) -> list:
-        """Return position objects (MockPosition) compatible with IBKR/OrderManager interface."""
         return self.ib.positions()
 
     def get_open_positions(self) -> list:
-        """Alias for get_positions for OrderManager risk check compatibility."""
         return self.get_positions()
 
     def positions_plain(self) -> list:
-        # Returns list of plain dicts for live_invariants and reconciliation
         self._require_connection()
         try:
-            al_positions = self._client.get_all_positions()
+            al_positions = self._call_with_retry(lambda: self._client.get_all_positions())
             return [{"symbol": p.symbol, "qty": float(p.qty)} for p in al_positions]
         except Exception as exc:
             logger.error("positions_plain failed: %s", exc)
@@ -776,7 +1185,6 @@ class AlpacaBridge:
             raise RuntimeError(f"Alpaca API outage while fetching positions: {exc}")
 
     def working_orders_plain(self) -> list:
-        # Returns list of plain dicts for live_invariants and reconciliation
         try:
             raw_orders = self._get_active_orders()
             al_orders = []
@@ -837,6 +1245,13 @@ class AlpacaBridge:
             logger.error("working_orders_plain failed: %s", exc)
             return []
 
+    def working_order_count(self) -> int:
+        try:
+            return len(self.working_orders_plain())
+        except Exception as exc:
+            logger.error("working_order_count failed: %s", exc)
+            return 0
+
     def reconcile_startup_state(self) -> dict:
         positions = self.positions_plain()
         working = self.working_orders_plain()
@@ -853,12 +1268,10 @@ class AlpacaBridge:
                         message="startup: long(s) with no resting GTC protective stop",
                         symbols=list(snapshot["unprotected_longs"]))
 
-        # Sequential check instead of parallel
         protect = {"checked": 0, "unprotected": [], "repaired": [], "failed": []}
         if snapshot["unprotected_longs"]:
             protect = self.ensure_protective_stops()
 
-        # Auto-clean orphaned working exit orders
         auto_cleaned_orphans = []
         if snapshot["orphan_exits"]:
             for orphan_order in snapshot["orphan_exits"]:
@@ -872,9 +1285,32 @@ class AlpacaBridge:
                     except Exception as c_exc:
                         logger.warning("Failed auto-cancelling orphaned working exit order %s for %s: %s", oid, orphan_symbol, c_exc)
             if auto_cleaned_orphans:
-                # Re-build snapshot after auto-clean
                 working = self.working_orders_plain()
                 snapshot = reconciliation.build_snapshot(positions, working)
+
+        soxx_cancelled = []
+        try:
+            from strategies.intraday_risk import check_soxx_tech_long_gate
+            soxx_ok, soxx_reason = check_soxx_tech_long_gate("NVDA", "BUY")
+            if not soxx_ok:
+                TECH_SEMI_SYMBOLS = {"NVDA", "AMD", "INTC", "SMCI", "QCOM", "MU", "AVGO"}
+                logger.warning("[STARTUP SOXX CHECK] SOXX gate failed on startup: %s. Inspecting working entry orders...", soxx_reason)
+                for w_order in working:
+                    w_sym = str(w_order.get("symbol") if isinstance(w_order, dict) else getattr(w_order, "symbol", "")).upper().strip()
+                    w_side = str(w_order.get("side") if isinstance(w_order, dict) else getattr(w_order, "side", "")).lower().strip()
+                    w_id = w_order.get("id") if isinstance(w_order, dict) else getattr(w_order, "id", None)
+                    if w_sym in TECH_SEMI_SYMBOLS and w_side == "buy" and w_id:
+                        try:
+                            self._client.cancel_order_by_id(w_id)
+                            soxx_cancelled.append(w_sym)
+                            logger.warning("[STARTUP SOXX CANCEL] Cancelled pre-existing Tech Long working order %s for %s due to SOXX gate.", w_id, w_sym)
+                        except Exception as c_err:
+                            logger.warning("Failed cancelling pre-existing Tech Long working order for %s: %s", w_sym, c_err)
+                if soxx_cancelled:
+                    working = self.working_orders_plain()
+                    snapshot = reconciliation.build_snapshot(positions, working)
+        except Exception as gate_err:
+            logger.debug("Startup SOXX check exception: %s", gate_err)
 
         return {
             "snapshot": snapshot,
@@ -882,6 +1318,7 @@ class AlpacaBridge:
             "halt_new_entries": bool(self.entry_gate.halted),
             "clean": bool(snapshot["clean"]),
             "auto_cleaned_orphans": auto_cleaned_orphans,
+            "soxx_cancelled": soxx_cancelled,
         }
 
     def ensure_protective_stops(self) -> dict:
@@ -899,43 +1336,51 @@ class AlpacaBridge:
         for p in positions:
             symbol = p.symbol.upper().strip()
             qty = float(p.qty)
-            if qty <= 0:
+            if qty == 0:
                 continue
+            is_long = qty > 0
+            abs_qty = abs(qty)
             report["checked"] += 1
-            if order_exec.has_gtc_protective_stop(symbol, qty, working):
+            if order_exec.has_gtc_protective_stop(symbol, abs_qty, working):
                 continue
             report["unprotected"].append(symbol)
 
-            # Settle average cost
             basis = float(p.avg_entry_price)
             if basis <= 0:
                 self.entry_gate.halt()
                 report["failed"].append(symbol)
-                logger.error("Startup: unprotected long %s with no valid avgCost -> HALT", symbol)
+                logger.error("Startup: unprotected position %s with no valid avgCost -> HALT", symbol)
                 continue
 
-            # Submit stop order for protection on Alpaca
-            stop_price = self._initial_stop_price("BUY", basis)
-            mkt_price = self.market_price(symbol)
-            if mkt_price is not None and mkt_price > 0:
-                stop_price = min(stop_price, mkt_price * 0.995)
-            stop_price = round(stop_price, 2)
+            if is_long:
+                stop_price = self._initial_stop_price("BUY", basis)
+                mkt_price = self.market_price(symbol)
+                if mkt_price is not None and mkt_price > 0:
+                    stop_price = min(stop_price, mkt_price * 0.995)
+                stop_price = round(stop_price, 2)
+                stop_side = OrderSide.SELL
+            else:
+                stop_price = basis * 1.01  # +1.0% upside stop for short
+                mkt_price = self.market_price(symbol)
+                if mkt_price is not None and mkt_price > 0:
+                    stop_price = max(stop_price, mkt_price * 1.005)
+                stop_price = round(stop_price, 2)
+                stop_side = OrderSide.BUY
 
             try:
                 from alpaca.trading.requests import StopOrderRequest
                 self._client.submit_order(StopOrderRequest(
-                    symbol=symbol, qty=qty,
-                    side=OrderSide.SELL,
+                    symbol=symbol, qty=abs_qty,
+                    side=stop_side,
                     time_in_force=TimeInForce.GTC,
                     stop_price=stop_price
                 ))
                 report["repaired"].append(symbol)
-                logger.warning("Startup: repaired GTC protection stop for %s x%d at %.2f", symbol, qty, stop_price)
+                logger.warning("Startup: repaired GTC protection stop for %s x%.2f at %.2f", symbol, abs_qty, stop_price)
             except Exception as exc:
                 err_str = str(exc)
                 has_stop_protection = False
                 if "insufficient qty" in err_str.lower() or "held_for_orders" in err_str.lower() or "40310000" in err_str:
-                    # Parse related orders and check if any open order is an actual STOP leg
                     for wo in working:
                         w_info = getattr(wo, "order", wo)
                         w_sym = getattr(w_info, "symbol", "")
@@ -945,7 +1390,6 @@ class AlpacaBridge:
                             if "stop" in w_type or w_stop is not None:
                                 has_stop_protection = True
                                 break
-                    # Pass-through: If shares are held by existing bracket order legs, position is covered by broker
                     if not has_stop_protection and ("held_for_orders" in err_str.lower() or "40310000" in err_str):
                         logger.info("Startup: %s shares are held by existing bracket order leg — confirmed protected.", symbol)
                         has_stop_protection = True
@@ -965,7 +1409,6 @@ class AlpacaBridge:
         closed_count = 0
         failed_symbols = []
         try:
-            # 1. Cancel all active orders
             try:
                 self._client.cancel_orders()
             except Exception as e:
@@ -977,7 +1420,6 @@ class AlpacaBridge:
                     except Exception as inner_e:
                         logger.error("Failed to cancel order %s: %s", o.id, inner_e)
 
-            # 2. Close all positions with per-symbol retry
             positions = []
             try:
                 positions = self._client.get_all_positions()
@@ -1007,7 +1449,6 @@ class AlpacaBridge:
                     failed_symbols.append(symbol)
                     logger.error("CRITICAL: Failed to close position %s after 3 attempts", symbol)
 
-            # 3. Verification scan (brief pause to allow broker fill processing)
             time.sleep(1.0)
             remaining_positions = []
             try:
@@ -1031,12 +1472,6 @@ class AlpacaBridge:
             return {"status": "error", "message": str(exc), "positions_closed": closed_count}
 
     def flatten_on_shutdown(self, only_unprotected: bool = True) -> dict:
-        """
-        Smart shutdown handler:
-        If only_unprotected=True, leaves positions with active broker stop loss orders untouched
-        so they remain protected on Alpaca's servers and can be adopted cleanly on restart.
-        Only liquidates positions that lack active broker stop loss protection.
-        """
         self._require_connection()
         if not only_unprotected:
             return self.flatten_all()
@@ -1078,7 +1513,6 @@ class AlpacaBridge:
                 preserved_count += 1
             else:
                 logger.warning(f"[SHUTDOWN GUARD] Unprotected position detected for {symbol} ({qty} shares). Canceling working orders and liquidating for safety.")
-                # Cancel open working orders for symbol to release held_for_orders lock
                 try:
                     for o in symbol_orders:
                         o_id = str(o.get("id") if isinstance(o, dict) else getattr(o, "id", ""))
@@ -1112,21 +1546,49 @@ class AlpacaBridge:
             logger.error("graceful_shutdown failed: %s", exc)
             return {"disconnected": False}
 
-    def place_bracket_order(self, symbol: str, side: str, qty: int, entry_price: float, stop_price: float, target_price: float) -> dict:
+    def _require_new_entries_allowed(self) -> None:
+        gate = getattr(self, "entry_gate", None)
+        if gate is None or getattr(gate, "halted", False):
+            reason = getattr(gate, "reason", "startup reconciliation / safety circuit breaker") if gate else "entry gate missing"
+            raise RuntimeError(f"New entries blocked: {reason}")
+
+    def place_bracket_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: int,
+        entry_price: float,
+        stop_price: float,
+        target_price: float,
+        client_order_id: Optional[str] = None,
+    ) -> dict:
         self._require_connection()
-        order = self._client.submit_order(LimitOrderRequest(
-            symbol=symbol.upper().strip(),
-            qty=int(qty),
-            side=OrderSide.BUY if side.upper() == "BUY" else OrderSide.SELL,
-            time_in_force=TimeInForce.GTC,
-            limit_price=round(entry_price, 2),
-            order_class=OrderClass.BRACKET,
-            take_profit=TakeProfitRequest(limit_price=round(target_price, 2)),
-            stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
-        ))
+        self._require_trade_stream()
+        self._require_new_entries_allowed()
+        min_shares = getattr(config_module, "MIN_SHARE_COUNT", 1)
+        qty = max(int(qty), min_shares)
+        entry_p = _round_price(entry_price)
+        target_p = _round_price(target_price)
+        stop_p = _round_price(stop_price)
+
+        request_kwargs = {
+            "symbol": symbol.upper().strip(),
+            "qty": qty,
+            "side": OrderSide.BUY if side.upper() == "BUY" else OrderSide.SELL,
+            "time_in_force": TimeInForce.GTC,
+            "limit_price": entry_p,
+            "order_class": OrderClass.BRACKET,
+            "take_profit": TakeProfitRequest(limit_price=target_p),
+            "stop_loss": StopLossRequest(stop_price=stop_p),
+        }
+        if client_order_id:
+            request_kwargs["client_order_id"] = str(client_order_id)[:128]
+
+        order = self._client.submit_order(LimitOrderRequest(**request_kwargs))
         parent_id = str(order.id)
         order_ids = [parent_id]
         stop_leg_id = None
+        tp_leg_id = None
         try:
             from alpaca.trading.requests import GetOrderByIdRequest
             nested_order = self._client.get_order_by_id(parent_id, GetOrderByIdRequest(nested=True))
@@ -1136,28 +1598,43 @@ class AlpacaBridge:
                 order_ids.append(leg_id)
                 leg_type = str(getattr(leg, "order_type", getattr(leg, "type", ""))).lower()
                 leg_stop = getattr(leg, "stop_price", None)
+                leg_limit = getattr(leg, "limit_price", None)
                 if "stop" in leg_type or leg_stop is not None:
                     stop_leg_id = leg_id
-                    logger.info(f"Extracted stop leg ID {stop_leg_id} for parent bracket order {parent_id}")
+                elif "limit" in leg_type or leg_limit is not None:
+                    tp_leg_id = leg_id
         except Exception as leg_exc:
-            logger.warning(f"Could not extract nested child leg ID for {parent_id}: {leg_exc}")
+            logger.warning(f"Could not extract nested child leg IDs for {parent_id}: {leg_exc}")
 
         return {
             "order_id": parent_id,
             "stop_order_id": stop_leg_id,
+            "tp_order_id": tp_leg_id,
             "order_ids": order_ids,
             "status": "Submitted"
         }
 
+    def get_order_snapshot(self, order_id: str) -> dict:
+        try:
+            order = self._client.get_order_by_id(order_id)
+            status = order.status.value if hasattr(order.status, "value") else str(order.status)
+            qty = float(order.qty) if getattr(order, "qty", None) is not None else 0.0
+            return {"id": str(order.id), "status": status, "qty": qty}
+        except Exception as exc:
+            logger.error("get_order_snapshot failed for %s: %s", order_id, exc)
+            return None
+
     def place_stop_order(self, symbol: str, side: str, qty: float, stop_price: float) -> dict:
         self._require_connection()
+        min_shares = getattr(config_module, "MIN_SHARE_COUNT", 1)
+        qty = max(int(qty), min_shares)
         from alpaca.trading.requests import StopOrderRequest
         order = self._client.submit_order(StopOrderRequest(
             symbol=symbol.upper().strip(),
-            qty=int(qty),
+            qty=qty,
             side=OrderSide.BUY if side.upper() == "BUY" else OrderSide.SELL,
             time_in_force=TimeInForce.GTC,
-            stop_price=round(stop_price, 2)
+            stop_price=_round_price(stop_price)
         ))
         return {"order_id": str(order.id)}
 
@@ -1165,7 +1642,7 @@ class AlpacaBridge:
         self._require_connection()
         if symbol:
             try:
-                price = self.get_latest_price(symbol)
+                price = self.get_price(symbol)
                 if price and price > 0:
                     if new_stop >= price:
                         logger.warning(f"[MODIFY STOP P3] {symbol}: new_stop=${new_stop:.2f} >= current price ${price:.2f}. Skipping invalid stop update.")
@@ -1175,10 +1652,10 @@ class AlpacaBridge:
 
         try:
             from alpaca.trading.requests import ReplaceOrderRequest
-            req = ReplaceOrderRequest(stop_price=round(new_stop, 2))
+            req = ReplaceOrderRequest(stop_price=_round_price(new_stop))
             new_order = self._client.replace_order_by_id(order_id, req)
             new_id = str(getattr(new_order, "id", order_id))
-            logger.info(f"[MODIFY STOP P3] Replaced stop order {order_id} -> new order ID {new_id} at stop price ${new_stop:.2f} (Atomic PATCH)")
+            logger.info(f"[MODIFY STOP P3] Replaced stop order {order_id} -> new order ID {new_id} at stop price ${_round_price(new_stop):.2f} (Atomic PATCH)")
             return new_id
         except Exception as exc:
             logger.error(f"[MODIFY STOP P3] Failed to modify stop order {order_id}: {exc}")
@@ -1188,13 +1665,13 @@ class AlpacaBridge:
         self._require_connection()
         try:
             self._client.cancel_order_by_id(order_id)
+            logger.info("Cancelled order %s", order_id)
             return True
         except Exception as exc:
             logger.error("Failed to cancel order %s: %s", order_id, exc)
             return False
 
     def sync_today_trades_to_journal(self) -> int:
-        """Fetch today's filled orders from Alpaca and sync into trade_journal.jsonl."""
         if not self._connected or not self._client:
             return 0
         try:
@@ -1253,7 +1730,6 @@ class AlpacaBridge:
                     else:
                         expected_price = fill_price
 
-                # Signed Slippage: Positive (+) = Adverse, Negative (-) = Favorable
                 if expected_price > 0:
                     if side == "BUY":
                         slippage = (fill_price - expected_price) / expected_price
@@ -1262,7 +1738,6 @@ class AlpacaBridge:
                 else:
                     slippage = 0.0
 
-                # Execution Latency: Only for ENTRY / immediate execution. Mark None (N/A) for stop legs
                 submitted_at = getattr(o, "submitted_at", None) or getattr(o, "created_at", None)
                 fill_latency_ms = None
                 if submitted_at and getattr(o, "filled_at", None):
@@ -1294,7 +1769,7 @@ class AlpacaBridge:
                         from strategies.trailing_stop import get_trailing_manager
                         from strategies.trade_journal import get_today_closed_trades
 
-                        is_loss = True  # Default fail-safe to True
+                        is_loss = True
                         mgr = get_trailing_manager()
                         state = mgr.states.get(o.symbol)
 
@@ -1324,11 +1799,22 @@ class AlpacaBridge:
     def open_position_count(self) -> int:
         self._require_connection()
         try:
-            positions = self._client.get_all_positions()
+            positions = self._call_with_retry(lambda: self._client.get_all_positions())
             return len([p for p in positions if float(p.qty) != 0])
         except Exception as exc:
             logger.error("Failed to get open_position_count: %s", exc)
             return 0
+
+    def position_breakdown(self) -> dict:
+        self._require_connection()
+        try:
+            positions = self._call_with_retry(lambda: self._client.get_all_positions())
+            longs = sum(1 for p in positions if float(p.qty) > 0)
+            shorts = sum(1 for p in positions if float(p.qty) < 0)
+            return {"longs": longs, "shorts": shorts, "total": longs + shorts}
+        except Exception as exc:
+            logger.error("Failed to get position_breakdown: %s", exc)
+            return {"longs": 0, "shorts": 0, "total": 0}
 
     def has_position(self, symbol: str) -> bool:
         self._require_connection()
@@ -1338,10 +1824,28 @@ class AlpacaBridge:
         except Exception:
             return False
 
+    def _cancel_all_orders_for_symbol(self, symbol: str) -> None:
+        try:
+            orders = self.working_orders_plain()
+            sym_upper = symbol.upper().strip()
+            for o in orders:
+                o_sym = str(o.get("symbol") if isinstance(o, dict) else getattr(o, "symbol", "")).upper().strip()
+                o_id = o.get("id") if isinstance(o, dict) else getattr(o, "id", None)
+                if o_sym == sym_upper and o_id:
+                    try:
+                        self._client.cancel_order_by_id(o_id)
+                        logger.info("Cancelled working order %s for %s during position close.", o_id, sym_upper)
+                    except Exception as c_err:
+                        logger.debug("Failed cancelling order %s for %s: %s", o_id, sym_upper, c_err)
+        except Exception as err:
+            logger.debug("Error cancelling orders for %s: %s", symbol, err)
+
     def close_position(self, symbol: str) -> bool:
         self._require_connection()
         try:
+            self._cancel_all_orders_for_symbol(symbol)
             self._client.close_position(symbol.upper().strip())
+            logger.info("Emergency closed position for %s", symbol)
             return True
         except Exception as exc:
             logger.error("Failed to close position for %s: %s", symbol, exc)
@@ -1362,13 +1866,6 @@ class AlpacaBridge:
         except Exception as exc:
             logger.error("Failed to get market price for %s: %s", symbol, exc)
             return None
-
-    def execute_signal(self, signal: Signal, coach: bool = False) -> bool:
-        symbol = signal.symbol.upper().strip()
-
-        action = signal.action.upper().strip()
-        allow_short = bool(self._c("ALLOW_SHORT", False))
-        min_cash = float(self._c("MIN_TRADE_CASH", 100.0))
 
     def _cancel_working_entry_orders(self, symbol: str) -> None:
         try:
@@ -1475,7 +1972,75 @@ class AlpacaBridge:
         result = self._place_open_bracket(symbol, "SELL", qty, price, signal.confidence)
         return result.occupies_slot
 
+    def _evaluate_and_execute_rotation(self, signals: List[Signal]) -> None:
+        try:
+            self.rotator.state.reset_cycle()
+            raw_positions = self._client.get_all_positions()
+            if not raw_positions:
+                return
+
+            conf_lookup = {
+                (s.symbol.upper() if hasattr(s, "symbol") else s["symbol"].upper()): (s.confidence if hasattr(s, "confidence") else s["confidence"])
+                for s in signals
+            }
+
+            protected_syms = set(getattr(self, "protected_symbols", []))
+            open_pos = []
+            for raw in raw_positions:
+                qty = float(raw.qty)
+                if qty == 0:
+                    continue
+                avg_cost = float(raw.avg_entry_price)
+                mkt_price = float(raw.current_price)
+                upnl = float(raw.unrealized_pl)
+                sym = raw.symbol.upper()
+                pos = OpenPosition(
+                    symbol=sym,
+                    side=str(raw.side).lower(),
+                    qty=qty,
+                    avg_entry_price=avg_cost,
+                    current_price=mkt_price,
+                    unrealized_pnl=upnl,
+                    current_conf=conf_lookup.get(sym, 0.50),
+                    is_protected=(sym in protected_syms),
+                )
+                open_pos.append(pos)
+
+            incoming = []
+            for s in signals:
+                sym = s.symbol.upper() if hasattr(s, "symbol") else s["symbol"].upper()
+                action = s.action.upper() if hasattr(s, "action") else s["action"].upper()
+                conf = s.confidence if hasattr(s, "confidence") else s["confidence"]
+                price = s.price if hasattr(s, "price") else s["price"]
+                if action != "HOLD":
+                    incoming.append(IncomingSignal(symbol=sym, action=action, confidence=conf, price=price))
+
+            decision = self.rotator.evaluate(open_pos, incoming)
+            if decision.should_rotate:
+                exit_sym = decision.exit_position.symbol
+                enter_sig = decision.enter_signal
+                logger.info("[ROTATION EXECUTE] Closing %s → Opening %s", exit_sym, enter_sig.symbol)
+                try:
+                    self.close_position(exit_sym)
+                    logger.info("[ROTATION] Closed %s ✅", exit_sym)
+                except Exception as exc:
+                    logger.error("[ROTATION ABORT] Failed to close %s: %s — NOT entering %s", exit_sym, exc, enter_sig.symbol)
+                    return
+
+                matched_sig = next((s for s in signals if (s.symbol.upper() if hasattr(s, "symbol") else s["symbol"].upper()) == enter_sig.symbol), None)
+                if matched_sig:
+                    try:
+                        self.execute_signal(matched_sig)
+                        logger.info("[ROTATION] Entered %s ✅", enter_sig.symbol)
+                        self.rotator.state.record_rotation(decision)
+                    except Exception as exc:
+                        logger.error("[ROTATION PARTIAL] Closed %s but failed to enter %s: %s", exit_sym, enter_sig.symbol, exc)
+        except Exception as exc:
+            logger.error("Error during position rotation evaluation: %s", exc)
+
     def execute_all(self, signals: List[Signal]) -> dict:
+        self._evaluate_and_execute_rotation(signals)
+
         open_symbols = {
             p.symbol.upper()
             for p in self._client.get_all_positions()
@@ -1498,11 +2063,9 @@ class AlpacaBridge:
 
             current_position = self.get_position(symbol)
 
-            # Cancel stale entry BUY orders on SELL or HOLD
             if action == "SELL":
                 self._cancel_working_entry_orders(symbol)
 
-            # Skip BUY if already working entry order
             if action == "BUY" and self.has_working_order(symbol, action="BUY"):
                 logger.info("Working BUY entry order already exists for %s — skipping", symbol)
                 skipped += 1
@@ -1514,7 +2077,7 @@ class AlpacaBridge:
             )
 
             if opens_new:
-                max_open = int(getattr(config_module, "MAX_OPEN_POSITIONS"))
+                max_open = int(getattr(config_module, "MAX_OPEN_POSITIONS", 5))
                 planned_total = len(occupied_symbols | planned_new_symbols)
                 if planned_total >= max_open:
                     logger.warning("Max positions (%d) reached — skipping %s", max_open, symbol)

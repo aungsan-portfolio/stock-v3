@@ -70,12 +70,20 @@ def _cache_key(
 
 
 def _get_cache_file(key: str) -> str:
-    return os.path.join(_cache_dir, f"{key}.pkl")
+    return os.path.join(_cache_dir, f"{key}.json")
 
 
 def _read_cache(key: str, ttl: int = None) -> Optional[pd.DataFrame]:
     with _cache_lock:
         cache_file = _get_cache_file(key)
+        # Delete legacy .pkl if present for security
+        legacy_pkl = os.path.join(_cache_dir, f"{key}.pkl")
+        if os.path.exists(legacy_pkl):
+            try:
+                os.remove(legacy_pkl)
+            except Exception:
+                pass
+
         if not os.path.exists(cache_file):
             return None
         try:
@@ -83,20 +91,30 @@ def _read_cache(key: str, ttl: int = None) -> Optional[pd.DataFrame]:
             limit = ttl if ttl is not None else getattr(config, "INTRADAY_CACHE_TTL_SECONDS", 30)
             if (_time.time() - mtime) > limit:
                 return None
-            with open(cache_file, "rb") as f:
-                return pickle.load(f)
-        except Exception:
+            df = pd.read_json(cache_file, orient="split")
+            return df
+        except Exception as e:
+            logger.debug(f"Failed to read JSON cache for {key}: {e}")
             return None
 
 
 def _write_cache(key: str, df: pd.DataFrame):
+    if df is None or df.empty:
+        return
     with _cache_lock:
         cache_file = _get_cache_file(key)
+        temp_file = cache_file + ".tmp"
         try:
-            with open(cache_file, "wb") as f:
-                pickle.dump(df, f)
+            df.to_json(temp_file, orient="split", date_format="iso")
+            os.replace(temp_file, cache_file)
         except Exception as e:
-            logger.warning(f"Failed to write cache for {key}: {e}")
+            logger.warning(f"Failed to write JSON cache for {key}: {e}")
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except Exception:
+                    pass
+
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -147,11 +165,25 @@ def _validate_intraday_data(df: pd.DataFrame, symbol: str, interval: str, valida
                 logger.warning("Data validation failed for %s: Non-positive price detected.", symbol)
                 return pd.DataFrame()
 
+        # 1.5. Price Integrity Check (High < Low)
+        if 'high' in df.columns and 'low' in df.columns:
+            if (df['high'] < df['low']).any():
+                logger.warning("Data validation failed for %s: High < Low inverted price detected.", symbol)
+                return pd.DataFrame()
+
         # 2. Frozen Feed Check (Constant close prices)
         if 'close' in df.columns and len(df) >= 10:
             recent_closes = df['close'].tail(10)
             if recent_closes.nunique() == 1:
                 logger.warning("Data validation failed for %s: True frozen price feed detected.", symbol)
+                return pd.DataFrame()
+
+        # 2.5. ATR & Feature Integrity Check
+        if "atr" in df.columns and len(df) > 0:
+            last_atr = float(df["atr"].iloc[-1])
+            import numpy as np
+            if np.isnan(last_atr) or last_atr <= 0:
+                logger.warning("Data validation failed for %s: Invalid ATR %.4f detected.", symbol, last_atr)
                 return pd.DataFrame()
 
         # 3. Stale Quote Guard (Only for live real-time feeds when validate_staleness is True)
@@ -176,7 +208,7 @@ def _validate_intraday_data(df: pd.DataFrame, symbol: str, interval: str, valida
                     interval_seconds = int(interval.replace("h", "")) * 3600
                     
                 buffer_seconds = getattr(config, "STALE_QUOTE_BUFFER_SECONDS", 30)
-                max_stale = getattr(config, "STALE_QUOTE_MAX_SECONDS", 1200)
+                max_stale = getattr(config, "STALE_QUOTE_MAX_SECONDS", 300)
 
                 if staleness_seconds > max_stale:
                     msg = f"Data validation failed for {symbol}: Stale quote. Last bar was {staleness_seconds}s ago (Limit: {max_stale}s)."

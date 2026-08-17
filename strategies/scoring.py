@@ -11,6 +11,10 @@ class RiskAdjustedSignalScorer:
     def __init__(self):
         pass
 
+    def score_signal(self, signal) -> float:
+        """Alias method calling calculate_risk_adjusted_confidence for backtester compatibility."""
+        return self.calculate_risk_adjusted_confidence(signal)
+
     def calculate_risk_adjusted_confidence(self, signal) -> float:
         """
         Adjusts the raw strategy confidence score based on:

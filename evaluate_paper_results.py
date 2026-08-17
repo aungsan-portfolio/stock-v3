@@ -151,9 +151,9 @@ def print_report(m: dict):
     print("----------------------------------------------------------------------")
     
     def format_status(passed: bool) -> str:
-        return "✅ PASSED" if passed else "❌ FAILED"
+        return "[PASS]" if passed else "[FAIL]"
 
-    prelim = " (⚠️ Preliminary - sample size N < 30)" if not gate_n else ""
+    prelim = " (Preliminary - sample size N < 30)" if not gate_n else ""
 
     print(f"1. Statistical Sample Size (N >= 30):   {format_status(gate_n)} (N = {m['n_trades']})")
     
@@ -165,10 +165,10 @@ def print_report(m: dict):
     print("----------------------------------------------------------------------")
     
     if all_passed:
-        print("🎉 STATUS: ALL GATES PASSED! Safe to promote system to LIVE TRADING.")
+        print("[SUCCESS] STATUS: ALL GATES PASSED! Safe to promote system to LIVE TRADING.")
         sys.exit(0)
     else:
-        print("⚠️ STATUS: GATES NOT YET SATISFIED. Continue paper trading.")
+        print("[NOTICE] STATUS: GATES NOT YET SATISFIED. Continue paper trading.")
         sys.exit(1)
 
 

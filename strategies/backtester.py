@@ -98,6 +98,7 @@ def run_backtest(symbol: str, strategy_name: str, lookback_days: int = 5, overri
         
     trades: List[dict] = []
     active_trade = None
+    pending_signal = None  # H-06 Causal Queue for t+1 Open Fill
     
     start_equity = 100_000.0
     current_equity = start_equity
@@ -125,6 +126,44 @@ def run_backtest(symbol: str, strategy_name: str, lookback_days: int = 5, overri
             day_opening_equity = current_equity
             last_date = current_date
             
+        # 0. Execute pending signal from t-1 on bar t+1's Open (H-06 Causal Fill)
+        if pending_signal is not None and not active_trade:
+            p_sig = pending_signal["signal"]
+            p_shares = pending_signal["shares"]
+            p_decision_time = pending_signal["decision_time"]
+
+            fill_price = current_open * (1 + slippage_pct) if p_sig.side == 'BUY' else current_open * (1 - slippage_pct)
+            stop_dist = abs(p_sig.entry_price - p_sig.stop_price)
+            target_dist = abs(p_sig.target_price - p_sig.entry_price)
+            stop_price = fill_price - stop_dist if p_sig.side == 'BUY' else fill_price + stop_dist
+            target_price = fill_price + target_dist if p_sig.side == 'BUY' else fill_price - target_dist
+
+            trade_id_counter += 1
+            active_trade = {
+                'id': trade_id_counter,
+                'symbol': symbol,
+                'side': p_sig.side,
+                'shares': p_shares,
+                'entry': fill_price,
+                'stop': stop_price,
+                'target': target_price,
+                'decision_time': p_decision_time,
+                'submit_time': current_time,
+                'fill_time': current_time,
+                'entry_time': current_time,
+                'reason': p_sig.reason
+            }
+            mock_executions.append({
+                "timestamp": current_time.isoformat(),
+                "event_type": "FILL",
+                "type": "FILL",
+                "execution_id": f"backtest-entry-{trade_id_counter}",
+                "qty": float(p_shares),
+                "side": "BUY" if p_sig.side == "BUY" else "SELL",
+                "symbol": symbol
+            })
+            pending_signal = None
+
         # 1. Check active trade exits using t-1 stop
         if active_trade:
             exit_price = _intrabar_exit_price(
@@ -198,8 +237,8 @@ def run_backtest(symbol: str, strategy_name: str, lookback_days: int = 5, overri
                 )
                 active_trade['stop'] = min(active_trade['stop'], stop_val)
             
-        # 2. No active trade, check risk limits & entries
-        if not active_trade:
+        # 2. No active trade or pending signal, check risk limits & entries
+        if not active_trade and pending_signal is None:
             # Check Daily Loss halt parity (Dollar & Percentage limits)
             max_daily_loss_dollars = getattr(config, "MAX_DAILY_LOSS_DOLLARS", 300.0)
             max_daily_loss_pct = getattr(config, "MAX_DAILY_LOSS_PCT", 3.0) / 100.0
@@ -241,20 +280,16 @@ def run_backtest(symbol: str, strategy_name: str, lookback_days: int = 5, overri
                 try:
                     scorer = RiskAdjustedSignalScorer()
                     score = scorer.score_signal(signal)
-                    signal.confidence = score.final_confidence
+                    signal.confidence = score if isinstance(score, (int, float)) else getattr(score, "final_confidence", score)
                 except Exception:
                     pass
 
             if signal and signal.confidence >= min_confidence:
-                # Apply slippage to entry price
-                entry_price = signal.entry_price
-                entry_price = entry_price * (1 + slippage_pct) if signal.side == 'BUY' else entry_price * (1 - slippage_pct)
-                
                 # Apply Sizing Parity (C3)
                 sizing_method = getattr(config, "SIZING_METHOD", "risk_based")
                 if sizing_method == "risk_based":
                     try:
-                        shares = calculate_shares(signal, current_equity, getattr(strategy, "name", "ORB"))
+                        shares = calculate_shares(signal, current_equity)
                     except Exception:
                         risk_pct = getattr(config, "MAX_RISK_PER_TRADE_PCT", 1.0) / 100.0
                         max_trade_val = getattr(config, "MAX_TRADE_VALUE", None)
@@ -263,7 +298,7 @@ def run_backtest(symbol: str, strategy_name: str, lookback_days: int = 5, overri
                         shares = risk_math.shares_for_risk(
                             account_equity=current_equity,
                             risk_pct=risk_pct,
-                            entry_price=entry_price,
+                            entry_price=signal.entry_price,
                             stop_price=signal.stop_price,
                             side=math_side,
                             max_trade_value=max_trade_val,
@@ -271,36 +306,42 @@ def run_backtest(symbol: str, strategy_name: str, lookback_days: int = 5, overri
                         )
                 elif sizing_method == "fixed_dollars":
                     dollar_amount = getattr(config, "FIXED_DOLLAR_AMOUNT", 1000.0)
-                    shares = math.floor(dollar_amount / entry_price)
+                    shares = math.floor(dollar_amount / signal.entry_price)
                 else:
                     shares = getattr(config, "BACKTEST_SHARE_COUNT", getattr(config, "FIXED_SHARE_COUNT", 100))
                     
                 if shares <= 0:
                     continue
+
+                # H-07 Unified Risk Gate Check
+                try:
+                    from strategies.intraday_risk import pre_trade_check
+                    risk_dollars = shares * abs(signal.entry_price - signal.stop_price)
+                    allowed, veto_reason = pre_trade_check(
+                        equity=current_equity,
+                        current_pnl=current_equity - start_equity,
+                        trades_today=len([tr for tr in trades if tr['exit_time'].date() == current_date]),
+                        open_positions=1 if active_trade else 0,
+                        day_trades_last_5_days=day_trades_count,
+                        risk_dollars=risk_dollars,
+                        symbol=symbol,
+                        side=signal.side,
+                        open_symbols=[symbol] if active_trade else [],
+                        max_trades=getattr(config, "MAX_TRADES_PER_DAY", 15),
+                    )
+                    if not allowed:
+                        logger.debug(f"[BACKTEST RISK VETO] {symbol} {signal.side}: {veto_reason}")
+                        continue
+                except Exception as risk_err:
+                    logger.warning("[BACKTEST RISK GATE ERROR] %s: %s", symbol, risk_err)
                     
-                trade_id_counter += 1
-                active_trade = {
-                    'id': trade_id_counter,
-                    'symbol': symbol,
-                    'side': signal.side,
-                    'shares': shares,
-                    'entry': entry_price,
-                    'stop': signal.stop_price,
-                    'target': signal.target_price,
-                    'entry_time': current_time,
-                    'reason': signal.reason
+                # Store in queue for causal t+1 open fill
+                pending_signal = {
+                    "signal": signal,
+                    "shares": shares,
+                    "decision_time": current_time,
                 }
-                
-                # Append entry mock execution
-                mock_executions.append({
-                    "timestamp": current_time.isoformat(),
-                    "event_type": "FILL",
-                    "type": "FILL",
-                    "execution_id": f"backtest-entry-{trade_id_counter}",
-                    "qty": float(shares),
-                    "side": "BUY" if signal.side == "BUY" else "SELL",
-                    "symbol": symbol
-                })
+
                 
     # Force close any open trade at the end
     if active_trade:
@@ -461,6 +502,7 @@ def run_portfolio_backtest(
     alloc_pct = getattr(config, "PORTFOLIO_ALLOCATION_PER_TRADE", 0.20)
     
     active_positions = {}
+    pending_signals = {}  # H-06 Causal Queue for portfolio t+1 Open Fill
     trades = []
     equity_curve = []
     
@@ -479,6 +521,59 @@ def run_portfolio_backtest(
             day_opening_equity = current_equity
             last_date = current_date
             symbol_consecutive_losses = {} # Reset per-symbol loss counts on new day
+
+        # 0. Execute pending signals from t-1 on bar t's Open (H-06 Causal Fill)
+        executed_pending_syms = []
+        for sym, p_data in list(pending_signals.items()):
+            if len(active_positions) >= max_positions or sym in active_positions:
+                executed_pending_syms.append(sym)
+                continue
+            df = data_dict.get(sym)
+            if df is None or t not in df.index:
+                continue
+
+            current_open = df.loc[t, 'open']
+            p_sig = p_data["signal"]
+            p_shares = p_data["shares"]
+            p_decision_time = p_data["decision_time"]
+
+            fill_price = current_open * (1 + slippage_pct) if p_sig.side == 'BUY' else current_open * (1 - slippage_pct)
+            stop_dist = abs(p_sig.entry_price - p_sig.stop_price)
+            target_dist = abs(p_sig.target_price - p_sig.entry_price)
+            stop_price = fill_price - stop_dist if p_sig.side == 'BUY' else fill_price + stop_dist
+            target_price = fill_price + target_dist if p_sig.side == 'BUY' else fill_price - target_dist
+
+            trade_id_counter += 1
+            active_positions[sym] = {
+                'id': trade_id_counter,
+                'symbol': sym,
+                'side': p_sig.side,
+                'confidence': float(p_sig.confidence),
+                'shares': p_shares,
+                'entry': fill_price,
+                'stop': stop_price,
+                'target': target_price,
+                'peak': fill_price,
+                'decision_time': p_decision_time,
+                'submit_time': t,
+                'fill_time': t,
+                'entry_time': t,
+                'strategy': getattr(p_sig, "strategy", strategy_name),
+                'reason': p_sig.reason
+            }
+            mock_executions.append({
+                "timestamp": t.isoformat(),
+                "event_type": "FILL",
+                "type": "FILL",
+                "execution_id": f"backtest-entry-{trade_id_counter}",
+                "qty": float(p_shares),
+                "side": "BUY" if p_sig.side == "BUY" else "SELL",
+                "symbol": sym
+            })
+            executed_pending_syms.append(sym)
+
+        for sym in executed_pending_syms:
+            pending_signals.pop(sym, None)
 
         # 1. Check Exits using t-1 stop
         exited_symbols = []
@@ -572,7 +667,7 @@ def run_portfolio_backtest(
             del active_positions[sym]
             
         # 2. Check Entries
-        if len(active_positions) < max_positions:
+        if len(active_positions) + len(pending_signals) < max_positions:
             # Check Daily Loss Halt Parity
             max_daily_loss_dollars = getattr(config, "MAX_DAILY_LOSS_DOLLARS", 300.0)
             max_daily_loss_pct = getattr(config, "MAX_DAILY_LOSS_PCT", 3.0) / 100.0
@@ -592,9 +687,10 @@ def run_portfolio_backtest(
                     continue
 
                 for sym, df in data_dict.items():
-                    if len(active_positions) >= max_positions:
+                    if len(active_positions) + len(pending_signals) >= max_positions:
                         break
-                    if sym in active_positions: continue
+                    if sym in active_positions or sym in pending_signals:
+                        continue
                     if t not in df.index: continue
                     
                     current_df = df.loc[:t]
@@ -603,7 +699,7 @@ def run_portfolio_backtest(
                     if live_parity:
                         # Check correlated tech cluster exposure cap (Option A Parity)
                         from strategies.intraday_risk import check_correlated_cluster_exposure
-                        if check_correlated_cluster_exposure(list(active_positions.keys()), sym):
+                        if check_correlated_cluster_exposure(list(active_positions.keys()) + list(pending_signals.keys()), sym):
                             continue
 
                         # Check 5-min symbol cooldown on loss
@@ -638,9 +734,6 @@ def run_portfolio_backtest(
                             best_signal = None
 
                     if best_signal:
-                        entry_price = best_signal.entry_price
-                        entry_price = entry_price * (1 + slippage_pct) if best_signal.side == 'BUY' else entry_price * (1 - slippage_pct)
-                        
                         # Apply Sizing Parity
                         sizing_method = getattr(config, "SIZING_METHOD", "risk_based")
                         if sizing_method == "risk_based":
@@ -651,7 +744,7 @@ def run_portfolio_backtest(
                             shares = risk_math.shares_for_risk(
                                 account_equity=current_equity,
                                 risk_pct=risk_pct,
-                                entry_price=entry_price,
+                                entry_price=best_signal.entry_price,
                                 stop_price=best_signal.stop_price,
                                 side=math_side,
                                 max_trade_value=max_trade_val,
@@ -659,40 +752,43 @@ def run_portfolio_backtest(
                             )
                         elif sizing_method == "fixed_dollars":
                             dollar_amount = getattr(config, "FIXED_DOLLAR_AMOUNT", 1000.0)
-                            shares = math.floor(dollar_amount / entry_price)
+                            shares = math.floor(dollar_amount / best_signal.entry_price)
                         else:
                             alloc_dollars = current_equity * alloc_pct
-                            shares = int(alloc_dollars / entry_price)
+                            shares = int(alloc_dollars / best_signal.entry_price)
                             
                         if shares <= 0:
                             continue
-                            
-                        trade_id_counter += 1
-                        active_positions[sym] = {
-                            'id': trade_id_counter,
-                            'symbol': sym,
-                            'side': best_signal.side,
-                            'confidence': float(best_signal.confidence),
-                            'shares': shares,
-                            'entry': entry_price,
-                            'stop': best_signal.stop_price,
-                            'target': best_signal.target_price,
-                            'peak': entry_price,
-                            'entry_time': t,
-                            'strategy': getattr(best_signal, "strategy", strategy_name),
-                            'reason': best_signal.reason
+
+                        # H-07 Unified Risk Gate Check
+                        try:
+                            from strategies.intraday_risk import pre_trade_check
+                            risk_dollars = shares * abs(best_signal.entry_price - best_signal.stop_price)
+                            allowed, veto_reason = pre_trade_check(
+                                equity=current_equity,
+                                current_pnl=current_equity - start_equity,
+                                trades_today=len([tr for tr in trades if tr['exit_time'].date() == current_date]),
+                                open_positions=len(active_positions),
+                                day_trades_last_5_days=today_trades_count,
+                                risk_dollars=risk_dollars,
+                                symbol=sym,
+                                side=best_signal.side,
+                                open_symbols=list(active_positions.keys()),
+                                max_trades=getattr(config, "MAX_TRADES_PER_DAY", 15),
+                            )
+                            if not allowed:
+                                logger.debug(f"[PORTFOLIO BACKTEST RISK VETO] {sym} {best_signal.side}: {veto_reason}")
+                                continue
+                        except Exception as risk_err:
+                            logger.warning("[PORTFOLIO BACKTEST RISK GATE ERROR] %s: %s", sym, risk_err)
+
+                        # Queue for causal t+1 open fill
+                        pending_signals[sym] = {
+                            "signal": best_signal,
+                            "shares": shares,
+                            "decision_time": t,
                         }
-                        
-                        # Append entry mock execution
-                        mock_executions.append({
-                            "timestamp": t.isoformat(),
-                            "event_type": "FILL",
-                            "type": "FILL",
-                            "execution_id": f"backtest-entry-{trade_id_counter}",
-                            "qty": float(shares),
-                            "side": "BUY" if best_signal.side == "BUY" else "SELL",
-                            "symbol": sym
-                        })
+
                         
                         if len(active_positions) >= max_positions:
                             break # portfolio full

@@ -6,6 +6,7 @@ Priority-1 production fixes:
 - Cached DataFrames are copied on read/write to avoid accidental mutation.
 - make_labels() preserves unknown future rows as NaN instead of converting them to 0.
 """
+import functools
 import logging
 import time
 from typing import Dict, Optional, Tuple
@@ -17,6 +18,55 @@ import yfinance as yf
 import config
 
 logger = logging.getLogger(__name__)
+
+# ─── Retry Configuration ───────────────────────────────────────────────────────
+MAX_FETCH_RETRIES   = 3       # Maximum retry attempts
+RETRY_BASE_DELAY    = 2.0     # Base delay in seconds (exponential backoff)
+RETRY_BACKOFF_MULT  = 2.0     # Multiplier: 2s → 4s → 8s
+RETRY_MAX_DELAY     = 30.0    # Cap so it never waits longer than 30s
+
+
+def with_exponential_backoff(max_retries=MAX_FETCH_RETRIES,
+                             base_delay=RETRY_BASE_DELAY,
+                             backoff_mult=RETRY_BACKOFF_MULT,
+                             max_delay=RETRY_MAX_DELAY,
+                             retryable_exceptions=(Exception,)):
+    """
+    Decorator: wraps any data-fetch function with exponential-backoff retry.
+    Only retries on retryable_exceptions; re-raises immediately on others.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            symbol  = args[0] if args else kwargs.get("symbol", "UNKNOWN")
+            delay   = base_delay
+            last_exc = None
+
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+
+                except retryable_exceptions as exc:
+                    last_exc = exc
+                    if attempt == max_retries:
+                        logger.error(
+                            "[DATA FETCH FAILED] %s — all %d attempts exhausted. "
+                            "Last error: %s",
+                            symbol, max_retries, exc
+                        )
+                        raise
+
+                    wait = min(delay, max_delay)
+                    logger.warning(
+                        "[DATA FETCH RETRY] %s — attempt %d/%d failed (%s). "
+                        "Retrying in %.1fs...",
+                        symbol, attempt, max_retries, exc, wait
+                    )
+                    time.sleep(wait)
+                    delay *= backoff_mult   # 2s → 4s → 8s ...
+
+        return wrapper
+    return decorator
 
 # key = (symbol, period, interval), value = (timestamp, dataframe)
 _cache: Dict[Tuple[str, str, str], Tuple[float, pd.DataFrame]] = {}
@@ -97,6 +147,10 @@ def _get_or_create_provider():
     from data_providers import MultiSourceDataProvider
     return MultiSourceDataProvider()
 
+@with_exponential_backoff(
+    max_retries=MAX_FETCH_RETRIES,
+    retryable_exceptions=(ValueError, ConnectionError, TimeoutError, OSError)
+)
 def fetch_ohlcv(
     symbol: str,
     period: str = None,
@@ -297,13 +351,17 @@ def _add_market_relative_features(
     """
     cfg = cfg or config
     if market_df is None or "Close" not in getattr(market_df, "columns", []):
+        try:
+            market_df = fetch_market_benchmark()
+        except Exception as e:
+            logger.debug("Auto-fetch market_df failed: %s", e)
+
+    if market_df is None or "Close" not in getattr(market_df, "columns", []):
         global _MARKET_DF_WARNED
         if not _MARKET_DF_WARNED:
             logger.warning(
-                "USE_MARKET_RELATIVE_FEATURES is on but no market_df was passed to "
-                "build_features() — emitting NEUTRAL (0.0) relative-strength features. "
-                "Wire market_df (data_manager.fetch_market_benchmark) through the "
-                "engines before trusting these features in training."
+                "USE_MARKET_RELATIVE_FEATURES is on but market_df unavailable — "
+                "emitting NEUTRAL (0.0) relative-strength features."
             )
             _MARKET_DF_WARNED = True
         for col in _MARKET_REL_FEATURE_COLS:

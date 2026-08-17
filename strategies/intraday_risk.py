@@ -6,7 +6,7 @@ Every function takes plain values and returns bool/float.
 """
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 import config
 from strategies.errors import (
@@ -148,6 +148,105 @@ def get_symbol_consecutive_losses(symbol: str, journal_file=None) -> int:
 
 
 TECH_CORRELATED_CLUSTER = {"NVDA", "AAPL", "MSFT", "AMZN", "TSLA", "META", "AMD", "GOOGL", "QQQ", "PLTR", "AVGO", "MU", "NFLX"}
+SOXX_TECH_LONG_VETO_THRESHOLD = -0.75  # SOXX -0.75% threshold
+
+
+def _get_soxx_realtime_pct_change() -> Optional[float]:
+    """Fetch real-time % change for SOXX semiconductor ETF."""
+    try:
+        from strategies.regime_engine import get_soxx_pct_change
+        cached = get_soxx_pct_change()
+        if cached is not None:
+            return cached
+    except Exception:
+        pass
+    try:
+        import yfinance as yf
+        soxx = yf.Ticker("SOXX")
+        hist = soxx.history(period="1d", interval="1m")
+        if hist.empty:
+            return None
+        open_price = hist["Close"].iloc[0]
+        last_price = hist["Close"].iloc[-1]
+        return ((last_price - open_price) / open_price) * 100.0
+    except Exception as e:
+        logger.debug("[SOXX GATE] Error fetching SOXX: %s", e)
+        return None
+
+
+from rs_calculator import RelativeStrengthEvaluator
+from strategies.soxx_gate_config import (
+    SOXX_VETO_THRESHOLD,
+    SOXX_GOVERNED_SYMBOLS,
+    RS_BYPASS_COOLDOWN_CYCLES,
+)
+
+_rs_evaluator = RelativeStrengthEvaluator()
+_bypass_cooldowns: dict[str, int] = {}
+
+
+def check_soxx_tech_long_gate(
+    symbol: str,
+    side: str = "BUY",
+    pred_conf: float = 0.55,
+    symbol_df=None,
+    soxx_df=None,
+) -> Tuple[bool, str]:
+    """
+    Blocks BUY/Long entries on Tech/Semi symbols if SOXX ETF is weak (<= -0.75%),
+    UNLESS the individual symbol demonstrates strong Relative Strength (RSI >= 55 or Alpha >= +1.5%).
+    """
+    if not getattr(config, "SOXX_GATE_ENABLED", True):
+        return True, "SOXX gate: disabled"
+    if side.upper() not in ("BUY", "LONG"):
+        return True, "SOXX gate: N/A (short trade)"
+    sym_upper = symbol.upper().strip()
+    if sym_upper not in SOXX_GOVERNED_SYMBOLS and sym_upper not in {"NVDA", "AMD", "INTC", "SMCI", "QCOM", "MU", "AVGO"}:
+        return True, "SOXX gate: N/A (non-tech symbol)"
+
+    soxx_pct = _get_soxx_realtime_pct_change()
+    if soxx_pct is None:
+        logger.warning("[SOXX GATE] Could not fetch SOXX data. Allowing %s entry.", symbol)
+        return True, "SOXX gate: data unavailable (pass)"
+
+    # Convert pct change from percentage (e.g. -1.49) to float ratio (e.g. -0.0149)
+    soxx_ratio = soxx_pct / 100.0
+
+    if soxx_ratio <= SOXX_VETO_THRESHOLD:
+        # Check RS Bypass if DataFrames are provided
+        if symbol_df is not None and soxx_df is not None:
+            remaining_cooldown = _bypass_cooldowns.get(sym_upper, 0)
+            if remaining_cooldown > 0:
+                _bypass_cooldowns[sym_upper] = remaining_cooldown - 1
+                reason = f"SOXX Gate VETO: {sym_upper} RS Bypass on cooldown ({remaining_cooldown} cycles left). SOXX is {soxx_pct:.2f}%"
+                logger.info("[SOXX GATE VETO] %s", reason)
+                return False, reason
+
+            try:
+                rs_res = _rs_evaluator.evaluate(
+                    symbol=sym_upper,
+                    symbol_df=symbol_df,
+                    soxx_df=soxx_df,
+                    soxx_chg_pct=soxx_ratio,
+                    pred_conf=pred_conf,
+                )
+                if rs_res.bypass_granted:
+                    _bypass_cooldowns[sym_upper] = RS_BYPASS_COOLDOWN_CYCLES
+                    reason = f"SOXX Gate BYPASS: {sym_upper} Long ALLOWED despite SOXX {soxx_pct:.2f}%. {rs_res.bypass_reason}"
+                    logger.info("[SOXX GATE BYPASS] %s", reason)
+                    return True, reason
+            except Exception as exc:
+                logger.warning("[SOXX GATE] RS Eval error: %s", exc)
+
+        reason = (
+            f"SOXX Pre-Trade Gate VETO: {symbol} Long blocked. "
+            f"SOXX is {soxx_pct:.2f}% (threshold: {SOXX_TECH_LONG_VETO_THRESHOLD}%)"
+        )
+        logger.info("[SOXX GATE VETO] %s", reason)
+        return False, reason
+
+    return True, f"SOXX gate: passed ({soxx_pct:.2f}%)"
+
 
 def check_correlated_cluster_exposure(open_symbols: list, new_symbol: str) -> Optional[str]:
     """Prevent sector risk concentration by capping simultaneous open positions in the Tech correlated cluster."""
@@ -164,7 +263,7 @@ def check_correlated_cluster_exposure(open_symbols: list, new_symbol: str) -> Op
 
 def pre_trade_check(
     equity: float,
-    current_pnl: float,
+    current_pnl: Optional[float],
     trades_today: int,
     open_positions: int,
     day_trades_last_5_days: int,
@@ -173,6 +272,7 @@ def pre_trade_check(
     max_risk_pct: float = 1.0,
     open_symbols: Optional[list] = None,
     max_trades: Optional[int] = None,
+    side: str = "BUY",
 ) -> str:
     """Run all risk checks before placing a trade."""
     if current_pnl is None:
@@ -182,6 +282,11 @@ def pre_trade_check(
         cluster_err = check_correlated_cluster_exposure(open_symbols, symbol)
         if cluster_err:
             return cluster_err
+
+    if symbol:
+        soxx_ok, soxx_reason = check_soxx_tech_long_gate(symbol, side=side)
+        if not soxx_ok:
+            return soxx_reason
 
     if not check_daily_loss(current_pnl, equity):
         return f"Daily loss limit reached (PnL ${current_pnl:.2f})"

@@ -58,7 +58,8 @@ class GapAndGoStrategy(BaseStrategy):
         volume = float(last.get("volume", 0))
         vol_ma = float(last.get("volume_ma", 1))
 
-        if atr <= 0 or np.isnan(atr):
+        if atr < 0.01 or np.isnan(atr):
+            logger.warning("[GAP QUALITY FAIL] %s: ATR=%.4f invalid (< $0.01 threshold). Rejecting.", symbol, atr)
             return None
 
         rel_vol = volume / vol_ma if vol_ma > 0 else 0

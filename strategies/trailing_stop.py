@@ -10,7 +10,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, asdict
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import config
 from strategies.base import TradeSignal
@@ -73,6 +73,50 @@ class TrailingStopState:
     strategy: str = "UNKNOWN"
     signal_id: Optional[str] = None
     target_price: Optional[float] = None
+    entry_time: float = 0.0
+
+
+MAX_HOLD_MINUTES = 25.0
+BREAKEVEN_BAND_PCT = 0.10
+TIME_EXIT_CHECK_ENABLED = True
+
+
+def check_time_based_exit(
+    symbol: str,
+    side: str,
+    entry_price: float,
+    current_price: float,
+    entry_timestamp: float,
+    cfg=None
+) -> Tuple[bool, str]:
+    """
+    Triggers time-based exit if scalp position held > 25 minutes and stagnant near breakeven (+-0.10%).
+    """
+    cfg = cfg or config
+    enabled = getattr(cfg, "TIME_EXIT_CHECK_ENABLED", TIME_EXIT_CHECK_ENABLED)
+    if not enabled or not entry_timestamp:
+        return False, "Time exit: disabled or missing timestamp"
+
+    now_ts = time.time()
+    hold_minutes = (now_ts - entry_timestamp) / 60.0
+    max_hold = getattr(cfg, "MAX_HOLD_MINUTES", MAX_HOLD_MINUTES)
+
+    if hold_minutes < max_hold:
+        return False, f"Time exit: {hold_minutes:.1f}m < {max_hold}m threshold"
+
+    pct_from_entry = ((current_price - entry_price) / entry_price) * 100.0 if entry_price > 0 else 0.0
+    band_pct = getattr(cfg, "BREAKEVEN_BAND_PCT", BREAKEVEN_BAND_PCT)
+
+    if abs(pct_from_entry) > band_pct:
+        direction = "profit" if pct_from_entry > 0 else "loss"
+        return False, f"Time exit: {hold_minutes:.1f}m held but price moved {pct_from_entry:+.2f}% ({direction}) — let run"
+
+    reason = (
+        f"TIME EXIT TRIGGERED: {symbol} ({side}) held {hold_minutes:.1f}m "
+        f"with price {pct_from_entry:+.2f}% from entry — stagnant near breakeven. Closing to free capital."
+    )
+    logger.info("[TIME EXIT] %s", reason)
+    return True, reason
 
 
 def normalize_order_type(order_type: object) -> str:
@@ -142,7 +186,7 @@ def _extract_order_info(o: object) -> dict:
 
 class DynamicTrailingStopManager:
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         with self._lock:
             self.states: Dict[str, TrailingStopState] = {}
             self._load_state()
@@ -172,7 +216,53 @@ class DynamicTrailingStopManager:
         except Exception as e:
             logger.error(f"Failed to save trailing stop state: {e}")
 
+    def reset(self, symbol: str):
+        """Reset trailing stop state for a symbol."""
+        sym_upper = symbol.upper().strip()
+        with self._lock:
+            keys_to_del = [k for k in self.states if k.upper().strip() == sym_upper]
+            for k in keys_to_del:
+                del self.states[k]
+            self._save_state()
+            logger.info(f"Reset trailing stop state for {symbol}")
+
+
+    def apply_confirmed_fill(
+
+        self,
+        signal: TradeSignal,
+        average_fill_price: float,
+        cumulative_qty: float,
+        stop_order_id: Optional[str] = None,
+        bridge: Optional[object] = None,
+        tp_order_id: Optional[str] = None,
+    ) -> TrailingStopState:
+        """Apply a confirmed fill report to initialize or update position trailing state."""
+        symbol = signal.symbol.upper().strip()
+        with self._lock:
+            if symbol in self.states:
+                state = self.states[symbol]
+                state.entry_price = average_fill_price
+                state.qty = cumulative_qty
+                if stop_order_id:
+                    state.order_id = stop_order_id
+                state.last_updated = time.time()
+                self._save_state()
+                logger.info(f"Updated Trailing Stop for {symbol}: fill=${average_fill_price:.4f}, cumulative_qty={cumulative_qty:.4f}")
+                return state
+            else:
+                return self.initialize_position(
+                    signal=signal,
+                    fill_price=average_fill_price,
+                    qty=cumulative_qty,
+                    stop_order_id=stop_order_id,
+                    bridge=bridge,
+                    tp_order_id=tp_order_id,
+                )
+
     def initialize_position(self, signal: TradeSignal, fill_price: float, qty: float = 0.0, stop_order_id: Optional[str] = None, bridge: Optional[object] = None, tp_order_id: Optional[str] = None) -> TrailingStopState:
+
+
         """Initialize trailing stop when order is filled."""
         with self._lock:
             atr = getattr(signal, 'atr', 0.0)
@@ -244,8 +334,8 @@ class DynamicTrailingStopManager:
         is_short = (side.upper() == "SELL")
         decimals = 4 if fill_price < 1.0 else 2
         stop_distance = (initial_stop - fill_price) if is_short else (fill_price - initial_stop)
-        # Fix A: +15% rebuild buffer to prevent rounding errors
-        min_required_distance = max(0.05, fill_price * 0.002)
+        # Fix A: Minimum required broker tick/distance buffer (0.05 min or 5 bps price scale)
+        min_required_distance = max(0.05, fill_price * 0.0005)
         min_rebuild_distance  = round(min_required_distance * 1.15, decimals)
         
         if is_short:
@@ -269,40 +359,42 @@ class DynamicTrailingStopManager:
             # Fix B: min_rebuild_distance (with 15% buffer) for safe offset
             stop_offset = max(fill_price * 0.005, min_rebuild_distance)
 
+            min_rr = getattr(config, "MIN_RR_RATIO", 1.0)
             if is_short:
                 new_stop_price = round(fill_price + stop_offset, decimals)
-                new_target_price = None
-                if target_price and target_price < signal_price:
-                    tp_offset = signal_price - target_price
-                    new_target_price = round(max(0.01, fill_price - tp_offset), decimals)
+                rebuilt_stop_dist = new_stop_price - fill_price
+                min_tp_dist = round(max(stop_offset, rebuilt_stop_dist * min_rr + 1e-4), decimals)
+                new_target_price = round(max(0.01, fill_price - min_tp_dist), decimals)
             else:
                 new_stop_price = round(max(0.01, fill_price - stop_offset), decimals)
-                new_target_price = None
-                if target_price and target_price > signal_price:
-                    tp_offset = target_price - signal_price
-                    new_target_price = round(fill_price + tp_offset, decimals)
+                rebuilt_stop_dist = fill_price - new_stop_price
+                min_tp_dist = round(max(stop_offset, rebuilt_stop_dist * min_rr + 1e-4), decimals)
+                new_target_price = round(fill_price + min_tp_dist, decimals)
 
             logger.warning(
                 f"[POST-FILL GEOMETRY REBUILD] {symbol} ({side.upper()}): Adjusted invalid stop price from ${initial_stop:.{decimals}f} "
                 f"to ${new_stop_price:.{decimals}f} (new_target=${new_target_price or 0.0:.{decimals}f}) relative to actual fill ${fill_price:.4f}"
             )
             
-            # Post-Rebuild Re-Validation Assertion
+            # Post-Rebuild Re-Validation Assertion (Stop distance + R:R Ratio check)
             rebuilt_stop_dist = (new_stop_price - fill_price) if is_short else (fill_price - new_stop_price)
+            rebuilt_tp_dist = (fill_price - new_target_price) if is_short else (new_target_price - fill_price)
+            rebuilt_rr = (rebuilt_tp_dist / rebuilt_stop_dist) if rebuilt_stop_dist > 0 else 0.0
+            rebuilt_rr_valid = round(rebuilt_rr, 4) >= (min_rr - 1e-4)
+
             if is_short:
-                rebuilt_valid = (new_stop_price > fill_price) and (rebuilt_stop_dist >= min_required_distance)
+                rebuilt_valid = (new_stop_price > fill_price) and (rebuilt_stop_dist >= min_required_distance) and rebuilt_rr_valid
                 if target_price and target_price > 0:
-                    rebuilt_valid = rebuilt_valid and (fill_price > (new_target_price or target_price))
+                    rebuilt_valid = rebuilt_valid and (fill_price > new_target_price)
             else:
-                rebuilt_valid = (new_stop_price < fill_price) and (rebuilt_stop_dist >= min_required_distance)
+                rebuilt_valid = (new_stop_price < fill_price) and (rebuilt_stop_dist >= min_required_distance) and rebuilt_rr_valid
                 if target_price and target_price > 0:
-                    rebuilt_valid = rebuilt_valid and (fill_price < (new_target_price or target_price))
+                    rebuilt_valid = rebuilt_valid and (fill_price < new_target_price)
 
             if not rebuilt_valid:
                 logger.error(
                     f"[POST-FILL GEOMETRY REBUILD FAILED] {symbol} ({side.upper()}): "
-                    f"Rebuilt stop ${new_stop_price:.{decimals}f} still invalid "
-                    f"(min_dist=${min_rebuild_distance:.4f}). "
+                    f"Rebuilt geometry invalid (stop=${new_stop_price:.{decimals}f}, R:R={rebuilt_rr:.2f} < {min_rr:.2f}). "
                     f"Triggering fail-safe position close."
                 )
                 # Fix C: Fail-safe: close position immediately to prevent naked exposure
@@ -330,8 +422,11 @@ class DynamicTrailingStopManager:
                     # 1. Replace Stop Loss Order
                     if stop_order_id:
                         try:
-                            from alpaca.trading.requests import ReplaceOrderRequest
-                            req = ReplaceOrderRequest(stop_price=new_stop_price)
+                            try:
+                                from alpaca.trading.requests import ReplaceOrderRequest
+                                req = ReplaceOrderRequest(stop_price=new_stop_price)
+                            except Exception:
+                                req = {"stop_price": new_stop_price}
                             res = replace_fn(stop_order_id, req)
                             new_id = getattr(res, "id", stop_order_id)
                             logger.info(f"[POST-FILL GEOMETRY REBUILD] Replaced broker stop order {stop_order_id} -> {new_id} at new stop price ${new_stop_price:.{decimals}f}")
@@ -341,8 +436,11 @@ class DynamicTrailingStopManager:
                     # 2. Replace Take Profit Order if tp_order_id is provided and new_target_price is set
                     if tp_order_id and new_target_price:
                         try:
-                            from alpaca.trading.requests import ReplaceOrderRequest
-                            req = ReplaceOrderRequest(limit_price=new_target_price)
+                            try:
+                                from alpaca.trading.requests import ReplaceOrderRequest
+                                req = ReplaceOrderRequest(limit_price=new_target_price)
+                            except Exception:
+                                req = {"limit_price": new_target_price}
                             replace_fn(tp_order_id, req)
                             logger.info(f"[POST-FILL GEOMETRY REBUILD] Replaced broker TP order {tp_order_id} at new limit price ${new_target_price:.{decimals}f}")
                         except Exception as tp_err:
@@ -386,7 +484,14 @@ class DynamicTrailingStopManager:
             broker_stop_price = None
             target_side = "sell" if side == "BUY" else "buy"
             
+            all_candidate_orders = []
             for o in open_orders:
+                all_candidate_orders.append(o)
+                legs = getattr(o, "legs", []) or []
+                for leg in legs:
+                    all_candidate_orders.append(leg)
+
+            for o in all_candidate_orders:
                 info = _extract_order_info(o)
                 if info["symbol"] == symbol.upper().strip() and self._is_valid_stop_order(o, target_side):
                     if info["stop_price"] is not None:
@@ -502,7 +607,9 @@ class DynamicTrailingStopManager:
                 o_stop = info["stop_price"]
                 o_type = info["type"]
                 broker_stop_price = float(o_stop) if o_stop is not None else state.stop_price
-                state.order_id = info["id"]
+                old_order_id = str(state.order_id or "").strip()
+                new_order_id = str(info["id"] or "").strip()
+                state.order_id = new_order_id
                 state.remediation_attempts = 0
                 state.escalation_alerted = False
                 state.remediation_in_progress = False
@@ -512,7 +619,10 @@ class DynamicTrailingStopManager:
                     else:
                         state.stop_price = min(state.stop_price, broker_stop_price)
                 self._save_state()
-                logger.info(f"Reconciled active STOP order for {state.symbol} ({state.side}): Adopted Order ID {state.order_id} (type={o_type}), stop_price ${state.stop_price:.2f}")
+                if old_order_id != new_order_id:
+                    logger.info(f"Reconciled active STOP order for {state.symbol} ({state.side}): Adopted Order ID {state.order_id} (type={o_type}), stop_price ${state.stop_price:.2f}")
+                else:
+                    logger.debug(f"Reconciled active STOP order for {state.symbol} ({state.side}): Order ID {state.order_id} active, stop_price ${state.stop_price:.2f}")
                 return True
         return False
 
@@ -544,29 +654,54 @@ class DynamicTrailingStopManager:
             new_stop = state.stop_price
             should_update = False
 
+            # --- Breakeven Stop Lock Logic ---
+            breakeven_enabled = getattr(config, "BREAKEVEN_LOCK_ENABLED", True)
+            breakeven_threshold_atr = getattr(config, "BREAKEVEN_LOCK_THRESHOLD_ATR", 1.0)
+            cushion = 0.01 if getattr(config, "BREAKEVEN_SLIPPAGE_CUSHION", True) else 0.0
+
             if state.side == "BUY":
                 if current_price > state.peak_price:
                     state.peak_price = current_price
                     
                 profit_pct = (state.peak_price - state.entry_price) / state.entry_price if state.entry_price > 0 else 0.0
-                if profit_pct >= min_profit_pct:
-                    effective_trail = max(trail_distance, state.entry_price * min_trail_pct)
-                    computed_stop = state.peak_price - effective_trail
-                    if computed_stop > state.stop_price + min_delta:
-                        new_stop = computed_stop
+                profit_atr = (state.peak_price - state.entry_price) / state.atr if state.atr > 0 else 0.0
+
+                if breakeven_enabled and state.atr > 0 and profit_atr >= breakeven_threshold_atr:
+                    breakeven_stop = state.entry_price + cushion
+                    if breakeven_stop > new_stop:
+                        new_stop = breakeven_stop
                         should_update = True
+                        logger.info(f"[BREAKEVEN LOCK] {symbol}: Profit {profit_atr:.2f}x >= {breakeven_threshold_atr}x ATR. Locking stop at ${breakeven_stop:.2f}")
+
+                if not (breakeven_enabled and state.atr > 0 and profit_atr >= breakeven_threshold_atr and new_stop >= state.entry_price):
+                    if profit_pct >= min_profit_pct:
+                        effective_trail = max(trail_distance, state.entry_price * min_trail_pct)
+                        computed_stop = state.peak_price - effective_trail
+                        if computed_stop > state.stop_price + min_delta:
+                            new_stop = computed_stop
+                            should_update = True
                     
             else: # SELL (Short)
                 if current_price < state.peak_price:
                     state.peak_price = current_price
                     
                 profit_pct = (state.entry_price - state.peak_price) / state.entry_price if state.entry_price > 0 else 0.0
-                if profit_pct >= min_profit_pct:
-                    effective_trail = max(trail_distance, state.entry_price * min_trail_pct)
-                    computed_stop = state.peak_price + effective_trail
-                    if computed_stop < state.stop_price - min_delta:
-                        new_stop = computed_stop
+                profit_atr = (state.entry_price - state.peak_price) / state.atr if state.atr > 0 else 0.0
+
+                if breakeven_enabled and state.atr > 0 and profit_atr >= breakeven_threshold_atr:
+                    breakeven_stop = state.entry_price - cushion
+                    if breakeven_stop < new_stop:
+                        new_stop = breakeven_stop
                         should_update = True
+                        logger.info(f"[BREAKEVEN LOCK] {symbol}: Profit {profit_atr:.2f}x >= {breakeven_threshold_atr}x ATR. Locking stop at ${breakeven_stop:.2f}")
+
+                if not (breakeven_enabled and state.atr > 0 and profit_atr >= breakeven_threshold_atr and new_stop <= state.entry_price):
+                    if profit_pct >= min_profit_pct:
+                        effective_trail = max(trail_distance, state.entry_price * min_trail_pct)
+                        computed_stop = state.peak_price + effective_trail
+                        if computed_stop < state.stop_price - min_delta:
+                            new_stop = computed_stop
+                            should_update = True
 
             if should_update:
                 logger.info(f"Trailing stop for {symbol} moving from ${state.stop_price:.2f} -> ${new_stop:.2f}")
@@ -763,14 +898,14 @@ class DynamicTrailingStopManager:
         if protection_method == "replace":
             try:
                 open_orders = []
-                if hasattr(bridge, "ib") and hasattr(bridge.ib, "openTrades"):
-                    try:
-                        open_orders = bridge.ib.openTrades()
-                    except Exception:
-                        open_orders = []
-                elif hasattr(bridge, "working_orders_plain"):
+                if hasattr(bridge, "working_orders_plain"):
                     try:
                         open_orders = bridge.working_orders_plain()
+                    except Exception:
+                        open_orders = []
+                elif hasattr(bridge, "ib") and hasattr(bridge.ib, "openTrades"):
+                    try:
+                        open_orders = bridge.ib.openTrades()
                     except Exception:
                         open_orders = []
 
@@ -786,7 +921,7 @@ class DynamicTrailingStopManager:
                         fetched_orders = bridge._client.get_orders(req) or []
                         with self._lock:
                             if self._reconcile_broker_order(state, fetched_orders):
-                                logger.info(f"Reconciled active broker stop order {state.order_id} for {symbol} — skipping new submission.")
+                                logger.debug(f"Reconciled active broker stop order {state.order_id} for {symbol} — skipping new submission.")
                                 return
                     except Exception as rec_exc:
                         logger.debug(f"Pre-reconcile failed for {symbol}: {rec_exc}")
@@ -965,7 +1100,11 @@ class DynamicTrailingStopManager:
             try:
                 # Cancel open orders for this symbol first to release held shares
                 try:
-                    open_orders = bridge.ib.openTrades()
+                    open_orders = []
+                    if hasattr(bridge, "working_orders_plain"):
+                        open_orders = bridge.working_orders_plain()
+                    elif hasattr(bridge, "ib") and hasattr(bridge.ib, "openTrades"):
+                        open_orders = bridge.ib.openTrades()
                     for o in open_orders:
                         o_sym = getattr(o, "symbol", None)
                         if not o_sym:
@@ -1055,6 +1194,53 @@ class DynamicTrailingStopManager:
                     if current_state and current_state.active:
                         current_state.remediation_in_progress = False
                         self._save_state()
+
+    def emergency_flatten(self, symbol: str, position_qty: float, bridge: Optional[object] = None, dry_run: bool = False):
+        """Emergency flatten a naked position immediately using broker close_position."""
+        logger.critical(f"CRITICAL: Naked position detected for {symbol} ({position_qty} shares) with no stop order protection. EMERGENCY FLATTENING POSITION!")
+        try:
+            send_discord_alert(
+                f"🚨 **CRITICAL: NAKED POSITION EMERGENCY FLATTEN** 🚨\n"
+                f"**Symbol**: {symbol}\n"
+                f"**Qty**: {position_qty}\n"
+                f"**Reason**: Naked position detected on broker side. Triggering emergency close."
+            )
+        except Exception as alert_exc:
+            logger.error(f"Failed to send Discord alert: {alert_exc}")
+
+        if dry_run:
+            logger.info(f"[DRY-RUN] Emergency flatten for {symbol}")
+            return
+
+        try:
+            if bridge and hasattr(bridge, "working_orders_plain"):
+                open_orders = bridge.working_orders_plain() or []
+                for o in open_orders:
+                    o_sym = getattr(o, "symbol", "")
+                    if str(o_sym).upper().strip() == symbol.upper().strip():
+                        order_id = getattr(o, "id", None)
+                        if order_id and hasattr(bridge, "cancel_order"):
+                            bridge.cancel_order(str(order_id))
+        except Exception as cancel_exc:
+            logger.error(f"Failed to cancel open orders for {symbol} before flattening: {cancel_exc}")
+
+        close_ok = False
+        if bridge and hasattr(bridge, "close_position"):
+            for attempt in range(3):
+                try:
+                    close_ok = bridge.close_position(symbol)
+                    if close_ok:
+                        break
+                except Exception as close_err:
+                    logger.warning(f"Attempt {attempt+1} to emergency close {symbol} failed: {close_err}")
+                time.sleep(1.5)
+
+        with self._lock:
+            current_state = self.states.get(symbol)
+            if current_state:
+                current_state.active = False
+                current_state.remediation_in_progress = False
+            self._save_state()
 
     def reset(self, symbol: str) -> None:
         with self._lock:
