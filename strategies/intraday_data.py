@@ -60,7 +60,8 @@ def _cache_key(
 ) -> str:
     session = "prepost" if prepost else "regular"
     lookback = lookback_days if lookback_days is not None else "default"
-    now = datetime.now()
+    from strategies.session import now_eastern
+    now = now_eastern()
     today_str = now.strftime("%Y-%m-%d")
     if interval in ("5m", "5Min"):
         bar_minute = (now.minute // 5) * 5

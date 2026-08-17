@@ -10,9 +10,11 @@ import pytz
 import config
 
 
+EASTERN_TZ = pytz.timezone("America/New_York")
+
+
 def now_eastern() -> datetime:
-    tz = pytz.timezone(config.TIMEZONE)
-    return datetime.now(tz)
+    return datetime.now(EASTERN_TZ)
 
 
 def current_session_time() -> time:

@@ -209,10 +209,12 @@ class ConnectionHealth:
 class EntryGateMock:
     def __init__(self, bridge=None):
         self.halted = False
+        self.halt_reason = ""
         self.bridge = bridge
 
-    def halt(self):
+    def halt(self, reason: str = ""):
         self.halted = True
+        self.halt_reason = str(reason or "")
 
     def risk_sized_qty(self, symbol, signal, price, qty):
         if self.halted:
@@ -310,8 +312,13 @@ class AlpacaBridge:
             except Exception as e:
                 logger.warning(f"Failed to auto-parse .env file: {e}")
 
-        key = os.environ.get("APCA_API_KEY_ID", "") or os.environ.get("DAYTRADE_APCA_API_KEY_ID", "")
-        secret = os.environ.get("APCA_API_SECRET_KEY", "") or os.environ.get("DAYTRADE_APCA_API_SECRET_KEY", "")
+        mode = getattr(self, "mode", None) or os.environ.get("TRADING_MODE", "daytrade")
+        if str(mode).lower() == "swing":
+            key = os.environ.get("APCA_API_KEY_ID", "") or os.environ.get("SWING_APCA_API_KEY_ID", "")
+            secret = os.environ.get("APCA_API_SECRET_KEY", "") or os.environ.get("SWING_APCA_API_SECRET_KEY", "")
+        else:
+            key = os.environ.get("APCA_API_KEY_ID", "") or os.environ.get("DAYTRADE_APCA_API_KEY_ID", "")
+            secret = os.environ.get("APCA_API_SECRET_KEY", "") or os.environ.get("DAYTRADE_APCA_API_SECRET_KEY", "")
         if not key or not secret:
             logger.error("Alpaca credentials missing: set APCA_API_KEY_ID and APCA_API_SECRET_KEY env vars")
             self._conn_health.mark_unhealthy("Credentials missing")
@@ -943,22 +950,27 @@ class AlpacaBridge:
     ) -> order_exec.OrderResult:
         self._require_connection()
         self._require_trade_stream()
+        self._require_new_entries_allowed()
         min_shares = getattr(config_module, "MIN_SHARE_COUNT", 1)
-        qty = max(int(qty), min_shares)
+        if int(qty) <= 0:
+            raise ValueError(f"Order quantity must be positive, got {qty}")
+        if int(qty) < min_shares:
+            raise ValueError(f"Order quantity {qty} is below minimum allowed share count {min_shares}")
+        qty = int(qty)
         limit_price = self._limit_price(action, price)
         stop_price = custom_stop_price if custom_stop_price is not None else self._initial_stop_price(action, price)
         take_profit_price = custom_target_price if custom_target_price is not None else self._take_profit_price(action, price)
         
         strat_tag = str(strategy_name or "UNKNOWN").replace("StrategyName.", "").upper()
-        ts_suffix = str(int(time.time()))[-5:]
-        client_order_id = f"dt_{strat_tag[:10]}_{symbol}_{action}_{ts_suffix}"[:48]
+        from strategies.order_idempotency import build_client_order_id
+        client_order_id = build_client_order_id(symbol=symbol, side=action, bar_timestamp_utc="", signal_hash=f"{strat_tag}_{int(price*100)}_{int(time.time()//300)}", attempt=0)
 
         order_audit.log_event(
             order_audit.STAGE_SUBMIT, kind="open", symbol=symbol, action=action,
             qty=qty, limit_price=limit_price, confidence=confidence, order_ref=client_order_id,
         )
 
-        tif = TimeInForce.DAY if action == "SELL" else TimeInForce.GTC
+        tif = TimeInForce.DAY
         try:
             order = self._client.submit_order(LimitOrderRequest(
                 symbol=symbol, qty=qty,
@@ -1566,7 +1578,11 @@ class AlpacaBridge:
         self._require_trade_stream()
         self._require_new_entries_allowed()
         min_shares = getattr(config_module, "MIN_SHARE_COUNT", 1)
-        qty = max(int(qty), min_shares)
+        if int(qty) <= 0:
+            raise ValueError(f"Order quantity must be positive, got {qty}")
+        if int(qty) < min_shares:
+            raise ValueError(f"Order quantity {qty} is below minimum allowed share count {min_shares}")
+        qty = int(qty)
         entry_p = _round_price(entry_price)
         target_p = _round_price(target_price)
         stop_p = _round_price(stop_price)
@@ -1575,7 +1591,7 @@ class AlpacaBridge:
             "symbol": symbol.upper().strip(),
             "qty": qty,
             "side": OrderSide.BUY if side.upper() == "BUY" else OrderSide.SELL,
-            "time_in_force": TimeInForce.GTC,
+            "time_in_force": TimeInForce.DAY,
             "limit_price": entry_p,
             "order_class": OrderClass.BRACKET,
             "take_profit": TakeProfitRequest(limit_price=target_p),
@@ -1916,24 +1932,40 @@ class AlpacaBridge:
                 qty = int(abs(position))
                 return self._close_position(symbol, "BUY", qty, price, "Close short").has_fill
 
-            cash = self.get_cash()
-            if cash < min_cash:
-                logger.warning("Insufficient cash for BUY %s: $%.2f", symbol, cash)
-                return False
-            qty = self._calc_quantity(price, cash)
-            if qty == 0:
-                logger.warning("Qty=0 for BUY %s", symbol)
+            equity = self.get_net_liquidation()
+            if equity <= 0:
+                equity = self.get_cash()
+            if equity < min_cash:
+                logger.warning("Insufficient equity for BUY %s: $%.2f", symbol, equity)
                 return False
 
             strat_name = getattr(signal, "strategy", getattr(signal, "strategy_name", ""))
             stop_price = getattr(signal, "stop_price", getattr(signal, "stop_loss", None))
             target_price = getattr(signal, "target_price", getattr(signal, "take_profit", None))
-            if coach and (stop_price is None or target_price is None or stop_price <= 0 or target_price <= 0):
+            if stop_price is None or target_price is None or stop_price <= 0 or target_price <= 0:
                 logger.warning("Rejecting execute_signal for %s: missing explicit stop_loss/target_price geometry (fail-closed)", symbol)
                 return False
 
+            # Risk-based sizing with account equity
+            risk_per_share = max(price - stop_price, 0.01)
+            max_risk_pct = float(self._c("MAX_RISK_PER_TRADE_PCT", 0.01))
+            risk_budget = equity * max_risk_pct
+            risk_cap = float(self._c("MAX_RISK_PER_TRADE_DOLLARS", 150.0))
+            risk_budget = min(risk_budget, risk_cap)
+            qty = max(int(risk_budget / risk_per_share), 0)
+
+            # Cap by maximum position allocation
+            max_pos_val = equity * float(self._c("MAX_POSITION_PCT", 0.08))
+            if qty * price > max_pos_val:
+                qty = max(int(max_pos_val / price), 0)
+
+            min_shares = getattr(config_module, "MIN_SHARE_COUNT", 1)
+            if qty < min_shares:
+                logger.warning("Calculated qty=%d below min_shares=%d for BUY %s (risk_per_share=%.2f)", qty, min_shares, symbol, risk_per_share)
+                return False
+
             result = self._place_open_bracket(
-                symbol, "BUY", qty, price, signal.confidence,
+                symbol, "BUY", qty, price, getattr(signal, "confidence", 1.0),
                 strategy_name=strat_name,
                 custom_stop_price=stop_price,
                 custom_target_price=target_price
@@ -1960,16 +1992,40 @@ class AlpacaBridge:
             logger.info("Working SELL order already exists for %s — skipping short SELL", symbol)
             return False
 
-        cash = self.get_cash()
-        if cash < min_cash:
-            logger.warning("Insufficient cash for short SELL %s", symbol)
-            return False
-        qty = self._calc_quantity(price, cash)
-        if qty == 0:
-            logger.warning("Qty=0 for short SELL %s", symbol)
+        equity = self.get_net_liquidation()
+        if equity <= 0:
+            equity = self.get_cash()
+        if equity < min_cash:
+            logger.warning("Insufficient equity for short SELL %s", symbol)
             return False
 
-        result = self._place_open_bracket(symbol, "SELL", qty, price, signal.confidence)
+        strat_name = getattr(signal, "strategy", getattr(signal, "strategy_name", ""))
+        stop_price = getattr(signal, "stop_price", getattr(signal, "stop_loss", None))
+        target_price = getattr(signal, "target_price", getattr(signal, "take_profit", None))
+        if stop_price is None or target_price is None or stop_price <= 0 or target_price <= 0:
+            logger.warning("Rejecting short SELL for %s: missing explicit stop_loss/target_price geometry (fail-closed)", symbol)
+            return False
+
+        risk_per_share = max(stop_price - price, 0.01)
+        max_risk_pct = float(self._c("MAX_RISK_PER_TRADE_PCT", 0.01))
+        risk_budget = min(equity * max_risk_pct, float(self._c("MAX_RISK_PER_TRADE_DOLLARS", 150.0)))
+        qty = max(int(risk_budget / risk_per_share), 0)
+
+        max_pos_val = equity * float(self._c("MAX_POSITION_PCT", 0.08))
+        if qty * price > max_pos_val:
+            qty = max(int(max_pos_val / price), 0)
+
+        min_shares = getattr(config_module, "MIN_SHARE_COUNT", 1)
+        if qty < min_shares:
+            logger.warning("Calculated qty=%d below min_shares=%d for short SELL %s", qty, min_shares, symbol)
+            return False
+
+        result = self._place_open_bracket(
+            symbol, "SELL", qty, price, getattr(signal, "confidence", 1.0),
+            strategy_name=strat_name,
+            custom_stop_price=stop_price,
+            custom_target_price=target_price
+        )
         return result.occupies_slot
 
     def _evaluate_and_execute_rotation(self, signals: List[Signal]) -> None:

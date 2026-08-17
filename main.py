@@ -2730,7 +2730,8 @@ def cmd_daytrade_bot(args) -> int:
         try:
             print(f"\n[SIGNAL] Received signal {signum}. Initiating Smart Shutdown Guard...")
             bridge.flatten_on_shutdown(only_unprotected=True)
-            print("✅ Flatten completed. Sub-Account PA3UODIC5JTA secured.")
+            acct_id = getattr(bridge, "_account_id", getattr(bridge, "account_id", "ACTIVE"))
+            print(f"✅ Flatten completed. Sub-Account {acct_id} secured.")
         except Exception as e:
             print(f"❌ Error during shutdown position evaluation: {e}")
             try:
