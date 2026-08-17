@@ -127,13 +127,15 @@ def _get_premarket_pct_change(symbol: str, bridge=None) -> Tuple[Optional[float]
                         try:
                             from alpaca.data.requests import StockBarsRequest
                             from alpaca.data.timeframe import TimeFrame
+                            from alpaca.data.enums import Adjustment
                             from datetime import timedelta
                             now_utc = datetime.now(timezone.utc)
                             req = StockBarsRequest(
                                 symbol_or_symbols=symbol,
                                 timeframe=TimeFrame.Day,
                                 start=now_utc - timedelta(days=7),
-                                end=now_utc
+                                end=now_utc,
+                                adjustment=Adjustment.ALL,
                             )
                             bars = bridge._data_client.get_stock_bars(req)
                             symbol_bars = bars.get(symbol, []) if bars else []

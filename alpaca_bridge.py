@@ -902,12 +902,14 @@ class AlpacaBridge:
             end = _dt.datetime.now(_dt.timezone.utc)
             start = end - _dt.timedelta(days=days)
 
+            from alpaca.data.enums import Adjustment
             bars = self._data_client.get_stock_bars(StockBarsRequest(
                 symbol_or_symbols=symbol.upper().strip(),
                 timeframe=tf,
                 start=start,
                 end=end,
-                feed="iex"
+                feed="iex",
+                adjustment=Adjustment.ALL,
             ))
             raw_bars = bars.data.get(symbol.upper().strip(), [])
             return [_Bar(b) for b in raw_bars]
@@ -1322,6 +1324,23 @@ class AlpacaBridge:
                     snapshot = reconciliation.build_snapshot(positions, working)
         except Exception as gate_err:
             logger.debug("Startup SOXX check exception: %s", gate_err)
+
+        # Reconcile local trailing stop states against broker open positions
+        try:
+            from strategies.trailing_stop import manager as trailing_manager
+            open_symbols = {
+                (p.get("symbol") if isinstance(p, dict) else getattr(p, "symbol", "")).upper().strip()
+                for p in positions
+            }
+            with trailing_manager._lock:
+                orphan_states = [sym for sym in list(trailing_manager.states.keys()) if sym.upper().strip() not in open_symbols]
+                for sym in orphan_states:
+                    logger.info("[RECONCILE TRAILING STOP] Cleaning up orphan trailing stop state for closed position %s", sym)
+                    del trailing_manager.states[sym]
+                if orphan_states:
+                    trailing_manager._save_state()
+        except Exception as trail_rec_err:
+            logger.debug("Trailing stop startup reconciliation error: %s", trail_rec_err)
 
         return {
             "snapshot": snapshot,

@@ -285,6 +285,7 @@ def fetch_intraday_alpaca(
         from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+        from alpaca.data.enums import Adjustment
         from datetime import timezone
 
         client = _get_alpaca_client()
@@ -309,6 +310,7 @@ def fetch_intraday_alpaca(
                 timeframe=tf,
                 start=start,
                 feed=primary_feed,
+                adjustment=Adjustment.ALL,
             )
             bars_dict = client.get_stock_bars(req)
         except Exception as primary_err:
@@ -319,6 +321,7 @@ def fetch_intraday_alpaca(
                     timeframe=tf,
                     start=start,
                     feed=backup_feed,
+                    adjustment=Adjustment.ALL,
                 )
                 bars_dict = client.get_stock_bars(req)
             except Exception as backup_err:
@@ -333,6 +336,7 @@ def fetch_intraday_alpaca(
                     timeframe=tf,
                     start=start,
                     feed=backup_feed,
+                    adjustment=Adjustment.ALL,
                 )
                 bars_dict = client.get_stock_bars(req)
             except Exception:
@@ -555,6 +559,7 @@ def fetch_daily_alpaca(symbol: str, lookback_days: int = None) -> pd.DataFrame:
         from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
+        from alpaca.data.enums import Adjustment
         from datetime import timezone
 
         client = StockHistoricalDataClient(api_key, secret_key)
@@ -566,6 +571,7 @@ def fetch_daily_alpaca(symbol: str, lookback_days: int = None) -> pd.DataFrame:
                 timeframe=TimeFrame.Day,
                 start=start,
                 feed="iex",
+                adjustment=Adjustment.ALL,
             )
             bars_dict = client.get_stock_bars(req)
         except Exception:
@@ -575,6 +581,7 @@ def fetch_daily_alpaca(symbol: str, lookback_days: int = None) -> pd.DataFrame:
                     timeframe=TimeFrame.Day,
                     start=start,
                     feed="sip",
+                    adjustment=Adjustment.ALL,
                 )
                 bars_dict = client.get_stock_bars(req)
             except Exception:
