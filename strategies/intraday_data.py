@@ -187,6 +187,17 @@ def _validate_intraday_data(df: pd.DataFrame, symbol: str, interval: str, valida
                 logger.warning("Data validation failed for %s: Extreme single-bar price discontinuity (>50%%) detected.", symbol)
                 return pd.DataFrame()
 
+        # 1.7. Series-Wide Median Drift & Outlier Sanity Guard
+        if 'close' in df.columns and len(df) >= 10:
+            median_p = float(df['close'].median())
+            last_p = float(df['close'].iloc[-1])
+            if median_p > 0 and (last_p / median_p > 2.5 or last_p / median_p < 0.40):
+                logger.warning(
+                    "Data validation failed for %s: Extreme series-wide drift detected (Last: $%.2f vs Median: $%.2f).",
+                    symbol, last_p, median_p
+                )
+                return pd.DataFrame()
+
         # 2. Frozen Feed Check (Constant close prices)
         if 'close' in df.columns and len(df) >= 10:
             recent_closes = df['close'].tail(10)
@@ -790,3 +801,25 @@ def clear_cache():
             os.remove(f)
         except OSError:
             pass
+
+
+def verify_cross_source_price(symbol: str, price: float, max_deviation_pct: float = 0.20) -> tuple[bool, str]:
+    """Cross-verify primary price against secondary market data source (e.g. yfinance vs Alpaca).
+    Returns (True, 'OK') if within acceptable deviation (default 20%), or (False, reason) if anomaly detected.
+    """
+    if price <= 0:
+        return False, "Non-positive price"
+    try:
+        import yfinance as yf
+        t = yf.Ticker(symbol.upper().strip())
+        sec_price = getattr(t.fast_info, "last_price", None)
+        if sec_price is None or sec_price <= 0:
+            sec_price = getattr(t.fast_info, "previous_close", None)
+        if sec_price and sec_price > 0:
+            dev = abs(price - sec_price) / sec_price
+            if dev > max_deviation_pct:
+                return False, f"Cross-source deviation {dev*100:.1f}% exceeds max {max_deviation_pct*100:.1f}% (Primary: ${price:.2f} vs Secondary: ${sec_price:.2f})"
+        return True, "Verified"
+    except Exception as exc:
+        logger.debug("Cross-source price check error for %s: %s", symbol, exc)
+        return True, f"Check bypassed: {exc}"
