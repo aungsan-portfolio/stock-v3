@@ -44,8 +44,11 @@ archive_cleanup_*/
 .testdeps/
 .coverage
 .pytest_cache/
+.pytest_tmp/
 .mypy_cache/
 .ruff_cache/
+.cache_data/
+artifacts/
 coverage.xml
 predict.pid
 predict_output.txt
