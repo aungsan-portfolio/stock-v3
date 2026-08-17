@@ -22,6 +22,16 @@ from strategies.order_manager import _pending_order_contexts, register_pending_o
 from strategies.trailing_stop import manager as trailing_manager
 
 
+@pytest.fixture(autouse=True)
+def isolate_journal(tmp_path, monkeypatch):
+    import config
+    fake_journal = tmp_path / "test_trade_journal.jsonl"
+    monkeypatch.setattr(config, "DAYTRADE_TRADE_JOURNAL_FILE", fake_journal)
+    # Clear any active idempotency locks
+    from strategies.order_idempotency import idempotency_manager
+    idempotency_manager.reservations.clear()
+
+
 def test_mean_reversion_builds_valid_trade_signal():
     """C-01: MeanReversionStrategy must create a valid TradeSignal without TypeError."""
     np.random.seed(42)

@@ -307,6 +307,7 @@ IBKR_MARKET_DATA_TYPE = 3
 
 # ── Alpaca ───────────────────────────────────────
 ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets"
+ALPACA_DATA_FEED      = "iex"
 
 # ── Logging ──────────────────────────────────────
 LOG_FILE            = LOG_DIR / "stock_engine.log"

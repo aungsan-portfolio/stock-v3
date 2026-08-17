@@ -817,7 +817,8 @@ def execute_signal(
         parent_order_id = str(parent_id) if parent_id else ""
         from strategies.entry_lifecycle import entry_lifecycle
         try:
-            register_pending_order(
+            reg_fn = globals().get("register_pending_order", register_pending_order)
+            reg_fn(
                 parent_id=parent_order_id,
                 signal=signal,
                 limit_price=limit_price,

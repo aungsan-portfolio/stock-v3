@@ -293,27 +293,43 @@ def fetch_intraday_alpaca(
             tf = TimeFrame.Hour
 
         bars_dict = None
+        primary_feed = str(getattr(config, "ALPACA_DATA_FEED", "iex")).lower()
+        backup_feed = "sip" if primary_feed == "iex" else "iex"
+
         try:
             req = StockBarsRequest(
                 symbol_or_symbols=symbol.upper(),
                 timeframe=tf,
                 start=start,
-                feed="sip",
+                feed=primary_feed,
             )
             bars_dict = client.get_stock_bars(req)
-        except Exception as sip_err:
-            logger.debug("Alpaca SIP feed error for %s (%s). Trying IEX feed.", symbol, sip_err)
+        except Exception as primary_err:
+            logger.debug("Alpaca %s feed error for %s (%s). Trying %s feed.", primary_feed.upper(), symbol, primary_err, backup_feed.upper())
             try:
                 req = StockBarsRequest(
                     symbol_or_symbols=symbol.upper(),
                     timeframe=tf,
                     start=start,
-                    feed="iex",
+                    feed=backup_feed,
                 )
                 bars_dict = client.get_stock_bars(req)
-            except Exception as iex_err:
-                logger.warning("Alpaca feed error for %s (%s).", symbol, iex_err)
+            except Exception as backup_err:
+                logger.warning("Alpaca data feed error for %s (%s).", symbol, backup_err)
                 return pd.DataFrame()
+
+        # If primary feed returned empty, try fallback feed before giving up
+        if not hasattr(bars_dict, "df") or bars_dict.df.empty:
+            try:
+                req = StockBarsRequest(
+                    symbol_or_symbols=symbol.upper(),
+                    timeframe=tf,
+                    start=start,
+                    feed=backup_feed,
+                )
+                bars_dict = client.get_stock_bars(req)
+            except Exception:
+                pass
 
         if not hasattr(bars_dict, "df") or bars_dict.df.empty:
             return pd.DataFrame()
