@@ -1,0 +1,157 @@
+"""
+execution_quote.py -- M-01 Execution Quote Verification Module
+
+Validates fresh broker quote, data provenance, spread, staleness, and decision-to-execution price deviation before order entry.
+"""
+import logging
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BrokerQuote:
+    symbol: str
+    bid: float
+    ask: float
+    last: float
+    timestamp: float
+    source: str = "broker"
+    is_realtime: bool = True
+
+    def executable_price(self, side: str = "BUY") -> float:
+        """Return ask for BUY, bid for SELL/SHORT."""
+        s = side.upper().strip()
+        if s in ("BUY", "LONG"):
+            return self.ask if self.ask > 0 else self.last
+        elif s in ("SELL", "SHORT"):
+            return self.bid if self.bid > 0 else self.last
+        return self.last if self.last > 0 else (self.ask or self.bid)
+
+
+@dataclass
+class QuoteValidationResult:
+    valid: bool
+    reason: str
+    quote: Optional[BrokerQuote] = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.valid
+
+
+ExecutionQuoteResult = QuoteValidationResult
+
+
+def validate_execution_quote(
+    bridge: Any,
+    symbol: str,
+    side: str = "BUY",
+    decision_price: float = 0.0,
+    max_spread_pct: float = 1.0,
+    max_deviation_pct: float = 1.5,
+    max_age_seconds: float = 10.0,
+) -> QuoteValidationResult:
+
+    """
+    Validate that a fresh, real-time broker quote is available and within acceptable risk parameters.
+    Fail-closed: Returns valid=False if quote is missing, stale, inverted, wide-spread, or deviates from decision price.
+    """
+    get_quote_fn = getattr(bridge, "get_quote", None)
+    if not callable(get_quote_fn):
+        return QuoteValidationResult(
+            valid=False,
+            reason=f"Broker bridge does not implement get_quote() contract for {symbol}",
+        )
+
+    try:
+        raw_quote = get_quote_fn(symbol)
+    except Exception as exc:
+        return QuoteValidationResult(
+            valid=False,
+            reason=f"Failed to fetch quote for {symbol}: {exc}",
+        )
+
+    if not raw_quote:
+        return QuoteValidationResult(
+            valid=False,
+            reason=f"Broker returned empty/null quote for {symbol}",
+        )
+
+    # Standardize mapping or dataclass
+    if isinstance(raw_quote, dict):
+        bid = float(raw_quote.get("bid", 0.0) or 0.0)
+        ask = float(raw_quote.get("ask", 0.0) or 0.0)
+        last = float(raw_quote.get("last", 0.0) or 0.0)
+        ts = float(raw_quote.get("timestamp", 0.0) or 0.0)
+        source = str(raw_quote.get("source", "broker"))
+        is_realtime = bool(raw_quote.get("is_realtime", True))
+    else:
+        bid = float(getattr(raw_quote, "bid", 0.0) or 0.0)
+        ask = float(getattr(raw_quote, "ask", 0.0) or 0.0)
+        last = float(getattr(raw_quote, "last", 0.0) or 0.0)
+        ts = float(getattr(raw_quote, "timestamp", 0.0) or 0.0)
+        source = str(getattr(raw_quote, "source", "broker"))
+        is_realtime = bool(getattr(raw_quote, "is_realtime", True))
+
+    quote = BrokerQuote(
+        symbol=symbol.upper().strip(),
+        bid=bid,
+        ask=ask,
+        last=last,
+        timestamp=ts,
+        source=source,
+        is_realtime=is_realtime,
+    )
+
+    if not is_realtime:
+        return QuoteValidationResult(
+            valid=False,
+            reason=f"Quote for {symbol} is not real-time (source={source})",
+            quote=quote,
+        )
+
+    now = time.time()
+    if ts <= 0 or (now - ts) > max_age_seconds:
+        age_str = f"{(now - ts):.1f}s" if ts > 0 else "unknown"
+        return QuoteValidationResult(
+            valid=False,
+            reason=f"Quote for {symbol} is stale (age={age_str} > limit={max_age_seconds}s)",
+            quote=quote,
+        )
+
+    if bid <= 0 or ask <= 0:
+        return QuoteValidationResult(
+            valid=False,
+            reason=f"Invalid bid/ask prices for {symbol}: bid=${bid:.2f}, ask=${ask:.2f}",
+            quote=quote,
+        )
+
+    if bid > ask:
+        return QuoteValidationResult(
+            valid=False,
+            reason=f"Inverted order book for {symbol}: bid=${bid:.2f} > ask=${ask:.2f}",
+            quote=quote,
+        )
+
+    mid = (bid + ask) / 2.0
+    spread_pct = ((ask - bid) / mid) * 100.0
+    if spread_pct > max_spread_pct:
+        return QuoteValidationResult(
+            valid=False,
+            reason=f"Spread too wide for {symbol}: {spread_pct:.2f}% > limit {max_spread_pct:.2f}%",
+            quote=quote,
+        )
+
+    if decision_price > 0:
+        dev_pct = (abs(mid - decision_price) / decision_price) * 100.0
+        if dev_pct > max_deviation_pct:
+            return QuoteValidationResult(
+                valid=False,
+                reason=f"Price deviation for {symbol}: quote mid ${mid:.2f} vs decision ${decision_price:.2f} ({dev_pct:.2f}% > limit {max_deviation_pct:.2f}%)",
+                quote=quote,
+            )
+
+    return QuoteValidationResult(valid=True, reason="Quote valid", quote=quote)
