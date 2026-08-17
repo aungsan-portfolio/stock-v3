@@ -43,8 +43,16 @@ def _get_alpaca_client():
     if _alpaca_client is None:
         with _client_lock:
             if _alpaca_client is None:
-                api_key = os.environ.get("APCA_API_KEY_ID", "")
-                secret_key = os.environ.get("APCA_API_SECRET_KEY", "")
+                api_key = (
+                    os.environ.get("APCA_API_KEY_ID", "")
+                    or os.environ.get("DAYTRADE_APCA_API_KEY_ID", "")
+                    or os.environ.get("SWING_APCA_API_KEY_ID", "")
+                )
+                secret_key = (
+                    os.environ.get("APCA_API_SECRET_KEY", "")
+                    or os.environ.get("DAYTRADE_APCA_API_SECRET_KEY", "")
+                    or os.environ.get("SWING_APCA_API_SECRET_KEY", "")
+                )
                 if api_key and secret_key:
                     from alpaca.data.historical import StockHistoricalDataClient
                     _alpaca_client = StockHistoricalDataClient(api_key, secret_key)

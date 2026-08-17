@@ -292,7 +292,7 @@ class AlpacaBridge:
 
     # ── Connection ───────────────────────────────────────────────
     def connect(self) -> bool:
-        # Load .env credentials if missing from environment
+        # Load .env credentials if present
         if os.path.exists(".env"):
             try:
                 with open(".env", "r", encoding="utf-8") as f:
@@ -300,31 +300,29 @@ class AlpacaBridge:
                         line = line.strip()
                         if line and not line.startswith("#") and "=" in line:
                             k, v = line.split("=", 1)
-                            k, v = k.strip(), v.strip()
-                            if k == "DAYTRADE_APCA_API_KEY_ID" and "DAYTRADE_APCA_API_KEY_ID" not in os.environ:
-                                os.environ["DAYTRADE_APCA_API_KEY_ID"] = v
-                            elif k == "DAYTRADE_APCA_API_SECRET_KEY" and "DAYTRADE_APCA_API_SECRET_KEY" not in os.environ:
-                                os.environ["DAYTRADE_APCA_API_SECRET_KEY"] = v
-                            elif k == "SWING_APCA_API_KEY_ID" and "SWING_APCA_API_KEY_ID" not in os.environ:
-                                os.environ["SWING_APCA_API_KEY_ID"] = v
-                            elif k == "SWING_APCA_API_SECRET_KEY" and "SWING_APCA_API_SECRET_KEY" not in os.environ:
-                                os.environ["SWING_APCA_API_SECRET_KEY"] = v
+                            k, v = k.strip(), v.strip().strip("'").strip('"')
+                            os.environ[k] = v
             except Exception as e:
                 logger.warning(f"Failed to auto-parse .env file: {e}")
 
         mode = getattr(self, "mode", None) or os.environ.get("TRADING_MODE", "daytrade")
         if str(mode).lower() == "swing":
-            key = os.environ.get("APCA_API_KEY_ID", "") or os.environ.get("SWING_APCA_API_KEY_ID", "")
-            secret = os.environ.get("APCA_API_SECRET_KEY", "") or os.environ.get("SWING_APCA_API_SECRET_KEY", "")
+            key = os.environ.get("SWING_APCA_API_KEY_ID", "") or os.environ.get("APCA_API_KEY_ID", "")
+            secret = os.environ.get("SWING_APCA_API_SECRET_KEY", "") or os.environ.get("APCA_API_SECRET_KEY", "")
+            endpoint = os.environ.get("SWING_APCA_API_BASE_URL", "") or os.environ.get("APCA_API_BASE_URL", self._c("ALPACA_PAPER_BASE_URL", "https://paper-api.alpaca.markets")).rstrip("/")
         else:
-            key = os.environ.get("APCA_API_KEY_ID", "") or os.environ.get("DAYTRADE_APCA_API_KEY_ID", "")
-            secret = os.environ.get("APCA_API_SECRET_KEY", "") or os.environ.get("DAYTRADE_APCA_API_SECRET_KEY", "")
+            key = os.environ.get("DAYTRADE_APCA_API_KEY_ID", "") or os.environ.get("APCA_API_KEY_ID", "")
+            secret = os.environ.get("DAYTRADE_APCA_API_SECRET_KEY", "") or os.environ.get("APCA_API_SECRET_KEY", "")
+            endpoint = os.environ.get("DAYTRADE_APCA_API_BASE_URL", "") or os.environ.get("APCA_API_BASE_URL", self._c("ALPACA_PAPER_BASE_URL", "https://paper-api.alpaca.markets")).rstrip("/")
         if not key or not secret:
             logger.error("Alpaca credentials missing: set APCA_API_KEY_ID and APCA_API_SECRET_KEY env vars")
             self._conn_health.mark_unhealthy("Credentials missing")
             return False
 
-        endpoint = os.environ.get("APCA_API_BASE_URL", self._c("ALPACA_PAPER_BASE_URL", "https://paper-api.alpaca.markets")).rstrip("/")
+        # Export active credentials to os.environ so historical data and screener clients authenticate correctly
+        os.environ["APCA_API_KEY_ID"] = key
+        os.environ["APCA_API_SECRET_KEY"] = secret
+        os.environ["APCA_API_BASE_URL"] = endpoint
         if endpoint != "https://paper-api.alpaca.markets":
             logger.error("Safety block: APCA_API_BASE_URL must be paper endpoint (https://paper-api.alpaca.markets)")
             self._conn_health.mark_unhealthy("Non-paper base URL detected")

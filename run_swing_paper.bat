@@ -4,16 +4,16 @@ chcp 65001 >nul
 set PYTHONUTF8=1
 cd /d "%~dp0"
 
-:: ---------------------------------------------------------
-:: 1. Clear credentials to prevent cross-account pollution
-:: ---------------------------------------------------------
+REM ---------------------------------------------------------
+REM 1. Clear credentials to prevent cross-account pollution
+REM ---------------------------------------------------------
 set "APCA_API_KEY_ID="
 set "APCA_API_SECRET_KEY="
 set "APCA_API_BASE_URL="
 
-:: ---------------------------------------------------------
-:: 2. Load Swing Credentials from .env safely
-:: ---------------------------------------------------------
+REM ---------------------------------------------------------
+REM 2. Load Swing Credentials from .env safely
+REM ---------------------------------------------------------
 if exist .env (
     for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
         set "KEY_NAME=%%A"
@@ -28,12 +28,12 @@ if exist .env (
     exit /b 1
 )
 
-:: ---------------------------------------------------------
-:: 3. Validation & Fail-Fast Guards
-:: ---------------------------------------------------------
+REM ---------------------------------------------------------
+REM 3. Validation and Fail-Fast Guards
+REM ---------------------------------------------------------
 if not defined APCA_API_BASE_URL set "APCA_API_BASE_URL=https://paper-api.alpaca.markets"
 
-:: Safety Guard: Ensure Paper API URL strictly
+REM Safety Guard: Ensure Paper API URL strictly
 echo !APCA_API_BASE_URL! | findstr /i "paper-api.alpaca.markets" >nul
 if %errorlevel% neq 0 (
     echo [CRITICAL ERROR] APCA_API_BASE_URL is NOT paper trading!
@@ -43,7 +43,7 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-:: Safety Guard: Check for missing or placeholder keys
+REM Safety Guard: Check for missing or placeholder keys
 if not defined APCA_API_KEY_ID (
     echo [ERROR] SWING_APCA_API_KEY_ID is not defined in .env!
     pause
@@ -61,44 +61,36 @@ if %errorlevel% equ 0 (
     exit /b 1
 )
 
-:: ---------------------------------------------------------
-:: 4. Single-Instance Lock
-:: ---------------------------------------------------------
+REM ---------------------------------------------------------
+REM 4. Lock File Tracking
+REM ---------------------------------------------------------
 set "LOCK_FILE=%~dp0data\swing_bot.lock"
 if not exist "%~dp0data" mkdir "%~dp0data"
+echo %DATE% %TIME% > "!LOCK_FILE!"
 
-if exist "!LOCK_FILE!" (
-    echo [WARNING] Lock file detected at: !LOCK_FILE!
-    echo Another instance of Swing Bot may already be running.
-    echo If this is from a previous crash, delete data\swing_bot.lock and restart.
-    set /p UNLOCK="Type FORCE to override lock: "
-    if /I not "!UNLOCK!"=="FORCE" exit /b 1
-)
-echo %DATE% %TIME% - PID: %RANDOM% > "!LOCK_FILE!"
-
-:: ---------------------------------------------------------
-:: 5. Python Environment Selection
-:: ---------------------------------------------------------
+REM ---------------------------------------------------------
+REM 5. Python Environment Selection
+REM ---------------------------------------------------------
 set "PY_EXE=python"
 if exist "%~dp0.venv\Scripts\python.exe" set "PY_EXE=%~dp0.venv\Scripts\python.exe"
 
-:: ---------------------------------------------------------
-:: 6. Masked Display & Launch
-:: ---------------------------------------------------------
+REM ---------------------------------------------------------
+REM 6. Masked Display and Launch
+REM ---------------------------------------------------------
 set "MASKED_KEY=!APCA_API_KEY_ID:~0,4!****************!APCA_API_KEY_ID:~-4!"
 
 echo =======================================================
-echo   📈 Starting Swing Trading Engine (Alpaca Swing Sub-Account)
-echo   🔑 Account Key: !MASKED_KEY!
-echo   🌐 Endpoint:    !APCA_API_BASE_URL!
-echo   🐍 Python:      !PY_EXE!
+echo   Starting Swing Trading Engine (Alpaca Swing Sub-Account)
+echo   Account Key: !MASKED_KEY!
+echo   Endpoint:    !APCA_API_BASE_URL!
+echo   Python:      !PY_EXE!
 echo =======================================================
 echo.
 
 "!PY_EXE!" -X utf8 main.py paper --broker alpaca --loop --interval 1800
 set "EXIT_CODE=%errorlevel%"
 
-:: Clean lock file on exit
+REM Clean lock file on exit
 if exist "!LOCK_FILE!" del "!LOCK_FILE!"
 
 if %EXIT_CODE% neq 0 (
