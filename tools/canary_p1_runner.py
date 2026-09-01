@@ -57,13 +57,17 @@ def run_isolated_paper_canary(mode: str = "SIMULATION") -> dict:
     t_start_utc = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
     t_start_local = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
+    from observability import get_build_provenance
+    prov = get_build_provenance()
+
     evidence = {
         "schema_version": "1.0",
         "run_id": run_id,
         "run_type": "PRE_CLOSE_SIMULATED_REHEARSAL" if mode == "SIMULATION" else "POST_CLOSE_FINAL_CANARY",
         "execution_mode": mode,
-        "git_commit": "bebe930",
-        "git_branch": "feature/p1-resilience-reconnect-hardening",
+        "git_commit": prov.commit,
+        "git_branch": prov.branch,
+        "working_tree_clean": prov.working_tree_clean,
         "runner_file_sha256": file_hash,
         "broker_network_enabled": False if mode == "SIMULATION" else True,
         "order_submission_enabled": False,
@@ -81,7 +85,7 @@ def run_isolated_paper_canary(mode: str = "SIMULATION") -> dict:
     print(f"\n{'='*75}")
     print(f"  P1 CANARY RUNNER — RUN ID: {run_id} | MODE: {mode}")
     print(f"  Run Type: {evidence['run_type']}")
-    print(f"  Git Commit: bebe930 | Branch: feature/p1-resilience-reconnect-hardening")
+    print(f"  Git Commit: {prov.commit} | Branch: {prov.branch}")
     print(f"  Runner SHA256: {file_hash[:16]}...")
     print(f"  Local Time: {t_start_local} (+07:00 ICT)")
     print(f"{'='*75}\n")

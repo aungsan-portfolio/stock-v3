@@ -482,10 +482,8 @@ class AlpacaBridge:
 
             self._account_id = str(getattr(acct, "account_number", "") or getattr(acct, "id", "") or "default")
             logger.info("Connected to Alpaca Paper Account (%s) | Status: %s | Equity: %s", self._account_id, acct.status, acct.equity)
-            logger.info(
-                "[P1 BUILD] git_commit=b35e4de branch=feature/p1-resilience-reconnect-hardening "
-                "stream_state_machine=v1 persistent_bridge=True broker_order_check=TRI_STATE"
-            )
+            from observability import get_build_provenance
+            logger.info(get_build_provenance().marker_string())
             from strategies.session import now_eastern
             et_date = str(now_eastern().date())
             state = self._load_daytrade_risk_state(self._account_id)
@@ -1775,6 +1773,32 @@ class AlpacaBridge:
                     sm.heartbeat_if_due(interval_seconds=0.0)  # Immediate heartbeat on dirty startup
         except Exception as l_exc:
             logger.debug("[STARTUP RECONCILE] Latch reconciliation non-fatal warning: %s", l_exc)
+
+        # Update Stream State Machine if in startup or reconciling phase
+        try:
+            with self._stream_state_lock:
+                if self._stream_state == StreamState.AUTHENTICATED_UNRECONCILED:
+                    self._transition_stream_state(
+                        expected={StreamState.AUTHENTICATED_UNRECONCILED},
+                        new_state=StreamState.RECONCILING,
+                        reason="Broker reconciliation started",
+                    )
+                if self._stream_state == StreamState.RECONCILING:
+                    if snapshot.get("clean"):
+                        self._transition_stream_state(
+                            expected={StreamState.RECONCILING},
+                            new_state=StreamState.HEALTHY,
+                            reason="Broker reconciliation clean=True",
+                        )
+                        self._clear_recovery_halts()
+                    else:
+                        self._transition_stream_state(
+                            expected={StreamState.RECONCILING},
+                            new_state=StreamState.LATCHED_DESYNC,
+                            reason="Broker reconciliation clean=False (desync/unprotected)",
+                        )
+        except Exception as st_exc:
+            logger.debug("[STARTUP RECONCILE] Stream state transition non-fatal: %s", st_exc)
 
         return {
             "snapshot": snapshot,
