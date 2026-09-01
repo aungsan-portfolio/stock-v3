@@ -261,17 +261,21 @@ def _print_startup_reconciliation(recon: dict) -> None:
         print(f"Orphan exit order(s) with no covering long: {orphan_syms}")
 
 
-def _place_paper_orders(signals, broker: str = "ibkr") -> int:
+def _place_paper_orders(signals, broker: str = "ibkr", bridge=None) -> int:
     """Place signals on the PAPER account via IBKRBridge or AlpacaBridge."""
     if str(broker).lower() == "alpaca":
         from alpaca_bridge import AlpacaBridge
-        bridge = AlpacaBridge(mode="swing")
-        print(f"\n{'='*60}")
-        print("  SWING TRADING ENGINE (ALPACA SWING SUB-ACCOUNT)")
-        print(f"{'='*60}\n")
-        if not bridge.connect():
-            print("❌ Could not connect to Alpaca Paper Broker.")
-            return 1
+        own_bridge = False
+        if bridge is None:
+            bridge = AlpacaBridge(mode="swing")
+            own_bridge = True
+            print(f"\n{'='*60}")
+            print("  SWING TRADING ENGINE (ALPACA SWING SUB-ACCOUNT)")
+            print(f"{'='*60}\n")
+            if not bridge.connect():
+                print("❌ Could not connect to Alpaca Paper Broker.")
+                return 1
+
         try:
             try:
                 acct_equity = bridge.get_net_liquidation()
@@ -292,8 +296,15 @@ def _place_paper_orders(signals, broker: str = "ibkr") -> int:
             print(f"\n✅ Orders accepted : {result.get('placed', 0)}")
             print(f"   Skipped         : {result.get('skipped', 0)}")
             print(f"   Total signals   : {result.get('total', len(signals))}")
+
+            # Run post-scan cycle reconciliation before closing connection
+            post_recon = bridge.reconcile_startup_state()
+            post_snap = post_recon.get("snapshot", {})
+            if not post_snap.get("clean", True):
+                print(f"⚠️ Post-scan reconciliation warning: {post_snap.get('orphan_exits', [])} orphan exits, {post_recon.get('protect', {}).get('unprotected', [])} unprotected longs")
         finally:
-            bridge.disconnect()
+            if own_bridge:
+                bridge.disconnect()
         return 0
 
     # Windows asyncio policy fix for ib_insync.
@@ -314,32 +325,32 @@ def _place_paper_orders(signals, broker: str = "ibkr") -> int:
     try:
         from ibkr_bridge import IBKRBridge
     except ImportError:
-        print("â Œ ib_insync not installed. Run: pip install ib_insync")
+        print("❌ ib_insync not installed. Run: pip install ib_insync")
         return 2
 
-    bridge = IBKRBridge()
-    if not bridge.connect():
-        print(
-            "â Œ Could not connect to IBKR TWS.\n"
-            "   Ensure TWS/Gateway is running on port 7497 (paper).\n"
-            "   Settings â†’ API â†’ Enable Socket Clients â†’ Port 7497"
-        )
-        return 1
+    own_bridge = False
+    if bridge is None:
+        bridge = IBKRBridge()
+        own_bridge = True
+        if not bridge.connect():
+            print(
+                "❌ Could not connect to IBKR TWS.\n"
+                "   Ensure TWS/Gateway is running on port 7497 (paper).\n"
+                "   Settings → API → Enable Socket Clients → Port 7497"
+            )
+            return 1
 
     try:
         recon = _run_paper_startup_checks(bridge)
         _print_startup_reconciliation(recon)
 
         result = bridge.execute_all(signals)
-        print(f"\nâœ… Orders accepted : {result['placed']}")
+        print(f"\n✅ Orders accepted : {result['placed']}")
         print(f"   Skipped         : {result['skipped']}")
         print(f"   Total signals   : {result['total']}")
     finally:
-        # Phase 5B-3: graceful shutdown -- preserve every resting GTC protective
-        # stop, repair any unprotected long via the existing Phase-3 path (or
-        # halt), and mark the disconnect intentional so the watchdog reads it as
-        # a clean close. Never opens a new entry; never cancels a protective stop.
-        bridge.graceful_shutdown()
+        if own_bridge:
+            bridge.graceful_shutdown()
     return 0
 
 
@@ -369,12 +380,33 @@ def cmd_paper(args) -> int:
     print(f"  Scan Interval: {interval//60} minutes | Broker: {broker.upper()}")
     print(f"{'='*65}\n")
 
-    import time
+    import threading
     from strategies.session import is_market_open, now_eastern
 
+    bridge = None
+    if str(broker).lower() == "alpaca":
+        from alpaca_bridge import AlpacaBridge
+        bridge = AlpacaBridge(mode="swing")
+        print(f"\n{'='*60}")
+        print("  SWING TRADING ENGINE (ALPACA SWING SUB-ACCOUNT)")
+        print(f"{'='*60}\n")
+        if not bridge.connect():
+            print("❌ Could not connect to Alpaca Paper Broker.")
+            return 1
+        try:
+            acct_equity = bridge.get_net_liquidation()
+            print(f"  Connected to Alpaca Paper Account | Status: ACTIVE | Equity: ${acct_equity:,.2f}")
+            print(f"  Open Positions: {bridge.open_position_count()}\n")
+        except Exception as e:
+            print(f"  Connected to Alpaca Paper Account | Equity fetch info: {e}\n")
+
+        recon = _run_paper_startup_checks(bridge)
+        _print_startup_reconciliation(recon)
+
+    shutdown_event = threading.Event()
     cycle = 0
     try:
-        while True:
+        while not shutdown_event.is_set():
             cycle += 1
             now_dt = now_eastern()
             now_str = now_dt.strftime('%Y-%m-%d %H:%M:%S %Z')
@@ -389,17 +421,29 @@ def cmd_paper(args) -> int:
                     signals = Predictor().predict_all()
                     _print_paper_signals_table(signals)
                     if not args.dry_run:
-                        _place_paper_orders(signals, broker=broker)
+                        _place_paper_orders(signals, broker=broker, bridge=bridge)
                     else:
                         print("\n⚠️   Dry-run mode — no orders placed.")
                 except Exception as cycle_err:
                     print(f"  ERROR during swing scan cycle #{cycle}: {cycle_err}")
 
             print(f"\n  Next Swing Scan in {interval//60} minutes ({interval}s). Press Ctrl+C to exit.\n")
-            time.sleep(interval)
+            if shutdown_event.wait(timeout=interval):
+                break
     except KeyboardInterrupt:
-        print("\n\nSwing Trading Scheduler stopped by user. Exiting cleanly.")
-        return 0
+        print("\n\nSwing Trading Scheduler stopping by user. Exiting cleanly...")
+        shutdown_event.set()
+    finally:
+        if bridge is not None:
+            print("Performing graceful shutdown of Swing Alpaca Bridge...")
+            try:
+                res = bridge.graceful_shutdown(preserve_protected=True)
+                clean_str = getattr(res, "clean", True)
+                print(f"Swing Alpaca Bridge stopped: clean={clean_str}")
+            except Exception as sht_err:
+                print(f"Bridge graceful shutdown error: {sht_err}")
+
+    return 0
 
 
 # â”€â”€ Full-market hot scanner commands â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1839,6 +1883,23 @@ def cmd_live_readiness(args) -> int:
     return 0 if ready else 1
 
 
+# -- Automated Pre-Flight Go / No-Go Gate ---------------------------------------
+def cmd_preflight(args) -> int:
+    """Run 4-layer Pre-Flight Verification Gate:
+    1. Data Freshness (SPY/QQQ latest bars)
+    2. Broker Reconciliation (Alpaca Paper, 0 duplicates, 0 orphans)
+    3. Position Protection (100% covering stop loss orders)
+    4. Event Risk & Model Freshness (Event Guard phase, RF/LSTM models)
+
+    Exit code: 0 if GO (all critical gates pass), 1 if NO-GO.
+    """
+    from preflight import run_preflight_audit, print_preflight_scorecard
+    save_report = not bool(getattr(args, "no_save", False))
+    report = run_preflight_audit(save_report=save_report)
+    print_preflight_scorecard(report)
+    return 0 if report.status == "GO" else 1
+
+
 # -- Emergency kill-switch: cancel orders + flatten positions (PAPER) ----------
 def cmd_panic_flatten(args) -> int:
     """Emergency: cancel ALL working orders and market-close ALL positions on the
@@ -2521,6 +2582,7 @@ def cmd_daytrade_status(args) -> int:
                 f"Gap-and-Go:    {'ON' if getattr(config, 'STRATEGY_GAP_AND_GO_ENABLED', True) else 'OFF'}\n"
                 f"Momentum:      {'ON' if getattr(config, 'STRATEGY_MOMENTUM_SCALP_ENABLED', True) else 'OFF'}\n"
                 f"Candlestick:   {'ON' if getattr(config, 'STRATEGY_CANDLESTICK_ENABLED', True) else 'OFF'}\n"
+                f"Mean Reversion:{'ON' if getattr(config, 'STRATEGY_MEAN_REVERSION_ENABLED', True) else 'OFF'}\n"
             )
             strategy_panel = Panel(
                 Align.center(strategy_text, vertical="middle"),
@@ -2596,6 +2658,7 @@ def cmd_daytrade_status(args) -> int:
             print(f"    Gap-and-Go:    {'ON' if getattr(config, 'STRATEGY_GAP_AND_GO_ENABLED', True) else 'OFF'}")
             print(f"    Momentum:      {'ON' if getattr(config, 'STRATEGY_MOMENTUM_SCALP_ENABLED', True) else 'OFF'}")
             print(f"    Candlestick:   {'ON' if getattr(config, 'STRATEGY_CANDLESTICK_ENABLED', True) else 'OFF'}")
+            print(f"    Mean Reversion:{'ON' if getattr(config, 'STRATEGY_MEAN_REVERSION_ENABLED', True) else 'OFF'}")
             print()
 
             sizing_method = getattr(config, "SIZING_METHOD", "risk_percent")
@@ -2680,6 +2743,13 @@ def cmd_daytrade_bot(args) -> int:
         sys.exit(1)
 
     try:
+        from preflight import run_preflight_audit, print_preflight_scorecard
+        pf_report = run_preflight_audit(bridge=bridge, save_report=True)
+        print_preflight_scorecard(pf_report)
+        if pf_report.status != "GO":
+            print(f"🚨 PRE-FLIGHT VERIFICATION FAILED ({pf_report.status}) — Halting new entries.")
+            bridge.entry_gate.halt("Pre-flight audit failed")
+
         recon = bridge.reconcile_startup_state()
         _print_startup_reconciliation(recon)
         if recon.get("halt_new_entries") or getattr(bridge.entry_gate, "halted", False):
@@ -2694,6 +2764,10 @@ def cmd_daytrade_bot(args) -> int:
     bg_scanner = None
 
     if use_dynamic_scanner:
+        from strategies.scanner.premarket_scanner import clear_quarantine
+        clear_quarantine()
+        from strategies.order_manager import reset_session_skip_state
+        reset_session_skip_state()
         print("Running initial synchronous scanner scan on startup...")
         try:
             candidates = scan(max_candidates=10)
@@ -2770,7 +2844,15 @@ def cmd_daytrade_bot(args) -> int:
                 logger.warning("[ENTRY GATE HALTED] Startup reconciliation or safety circuit breaker has halted new entries.")
             if use_dynamic_scanner:
                 if bg_scanner:
+                    bg_scanner.ensure_running()
                     watchlist = bg_scanner.get_watchlist()
+                    health = bg_scanner.get_health_status()
+                    if health.get("restart_count", 0) > 0:
+                        logger.debug(
+                            "[SCANNER HEALTH] Thread alive=%s | restarts=%d | age=%ss | candidates=%d",
+                            health.get("thread_alive"), health.get("restart_count"),
+                            str(health.get("scanner_age_seconds")), len(watchlist)
+                        )
                     # Check for staleness (15 minutes = 900 seconds)
                     last_completed = bg_scanner.get_last_scan_completed_time()
                     if last_completed > 0:
@@ -3180,7 +3262,19 @@ def main() -> int:
              "stays paper-port-locked. Never enables live trading.",
     )
 
+    # -- Automated Pre-Flight Go/No-Go Gate --
+    p_pf = sub.add_parser(
+        "preflight",
+        help="Run automated Pre-Flight Go/No-Go Gate audit (Data, Broker, Protection, Events)",
+    )
+    p_pf.add_argument(
+        "--no-save", action="store_true",
+        help="Do not save the JSON audit report to reports/preflight_report.json",
+    )
+
     args = parser.parse_args()
+    if args.command == "preflight":
+        return cmd_preflight(args)
     if args.command == "daytrade-scan":
         return cmd_daytrade_scan(args)
     if args.command == "daytrade-signals":
