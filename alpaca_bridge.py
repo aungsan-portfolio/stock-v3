@@ -416,20 +416,21 @@ class AlpacaBridge:
             raise RuntimeError("AlpacaBridge is not connected")
 
     def _require_trade_stream(self) -> None:
-        """Fail closed for new entries when order-state streaming is unavailable."""
+        """Fail closed for new entries when order-state streaming is unavailable or not HEALTHY."""
         if os.environ.get("PYTEST_CURRENT_TEST") or getattr(self, "_test_mode", False):
             return
         thread = self._trade_stream_thread
         stream = self._trade_stream
         if (
-            not self._trade_stream_ready
+            self._stream_state != StreamState.HEALTHY
+            or not self._trade_stream_ready
             or thread is None
             or not thread.is_alive()
             or self._trade_stream_recovery_required
             or stream is None
             or not getattr(stream, "_running", False)
         ):
-            raise RuntimeError("Trade-update stream is unavailable; refusing new entry")
+            raise RuntimeError(f"Trade-update stream is not HEALTHY (state: {self._stream_state}); refusing new entry")
 
     # ── Connection ───────────────────────────────────────────────
     def connect(self) -> bool:
