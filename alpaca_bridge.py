@@ -482,6 +482,10 @@ class AlpacaBridge:
 
             self._account_id = str(getattr(acct, "account_number", "") or getattr(acct, "id", "") or "default")
             logger.info("Connected to Alpaca Paper Account (%s) | Status: %s | Equity: %s", self._account_id, acct.status, acct.equity)
+            logger.info(
+                "[P1 BUILD] git_commit=b35e4de branch=feature/p1-resilience-reconnect-hardening "
+                "stream_state_machine=v1 persistent_bridge=True broker_order_check=TRI_STATE"
+            )
             from strategies.session import now_eastern
             et_date = str(now_eastern().date())
             state = self._load_daytrade_risk_state(self._account_id)
