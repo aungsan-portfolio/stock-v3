@@ -886,7 +886,8 @@ class AlpacaBridge:
                     from observability import get_latch_state_machine, LatchTrigger
                     get_latch_state_machine().latch(
                         LatchTrigger.RECONCILE_MISMATCH,
-                        context={"snapshot": recon.get("snapshot", {})},
+                        bridge=self,
+                        extra_context={"snapshot": recon.get("snapshot", {})},
                     )
                 except Exception as l_err:
                     logger.warning("Could not trigger latch state machine during desync: %s", l_err)
