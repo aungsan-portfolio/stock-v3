@@ -405,6 +405,9 @@ class ShadowLifecycleManager:
             trade.outcome_class = "BREAKEVEN"
 
 
+import threading
+
+_shadow_mgr_lock = threading.Lock()
 _shadow_lifecycle_manager_instance: Optional[ShadowLifecycleManager] = None
 
 
@@ -413,19 +416,22 @@ def get_shadow_lifecycle_manager(
     clock: Optional[Callable[[], pd.Timestamp]] = None,
     force_new: bool = False,
 ) -> ShadowLifecycleManager:
-    """Returns singleton instance of ShadowLifecycleManager."""
+    """Returns thread-safe singleton instance of ShadowLifecycleManager."""
     global _shadow_lifecycle_manager_instance
-    if _shadow_lifecycle_manager_instance is None or force_new:
-        _shadow_lifecycle_manager_instance = ShadowLifecycleManager(storage=storage, clock=clock)
-    return _shadow_lifecycle_manager_instance
+    with _shadow_mgr_lock:
+        if _shadow_lifecycle_manager_instance is None or force_new:
+            _shadow_lifecycle_manager_instance = ShadowLifecycleManager(storage=storage, clock=clock)
+        return _shadow_lifecycle_manager_instance
 
 
 def reset_shadow_lifecycle_manager() -> None:
     """Resets singleton instance and releases lock (for tests / restart)."""
     global _shadow_lifecycle_manager_instance
-    if _shadow_lifecycle_manager_instance is not None:
-        try:
-            _shadow_lifecycle_manager_instance.storage.release_lock()
-        except Exception:
-            pass
+    with _shadow_mgr_lock:
+        if _shadow_lifecycle_manager_instance is not None:
+            try:
+                _shadow_lifecycle_manager_instance.storage.release_lock()
+            except Exception:
+                pass
+            _shadow_lifecycle_manager_instance = None
         _shadow_lifecycle_manager_instance = None

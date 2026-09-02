@@ -79,7 +79,8 @@ class ShadowStorageManager:
 
         # Write our lock
         try:
-            tmp_lock = self.dir_path / f"shadow.lock.{os.getpid()}.tmp"
+            import threading
+            tmp_lock = self.dir_path / f"shadow.lock.{os.getpid()}.{threading.get_ident()}.tmp"
             with open(tmp_lock, "w", encoding="utf-8") as f:
                 json.dump(lock_info, f, indent=2)
             os.replace(tmp_lock, self.lock_file)
