@@ -51,21 +51,37 @@ class ShadowLifecycleManager:
             logger.warning("[SHADOW DISABLED: LOCK UNAVAILABLE] Lifecycle manager disabled due to lock contention.")
         else:
             self._active_trades = self.storage.load_active_trades()
+            import os, socket
+            git_rev = "0850a1d"
+            try:
+                import subprocess
+                git_rev = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL).decode().strip()
+            except Exception:
+                pass
+
             logger.info(
                 "[P1.6 SHADOW STARTUP]\n"
+                "  commit=%s\n"
+                "  pid=%d\n"
+                "  hostname=%s\n"
                 "  enabled=%s\n"
-                "  strategy=%s\n"
                 "  role=%s\n"
+                "  strategy=%s\n"
                 "  production_orb_enabled=%s\n"
+                "  allow_short=%s\n"
                 "  broker_dependency=%s\n"
                 "  storage=%s\n"
                 "  lock_acquired=%s\n"
                 "  active_loaded=%d\n"
                 "  closed_loaded=%d",
+                git_rev,
+                os.getpid(),
+                socket.gethostname(),
                 getattr(config, "P1_6_ORB_SHADOW_ENABLED", False),
-                self.storage.strategy_version,
                 self.storage.role,
+                self.storage.strategy_version,
                 getattr(config, "STRATEGY_ORB_ENABLED", False),
+                getattr(config, "ORB_SHADOW_ALLOW_SHORT", False),
                 False,
                 str(self.storage.dir_path),
                 self.storage.is_locked,
