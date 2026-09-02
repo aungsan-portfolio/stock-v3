@@ -837,7 +837,8 @@ def evaluate_and_execute(
                             avg_cost=p.avgCost,
                             open_orders=open_orders,
                             current_price=price,
-                            qty=p.position
+                            qty=p.position,
+                            bridge=bridge,
                         )
                         if state and state.active and getattr(state, "entry_time", 0) > 0:
                             from strategies.trailing_stop import check_time_based_exit

@@ -37,6 +37,9 @@ class PendingEntry:
     cumulative_filled_qty: float = 0.0
     average_fill_price: float = 0.0
     execution_ids: Set[str] = field(default_factory=set)
+    submitted_entry_price: Optional[float] = None
+    submitted_stop_price: Optional[float] = None
+    submitted_target_price: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +72,9 @@ class EntryOrderLifecycle:
         requested_qty: float,
         stop_order_id: object = None,
         target_order_id: object = None,
+        submitted_entry_price: Optional[float] = None,
+        submitted_stop_price: Optional[float] = None,
+        submitted_target_price: Optional[float] = None,
     ) -> PendingEntry:
         """Record a submitted bracket; this does *not* create position state."""
         parent_id = self._order_id(parent_order_id)
@@ -82,13 +88,30 @@ class EntryOrderLifecycle:
         if stop_id is None or target_id is None or stop_id == target_id:
             raise ValueError("Bracket must provide distinct stop and target child order IDs")
 
+        # P1.5.2: Propagate submitted geometry to effective signal
+        from dataclasses import replace
+        entry_px = float(submitted_entry_price) if submitted_entry_price is not None else float(signal.entry_price)
+        stop_px = float(submitted_stop_price) if submitted_stop_price is not None else float(signal.stop_price)
+        target_px = float(submitted_target_price) if submitted_target_price is not None else getattr(signal, "target_price", None)
+
+        effective_signal = replace(
+            signal,
+            entry_price=entry_px,
+            stop_price=stop_px,
+            target_price=target_px,
+            risk_per_share=abs(entry_px - stop_px),
+        )
+
         entry = PendingEntry(
             parent_order_id=parent_id,
-            symbol=signal.symbol.upper().strip(),
-            signal=signal,
+            symbol=effective_signal.symbol.upper().strip(),
+            signal=effective_signal,
             requested_qty=float(requested_qty),
             stop_order_id=stop_id,
             target_order_id=target_id,
+            submitted_entry_price=entry_px,
+            submitted_stop_price=stop_px,
+            submitted_target_price=target_px,
         )
         with self._lock:
             if parent_id in self._pending:
@@ -391,6 +414,9 @@ class EntryOrderLifecycle:
                     "stop_order_id": entry.stop_order_id,
                     "target_order_id": entry.target_order_id,
                     "submitted_at": entry.submitted_at,
+                    "submitted_entry_price": entry.submitted_entry_price,
+                    "submitted_stop_price": entry.submitted_stop_price,
+                    "submitted_target_price": entry.submitted_target_price,
                 }
                 for parent_id, entry in self._pending.items()
             }

@@ -299,6 +299,13 @@ MAX_DECISION_DEVIATION_PCT       = 1.5    # 1.5% max price deviation
 MAX_QUOTE_AGE_SECONDS            = 10.0   # 10 seconds max quote staleness
 MARKET_HOURS_GATE_ENABLED        = True
 
+# ── P1.5.2 Bar Staleness & Reconciliation Settings ───
+INTRADAY_BAR_SECONDS             = 300.0  # 5-minute default bar interval
+BAR_CLOSE_GRACE_SECONDS          = 45.0   # 45s grace period post completed bar close
+BAR_FUTURE_TOLERANCE_SECONDS     = 5.0    # 5s clock skew tolerance for completed bars
+TRAILING_STOP_RECONCILE_TOLERANCE = None  # None defaults dynamically to tick_size / 2.0
+
+
 DATA_HEALTH_SETTINGS = {
     "critical_symbols": ["SPY", "QQQ"],
     "stale_threshold_s": {

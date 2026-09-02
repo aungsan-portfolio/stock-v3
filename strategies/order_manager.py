@@ -435,15 +435,31 @@ def register_pending_order(
     qty: float,
     stop_id: Optional[str] = None,
     tp_id: Optional[str] = None,
+    submitted_entry_price: Optional[float] = None,
+    submitted_stop_price: Optional[float] = None,
+    submitted_target_price: Optional[float] = None,
 ) -> None:
     """Register a pending parent order until its terminal broker state."""
     if not parent_id:
         return
 
+    from dataclasses import replace
+    entry_px = float(submitted_entry_price) if submitted_entry_price is not None else float(limit_price)
+    stop_px = float(submitted_stop_price) if submitted_stop_price is not None else float(signal.stop_price)
+    target_px = float(submitted_target_price) if submitted_target_price is not None else getattr(signal, "target_price", None)
+
+    effective_signal = replace(
+        signal,
+        entry_price=entry_px,
+        stop_price=stop_px,
+        target_price=target_px,
+        risk_per_share=abs(entry_px - stop_px),
+    )
+
     key = str(parent_id)
     with _pending_order_contexts_lock:
         _pending_order_contexts[key] = {
-            "signal": signal,
+            "signal": effective_signal,
             "limit_price": float(limit_price),
             "requested_qty": float(qty),
             "cumulative_filled_qty": 0.0,
@@ -454,6 +470,9 @@ def register_pending_order(
             "seen_execution_ids": [],
             "lifecycle_registered": False,
             "reconciliation_required": False,
+            "submitted_entry_price": entry_px,
+            "submitted_stop_price": stop_px,
+            "submitted_target_price": target_px,
         }
 
 
@@ -1193,8 +1212,33 @@ def execute_signal(
         )
         return result
 
-    # Phase D: Post-Submission Lifecycle Registration
+    # Phase D: Post-Submission Lifecycle Registration & Geometry Propagation
     try:
+        # P1-5: Structured single-line geometry logging
+        logger.info(
+            "[ORDER GEOMETRY] %s parent=%s | signal: entry=%.2f stop=%.2f tp=%.2f | "
+            "submitted: entry=%.2f stop=%.2f tp=%.2f | legs: stop=%s tp=%s",
+            signal.symbol,
+            parent_order_id,
+            float(signal.entry_price),
+            float(signal.stop_price),
+            float(getattr(signal, "target_price", 0.0) or 0.0),
+            float(limit_price),
+            float(stop_price),
+            float(target_price),
+            str(stop_id),
+            str(tp_id),
+        )
+
+        from dataclasses import replace
+        submitted_signal = replace(
+            signal,
+            entry_price=float(limit_price),
+            stop_price=float(stop_price),
+            target_price=float(target_price),
+            risk_per_share=abs(float(limit_price) - float(stop_price)),
+        )
+
         register_signal = getattr(bridge, "register_order_signal", None)
         if callable(register_signal):
             register_signal(order_ids, signal.signal_id)
@@ -1203,19 +1247,25 @@ def execute_signal(
 
         register_pending_order(
             parent_id=parent_order_id,
-            signal=signal,
+            signal=submitted_signal,
             limit_price=limit_price,
             qty=shares,
             stop_id=str(stop_id),
             tp_id=str(tp_id),
+            submitted_entry_price=limit_price,
+            submitted_stop_price=stop_price,
+            submitted_target_price=target_price,
         )
 
         entry_lifecycle.register_submission(
             parent_order_id=parent_order_id,
-            signal=signal,
+            signal=submitted_signal,
             requested_qty=shares,
             stop_order_id=str(stop_id),
             target_order_id=str(tp_id),
+            submitted_entry_price=limit_price,
+            submitted_stop_price=stop_price,
+            submitted_target_price=target_price,
         )
 
         with _pending_order_contexts_lock:

@@ -77,6 +77,15 @@ class TrailingStopState:
     partial_taken: bool = False
     partial_qty: float = 0.0
     partial_exit_price: float = 0.0
+    desired_stop_price: Optional[float] = None
+    confirmed_broker_stop_price: Optional[float] = None
+    stop_reconciliation_required: bool = False
+
+    def __post_init__(self):
+        if self.desired_stop_price is None:
+            self.desired_stop_price = float(self.stop_price)
+        if self.confirmed_broker_stop_price is None:
+            self.confirmed_broker_stop_price = float(self.stop_price)
 
 
 MAX_HOLD_MINUTES = 25.0
@@ -229,6 +238,10 @@ class DynamicTrailingStopManager:
                 if isinstance(data, dict):
                     for sym, state_dict in data.items():
                         if state_dict.get('active'):
+                            # P1.5.2 Migration for legacy state dictionaries
+                            state_dict.setdefault("desired_stop_price", state_dict.get("stop_price"))
+                            state_dict.setdefault("confirmed_broker_stop_price", state_dict.get("stop_price"))
+                            state_dict.setdefault("stop_reconciliation_required", False)
                             self.states[sym] = TrailingStopState(**state_dict)
             logger.info(f"Loaded {len(self.states)} active trailing stops.")
         except (json.JSONDecodeError, OSError) as e:
@@ -363,6 +376,9 @@ class DynamicTrailingStopManager:
                 peak_price=fill_price,
                 atr=atr,
                 stop_price=initial_stop,
+                desired_stop_price=initial_stop,
+                confirmed_broker_stop_price=initial_stop,
+                stop_reconciliation_required=False,
                 target_price=target_price,
                 trail_multiple=mult,
                 last_updated=time.time(),
@@ -525,6 +541,7 @@ class DynamicTrailingStopManager:
         original_stop: Optional[float] = None,
         qty: float = 0.0,
         original_entry_time: Optional[float] = None,
+        bridge: Optional[object] = None,
     ) -> Optional[TrailingStopState]:
         """Ensure trailing stop state is initialized for an active position."""
         with self._lock:
@@ -534,22 +551,69 @@ class DynamicTrailingStopManager:
                     all_open_orders = self._extract_all_orders_including_legs(open_orders)
                     open_order_ids = {_extract_order_info(o)["id"] for o in all_open_orders if _extract_order_info(o)["id"]}
                     if str(state.order_id) not in open_order_ids:
-                        # Check if a valid active stop order for symbol already exists on broker
-                        target_side = "sell" if state.side == "BUY" else "buy"
-                        matching_stop_id = None
-                        matching_stop_price = None
-                        for o in all_open_orders:
-                            info = _extract_order_info(o)
-                            if info["symbol"] == symbol.upper().strip() and self._is_valid_stop_order(o, target_side):
-                                matching_stop_id = info["id"]
-                                matching_stop_price = info["stop_price"]
-                                break
-                        if matching_stop_id:
-                            state.order_id = str(matching_stop_id)
-                            if matching_stop_price is not None:
-                                state.stop_price = float(matching_stop_price)
+                        # P1-3: Do NOT immediately wipe order_id to None on snapshot miss!
+                        direct_order = None
+                        if bridge and hasattr(bridge, "get_order_snapshot"):
+                            try:
+                                direct_order = bridge.get_order_snapshot(str(state.order_id))
+                            except Exception as lookup_err:
+                                logger.debug(f"[RECONCILE] Direct lookup error for {state.order_id}: {lookup_err}")
+                        elif bridge and hasattr(bridge, "_client") and hasattr(bridge._client, "get_order_by_id"):
+                            try:
+                                direct_order = bridge._client.get_order_by_id(str(state.order_id))
+                            except Exception as lookup_err:
+                                logger.debug(f"[RECONCILE] Direct client lookup error for {state.order_id}: {lookup_err}")
+
+                        if direct_order is not None:
+                            d_info = _extract_order_info(direct_order)
+                            d_status = str(d_info.get("status", "")).lower()
+                            if d_status in ("held", "new", "accepted", "submitted", "pending_new"):
+                                # Retain ID, order is active resting at broker
+                                if d_info.get("stop_price") is not None:
+                                    state.confirmed_broker_stop_price = float(d_info["stop_price"])
+                                    state.stop_price = float(d_info["stop_price"])
+                            elif d_status in ("filled", "partially_filled"):
+                                pos_qty = 0.0
+                                if bridge and hasattr(bridge, "get_positions"):
+                                    try:
+                                        for p in (bridge.get_positions() or []):
+                                            p_sym = getattr(p, "symbol", "") or (p.get("symbol") if isinstance(p, dict) else "")
+                                            if p_sym.upper() == state.symbol.upper():
+                                                pos_qty = float(getattr(p, "qty", 0.0) or (p.get("qty", 0.0) if isinstance(p, dict) else 0.0))
+                                    except Exception:
+                                        pos_qty = 0.0
+                                if pos_qty <= 0:
+                                    logger.info(f"[RECONCILE P0] {state.symbol}: Stop order {state.order_id} status='{d_status}' and position flat. Marking inactive cleanly.")
+                                    state.active = False
+                                    state.order_id = None
+                                    self._save_state()
+                                    return state
+                                else:
+                                    logger.info(f"[RECONCILE] {state.symbol}: Stop order {state.order_id} partially filled, remaining pos={pos_qty}")
+                                    state.qty = pos_qty
+                            elif d_status in ("cancelled", "canceled", "expired", "rejected"):
+                                logger.warning(f"[RECONCILE P0] {state.symbol}: Stop order {state.order_id} status='{d_status}'. Clearing order ID for remediation.")
+                                state.order_id = None
                         else:
-                            state.order_id = None
+                            # Direct lookup unavailable or not found:
+                            # Check if a matching stop exists in all_open_orders
+                            target_side = "sell" if state.side == "BUY" else "buy"
+                            matching_stop_id = None
+                            matching_stop_price = None
+                            for o in all_open_orders:
+                                info = _extract_order_info(o)
+                                if info["symbol"] == symbol.upper().strip() and self._is_valid_stop_order(o, target_side):
+                                    matching_stop_id = info["id"]
+                                    matching_stop_price = info["stop_price"]
+                                    break
+                            if matching_stop_id:
+                                state.order_id = str(matching_stop_id)
+                                if matching_stop_price is not None:
+                                    state.stop_price = float(matching_stop_price)
+                                    state.confirmed_broker_stop_price = float(matching_stop_price)
+                            else:
+                                state.stop_reconciliation_required = True
+                                logger.warning(f"[RECONCILE UNCERTAIN] {state.symbol}: Tracked stop ID {state.order_id} missing from snapshot; retaining ID.")
 
                 if state.order_id is None:
                     self._reconcile_broker_order(state, open_orders)
@@ -704,15 +768,41 @@ class DynamicTrailingStopManager:
                 state.escalation_alerted = False
                 state.remediation_in_progress = False
                 if o_stop is not None:
-                    if state.side == "BUY":
-                        state.stop_price = max(state.stop_price, broker_stop_price)
+                    state.confirmed_broker_stop_price = broker_stop_price
+                    state.stop_price = broker_stop_price  # Broker truth is the effective resting stop
+
+                    desired = state.desired_stop_price if state.desired_stop_price is not None else broker_stop_price
+                    tick_size = 0.01 if max(state.entry_price, broker_stop_price) >= 1.0 else 0.0001
+                    tolerance = max(
+                        tick_size / 2.0,
+                        float(getattr(config, "TRAILING_STOP_RECONCILE_TOLERANCE", tick_size / 2.0) or (tick_size / 2.0)),
+                    )
+                    diff = abs(desired - broker_stop_price)
+                    is_looser = (broker_stop_price < desired - tolerance) if state.side == "BUY" else (broker_stop_price > desired + tolerance)
+
+                    if diff > tolerance:
+                        state.stop_reconciliation_required = True
+                        if is_looser:
+                            logger.warning(
+                                f"[RECONCILE DIVERGENCE CRITICAL] {state.symbol} ({state.side}): "
+                                f"Broker stop ${broker_stop_price:.2f} is looser than desired ${desired:.2f} (diff=${diff:.2f}). "
+                                f"reconciliation_required=True."
+                            )
+                        else:
+                            logger.info(
+                                f"[RECONCILE DIVERGENCE] {state.symbol} ({state.side}): "
+                                f"Broker stop ${broker_stop_price:.2f} vs desired ${desired:.2f} (diff=${diff:.2f})."
+                            )
                     else:
-                        state.stop_price = min(state.stop_price, broker_stop_price)
+                        state.stop_reconciliation_required = False
+
                 self._save_state()
+                confirmed_disp = state.confirmed_broker_stop_price if state.confirmed_broker_stop_price is not None else state.stop_price
+                desired_disp = state.desired_stop_price if state.desired_stop_price is not None else state.stop_price
                 if old_order_id != new_order_id:
-                    logger.info(f"Reconciled active STOP order for {state.symbol} ({state.side}): Adopted Order ID {state.order_id} (type={o_type}), stop_price ${state.stop_price:.2f}")
+                    logger.info(f"Reconciled active STOP order for {state.symbol} ({state.side}): Adopted Order ID {state.order_id} (type={o_type}), broker_stop=${confirmed_disp:.2f}, desired_stop=${desired_disp:.2f}")
                 else:
-                    logger.debug(f"Reconciled active STOP order for {state.symbol} ({state.side}): Order ID {state.order_id} active, stop_price ${state.stop_price:.2f}")
+                    logger.debug(f"Reconciled active STOP order for {state.symbol} ({state.side}): Order ID {state.order_id} active, broker_stop=${confirmed_disp:.2f}, desired_stop=${desired_disp:.2f}")
                 return True
         return False
 
@@ -871,7 +961,8 @@ class DynamicTrailingStopManager:
                             should_update = True
 
             if should_update:
-                logger.info(f"Trailing stop for {symbol} moving from ${state.stop_price:.2f} -> ${new_stop:.2f}")
+                state.desired_stop_price = new_stop
+                logger.info(f"Trailing stop for {symbol} moving from ${state.stop_price:.2f} -> desired ${new_stop:.2f}")
                 update_succeeded = True
                 if not dry_run and bridge and state.order_id:
                     try:
@@ -893,8 +984,14 @@ class DynamicTrailingStopManager:
 
                 if update_succeeded:
                     state.stop_price = new_stop
+                    state.confirmed_broker_stop_price = new_stop
+                    state.stop_reconciliation_required = False
                     state.last_updated = now
                 else:
+                    prev_confirmed = state.confirmed_broker_stop_price if state.confirmed_broker_stop_price is not None else state.stop_price
+                    state.stop_price = prev_confirmed
+                    state.confirmed_broker_stop_price = prev_confirmed
+                    state.stop_reconciliation_required = True
                     state.last_updated = 0
                 self._save_state()
             elif atr_changed:

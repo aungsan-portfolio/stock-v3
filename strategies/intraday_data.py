@@ -321,25 +321,31 @@ def _validate_intraday_data(df: pd.DataFrame, symbol: str, interval: str, valida
             
             from strategies.session import is_market_open
             if is_market_open():
-                staleness_seconds = (current_time - last_timestamp).total_seconds()
-                
                 interval_seconds = 60 # Default to 1m
                 if "m" in interval:
                     interval_seconds = int(interval.replace("m", "")) * 60
                 elif "h" in interval:
                     interval_seconds = int(interval.replace("h", "")) * 3600
                     
-                buffer_seconds = getattr(config, "STALE_QUOTE_BUFFER_SECONDS", 30)
-                max_stale = getattr(config, "STALE_QUOTE_MAX_SECONDS", 300)
+                # P1.5.2: Bar freshness based on completed bar close time
+                bar_close_time = last_timestamp + pd.Timedelta(seconds=interval_seconds)
+                delay_seconds = (current_time - bar_close_time).total_seconds()
+                grace_seconds = float(getattr(config, "BAR_CLOSE_GRACE_SECONDS", 45.0))
+                future_tolerance = float(getattr(config, "BAR_FUTURE_TOLERANCE_SECONDS", 5.0))
 
-                if staleness_seconds > max_stale:
-                    msg = f"Data validation failed for {symbol}: Stale quote. Last bar was {staleness_seconds}s ago (Limit: {max_stale}s)."
+                if delay_seconds < -future_tolerance:
+                    msg = f"Data validation failed for {symbol}: Future-dated completed bar (delay={delay_seconds:.1f}s, tolerance={future_tolerance}s)."
+                    logger.warning("[FUTURE-BAR-GUARD] %s", msg)
+                    return _quarantine("future_dated_bar")
+
+                if delay_seconds > grace_seconds:
+                    msg = f"Data validation failed for {symbol}: Stale completed bar: post-close delay={delay_seconds:.1f}s (grace={grace_seconds:.1f}s)."
                     blacklist = set(getattr(config, "SYMBOL_STALE_QUOTE_BLACKLIST", []))
                     if symbol in blacklist or _in_market_open_transition():
                         logger.debug("[STALE-QUOTE] %s", msg)
                     else:
                         logger.warning("%s", msg)
-                    return _quarantine(f"stale_quote_gt_{max_stale}s")
+                    return _quarantine(f"stale_completed_bar_gt_{int(grace_seconds)}s")
     except Exception as e:
         logger.error("Error checking validation for %s: %s", symbol, e)
         return pd.DataFrame()

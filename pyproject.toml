@@ -5,6 +5,7 @@ norecursedirs = ["manual", ".venv", ".cache_data", "archive_cleanup_*"]
 addopts = "-s --cov=. --cov-report=term-missing --cov-report=xml --cov-fail-under=10 -v"
 filterwarnings = [
     "ignore:websockets.legacy is deprecated:DeprecationWarning",
+    "ignore::ResourceWarning",
 ]
 
 [tool.coverage.run]
