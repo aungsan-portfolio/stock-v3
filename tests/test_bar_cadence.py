@@ -17,7 +17,7 @@ def test_5m_bar_cadence_gate():
     mock_bridge.get_net_liquidation.return_value = 100000.0
 
     eval_count = 0
-    def mock_eval_parallel(watchlist, bridge=None):
+    def mock_eval_parallel(watchlist, bridge=None, **kwargs):
         nonlocal eval_count
         eval_count += 1
         return []

@@ -6,6 +6,8 @@ addopts = "-s --cov=. --cov-report=term-missing --cov-report=xml --cov-fail-unde
 filterwarnings = [
     "ignore:websockets.legacy is deprecated:DeprecationWarning",
     "ignore::ResourceWarning",
+    "ignore:.*WindowsSelectorEventLoopPolicy.*:DeprecationWarning",
+    "ignore:.*get_event_loop_policy.*:DeprecationWarning",
 ]
 
 [tool.coverage.run]

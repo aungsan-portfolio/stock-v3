@@ -729,6 +729,8 @@ def evaluate_and_execute(
         from strategies.session import is_past_opening_buffer
 
         scanner_count = getattr(bridge, "_last_scanner_candidate_count", None) if bridge else None
+        if not isinstance(scanner_count, (int, float)):
+            scanner_count = None
         if scanner_count is None or scanner_count == 0:
             scanner_count = len(watchlist) if watchlist else 0
         if not live_paper and scanner_count > 0 and scanner_count < 2:

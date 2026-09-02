@@ -299,10 +299,13 @@ MAX_DECISION_DEVIATION_PCT       = 1.5    # 1.5% max price deviation
 MAX_QUOTE_AGE_SECONDS            = 10.0   # 10 seconds max quote staleness
 MARKET_HOURS_GATE_ENABLED        = True
 
-# ── P1.5.2 Bar Staleness & Reconciliation Settings ───
+# ── P1.5.2 / P1.5.2.1 Bar Staleness & Reconciliation Settings ───
 INTRADAY_BAR_SECONDS             = 300.0  # 5-minute default bar interval
-BAR_CLOSE_GRACE_SECONDS          = 45.0   # 45s grace period post completed bar close
+ENTRY_BAR_CLOSE_GRACE_SECONDS    = 45.0   # 45s grace period post completed bar close for new entry signals
+BAR_CLOSE_GRACE_SECONDS          = 45.0   # Backward-compatible alias for entry grace
+POSITION_ATR_MAX_AGE_SECONDS     = 360.0  # 360s max age for active-position ATR updates during mid-bar polling
 BAR_FUTURE_TOLERANCE_SECONDS     = 5.0    # 5s clock skew tolerance for completed bars
+INTRADAY_DATA_SOURCE_TIMEZONE    = "US/Eastern" # Default fallback timezone for naive bar feeds
 TRAILING_STOP_RECONCILE_TOLERANCE = None  # None defaults dynamically to tick_size / 2.0
 
 

@@ -10,6 +10,7 @@ import time as _time
 import pickle
 from datetime import date, datetime, timedelta
 from typing import Optional
+from dataclasses import dataclass
 
 import pandas as pd
 import yfinance as yf
@@ -237,7 +238,115 @@ def _in_market_open_transition() -> bool:
         return False
 
 
-def _validate_intraday_data(df: pd.DataFrame, symbol: str, interval: str, validate_staleness: bool = True) -> pd.DataFrame:
+@dataclass(frozen=True)
+class CompletedBar:
+    row: pd.Series
+    start_time: pd.Timestamp
+    close_time: pd.Timestamp
+    post_close_delay_seconds: float
+
+
+def _normalize_utc_timestamp(
+    value,
+    *,
+    field_name: str = "timestamp",
+) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        source_tz = getattr(config, "INTRADAY_DATA_SOURCE_TIMEZONE", "US/Eastern")
+        if source_tz:
+            ts = ts.tz_localize(source_tz)
+        else:
+            raise ValueError(f"{field_name} must be timezone-aware (or INTRADAY_DATA_SOURCE_TIMEZONE configured)")
+    return ts.tz_convert("UTC")
+
+
+def _normalize_utc_index(index: pd.Index) -> pd.DatetimeIndex:
+    if not isinstance(index, pd.DatetimeIndex):
+        index = pd.to_datetime(index)
+    if index.tz is None:
+        source_tz = getattr(config, "INTRADAY_DATA_SOURCE_TIMEZONE", "US/Eastern")
+        if source_tz:
+            index = index.tz_localize(source_tz)
+        else:
+            raise ValueError("DataFrame index must be timezone-aware (or INTRADAY_DATA_SOURCE_TIMEZONE configured)")
+    return index.tz_convert("UTC")
+
+
+def select_last_completed_bar(
+    df: pd.DataFrame,
+    interval_seconds: int,
+    now_utc: pd.Timestamp,
+    close_tolerance_seconds: float = 0.0,
+) -> CompletedBar:
+    """
+    Return the latest bar that has completed by now_utc.
+
+    close_tolerance_seconds permits a small positive allowance for
+    clock-alignment differences. It is not the stale-data grace period.
+    """
+    if df is None or df.empty:
+        raise ValueError("No bars available")
+
+    if interval_seconds <= 0:
+        raise ValueError(
+            f"interval_seconds must be positive, got {interval_seconds}"
+        )
+
+    if not df.index.is_monotonic_increasing:
+        raise ValueError("Intraday bar index must be monotonic increasing")
+
+    if df.index.has_duplicates:
+        raise ValueError("Intraday bar index contains duplicate timestamps")
+
+    normalized_now = _normalize_utc_timestamp(
+        now_utc,
+        field_name="now_utc",
+    )
+
+    normalized_index = _normalize_utc_index(df.index)
+
+    close_times = normalized_index + pd.Timedelta(
+        seconds=interval_seconds
+    )
+
+    selection_cutoff = normalized_now + pd.Timedelta(
+        seconds=close_tolerance_seconds
+    )
+
+    completed_mask = close_times <= selection_cutoff
+
+    if not completed_mask.any():
+        earliest_close = close_times.min()
+        raise ValueError(
+            "No completed bars available. "
+            f"Earliest close={earliest_close.isoformat()}, "
+            f"now={normalized_now.isoformat()}"
+        )
+
+    completed_positions = completed_mask.nonzero()[0]
+    selected_position = int(completed_positions[-1])
+
+    bar_start = normalized_index[selected_position]
+    bar_close = close_times[selected_position]
+
+    return CompletedBar(
+        row=df.iloc[selected_position],
+        start_time=bar_start,
+        close_time=bar_close,
+        post_close_delay_seconds=float(
+            (normalized_now - bar_close).total_seconds()
+        ),
+    )
+
+
+def _validate_intraday_data(
+    df: pd.DataFrame,
+    symbol: str,
+    interval: str,
+    validate_staleness: bool = True,
+    purpose: str = "ENTRY_SIGNAL",
+) -> pd.DataFrame:
     """
     Validates intraday DataFrame for zero/negative prices, frozen feeds, and stale quotes.
     Returns empty DataFrame if validation fails.
@@ -310,15 +419,6 @@ def _validate_intraday_data(df: pd.DataFrame, symbol: str, interval: str, valida
 
         # 3. Stale Quote Guard (Only for live real-time feeds when validate_staleness is True)
         if validate_staleness:
-            last_timestamp = df.index[-1]
-            
-            if last_timestamp.tzinfo is None:
-                import pytz
-                tz = pytz.timezone(getattr(config, "TIMEZONE", "US/Eastern"))
-                last_timestamp = tz.localize(last_timestamp)
-                
-            current_time = pd.Timestamp.now(tz=last_timestamp.tz)
-            
             from strategies.session import is_market_open
             if is_market_open():
                 interval_seconds = 60 # Default to 1m
@@ -326,20 +426,37 @@ def _validate_intraday_data(df: pd.DataFrame, symbol: str, interval: str, valida
                     interval_seconds = int(interval.replace("m", "")) * 60
                 elif "h" in interval:
                     interval_seconds = int(interval.replace("h", "")) * 3600
-                    
-                # P1.5.2: Bar freshness based on completed bar close time
-                bar_close_time = last_timestamp + pd.Timedelta(seconds=interval_seconds)
-                delay_seconds = (current_time - bar_close_time).total_seconds()
-                grace_seconds = float(getattr(config, "BAR_CLOSE_GRACE_SECONDS", 45.0))
+
+                # Determine current UTC time
+                current_time = pd.Timestamp.now(tz="UTC")
                 future_tolerance = float(getattr(config, "BAR_FUTURE_TOLERANCE_SECONDS", 5.0))
 
-                if delay_seconds < -future_tolerance:
-                    msg = f"Data validation failed for {symbol}: Future-dated completed bar (delay={delay_seconds:.1f}s, tolerance={future_tolerance}s)."
-                    logger.warning("[FUTURE-BAR-GUARD] %s", msg)
-                    return _quarantine("future_dated_bar")
+                if purpose == "POSITION_MONITORING":
+                    grace_seconds = float(getattr(config, "POSITION_ATR_MAX_AGE_SECONDS", 360.0))
+                else:
+                    grace_seconds = float(getattr(config, "ENTRY_BAR_CLOSE_GRACE_SECONDS", getattr(config, "BAR_CLOSE_GRACE_SECONDS", 45.0)))
+
+                try:
+                    completed_bar = select_last_completed_bar(
+                        df=df,
+                        interval_seconds=interval_seconds,
+                        now_utc=current_time,
+                        close_tolerance_seconds=future_tolerance,
+                    )
+                except ValueError as ve:
+                    err_msg = str(ve)
+                    if "No completed bars available" in err_msg:
+                        msg = f"Data validation failed for {symbol}: No completed bars available ({err_msg})."
+                        logger.warning("[FUTURE-BAR-GUARD] %s", msg)
+                        return _quarantine("future_dated_bar")
+                    else:
+                        logger.warning("Data validation failed for %s: %s", symbol, err_msg)
+                        return _quarantine("invalid_bar_data")
+
+                delay_seconds = completed_bar.post_close_delay_seconds
 
                 if delay_seconds > grace_seconds:
-                    msg = f"Data validation failed for {symbol}: Stale completed bar: post-close delay={delay_seconds:.1f}s (grace={grace_seconds:.1f}s)."
+                    msg = f"Data validation failed for {symbol}: Stale completed bar: post-close delay={delay_seconds:.1f}s (grace={grace_seconds:.1f}s, purpose={purpose})."
                     blacklist = set(getattr(config, "SYMBOL_STALE_QUOTE_BLACKLIST", []))
                     if symbol in blacklist or _in_market_open_transition():
                         logger.debug("[STALE-QUOTE] %s", msg)
@@ -380,6 +497,7 @@ def fetch_intraday_alpaca(
     interval: str = None,
     lookback_days: int = None,
     prepost: bool = False,
+    purpose: str = "ENTRY_SIGNAL",
 ) -> pd.DataFrame:
     api_key = os.environ.get("APCA_API_KEY_ID", "")
     secret_key = os.environ.get("APCA_API_SECRET_KEY", "")
@@ -471,7 +589,7 @@ def fetch_intraday_alpaca(
         })
         df.index.name = "datetime"
         validate_staleness = (lookback_days is not None and lookback_days <= 1)
-        df = _validate_intraday_data(df, symbol, interval, validate_staleness=validate_staleness)
+        df = _validate_intraday_data(df, symbol, interval, validate_staleness=validate_staleness, purpose=purpose)
         if not df.empty:
             _write_cache(key, df.copy())
         return df
@@ -487,6 +605,7 @@ def fetch_intraday(
     lookback_days: int = None,
     prepost: bool = False,
     bridge = None,
+    purpose: str = "ENTRY_SIGNAL",
 ) -> pd.DataFrame:
     if is_quarantined(symbol):
         return pd.DataFrame()
@@ -508,7 +627,7 @@ def fetch_intraday(
         return cached_df.copy()
 
     if bridge is None or not bridge.is_connected:
-        df_alpaca = fetch_intraday_alpaca(symbol, interval, lookback_days, prepost)
+        df_alpaca = fetch_intraday_alpaca(symbol, interval, lookback_days, prepost, purpose=purpose)
         if not df_alpaca.empty:
             return df_alpaca
         return fetch_intraday_yfinance(symbol, interval, lookback_days, prepost)
@@ -548,7 +667,7 @@ def fetch_intraday(
         df = _bars_to_frame(bars)
         df = df.rename(columns={"date": "datetime"})
         df.set_index("datetime", inplace=True)
-        df = _validate_intraday_data(df, symbol, interval)
+        df = _validate_intraday_data(df, symbol, interval, purpose=purpose)
         if not df.empty:
             _write_cache(key, df.copy())
         logger.debug("Fetched %d broker bars for %s", len(df), symbol)
@@ -928,3 +1047,19 @@ def verify_cross_source_price(symbol: str, price: float, max_deviation_pct: floa
     except Exception as exc:
         logger.debug("Cross-source price check error for %s: %s", symbol, exc)
         return True, f"Check bypassed: {exc}"
+
+
+def get_intraday_features(
+    symbol: str,
+    interval: str = "5m",
+    lookback_days: int = None,
+    bridge = None,
+    purpose: str = "POSITION_MONITORING",
+) -> pd.DataFrame:
+    """Fetch intraday data with purpose-specific validation and compute indicators."""
+    df = fetch_intraday(symbol, interval=interval, lookback_days=lookback_days, bridge=bridge, purpose=purpose)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    from strategies.indicators import add_all_indicators
+    return add_all_indicators(df)
+
