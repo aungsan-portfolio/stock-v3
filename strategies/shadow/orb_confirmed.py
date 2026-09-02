@@ -150,6 +150,29 @@ class ConfirmedORBStrategy:
             stats.overextended,
             stats.spread_failed,
         )
+        accounted = (
+            stats.candidates
+            + stats.outside_window
+            + stats.incomplete_range
+            + stats.no_breakout
+            + stats.below_vwap
+            + stats.negative_vwap_slope
+            + stats.low_breakout_vol
+            + stats.rvol_low
+            + stats.stock_in_play_failed
+            + stats.market_unaligned
+            + stats.sector_unavailable
+            + stats.overextended
+            + stats.spread_failed
+            + stats.zero_risk
+        )
+        if accounted != stats.evaluated:
+            logger.error(
+                "[ORB SHADOW FUNNEL MISMATCH] evaluated=%d accounted=%d",
+                stats.evaluated,
+                accounted,
+            )
+        self._cycle_stats = ORBCycleStats()
 
     def evaluate_candidate(
         self,
