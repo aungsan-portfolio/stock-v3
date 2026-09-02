@@ -14,3 +14,18 @@ class ModelNotAvailableError(Exception):
     honest: a symbol with no trained model cannot silently count as an available
     ML model and unlock technical-only trading.
     """
+
+
+class BrokerSubmissionError(Exception):
+    """Base class for errors occurring during broker order placement."""
+    definitely_rejected: bool = False
+
+
+class BrokerOrderRejected(BrokerSubmissionError):
+    """Raised when broker definitely rejected the order (e.g. invalid price, buying power)."""
+    definitely_rejected: bool = True
+
+
+class BrokerSubmissionAmbiguous(BrokerSubmissionError):
+    """Raised when submission outcome is uncertain (e.g. timeout, network reset)."""
+    definitely_rejected: bool = False

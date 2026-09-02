@@ -5,27 +5,28 @@ The single entry point for executing a TradeSignal through the full pipeline.
 Always paper-trading only.
 """
 from dataclasses import replace
+import inspect
 import logging
 import math
-from typing import Optional, Tuple
+import threading
 import time
+from collections import defaultdict
+from typing import Optional, Tuple
 
 import config
+from errors import BrokerOrderRejected, BrokerSubmissionAmbiguous, BrokerSubmissionError
 from strategies.base import TradeSignal
 from strategies.intraday_risk import pre_trade_check
 from strategies.position_sizer import calculate_shares, estimated_cost, estimated_risk
 from strategies.trade_journal import log_fill, log_trade, today_trade_count
+from strategies.order_idempotency import idempotency_manager
 from strategies.webhook import send_discord_alert
 
 logger = logging.getLogger(__name__)
 
-from collections import defaultdict
-
-_recent_orders = {}
-IDEMPOTENCY_TTL = 60  # seconds
-
 _session_skip_counts = defaultdict(int)
 _session_suppressed = set()
+
 
 def _get_skip_limit() -> int:
     return getattr(config, "HARD_VETO_SKIP_LIMIT", 5)
@@ -44,6 +45,7 @@ def check_session_suppression(symbol: str) -> Tuple[bool, str]:
 
 _seen_veto_fingerprints = {}
 
+
 def record_hard_veto_skip(symbol: str, reason: str, bar_timestamp: str = ""):
     """Increments skip counter when noise floor / tight stop hard vetoes occur, deduplicated per bar fingerprint."""
     sym = symbol.upper().strip()
@@ -52,13 +54,12 @@ def record_hard_veto_skip(symbol: str, reason: str, bar_timestamp: str = ""):
         return
 
     # Deduplicate repeat logs for identical geometry within 3600 seconds (session-level) across identical veto reasons
-    fingerprint = f"{sym}:{reason.strip()[:80]}"
+    fingerprint = f"{sym}:{bar_timestamp}:{reason.strip()[:80]}"
     now = time.time()
     last_seen = _seen_veto_fingerprints.get(fingerprint, 0)
-    
+
     if now - last_seen < 3600:
         count = _session_skip_counts[sym]
-        limit = _get_skip_limit()
         logger.debug("[SKIP COUNTER REPEAT] %s: Repeat hard veto skip #%d (deduplicated) — reason: %s", sym, count, reason)
         return
 
@@ -79,8 +80,69 @@ def reset_session_skip_state():
     _session_skip_counts = defaultdict(int)
     _session_suppressed = set()
     _seen_veto_fingerprints = {}
-    _session_suppressed = set()
     logger.info("[ORDER MANAGER] Session skip state reset.")
+
+
+def _strategy_max_risk_pct(strategy: str) -> float:
+    """Safely retrieves max_risk_pct whether STRATEGY_SETTINGS is dict or object."""
+    strat_cfg = getattr(config, "STRATEGY_SETTINGS", {}).get(strategy)
+    if isinstance(strat_cfg, dict):
+        return float(strat_cfg.get("max_risk_pct", 1.0))
+    if strat_cfg is not None:
+        return float(getattr(strat_cfg, "max_risk_pct", 1.0))
+    return 1.0
+
+
+def _place_bracket_order_once(
+    bridge: object,
+    *,
+    symbol: str,
+    side: str,
+    qty: int,
+    entry_price: float,
+    stop_price: float,
+    target_price: float,
+    client_order_id: str,
+):
+    """
+    Submit a bracket order exactly once.
+
+    Determines client_order_id support before submission instead of retrying
+    after a broad TypeError.
+    """
+    place_fn = getattr(bridge, "place_bracket_order", None)
+    if not callable(place_fn):
+        raise AttributeError("Broker bridge does not implement place_bracket_order")
+
+    kwargs = {
+        "symbol": symbol,
+        "side": side,
+        "qty": qty,
+        "entry_price": entry_price,
+        "stop_price": stop_price,
+        "target_price": target_price,
+    }
+
+    try:
+        signature = inspect.signature(place_fn)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "Cannot inspect broker submission signature; "
+            "submission blocked to prevent duplicate order"
+        ) from exc
+
+    supports_client_order_id = (
+        "client_order_id" in signature.parameters
+        or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in signature.parameters.values()
+        )
+    )
+
+    if supports_client_order_id:
+        kwargs["client_order_id"] = client_order_id
+
+    return place_fn(**kwargs)
 
 
 def get_adaptive_stop_multiplier(symbol: str, beta: float = 1.0, earnings_near: bool = False, cfg=None) -> float:
@@ -363,49 +425,215 @@ def get_confidence_gate(regime_mode: str, signal_side: str) -> float:
 
 
 _pending_order_contexts = {}
+_pending_order_contexts_lock = threading.RLock()
 
 
-def register_pending_order(parent_id: str, signal: TradeSignal, limit_price: float, qty: float, stop_id: Optional[str] = None, tp_id: Optional[str] = None):
-    """Register pending order before fill confirmation."""
+def register_pending_order(
+    parent_id: str,
+    signal: TradeSignal,
+    limit_price: float,
+    qty: float,
+    stop_id: Optional[str] = None,
+    tp_id: Optional[str] = None,
+) -> None:
+    """Register a pending parent order until its terminal broker state."""
     if not parent_id:
         return
-    _pending_order_contexts[parent_id] = {
-        "signal": signal,
-        "limit_price": limit_price,
-        "qty": qty,
-        "stop_id": stop_id,
-        "tp_id": tp_id,
-        "submitted_at": time.time(),
+
+    key = str(parent_id)
+    with _pending_order_contexts_lock:
+        _pending_order_contexts[key] = {
+            "signal": signal,
+            "limit_price": float(limit_price),
+            "requested_qty": float(qty),
+            "cumulative_filled_qty": 0.0,
+            "average_fill_price": 0.0,
+            "stop_id": str(stop_id) if stop_id else None,
+            "tp_id": str(tp_id) if tp_id else None,
+            "submitted_at": time.time(),
+            "seen_execution_ids": [],
+            "lifecycle_registered": False,
+            "reconciliation_required": False,
+        }
+
+
+def on_broker_fill_event(
+    parent_id: str,
+    fill_price: float,
+    filled_qty: float,
+    bridge: Optional[object] = None,
+    *,
+    cumulative_filled_qty: Optional[float] = None,
+    average_fill_price: Optional[float] = None,
+    order_status: Optional[str] = None,
+    execution_id: Optional[str] = None,
+) -> None:
+    """
+    Apply partial or final fills without losing pending order context.
+
+    Preferred callback fields:
+      cumulative_filled_qty
+      average_fill_price
+      order_status
+      execution_id
+
+    For legacy callbacks, filled_qty is interpreted as the incremental fill.
+    """
+    key = str(parent_id)
+    normalized_status = str(order_status or "").lower().strip()
+    terminal_statuses = {
+        "filled",
+        "canceled",
+        "cancelled",
+        "rejected",
+        "expired",
     }
 
+    with _pending_order_contexts_lock:
+        ctx = _pending_order_contexts.get(key)
+        if not ctx:
+            logger.warning(
+                "Fill received for unknown/unregistered order ID %s",
+                key,
+            )
+            return
 
-def on_broker_fill_event(parent_id: str, fill_price: float, filled_qty: float, bridge: Optional[object] = None):
-    """Callback invoked when broker confirms execution fill for a pending order."""
-    ctx = _pending_order_contexts.pop(parent_id, None)
-    if not ctx:
-        logger.warning("Fill received for unknown/unregistered order ID %s", parent_id)
+        signal = ctx["signal"]
+        requested_qty = float(ctx.get("requested_qty", 0.0) or 0.0)
+        previous_qty = float(ctx.get("cumulative_filled_qty", 0.0) or 0.0)
+        previous_average = float(ctx.get("average_fill_price", 0.0) or 0.0)
+
+        # Guard B: Deduplicate execution_id for incremental fills
+        if execution_id:
+            seen = ctx.setdefault("seen_execution_ids", [])
+            if execution_id in seen:
+                logger.debug(
+                    "[DUPLICATE EXECUTION] parent=%s execution_id=%s",
+                    key,
+                    execution_id,
+                )
+                return
+            seen.append(execution_id)
+
+        # Guard A: Monotonic cumulative updates & Stale fill rejection
+        if cumulative_filled_qty is not None:
+            incoming_cumulative = float(cumulative_filled_qty)
+            if incoming_cumulative < previous_qty - 1e-9:
+                logger.warning(
+                    "[STALE FILL EVENT] %s parent=%s incoming=%.4f local=%.4f",
+                    signal.symbol,
+                    key,
+                    incoming_cumulative,
+                    previous_qty,
+                )
+                return
+            if math.isclose(incoming_cumulative, previous_qty, abs_tol=1e-9):
+                if normalized_status in terminal_statuses:
+                    _pending_order_contexts.pop(key, None)
+                    logger.info(
+                        "[FILL LIFECYCLE COMPLETE ON TERMINAL] %s parent=%s "
+                        "cumulative_qty=%.4f status=%s",
+                        signal.symbol,
+                        key,
+                        previous_qty,
+                        normalized_status,
+                    )
+                    return
+                logger.debug(
+                    "[DUPLICATE FILL EVENT] %s parent=%s cumulative=%.4f",
+                    signal.symbol,
+                    key,
+                    incoming_cumulative,
+                )
+                return
+
+            new_cumulative_qty = incoming_cumulative
+            new_average_price = float(
+                average_fill_price
+                if average_fill_price is not None
+                else fill_price
+            )
+        else:
+            incremental_qty = max(0.0, float(filled_qty or 0.0))
+            new_cumulative_qty = previous_qty + incremental_qty
+            if new_cumulative_qty > 0:
+                new_average_price = (
+                    (previous_average * previous_qty)
+                    + (float(fill_price) * incremental_qty)
+                ) / new_cumulative_qty
+            else:
+                new_average_price = previous_average
+
+        if requested_qty > 0:
+            new_cumulative_qty = min(new_cumulative_qty, requested_qty)
+
+        ctx["cumulative_filled_qty"] = new_cumulative_qty
+        ctx["average_fill_price"] = new_average_price
+
+        stop_id = ctx.get("stop_id")
+        tp_id = ctx.get("tp_id")
+
+    # Guard C: Handle terminal orders without any fill
+    if new_cumulative_qty <= 0:
+        if normalized_status in terminal_statuses:
+            with _pending_order_contexts_lock:
+                _pending_order_contexts.pop(key, None)
+        logger.info(
+            "[ORDER TERMINAL WITHOUT FILL] %s parent=%s status=%s",
+            signal.symbol,
+            key,
+            normalized_status,
+        )
         return
 
-    signal = ctx["signal"]
-    stop_id = ctx.get("stop_id")
-    tp_id = ctx.get("tp_id")
-
     try:
-        from strategies.trailing_stop import manager
-        manager.initialize_position(
+        from strategies.trailing_stop import get_trailing_manager
+        manager = get_trailing_manager()
+
+        manager.apply_confirmed_fill(
             signal=signal,
-            fill_price=fill_price,
-            qty=filled_qty,
+            average_fill_price=new_average_price,
+            cumulative_qty=new_cumulative_qty,
             stop_order_id=stop_id,
             bridge=bridge,
             tp_order_id=tp_id,
         )
+
         logger.info(
-            "[FILL CONFIRMED] Initialized position state for %s: fill=$%.2f, qty=%d",
-            signal.symbol, fill_price, filled_qty
+            "[FILL UPDATE] %s parent=%s "
+            "avg_fill=$%.4f cumulative_qty=%.4f/%.4f status=%s",
+            signal.symbol,
+            key,
+            new_average_price,
+            new_cumulative_qty,
+            requested_qty,
+            order_status or "UNKNOWN",
         )
-    except Exception as e:
-        logger.error("Failed to initialize position state on fill event for %s: %s", signal.symbol, e)
+    except Exception:
+        logger.exception(
+            "Failed to apply broker fill for %s parent=%s",
+            signal.symbol,
+            key,
+        )
+        return
+
+    fully_filled = (
+        requested_qty > 0
+        and new_cumulative_qty >= requested_qty - 1e-9
+    )
+
+    if fully_filled or normalized_status in terminal_statuses:
+        with _pending_order_contexts_lock:
+            _pending_order_contexts.pop(key, None)
+
+        logger.info(
+            "[FILL LIFECYCLE COMPLETE] %s parent=%s "
+            "cumulative_qty=%.4f status=%s",
+            signal.symbol,
+            key,
+            new_cumulative_qty,
+            normalized_status or "FILLED_BY_QTY",
+        )
 
 
 
@@ -424,6 +652,8 @@ def execute_signal(
     if dry_run is None:
         dry_run = config.SCHEDULER_DRY_RUN_DEFAULT
 
+    signal_metadata = getattr(signal, "metadata", None) or {}
+
     result = {
         "symbol": signal.symbol,
         "strategy": signal.strategy,
@@ -432,8 +662,15 @@ def execute_signal(
         "reason": "",
         "shares": 0,
         "order": None,
+        "warnings": [],
+        "metadata": {
+            "raw_confidence": signal_metadata.get("raw_confidence"),
+            "correlation_penalty": signal_metadata.get("correlation_penalty"),
+            "max_correlation": signal_metadata.get("max_correlation"),
+            "overlap_symbols": signal_metadata.get("portfolio_overlap_symbols"),
+            "trailing_stop_init": (getattr(signal, "atr", 0) > 0),
+        },
     }
-    cache_key = f"{signal.symbol.upper().strip()}_{signal.side.upper().strip()}"
 
     suppressed, supp_reason = check_session_suppression(signal.symbol)
     if suppressed:
@@ -464,7 +701,7 @@ def execute_signal(
     price_reason = _validate_signal_prices(signal, market_texture=market_texture)
     if price_reason:
         result["reason"] = price_reason
-        record_hard_veto_skip(signal.symbol, price_reason)
+        record_hard_veto_skip(signal.symbol, price_reason, getattr(signal, "bar_timestamp", "") or "")
         logger.info("Skipped %s: %s", signal.symbol, price_reason)
         return result
 
@@ -472,6 +709,7 @@ def execute_signal(
     executable_price_reason = _validate_signal_prices(executable_signal, market_texture=market_texture)
     if executable_price_reason:
         result["reason"] = f"Invalid executable limit: {executable_price_reason}"
+        record_hard_veto_skip(signal.symbol, executable_price_reason, getattr(signal, "bar_timestamp", "") or "")
         logger.info("Skipped %s: %s", signal.symbol, result["reason"])
         return result
 
@@ -607,8 +845,7 @@ def execute_signal(
         return result
     open_pos = bridge.open_position_count() if is_connected else 0
 
-    strat_cfg = getattr(config, "STRATEGY_SETTINGS", {}).get(signal.strategy)
-    risk_pct = strat_cfg.max_risk_pct if strat_cfg else 1.0
+    risk_pct = _strategy_max_risk_pct(signal.strategy)
     entry_p = entry_limit_price if entry_limit_price and entry_limit_price > 0 else executable_signal.entry_price
     stop_p = executable_signal.stop_price
     risk_dollars = shares * abs(entry_p - stop_p) if shares > 0 else (equity * (risk_pct / 100.0))
@@ -773,7 +1010,7 @@ def execute_signal(
         return result
 
     # M-05 Durable Idempotency Check
-    from strategies.order_idempotency import build_client_order_id, idempotency_manager
+    from strategies.order_idempotency import build_client_order_id
     bar_ts = getattr(signal, "bar_timestamp", "") or ""
     sig_hash = getattr(signal, "signal_hash", "") or ""
     client_order_id = build_client_order_id(
@@ -805,7 +1042,6 @@ def execute_signal(
         result["status"] = "DRY_RUN"
         result["reason"] = "Dry run -- no order placed"
         logger.info("[DRY RUN] Would place: %s %d %s", signal.side, shares, signal.symbol)
-        _recent_orders[cache_key] = time.time()
         return result
 
     if not config.BRACKET_ORDER_ENABLED:
@@ -813,14 +1049,14 @@ def execute_signal(
         result["reason"] = "Protective bracket orders are required for live paper entries"
         return result
 
-    try:
-        limit_price = executable_signal.entry_price
-        stop_price = signal.stop_price
-        target_price = signal.target_price
+    limit_price = executable_signal.entry_price
+    stop_price = signal.stop_price
+    target_price = signal.target_price
 
-        # M-01 Fresh Execution Quote Gate
-        require_realtime = getattr(config, "REQUIRE_REALTIME_DATA_FOR_ORDERS", True)
-        if not dry_run and require_realtime and is_connected:
+    # Phase A: Quote Validation Gate
+    require_realtime = getattr(config, "REQUIRE_REALTIME_DATA_FOR_ORDERS", True)
+    if not dry_run and require_realtime and is_connected:
+        try:
             from strategies.execution_quote import validate_execution_quote
             quote_res = validate_execution_quote(
                 bridge=bridge,
@@ -830,122 +1066,238 @@ def execute_signal(
                 max_deviation_pct=getattr(config, "MAX_DECISION_DEVIATION_PCT", 1.5),
                 max_age_seconds=getattr(config, "MAX_QUOTE_AGE_SECONDS", 10.0),
             )
-            if not quote_res.valid:
-                idempotency_manager.release(signal.symbol, side=signal.side, reason=f"quote_veto:{quote_res.reason}")
-                result["status"] = "VETOED"
-                result["reason"] = f"Execution Quote Gate: {quote_res.reason}"
-                logger.warning("[EXECUTION QUOTE VETO] %s: %s", signal.symbol, quote_res.reason)
-                return result
-            if quote_res.quote and quote_res.quote.last > 0:
-                offset_stop = executable_signal.entry_price - signal.stop_price
-                offset_target = signal.target_price - executable_signal.entry_price
-                limit_price = quote_res.quote.last
-                stop_price = round(limit_price - offset_stop, 2)
-                target_price = round(limit_price + offset_target, 2)
-        try:
-            order = bridge.place_bracket_order(
-                symbol=signal.symbol,
+        except Exception as quote_exc:
+            idempotency_manager.release(
+                signal.symbol,
                 side=signal.side,
-                qty=shares,
-                entry_price=limit_price,
-                stop_price=stop_price,
-                target_price=target_price,
-                client_order_id=client_order_id,
+                reason=f"quote_check_error:{quote_exc}",
             )
-        except TypeError:
-            order = bridge.place_bracket_order(
-                symbol=signal.symbol,
+            result["status"] = "VETOED"
+            result["reason"] = f"Execution Quote Gate failed closed: {quote_exc}"
+            logger.exception("[EXECUTION QUOTE ERROR] %s", signal.symbol)
+            return result
+
+        if not quote_res.valid:
+            idempotency_manager.release(
+                signal.symbol,
                 side=signal.side,
-                qty=shares,
-                entry_price=limit_price,
-                stop_price=stop_price,
-                target_price=target_price,
+                reason=f"quote_veto:{quote_res.reason}",
             )
-        order_ids = order.get("order_ids") or []
+            result["status"] = "VETOED"
+            result["reason"] = f"Execution Quote Gate: {quote_res.reason}"
+            logger.warning("[EXECUTION QUOTE VETO] %s: %s", signal.symbol, quote_res.reason)
+            return result
+
+        if quote_res.quote and quote_res.quote.last > 0:
+            offset_stop = executable_signal.entry_price - signal.stop_price
+            offset_target = signal.target_price - executable_signal.entry_price
+            limit_price = quote_res.quote.last
+            stop_price = round(limit_price - offset_stop, 2)
+            target_price = round(limit_price + offset_target, 2)
+
+    # Phase B: Broker Submission (Deterministic single call)
+    try:
+        order = _place_bracket_order_once(
+            bridge,
+            symbol=signal.symbol,
+            side=signal.side,
+            qty=shares,
+            entry_price=limit_price,
+            stop_price=stop_price,
+            target_price=target_price,
+            client_order_id=client_order_id,
+        )
+    except Exception as submit_exc:
+        definitely_rejected = bool(getattr(submit_exc, "definitely_rejected", False))
+        if definitely_rejected:
+            idempotency_manager.release(
+                signal.symbol,
+                side=signal.side,
+                reason=f"definite_submit_rejection:{submit_exc}",
+            )
+            result["status"] = "REJECTED"
+            result["reason"] = f"Broker definitely rejected order: {submit_exc}"
+        else:
+            result["status"] = "AMBIGUOUS_SUBMIT"
+            result["reason"] = (
+                f"Broker submission outcome is uncertain: {submit_exc}. "
+                "Idempotency lock retained for broker reconciliation."
+            )
+        logger.exception("[BROKER SUBMISSION] %s: %s", signal.symbol, result["reason"])
+        return result
+
+    # Phase C: Broker Response Validation
+    if not isinstance(order, dict):
+        result["status"] = "AMBIGUOUS_SUBMIT"
+        result["reason"] = (
+            f"Broker returned unsupported response type {type(order).__name__}. "
+            "Idempotency lock retained for reconciliation."
+        )
+        logger.error("[AMBIGUOUS SUBMIT] %s: %s", signal.symbol, result["reason"])
+        return result
+
+    order_ids = order.get("order_ids") or []
+    parent_id = (
+        order.get("parent_order_id")
+        or order.get("order_id")
+        or (order_ids[0] if order_ids else None)
+    )
+    parent_order_id = str(parent_id) if parent_id else ""
+
+    if not parent_order_id:
+        result["status"] = "AMBIGUOUS_SUBMIT"
+        result["reason"] = (
+            f"Broker submission returned no parent order ID for {signal.symbol}. "
+            "Idempotency lock retained for reconciliation."
+        )
+        logger.error("[AMBIGUOUS SUBMIT] %s: %s", signal.symbol, result["reason"])
+        return result
+
+    try:
+        idempotency_manager.attach_parent_order(
+            signal.symbol,
+            signal.side,
+            parent_order_id,
+        )
+    except Exception as attach_exc:
+        result["status"] = "SUBMITTED_RECONCILIATION_REQUIRED"
+        result["reason"] = (
+            f"Broker accepted parent {parent_order_id}, but durable "
+            f"idempotency attachment failed: {attach_exc}. "
+            "Reservation retained for reconciliation."
+        )
+        result["order"] = order
+        logger.exception(
+            "[IDEMPOTENCY ATTACH FAILURE] %s parent=%s",
+            signal.symbol,
+            parent_order_id,
+        )
+        return result
+
+    # Phase C-2: Validate Named Child Legs
+    stop_id = order.get("stop_order_id")
+    tp_id = order.get("tp_order_id")
+
+    if not stop_id or not tp_id or str(stop_id) == str(tp_id):
+        result["status"] = "SUBMITTED_RECONCILIATION_REQUIRED"
+        result["reason"] = (
+            f"Broker accepted parent order {parent_order_id}, "
+            "but named stop/target leg IDs are missing or ambiguous. "
+            "Idempotency lock retained for broker reconciliation."
+        )
+        result["order"] = order
+        logger.critical(
+            "[CHILD LEG RECONCILIATION] %s: %s",
+            signal.symbol,
+            result["reason"],
+        )
+        return result
+
+    # Phase D: Post-Submission Lifecycle Registration
+    try:
         register_signal = getattr(bridge, "register_order_signal", None)
         if callable(register_signal):
             register_signal(order_ids, signal.signal_id)
 
-        parent_id = order_ids[0] if order_ids else order.get("order_id")
-        parent_order_id = str(parent_id) if parent_id else ""
-
-        # Attach parent order ID to durable idempotency manager
-        if parent_order_id:
-            idempotency_manager.attach_parent_order(signal.symbol, signal.side, parent_order_id)
-        else:
-            # H-2: Ambiguous submit - Keep idempotency lock and return AMBIGUOUS_SUBMIT for broker reconciliation
-            result["status"] = "AMBIGUOUS_SUBMIT"
-            result["reason"] = f"Broker submission returned no parent_order_id for {signal.symbol} -- keeping idempotency lock for broker reconciliation"
-            logger.error("[AMBIGUOUS SUBMIT] %s: %s", signal.symbol, result["reason"])
-            return result
-
-        # Register expected prices for signed slippage and execution latency tracking
-        try:
-            from strategies.order_registry import register_order_expected_price
-            now_ts = time.time()
-            parent_id = order_ids[0] if order_ids else order.get("order_id")
-            stop_id = order.get("stop_order_id") or (order_ids[2] if len(order_ids) >= 3 else (order_ids[1] if len(order_ids) >= 2 else None))
-            tp_id = order.get("tp_order_id") or (order_ids[1] if len(order_ids) >= 2 else None)
-            exit_side = "SELL" if signal.side.upper() == "BUY" else "BUY"
-
-            if parent_id:
-                register_order_expected_price(parent_id, expected_price=limit_price, side=signal.side, order_type="ENTRY", submit_ts=now_ts, symbol=signal.symbol)
-            if stop_id:
-                register_order_expected_price(stop_id, expected_price=stop_price, side=exit_side, order_type="STOP_LOSS", submit_ts=now_ts, symbol=signal.symbol)
-            if tp_id and tp_id != stop_id:
-                register_order_expected_price(tp_id, expected_price=target_price, side=exit_side, order_type="TAKE_PROFIT", submit_ts=now_ts, symbol=signal.symbol)
-        except Exception as reg_err:
-            logger.debug(f"Failed to register order expected price: {reg_err}")
-
-        parent_order_id = str(parent_id) if parent_id else ""
         from strategies.entry_lifecycle import entry_lifecycle
+
+        register_pending_order(
+            parent_id=parent_order_id,
+            signal=signal,
+            limit_price=limit_price,
+            qty=shares,
+            stop_id=str(stop_id),
+            tp_id=str(tp_id),
+        )
+
+        entry_lifecycle.register_submission(
+            parent_order_id=parent_order_id,
+            signal=signal,
+            requested_qty=shares,
+            stop_order_id=str(stop_id),
+            target_order_id=str(tp_id),
+        )
+
+        with _pending_order_contexts_lock:
+            ctx = _pending_order_contexts.get(parent_order_id)
+            if ctx:
+                ctx["lifecycle_registered"] = True
+                ctx["reconciliation_required"] = False
+    except Exception as lifecycle_exc:
+        with _pending_order_contexts_lock:
+            ctx = _pending_order_contexts.get(parent_order_id)
+            if ctx:
+                ctx["lifecycle_registered"] = False
+                ctx["reconciliation_required"] = True
+
+        result["status"] = "SUBMITTED_RECONCILIATION_REQUIRED"
+        result["reason"] = (
+            f"Broker accepted parent order {parent_order_id}, "
+            f"but local lifecycle registration failed: {lifecycle_exc}. "
+            "Idempotency lock retained."
+        )
+        result["order"] = order
+        logger.exception("[POST-SUBMISSION FAILURE] %s", result["reason"])
+        return result
+
+    result["status"] = "PLACED"
+    result["reason"] = "Order placed and lifecycle registered"
+    result["order"] = order
+    result["shares"] = shares
+
+    # Auto confirm fill in backtest / paper simulation mode if enabled
+    auto_fill = getattr(config, "PAPER_MODE_AUTO_CONFIRM_FILL", False)
+    if auto_fill and parent_order_id:
+        on_broker_fill_event(
+            parent_order_id,
+            fill_price=limit_price,
+            filled_qty=shares,
+            bridge=bridge,
+        )
         try:
-            reg_fn = globals().get("register_pending_order", register_pending_order)
-            reg_fn(
-                parent_id=parent_order_id,
-                signal=signal,
-                limit_price=limit_price,
-                qty=shares,
-                stop_id=str(stop_id) if stop_id else None,
-                tp_id=str(tp_id) if tp_id else None,
+            entry_lifecycle.on_parent_fill(
+                bridge=bridge,
+                parent_order_id=parent_order_id,
+                cumulative_filled_qty=shares,
+                average_fill_price=limit_price,
             )
-            if stop_id and tp_id and stop_id != tp_id:
-                entry_lifecycle.register_submission(
-                    parent_order_id=parent_order_id,
-                    signal=signal,
-                    requested_qty=shares,
-                    stop_order_id=str(stop_id),
-                    target_order_id=str(tp_id),
-                )
-            result["status"] = "PLACED"
-            result["reason"] = "Order placed"
-            result["order"] = order
-        except Exception as reg_exc:
-            # H-3: Lifecycle registration failure must be fail-closed (AMBIGUOUS_LIFECYCLE)
-            err_msg = f"Lifecycle registration failed: {reg_exc}"
-            logger.error("[AMBIGUOUS LIFECYCLE] %s: %s", signal.symbol, err_msg)
-            result["status"] = "AMBIGUOUS_LIFECYCLE"
-            result["reason"] = err_msg
-            return result
+        except Exception as fill_exc:
+            logger.warning("Entry lifecycle fill confirmation: %s", fill_exc)
 
-        # C-02: Auto confirm fill default is False in production paper mode
-        auto_fill = getattr(config, "PAPER_MODE_AUTO_CONFIRM_FILL", False)
-        if auto_fill and parent_order_id:
-            on_broker_fill_event(parent_order_id, fill_price=limit_price, filled_qty=shares, bridge=bridge)
-            try:
-                if stop_id and tp_id and stop_id != tp_id:
-                    entry_lifecycle.on_parent_fill(
-                        bridge=bridge,
-                        parent_order_id=parent_order_id,
-                        cumulative_filled_qty=shares,
-                        average_fill_price=limit_price,
-                    )
-            except Exception as fill_exc:
-                logger.warning("Entry lifecycle fill confirmation: %s", fill_exc)
+    # Phase E: Non-Transactional Telemetry & Reporting
+    try:
+        from strategies.order_registry import register_order_expected_price
+        now_ts = time.time()
+        exit_side = "SELL" if signal.side.upper() == "BUY" else "BUY"
+        register_order_expected_price(
+            parent_order_id,
+            expected_price=limit_price,
+            side=signal.side,
+            order_type="ENTRY",
+            submit_ts=now_ts,
+            symbol=signal.symbol,
+        )
+        register_order_expected_price(
+            str(stop_id),
+            expected_price=stop_price,
+            side=exit_side,
+            order_type="STOP_LOSS",
+            submit_ts=now_ts,
+            symbol=signal.symbol,
+        )
+        register_order_expected_price(
+            str(tp_id),
+            expected_price=target_price,
+            side=exit_side,
+            order_type="TAKE_PROFIT",
+            submit_ts=now_ts,
+            symbol=signal.symbol,
+        )
+    except Exception as reg_err:
+        logger.exception("Expected-price registration failed for accepted parent %s: %s", parent_order_id, reg_err)
+        result["warnings"].append(f"expected_price_reg_failed:{reg_err}")
 
-        # Update idempotency cache
-        _recent_orders[cache_key] = time.time()
-
+    try:
         log_trade(
             symbol=signal.symbol,
             side=signal.side,
@@ -960,7 +1312,11 @@ def execute_signal(
             equity=equity,
             confidence=signal.confidence,
         )
+    except Exception as journal_err:
+        logger.exception("Journal write failed for accepted order %s: %s", parent_order_id, journal_err)
+        result["warnings"].append(f"journal_write_failed:{journal_err}")
 
+    try:
         alert_msg = (
             f"🚀 **PAPER TRADE PLACED** 🚀\n"
             f"**Symbol**: {signal.symbol}\n"
@@ -972,19 +1328,8 @@ def execute_signal(
             f"**Reason**: {signal.reason}"
         )
         send_discord_alert(alert_msg)
-        return result
-
-    except Exception as exc:
-        idempotency_manager.release(signal.symbol, side=signal.side, reason=f"submit_exception:{exc}")
-        result["reason"] = f"Order failed: {exc}"
-        logger.error("Order failed for %s: %s", signal.symbol, exc)
-
-    result["metadata"] = {
-        "raw_confidence": signal.metadata.get("raw_confidence"),
-        "correlation_penalty": signal.metadata.get("correlation_penalty"),
-        "max_correlation": signal.metadata.get("max_correlation"),
-        "overlap_symbols": signal.metadata.get("portfolio_overlap_symbols"),
-        "trailing_stop_init": getattr(signal, "atr", 0) > 0,
-    }
+    except Exception as alert_err:
+        logger.exception("Discord alert failed for accepted order %s: %s", parent_order_id, alert_err)
+        result["warnings"].append(f"discord_alert_failed:{alert_err}")
 
     return result
