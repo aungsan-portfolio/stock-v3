@@ -113,8 +113,31 @@ def calculate_metrics(records: list, initial_capital: float) -> dict:
         if exp_p > 0:
             slip_pct = (abs(fill_p - exp_p) / exp_p) * 100.0
             slippages.append(slip_pct)
-    
     avg_slippage = sum(slippages) / len(slippages) if slippages else 0.0
+
+    # 6. Expectancy and Average PnL Calculations
+    import math
+    losing_trades = [t for t in trades if float(t.get("pnl", 0.0) or 0.0) < 0.0]
+    avg_win = gross_profit / len(winning_trades) if winning_trades else 0.0
+    avg_loss = gross_loss / len(losing_trades) if losing_trades else 0.0
+    win_fraction = winning_trades_ratio
+    loss_fraction = len(losing_trades) / n_trades if n_trades > 0 else 0.0
+    expectancy = (win_fraction * avg_win) - (loss_fraction * avg_loss)
+
+    pnls = [float(t.get("pnl", 0.0) or 0.0) for t in trades]
+    if len(pnls) >= 2:
+        mean_pnl = sum(pnls) / len(pnls)
+        variance = sum((x - mean_pnl) ** 2 for x in pnls) / (len(pnls) - 1)
+        std_dev = math.sqrt(variance)
+        std_err = std_dev / math.sqrt(len(pnls))
+        ci_low = expectancy - 1.96 * std_err
+        ci_high = expectancy + 1.96 * std_err
+        is_statistically_robust = ci_low > 0
+    else:
+        std_err = 0.0
+        ci_low = expectancy
+        ci_high = expectancy
+        is_statistically_robust = False
 
     return {
         "n_trades": n_trades,
@@ -125,6 +148,13 @@ def calculate_metrics(records: list, initial_capital: float) -> dict:
         "avg_slippage": avg_slippage,
         "gross_profit": gross_profit,
         "gross_loss": gross_loss,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "expectancy": expectancy,
+        "std_err": std_err,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
+        "is_statistically_robust": is_statistically_robust,
         "final_equity": equity
     }
 
@@ -162,6 +192,28 @@ def print_report(m: dict):
     print(f"3. Win Rate Gate (WR >= 40%):           {format_status(gate_wr)} (WR = {m['win_rate']:.1f}%){prelim}")
     print(f"4. Drawdown Tolerance (Max DD <= 5.0%): {format_status(gate_dd)} (Max DD = {m['max_dd_pct']:.2f}% / ${m['max_dd_dollars']:.2f}){prelim}")
     print(f"5. Slippage Audit (Avg Slip <= 0.05%):  {format_status(gate_slip)} (Avg Slip = {m['avg_slippage']:.3f}%){prelim}")
+    print("----------------------------------------------------------------------")
+    print(f"Expectancy & Mathematical Edge (Statistical Robustness):")
+    print(f" • Avg Winning Trade: ${m['avg_win']:.2f} | Avg Losing Trade: ${m['avg_loss']:.2f}")
+    exp_status = "[PASS]" if m['expectancy'] > 0 else "[FAIL]"
+    print(f" • Point Expectancy: {exp_status} ${m['expectancy']:+.2f} per trade")
+
+    # Calculate R-multiple Net EV assuming average loss is 1R base risk
+    base_r = abs(m['avg_loss']) if m['avg_loss'] > 0 else (abs(m['expectancy']) or 1.0)
+    avg_win_r = m['avg_win'] / base_r if base_r > 0 else 0.0
+    avg_loss_r = 1.0 if m['avg_loss'] > 0 else 0.0
+    p_win = m['win_rate'] / 100.0
+    p_loss = 1.0 - p_win
+    avg_cost_r = 0.08
+    gross_ev_r = (p_win * avg_win_r) - (p_loss * avg_loss_r)
+    net_ev_r = gross_ev_r - avg_cost_r
+    net_ev_dollars = net_ev_r * base_r
+
+    print(f" • Friction-Adjusted Net EV: {net_ev_r:+.3f}R per trade (${net_ev_dollars:+.2f} after 0.08R cost)")
+    if m['n_trades'] >= 2:
+        print(f" • 95% Confidence Interval (CI95): [${m['ci_low']:+.2f}, ${m['ci_high']:+.2f}] (Std Err: ${m['std_err']:.2f})")
+        robust_tag = "[ROBUST EDGE - Lower CI > 0]" if m['is_statistically_robust'] else "[INCONCLUSIVE - Lower CI <= 0, need more sample size N]"
+        print(f" • Statistical Significance: {robust_tag}")
     print("----------------------------------------------------------------------")
     
     if all_passed:

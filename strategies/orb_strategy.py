@@ -74,6 +74,10 @@ class ORBStrategy(BaseStrategy):
             )
 
         allow_short = getattr(config, "ALLOW_SHORT", False)
+        inverse_etfs = getattr(config, "INVERSE_ETF_SYMBOLS", set())
+        if symbol.upper().strip() in inverse_etfs:
+            allow_short = False
+
         if price < orb_low and vol_ok and rsi > 25 and allow_short:
             stop = orb_high
             risk = stop - price

@@ -167,7 +167,7 @@ def _pre_submission_veto(signal: TradeSignal, df: Optional[object] = None, marke
 
     hard_veto_line  = noise_floor * hard_veto_ratio
 
-    if stop_distance < hard_veto_line:
+    if stop_distance < (hard_veto_line - 1e-4):
         reason = (
             f"Pre-submission Veto: Stop distance ${stop_distance:.4f} critically tight "
             f"(< {hard_veto_ratio*100:.0f}% of ATR noise floor ${noise_floor:.4f}). "
@@ -244,10 +244,28 @@ def _validate_signal_prices(signal: TradeSignal, market_texture: Optional[str] =
     else:
         return f"Unknown side {signal.side!r}"
 
-    min_rr = getattr(config, "MIN_RR_RATIO", 1.0)
-    rr_ratio = target_dist / stop_dist if stop_dist > 0 else 0.0
-    if rr_ratio < min_rr:
+    is_inverse = signal.symbol.upper().strip() in set(getattr(config, "INVERSE_ETF_SYMBOLS", set()))
+    if is_inverse and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False):
+        min_rr = getattr(config, "INVERSE_ETF_MIN_RR_RATIO", 1.40)
+    else:
+        min_rr = getattr(config, "MIN_RR_RATIO", 1.0)
+    rr_ratio = round(target_dist / stop_dist, 4) if stop_dist > 0 else 0.0
+    if rr_ratio < (min_rr - 1e-4):
         return f"Risk:Reward ratio {rr_ratio:.2f} is below minimum threshold {min_rr:.2f}"
+
+    # Target Reachability Sanity Guard:
+    # 1. Enforce max Reward:Risk ratio ceiling to prevent runaway / glitchy targets (> 5.0R)
+    max_rr = float(getattr(config, "MAX_TARGET_RR_RATIO", 5.0))
+    if rr_ratio > (max_rr + 1e-4):
+        return f"Unrealistic target R:R ratio {rr_ratio:.2f} (> {max_rr:.1f}x limit)"
+
+    # 2. Daily ATR Reachability Guard: If daily_atr is present in signal metadata, check reachability against Daily ATR
+    # Gracefully skipped if daily_atr is None or not provided.
+    daily_atr = signal.metadata.get("daily_atr") if getattr(signal, "metadata", None) else None
+    if daily_atr and daily_atr > 0:
+        max_daily_atr_reach = float(getattr(config, "MAX_TARGET_DAILY_ATR_MULTIPLE", 3.5))
+        if target_dist / daily_atr > max_daily_atr_reach:
+            return f"Unrealistic target distance ${target_dist:.2f} ({(target_dist/daily_atr):.1f}x Daily ATR > {max_daily_atr_reach:.1f}x limit)"
 
     return ""
 
@@ -258,10 +276,17 @@ def _executable_signal(signal: TradeSignal, entry_limit_price: Optional[float]) 
     Adheres to SEC Rule 612 (no sub-penny quotes for stocks >= $1.00).
     """
     if entry_limit_price is not None:
+        tick_size = 0.01 if entry_limit_price >= 1.0 else 0.0001
+        new_stop_dist = abs(entry_limit_price - signal.stop_price)
+        if new_stop_dist <= tick_size:
+            logger.warning(
+                "[GEOMETRY COLLAPSE VETO] %s live entry %.4f vs stop %.4f gives gap %.6f <= tick %.4f",
+                signal.symbol, entry_limit_price, signal.stop_price, new_stop_dist, tick_size,
+            )
         return replace(
             signal,
             entry_price=entry_limit_price,
-            risk_per_share=abs(entry_limit_price - signal.stop_price),
+            risk_per_share=new_stop_dist,
         )
     
     # 1. Determine tick size based on SEC Rule 612
@@ -334,7 +359,7 @@ def get_confidence_gate(regime_mode: str, signal_side: str) -> float:
         if side in ("BUY", "LONG"):
             return 0.72
         return 0.60
-    return 0.63
+    return 0.60
 
 
 _pending_order_contexts = {}
@@ -424,17 +449,23 @@ def execute_signal(
 
     market_texture = getattr(regime_result, "market_texture", "TRENDING") if regime_result else "TRENDING"
 
+    allow_short = getattr(config, "ALLOW_SHORT", False)
+    if signal.side.upper() in ("SELL", "SHORT") and not allow_short:
+        result["reason"] = "Short entries are disabled"
+        logger.info("Skipped %s: %s", signal.symbol, result["reason"])
+        return result
+
+    is_inverse_etf = signal.symbol.upper().strip() in set(getattr(config, "INVERSE_ETF_SYMBOLS", set()))
+    if is_inverse_etf and signal.side.upper() in ("SELL", "SHORT"):
+        result["reason"] = f"Inverse ETF {signal.symbol} cannot be sold short (Long-only hedge instrument)"
+        logger.info("Skipped %s: %s", signal.symbol, result["reason"])
+        return result
+
     price_reason = _validate_signal_prices(signal, market_texture=market_texture)
     if price_reason:
         result["reason"] = price_reason
         record_hard_veto_skip(signal.symbol, price_reason)
         logger.info("Skipped %s: %s", signal.symbol, price_reason)
-        return result
-
-    allow_short = getattr(config, "ALLOW_SHORT", False)
-    if signal.side.upper() == "SELL" and not allow_short:
-        result["reason"] = "Short entries are disabled"
-        logger.info("Skipped %s: %s", signal.symbol, result["reason"])
         return result
 
     executable_signal = _executable_signal(signal, entry_limit_price)
@@ -445,12 +476,16 @@ def execute_signal(
         return result
 
 
-    min_confidence = _min_confidence_for(signal, regime_result=regime_result)
-    if regime_result and getattr(regime_result, "confidence_boost", 0.0) > 0:
-        min_confidence += float(regime_result.confidence_boost)
+    is_inverse = signal.symbol.upper().strip() in set(getattr(config, "INVERSE_ETF_SYMBOLS", set()))
+    if is_inverse and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False):
+        min_confidence = float(getattr(config, "INVERSE_ETF_MIN_CONFIDENCE", 0.65))
+    else:
+        min_confidence = _min_confidence_for(signal, regime_result=regime_result)
+        if regime_result and getattr(regime_result, "confidence_boost", 0.0) > 0:
+            min_confidence += float(regime_result.confidence_boost)
 
-    if signal.confidence < min_confidence:
-        result["reason"] = f"Confidence {signal.confidence:.2f} < {min_confidence:.2f} ({signal.strategy})"
+    if signal.confidence < (min_confidence - 1e-4):
+        result["reason"] = f"Confidence {signal.confidence:.3f} < {min_confidence:.2f} ({signal.strategy})"
         logger.info("Skipped %s: %s", signal.symbol, result["reason"])
         return result
 
@@ -469,26 +504,64 @@ def execute_signal(
         return result
 
     # ── SPY/QQQ Intraday Trend Guard ───────────────────────────────────────
+    is_inverse_etf = signal.symbol.upper().strip() in set(getattr(config, "INVERSE_ETF_SYMBOLS", set()))
+    is_inverse_exempt = is_inverse_etf and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
+
     if signal.side.upper() == "BUY" and not dry_run and getattr(config, "SPY_TREND_GUARD_ENABLED", True):
+        guard_sym = "SPY"
         try:
             from strategies.intraday_data import fetch_intraday
-            guard_sym = getattr(config, "SPY_TREND_GUARD_SYMBOL", "SPY")
+            if is_inverse_exempt:
+                bench_map = getattr(config, "INVERSE_ETF_BENCHMARK_MAP", {})
+                guard_sym = bench_map.get(signal.symbol.upper().strip(), getattr(config, "SPY_TREND_GUARD_SYMBOL", "SPY"))
+            else:
+                guard_sym = getattr(config, "SPY_TREND_GUARD_SYMBOL", "SPY")
+
             spy_df = fetch_intraday(guard_sym)
             if spy_df is not None and not spy_df.empty and len(spy_df) >= 2:
                 last_close = float(spy_df["close"].iloc[-1])
                 last_open  = float(spy_df["open"].iloc[-1])
-                if last_close < last_open:
-                    guard_reason = (
-                        f"SPY Trend Guard: {guard_sym} 5m candle bearish "
-                        f"(Close ${last_close:.2f} < Open ${last_open:.2f}). "
-                        f"Blocking LONG entry."
-                    )
-                    logger.info("[SPY TREND GUARD] Blocked %s: %s", signal.symbol, guard_reason)
-                    result["reason"] = guard_reason
-                    return result
+                if is_inverse_exempt:
+                    # Inverted Trend Guard for Bear Hedges: block inverse long only if benchmark candle is surging bullish
+                    if last_close > last_open:
+                        guard_reason = (
+                            f"Trend Guard: {guard_sym} 5m candle bullish "
+                            f"(Close ${last_close:.2f} > Open ${last_open:.2f}). "
+                            f"Blocking {signal.symbol} LONG entry into {guard_sym} bounce."
+                        )
+                        logger.info("[TREND GUARD] Blocked %s: %s", signal.symbol, guard_reason)
+                        result["reason"] = guard_reason
+                        return result
+                    else:
+                        logger.info(
+                            "[TREND GUARD] Approved %s: Underlying %s 5m candle is bearish (Close $%.2f <= Open $%.2f) favoring bear hedge",
+                            signal.symbol, guard_sym, last_close, last_open
+                        )
+                else:
+                    if last_close < last_open:
+                        guard_reason = (
+                            f"SPY Trend Guard: {guard_sym} 5m candle bearish "
+                            f"(Close ${last_close:.2f} < Open ${last_open:.2f}). "
+                            f"Blocking LONG entry."
+                        )
+                        logger.info("[SPY TREND GUARD] Blocked %s: %s", signal.symbol, guard_reason)
+                        result["reason"] = guard_reason
+                        return result
+            elif is_inverse_exempt:
+                # Conservative safety: block inverse ETF if benchmark data is unavailable
+                guard_reason = f"Trend Guard: Benchmark {guard_sym} intraday data unavailable for {signal.symbol}. Entry blocked for safety."
+                logger.warning("[TREND GUARD] Blocked %s: %s", signal.symbol, guard_reason)
+                result["reason"] = guard_reason
+                return result
         except Exception as spy_err:
-            # Fail-open: do not block trade if SPY data unavailable
-            logger.debug("[SPY TREND GUARD] Skipped for %s: %s", signal.symbol, spy_err)
+            if is_inverse_exempt:
+                guard_reason = f"Trend Guard error fetching {guard_sym}: {spy_err}. Entry blocked for safety."
+                logger.warning("[TREND GUARD] Blocked %s: %s", signal.symbol, guard_reason)
+                result["reason"] = guard_reason
+                return result
+            else:
+                # Fail-open for normal longs if SPY data unavailable
+                logger.debug("[SPY TREND GUARD] Skipped for %s: %s", signal.symbol, spy_err)
     # ────────────────────────────────────────────────────────────────────────
 
     # Commodity Correlation Guard (GDX/GLD, etc.)
@@ -504,7 +577,9 @@ def execute_signal(
         return result
 
     shares = calculate_shares(executable_signal, equity)
-    if regime_result and getattr(regime_result, "position_scale", 1.0) < 1.0:
+    is_inverse_etf = signal.symbol.upper().strip() in set(getattr(config, "INVERSE_ETF_SYMBOLS", set()))
+    is_inverse_exempt = is_inverse_etf and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
+    if not is_inverse_exempt and regime_result and getattr(regime_result, "position_scale", 1.0) < 1.0:
         shares = math.floor(shares * float(regime_result.position_scale))
 
     if requested_shares is not None:
@@ -636,13 +711,21 @@ def execute_signal(
                 logger.info("Blocked %s: %s", signal.symbol, result["reason"])
                 return result
         else:
-            if getattr(regime_result, "halt_new_entries", False) or not getattr(regime_result, "allow_new_longs", True):
-                result["reason"] = f"Regime score {getattr(regime_result, 'score', 0)} <= -3 → No new long entries allowed"
-                logger.info("Blocked %s: %s", signal.symbol, result["reason"])
-                return result
+            is_inverse = signal.symbol.upper().strip() in getattr(config, "INVERSE_ETF_SYMBOLS", set())
+            inverse_exempt = is_inverse and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
+            if not inverse_exempt:
+                if getattr(regime_result, "halt_new_entries", False) or not getattr(regime_result, "allow_new_longs", True):
+                    result["reason"] = f"Regime score {getattr(regime_result, 'score', 0)} <= -3 → No new long entries allowed"
+                    logger.info("Blocked %s: %s", signal.symbol, result["reason"])
+                    return result
 
         if hasattr(regime_result, "max_trades_day") and regime_result.max_trades_day is not None:
-            effective_max_trades = min(effective_max_trades, regime_result.max_trades_day)
+            is_inverse = signal.symbol.upper().strip() in getattr(config, "INVERSE_ETF_SYMBOLS", set())
+            inverse_exempt = is_inverse and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
+            if is_inverse and inverse_exempt:
+                effective_max_trades = max(effective_max_trades, getattr(config, "MAX_DAILY_TRADES", 15))
+            else:
+                effective_max_trades = min(effective_max_trades, regime_result.max_trades_day)
         elif getattr(regime_result, "mode", "") == "CAUTION":
             effective_max_trades = min(effective_max_trades, 5)
 

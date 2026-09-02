@@ -82,7 +82,7 @@ IPO_WATCH_SYMBOLS = ["SPCX"]
 # ── Data Settings ────────────────────────────────
 PRICE_PERIOD        = "5y"
 PRICE_INTERVAL      = "1d"
-MIN_HISTORY_DAYS    = 252
+MIN_HISTORY_DAYS    = 240
 CACHE_TTL_SECONDS   = 300
 
 # ── Technical Indicators ─────────────────────────
@@ -193,25 +193,26 @@ MARKET_REGIME_SETTINGS = {
         "noise_floor_ratio": 0.85,
         "confidence_min": 0.75,
         "tp_atr_mult": 2.5,
-        "halt_new_entries": True,
-        "allowed_strategies": []
+        "halt_new_entries": True
     },
     "TRANSITIONING": {
         "noise_floor_ratio": 0.75,
-        "confidence_min": 0.70,
+        "confidence_min": 0.60,
         "tp_atr_mult": 1.5,
-        "halt_new_entries": True,
-        "allowed_strategies": []
+        "halt_new_entries": False,
+        "allowed_strategies": ["MEAN_REVERSION", "VWAP_BOUNCE", "ORB_BREAKOUT"]
     }
 }
+
+CAUTION_CONFIDENCE_BOOST    = 0.0  # Calibrated to 0.0 so CAUTION mode threshold stays at 0.60
 
 
 # ── Risk Management ──────────────────────────────
 MAX_POSITION_PCT    = 0.02
 MAX_TRADE_VALUE     = 2000.0
-MAX_OPEN_POSITIONS  = 5       # Capacity for up to 5 different stock symbols per trader instruction
+MAX_OPEN_POSITIONS  = 7       # Capacity for up to 7 concurrent positions (Phase 2 Expansion)
 PORTFOLIO_MAX_POSITIONS = MAX_OPEN_POSITIONS
-MAX_CORRELATED_TECH_POSITIONS = 3
+MAX_CORRELATED_TECH_POSITIONS = 2  # Tightened from 4 to 2 to prevent over-concentrated tech beta
 STOP_LOSS_PCT       = 0.008
 TAKE_PROFIT_PCT     = 0.015
 
@@ -233,13 +234,37 @@ TRAILING_STOP_PCT   = 0.01
 # ── Production Safety ────────────────────────────
 ALLOW_SHORT          = True   # Enabled short selling for bearish market regimes
 SHORT_HARD_STOP_PCT  = 0.01   # Hard Stop-Loss (+1.0% above entry) for short positions
+
+# ── Inverse Bear ETF Gating & Hedging ────────────
+INVERSE_ETF_SYMBOLS: set = {"SPDN", "SH", "SQQQ", "SOXS", "SDOW", "SPXU", "TZA", "TECS"}
+INVERSE_ETF_RISK_OFF_EXEMPT: bool = True  # Allow buying inverse ETFs as hedges during RISK_OFF/VOLATILE
+INVERSE_ETF_MAX_SIZE_PCT: float = 5.0     # Max position size (% of equity) for 1x unleveraged inverse ETF hedge
+LEVERAGED_INVERSE_ETF_SYMBOLS: set = {"SQQQ", "SOXS", "SDOW", "SPXU", "TZA", "TECS"}
+LEVERAGED_INVERSE_ETF_MAX_SIZE_PCT: float = 2.0  # Conservative 2.0% equity cap for 3x leveraged inverse ETFs
+INVERSE_ETF_SCANNER_EXEMPT: bool = True   # Relaxed volume/rvol filters in scanner for inverse ETFs
+INVERSE_ETF_MIN_AVG_DAILY_VOLUME: int = 200_000  # 200k daily volume floor for inverse ETFs
+INVERSE_ETF_MIN_RVOL: float = 0.30        # 0.30 rvol floor for inverse ETFs
+INVERSE_ETF_MIN_CONFIDENCE: float = 0.65  # Relaxed confidence floor for inverse ETF hedges
+INVERSE_ETF_MIN_RR_RATIO: float = 1.40    # Relaxed R:R threshold for inverse ETFs (permits 1.45-1.49 setups)
+INVERSE_ETF_BENCHMARK_MAP: dict = {
+    "SQQQ": "QQQ",
+    "PSQ": "QQQ",
+    "SOXS": "SOXX",
+    "TECS": "XLK",
+    "SDOW": "DIA",
+    "DOG": "DIA",
+    "TZA": "IWM",
+    "SPDN": "SPY",
+    "SH": "SPY",
+    "SPXU": "SPY",
+}
 MIN_TRADE_CASH       = 100.0
 LIMIT_ORDER_OFFSET_PCT = 0.001
-MAX_DAILY_TRADES     = 50
+MAX_DAILY_TRADES     = 100
 
 # ── Paper TradingStream Safety & Recovery ────────
 TRADE_STREAM_START_TIMEOUT_SECONDS        = 10.0
-TRADE_STREAM_STOP_TIMEOUT_SECONDS         = 5.0
+TRADE_STREAM_STOP_TIMEOUT_SECONDS         = 8.0
 TRADE_STREAM_RECONNECT_MAX_ATTEMPTS        = 8
 TRADE_STREAM_RECONNECT_BASE_DELAY_SECONDS = 1.0
 TRADE_STREAM_RECONNECT_MAX_DELAY_SECONDS  = 30.0
@@ -314,6 +339,13 @@ LOG_FILE            = LOG_DIR / "stock_engine.log"
 LOG_MAX_BYTES       = 10 * 1024 * 1024
 LOG_BACKUP_COUNT    = 5
 
+# ── Observability & Incident Telemetry ────────────
+INCIDENT_DIR            = LOG_DIR / "incidents"
+FLIGHT_RECORDER_CAPACITY = 500
+LATCH_HEARTBEAT_SECONDS = 300
+BROKER_EVENTS_PATH      = LOG_DIR / "broker_events.jsonl"
+
+
 # ── Coach ────────────────────────────────────────
 COACH_MIN_CONFIDENCE_FOR_CANDIDATE = 0.60
 COACH_REQUIRE_CHART_CHECK          = True
@@ -343,29 +375,34 @@ GLOBAL_OPENING_BUFFER_END_ET = "09:45"
 # Manual Denylist for scanner / trading exclusion
 SYMBOL_DENYLIST: list = [
     "TTD",
-    # Leveraged 3x / 2x ETFs Denylist (high slippage & whipsaw risk)
-    "SOXL", "SOXS", "TSLL", "TQQQ", "SQQQ", "SPXL", "SPXS",
+    # Ultra-high volatility Leveraged Bull ETFs Denylist (high slippage & whipsaw risk)
+    "SOXL", "TSLL", "TQQQ", "SPXL",
     "LABU", "LABD", "UVXY", "SVXY", "BOIL", "KOLD", "NUGT", "DUST",
+    # Untradeable low ATR / stale quote inverse ETFs
+    "PSQ", "DOG", "QID",
     # Micro-cap / Low-price exclusion denylist
-    "DRAM", "SKHY", "PATH", "CDE", "NU", "SOFI", "PLTD", "BTG", "SNXX", "DOCS", "SPCH"
+    "DRAM", "SKHY", "PATH", "CDE", "NU", "SOFI", "PLTD", "BTG", "SNXX", "DOCS", "SPCH",
+    # Stale quote / illiquid / extreme discontinuity symbols (Aug 2026 Audit)
+    "EDSA", "MRAL", "EDHL", "CRDX", "HVII", "TNON", "XXRP", "GXRP", "XRPT", "UMAL",
+    "BTDL", "WETO", "ETHD", "ZSTK", "STKH", "PCLA", "DBGI"
 ]
 
 INTRADAY_INTERVAL = "1m"
 INTRADAY_LOOKBACK_DAYS = 5
 DAILY_LOOKBACK_DAYS = 60
 PREMARKET_INTERVAL = "1m"
-INTRADAY_CACHE_TTL_SECONDS = 300
+INTRADAY_CACHE_TTL_SECONDS = 15  # 15s TTL (reduced from 300s) to guarantee fresh 5m bars on every cycle
 STALE_QUOTE_BUFFER_SECONDS = 30
 
-SCAN_MIN_PRICE = 10.0  # $10.0+ price floor to eliminate sub-$10 micro-caps
+SCAN_MIN_PRICE = 5.0  # $5.0+ price floor (lowered from $10 for expanded paper candidate discovery)
 SCAN_MAX_PRICE = 1000.0
-SCAN_MIN_PREMARKET_VOLUME = 50_000
+SCAN_MIN_PREMARKET_VOLUME = 10_000  # 10k premarket volume floor (lowered from 50k to capture early premarket movers)
 SCAN_MIN_AVG_DAILY_VOLUME = 1_000_000  # 1.0M+ volume floor for Large-Cap / Mid-Cap focus
-LARGE_CAP_PIVOT_SYMBOLS = ["PLTR", "NVDA", "AMD", "TSLA", "MSFT", "AMZN", "META", "MUU", "FIGS", "MARA"]
+LARGE_CAP_PIVOT_SYMBOLS = ["PLTR", "NVDA", "AMD", "TSLA", "MSFT", "AMZN", "META", "AAPL", "GOOGL", "IBIT", "NKE", "COIN", "MARA", "SPDN", "SH", "SQQQ", "SOXS", "SDOW", "SPXU", "TZA", "TECS"]
 SCAN_PREMARKET_MAX_SPREAD_PCT = 0.008  # 0.8% max spread in premarket
 SCAN_REGULAR_MAX_SPREAD_PCT   = 0.008  # 0.8% max spread in regular session
-SCAN_MIN_RELATIVE_VOLUME = 0.80
-SCAN_MIN_GAP_PCT = 1.4
+SCAN_MIN_RELATIVE_VOLUME = 0.80  # 0.80 minimum relative volume for high-quality catalyst filter
+SCAN_MIN_GAP_PCT = 1.0  # 1.0% (lowered from 1.4%)
 SCAN_MAX_GAP_PCT = 15.0
 SCAN_MIN_FLOAT_SHARES = 10_000_000
 SCAN_MAX_CANDIDATES = 5
@@ -378,7 +415,9 @@ NOISE_FLOOR_ATR_PERIOD       = 10    # ATR window (10 for responsiveness)
 NOISE_FLOOR_ATR_MULTIPLIER   = 1.00  # noise_floor = ATR * 1.00 (Calibrated from 0.75)
 NOISE_FLOOR_ABS_MIN          = 0.08  # minimum floor $0.08
 NOISE_FLOOR_HARD_VETO_RATIO  = 0.75  # veto if stop < 80% of noise floor (Calibrated from 0.70)
-MAX_RISK_PER_TRADE_DOLLARS   = 25.0  # Max per-trade dollar risk cap (Volatility Risk Parity)
+MAX_RISK_PER_TRADE_DOLLARS   = 50.0  # Max per-trade dollar risk cap (Calibrated to $50 for Phase 2 7-slot allocation)
+MAX_TARGET_RR_RATIO           = 5.0   # Target reachability ceiling (5.0x risk per share)
+MAX_TARGET_DAILY_ATR_MULTIPLE = 3.5   # Target ceiling multiple vs Daily ATR (if daily_atr present)
 
 # ── Short Counter-Trend Veto Rules in RISK_ON ──────
 APPLY_SHORT_VETO_TO_ALL_SYMBOLS = True
@@ -402,6 +441,15 @@ SYMBOL_STALE_QUOTE_BLACKLIST = [
     "SMTG", "OLOX", "GWAV",
     # IPO / watch-only (stale quotes expected)
     "SPCX",
+    # 2026-08-21 batch — persistent IEX thin-tape stale (>300s repeatedly)
+    "HOOX", "ELOX", "TXXS", "EUDA", "COIG", "COIA",
+    "DFNS", "BAFN", "RFAI", "HUTG", "GEMG",
+    "CIFG", "MFI", "AEHG", "SMST", "UXRP",
+    "ROBN", "SBIT", "CONI", "SDOT",
+    "CRMX", "KEEX", "PUR", "JUNS", "SUIL",
+    "APLX", "USAX", "USGG", "MRNX", "BABX",
+    # NOTE: TECS, SPXU, SDOW are intentionally omitted from this blacklist
+    # because they belong to INVERSE_ETF_SYMBOLS used for RISK_OFF portfolio hedging.
 ]
 
 DYNAMIC_SCREENER_ENABLED = True
@@ -452,13 +500,15 @@ class StrategyConfig:
 
 from strategies.constants import StrategyName
 STRATEGY_SETTINGS = {
-    StrategyName.ORB: StrategyConfig(confidence_min=0.60, max_risk_pct=1.0, priority=1),
-    StrategyName.VWAP_BOUNCE: StrategyConfig(confidence_min=0.55, max_risk_pct=1.0, priority=2),
-    StrategyName.MOMENTUM_SCALP: StrategyConfig(confidence_min=0.63, max_risk_pct=1.0, priority=3),
-    StrategyName.GAP_AND_GO: StrategyConfig(confidence_min=0.60, max_risk_pct=1.0, priority=4, entry_cutoff_time="10:30"),
+    StrategyName.ORB: StrategyConfig(confidence_min=0.55, max_risk_pct=1.0, priority=1),
+    StrategyName.VWAP_BOUNCE: StrategyConfig(confidence_min=0.50, max_risk_pct=1.0, priority=2),
+    StrategyName.MOMENTUM_SCALP: StrategyConfig(confidence_min=0.58, max_risk_pct=1.0, priority=3),
+    StrategyName.GAP_AND_GO: StrategyConfig(confidence_min=0.55, max_risk_pct=1.0, priority=4, entry_cutoff_time="10:30"),
     StrategyName.CANDLESTICK: StrategyConfig(confidence_min=0.40, max_risk_pct=0.5, priority=5),
-    StrategyName.MEAN_REVERSION: StrategyConfig(confidence_min=0.55, max_risk_pct=1.0, priority=6),
+    StrategyName.MEAN_REVERSION: StrategyConfig(confidence_min=0.50, max_risk_pct=1.0, priority=6),
 }
+
+STRATEGY_MEAN_REVERSION_ENABLED = True  # Native high-win-rate strategy for SIDEWAYS regimes
 
 
 ORB_MIN_VOLUME_RATIO = 1.5
@@ -479,6 +529,11 @@ HARD_VETO_SKIP_LIMIT = 5
 NEWS_HYGIENE_ENABLED = True
 TIME_EXIT_CHECK_ENABLED = True
 BREAKEVEN_BAND_PCT = 0.20
+
+# ── Midday Lunch Chop Filter (11:30 AM - 1:30 PM ET / 10:30 PM - 12:30 AM ICT) ──
+LUNCH_CHOP_FILTER_ENABLED = True  # Blocks low-volume false breakout entries during NY midday
+LUNCH_CHOP_START = "11:30"
+LUNCH_CHOP_END   = "13:30"
 GAP_CONTINUATION_MIN_HOLD_BARS = 3
 VOLATILITY_PENALTY_MULTIPLIER = 4.0
 
@@ -494,10 +549,10 @@ SPY_TREND_GUARD_SYMBOL          = "SPY"
 MAX_RISK_PER_TRADE_PCT = 0.3
 MAX_DAILY_LOSS_PCT      = 0.9
 MAX_DAILY_LOSS_DOLLARS  = MAX_DAILY_LOSS_DAYTRADE
-MAX_TRADES_PER_DAY = 50
+MAX_TRADES_PER_DAY = 100
 MAX_CONSECUTIVE_LOSSES = 10
 CONSECUTIVE_OUTAGE_LIMIT = 3
-MAX_POSITION_SIZE_DOLLARS = 5000.0
+MAX_POSITION_SIZE_DOLLARS = 4000.0  # $4,000 per slot (Phase 2 7-slot allocation)
 MAX_POSITION_PCT_OF_EQUITY = 0.20
 
 CORRELATION_USE_ABS = True
@@ -521,6 +576,13 @@ TRAILING_STOP_ENABLE_SHORT = True
 TRAILING_STOP_USE_ATR = True
 TRAILING_STOP_MIN_PROFIT_PCT = 0.01
 TRAILING_STOP_MIN_TRAIL_PCT = 0.005
+TRAILING_ATR_MAX_REFRESH_CHANGE_PCT: float = 0.25
+TRAILING_ATR_REFRESH_ALPHA: float = 0.25
+TRAILING_HIGH_VOL_ATR_PCT: float = 0.008
+TRAILING_STOP_MIN_COOLDOWN_SECONDS: float = 15.0
+TRAILING_FAST_UPDATE_SYMBOLS: frozenset = frozenset({"NVDA", "TSLA", "AVGO", "AMD", "PLTR"})
+TIME_EXIT_MIN_MFE_PCT: float = 0.30
+TIME_EXIT_MAX_GIVEBACK_PCT: float = 25.0
 NAKED_LIMIT_PROTECTION = "replace"
 
 DEFAULT_STOP_ATR_MULTIPLE = 1.5
@@ -556,6 +618,7 @@ DAYTRADE_TRADE_JOURNAL_FILE = REPORTS_DIR / "trade_journal.jsonl"
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 DAYTRADE_WATCHLIST = ["NVDA", "AAPL", "MSFT", "AMZN", "TSLA", "META", "AMD", "GOOGL", "QQQ", "SPY", "PLTR", "AVGO", "JPM", "BAC", "UBER", "MU", "NFLX"]
+USE_DYNAMIC_SCANNER = False  # False = Strictly trade pristine 17 Mega/Large-Cap DAYTRADE_WATCHLIST with zero slippage and institutional liquidity; True = Dynamic full-market scanner
 
 DAYTRADE_ML_ENABLED = False
 DAYTRADE_ML_CONFIDENCE_WEIGHT = 0.3
@@ -579,8 +642,10 @@ DAYTRADE_ML_TEST_SIZE = 0.2
 
 DAYTRADE_PAPER_RISK_PCT            = 0.001
 DAYTRADE_MIN_RR                    = 2.0
-DAYTRADE_ATR_STOP_MULTIPLE         = 1.5
+DAYTRADE_ATR_STOP_MULTIPLE         = 1.25
 DAYTRADE_MAX_PAPER_TRADES_PER_RUN  = 1
+MOMENTUM_OVEREXTENSION_ATR_MULT    = 1.25
+MAX_ACCEPTABLE_SPREAD_PCT          = 0.20  # Max bid-ask spread (0.20%) allowed for liquid execution
 
 # ── Scheduler ────────────────────────────────────
 SCHEDULER_ENABLED            = True
@@ -1016,6 +1081,13 @@ class Settings:
     TRAILING_STOP_FALLBACK_PCT: float = TRAILING_STOP_FALLBACK_PCT
     TRAILING_STOP_MIN_UPDATE_DELTA: float = TRAILING_STOP_MIN_UPDATE_DELTA
     TRAILING_STOP_UPDATE_COOLDOWN_SECONDS: int = TRAILING_STOP_UPDATE_COOLDOWN_SECONDS
+    TRAILING_ATR_MAX_REFRESH_CHANGE_PCT: float = TRAILING_ATR_MAX_REFRESH_CHANGE_PCT
+    TRAILING_ATR_REFRESH_ALPHA: float = TRAILING_ATR_REFRESH_ALPHA
+    TRAILING_HIGH_VOL_ATR_PCT: float = TRAILING_HIGH_VOL_ATR_PCT
+    TRAILING_STOP_MIN_COOLDOWN_SECONDS: float = TRAILING_STOP_MIN_COOLDOWN_SECONDS
+    TRAILING_FAST_UPDATE_SYMBOLS: frozenset = TRAILING_FAST_UPDATE_SYMBOLS
+    TIME_EXIT_MIN_MFE_PCT: float = TIME_EXIT_MIN_MFE_PCT
+    TIME_EXIT_MAX_GIVEBACK_PCT: float = TIME_EXIT_MAX_GIVEBACK_PCT
 
     # Breakeven Lock
     BREAKEVEN_LOCK_ENABLED:         bool  = BREAKEVEN_LOCK_ENABLED

@@ -63,6 +63,7 @@ class MarketRegimeResult:
     position_scale: float  # 1.0 for RISK_ON, 0.5 for CAUTION, 0.0 for RISK_OFF/DATA_DEGRADED
     confidence_boost: float  # +0.0 for RISK_ON, +0.15 for CAUTION
     allow_new_shorts: bool = True  # True if short selling allowed for current regime
+    allow_inverse_etf_longs: bool = False  # True if inverse/bear ETFs (SPDN/SQQQ) allowed in RISK_OFF
     reasons: List[str] = field(default_factory=list)
     factor_scores: Dict[str, int] = field(default_factory=dict)
     data: Dict[str, Any] = field(default_factory=dict)
@@ -226,6 +227,7 @@ def evaluate_market_regime(
             position_scale=0.0,
             confidence_boost=0.0,
             allow_new_shorts=False,
+            allow_inverse_etf_longs=False,
             reasons=[f"DATA_DEGRADED: {health_reason}"],
             factor_scores={},
             data=health_data,
@@ -268,12 +270,12 @@ def evaluate_market_regime(
     soxx_pct, soxx_source, _ = _get_premarket_pct_change("SOXX", bridge)
     data["SOXX"] = {"pct": soxx_pct, "source": soxx_source}
     if soxx_pct is not None:
-        if soxx_pct < -2.00:
+        if soxx_pct < -3.00:
             factor_scores["SOXX"] = -2
-            reasons.append(f"SOXX semiconductor ETF down {soxx_pct:.2f}% (< -2.00%) [{soxx_source}]")
-        elif soxx_pct < -1.00:
+            reasons.append(f"SOXX semiconductor ETF down {soxx_pct:.2f}% (< -3.00% severe) [{soxx_source}]")
+        elif soxx_pct < -1.50:
             factor_scores["SOXX"] = -1
-            reasons.append(f"SOXX semiconductor ETF weak {soxx_pct:.2f}% [{soxx_source}]")
+            reasons.append(f"SOXX semiconductor ETF weak {soxx_pct:.2f}% (< -1.50%) [{soxx_source}]")
         elif soxx_pct > 2.00:
             factor_scores["SOXX"] = 1
             reasons.append(f"SOXX semiconductor ETF strong +{soxx_pct:.2f}% [{soxx_source}]")
@@ -309,7 +311,7 @@ def evaluate_market_regime(
         mode = MODE_CAUTION
         requires_opening_buffer = True  # Must wait until 09:45 ET
         position_scale = 0.5
-        confidence_boost = 0.15
+        confidence_boost = float(getattr(config, "CAUTION_CONFIDENCE_BOOST", 0.0))
 
         # Dynamic max trades per day based on scanner health & Paper/Live mode
         is_paper = getattr(config, "IS_PAPER_TRADING", True) or getattr(config, "PAPER_TRADING", True)
@@ -355,10 +357,14 @@ def evaluate_market_regime(
         allow_new_longs = False
         reasons.append(f"Market texture '{market_texture}' forces entry halt via config rules")
 
-    # Short selling regime eligibility:
+    # Short selling & Inverse ETF regime eligibility:
     allow_short_cfg = getattr(config, "ALLOW_SHORT", False)
+    inverse_etf_exempt = getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
     macro_index_weak = (spy_pct is not None and spy_pct < -0.30) or (qqq_pct is not None and qqq_pct < -0.40) or (score <= -3)
     allow_new_shorts = allow_short_cfg and macro_index_weak
+
+    # Inverse ETF long-buy eligibility: valid when RISK_OFF / severe CAUTION has halted normal longs
+    allow_inverse_etf_longs = bool(inverse_etf_exempt and macro_index_weak and halt_new_entries)
 
     res = MarketRegimeResult(
         mode=mode,
@@ -368,6 +374,7 @@ def evaluate_market_regime(
         position_scale=position_scale,
         confidence_boost=confidence_boost,
         allow_new_shorts=allow_new_shorts,
+        allow_inverse_etf_longs=allow_inverse_etf_longs,
         reasons=reasons,
         factor_scores=factor_scores,
         data=data,
@@ -431,6 +438,7 @@ class RegimeStateTracker:
                         position_scale=0.0,
                         confidence_boost=0.0,
                         allow_new_shorts=False,
+                        allow_inverse_etf_longs=False,
                         reasons=latched_reasons,
                         factor_scores=raw_result.factor_scores,
                         data=raw_result.data,

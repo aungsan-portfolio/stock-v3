@@ -21,6 +21,7 @@ TRANSIENT_HALT_DATA_DEGRADED = "DATA_DEGRADED"
 TRANSIENT_HALT_GLOBAL_OPENING_BUFFER = "GLOBAL_OPENING_BUFFER"
 TRANSIENT_HALT_FILE_LOCK = "FILE_LOCK_HALT"
 TRANSIENT_HALT_RECONCILIATION = "RECONCILIATION_IN_PROGRESS"
+TRANSIENT_HALT_EVENT_BLACKOUT = "EVENT_BLACKOUT"
 
 _KNOWN_LATCHING_HALTS: FrozenSet[str] = frozenset({
     LATCHING_HALT_PROTECTION_FAILURE,
@@ -33,6 +34,7 @@ _KNOWN_TRANSIENT_HALTS: FrozenSet[str] = frozenset({
     TRANSIENT_HALT_GLOBAL_OPENING_BUFFER,
     TRANSIENT_HALT_FILE_LOCK,
     TRANSIENT_HALT_RECONCILIATION,
+    TRANSIENT_HALT_EVENT_BLACKOUT,
 })
 
 
@@ -47,7 +49,7 @@ class EntryHaltManager:
         self._lock = threading.RLock()
         self._active_halts: Set[str] = set()
 
-    def add(self, reason: str) -> bool:
+    def add(self, reason: str, bridge: Optional[object] = None) -> bool:
         """Add an active halt reason. Logs warning only on initial state transition (prevents log spam)."""
         if not reason:
             return False
@@ -56,6 +58,21 @@ class EntryHaltManager:
             self._active_halts.add(reason)
             if newly_added:
                 logger.warning("[HALT MANAGER] Entry halt activated: %s (Active: %s)", reason, sorted(self._active_halts))
+                # Trigger LatchStateMachine for latching halt events
+                try:
+                    from observability import get_latch_state_machine, LatchTrigger
+                    sm = get_latch_state_machine()
+                    trigger_map = {
+                        LATCHING_HALT_PROTECTION_FAILURE: LatchTrigger.UNPROTECTED_POSITION,
+                        LATCHING_HALT_DAILY_LOSS_BREACH: LatchTrigger.DAILY_LOSS_LIMIT,
+                        LATCHING_HALT_ORDER_TRACKING_FAILURE: LatchTrigger.ORDER_REJECT,
+                        "MANUAL_HALT": LatchTrigger.MANUAL_HALT,
+                    }
+                    trig = trigger_map.get(reason)
+                    if trig is not None:
+                        sm.latch(trig, bridge=bridge, reasons=[reason])
+                except Exception as sm_exc:
+                    logger.debug("[HALT MANAGER] Observability latch hook non-fatal error: %s", sm_exc)
             return newly_added
 
     def clear_transient(self, reason: str) -> bool:
@@ -101,6 +118,13 @@ class EntryHaltManager:
                     reason,
                     sorted(self._active_halts),
                 )
+                try:
+                    from observability import get_latch_state_machine, ClearReason
+                    sm = get_latch_state_machine()
+                    if not any(h in self._active_halts for h in _KNOWN_LATCHING_HALTS):
+                        sm.clear(ClearReason.STARTUP_RECONCILIATION_CLEAN)
+                except Exception:
+                    pass
                 return True
             return False
 
@@ -109,6 +133,12 @@ class EntryHaltManager:
         with self._lock:
             self._active_halts.clear()
             logger.info("[HALT MANAGER] All active entry halts reset.")
+            try:
+                from observability import get_latch_state_machine, ClearReason
+                sm = get_latch_state_machine()
+                sm.clear(ClearReason.MANUAL_RESET)
+            except Exception:
+                pass
 
     def entries_allowed(self) -> bool:
         """True if and only if no active halts are present."""
@@ -154,6 +184,13 @@ class EntryHaltManager:
             logger.exception("[HALT MANAGER] Exception checking HALT.lock file; failing closed: %s", exc)
             self.add(TRANSIENT_HALT_FILE_LOCK)
             return True
+
+    def apply_event_blackout(self, active: bool, tag: Optional[str] = None) -> bool:
+        """Toggle event blackout halt. Mirrors opening-buffer halt handling."""
+        if active:
+            return self.add(TRANSIENT_HALT_EVENT_BLACKOUT)
+        else:
+            return self.clear_transient(TRANSIENT_HALT_EVENT_BLACKOUT)
 
 
 # Global singleton instance

@@ -34,6 +34,7 @@ import live_invariants
 FILLED = "FILLED"                      # fully filled, remaining == 0
 PARTIALLY_FILLED = "PARTIALLY_FILLED"  # some shares filled, remaining > 0 (or partial-then-cancelled)
 WORKING = "WORKING"                    # live at broker, nothing filled yet
+CANCELLED = "CANCELLED"                # order cancelled with no fill
 REJECTED = "REJECTED"                  # cancelled/rejected/inactive with no fill
 TIMEOUT = "TIMEOUT"                    # we stopped waiting; still working, nothing filled
 

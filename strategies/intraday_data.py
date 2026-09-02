@@ -149,6 +149,85 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+QUARANTINE_TTL: float = 1800.0          # 30 minutes
+STALE_THRESHOLD: float = 300.0          # >300s = stale
+
+
+def is_quarantined(symbol: str, now: Optional[float] = None) -> bool:
+    """True if symbol is quarantined. Auto-releases on TTL expiry."""
+    try:
+        from strategies.scanner.premarket_scanner import is_quarantined as _scan_is_quarantined
+        return _scan_is_quarantined(symbol, now=now)
+    except Exception:
+        return False
+
+
+def quarantine(symbol: str, reason: str = "", now: Optional[float] = None) -> None:
+    """Quarantine a symbol for QUARANTINE_TTL."""
+    try:
+        from strategies.scanner.premarket_scanner import quarantine_symbol
+        quarantine_symbol(symbol, reason=reason, now=now)
+    except Exception:
+        pass
+
+
+def clear_quarantine() -> None:
+    """Session-reset hook."""
+    try:
+        from strategies.scanner.premarket_scanner import clear_quarantine as _scan_clear
+        _scan_clear()
+    except Exception:
+        pass
+
+
+def _is_frozen_feed(bars) -> bool:
+    """Helper to detect constant close prices in bars or DataFrame."""
+    if bars is None:
+        return False
+    if hasattr(bars, "frozen"):
+        return bool(getattr(bars, "frozen", False))
+    if isinstance(bars, pd.DataFrame):
+        if 'close' in bars.columns and len(bars) >= 10:
+            return bool(bars['close'].tail(10).nunique() == 1)
+    elif isinstance(bars, list) and len(bars) >= 10:
+        closes = [getattr(b, "close", None) for b in bars[-10:]]
+        return bool(len(set(closes)) == 1 and closes[0] is not None)
+    return False
+
+
+def _bar_age(bars, now: Optional[float] = None) -> float:
+    """Calculate the age in seconds of the latest bar timestamp."""
+    if bars is None:
+        return 999999.0
+    if hasattr(bars, "age_seconds"):
+        return float(getattr(bars, "age_seconds", 0.0))
+    if isinstance(bars, pd.DataFrame) and not bars.empty:
+        last_ts = bars.index[-1]
+        if hasattr(last_ts, "timestamp"):
+            bar_epoch = last_ts.timestamp()
+        else:
+            return 0.0
+        cur_epoch = now if now is not None else _time.time()
+        return max(0.0, cur_epoch - bar_epoch)
+    return 0.0
+
+
+def validate_feed(symbol: str, bars, now: Optional[float] = None) -> tuple[bool, str]:
+    """Per-cycle feed gate. Quarantines on frozen/stale, skips if already caged."""
+    if is_quarantined(symbol, now=now):
+        return (False, "QUARANTINED")
+
+    if _is_frozen_feed(bars):
+        quarantine(symbol, "FROZEN_FEED", now=now)
+        return (False, "FROZEN_FEED")
+
+    if _bar_age(bars, now=now) > STALE_THRESHOLD:
+        quarantine(symbol, f"STALE>{int(STALE_THRESHOLD)}s", now=now)
+        return (False, "STALE")
+
+    return (True, "OK")
+
+
 def _in_market_open_transition() -> bool:
     try:
         from strategies.session import current_session_time
@@ -162,8 +241,17 @@ def _validate_intraday_data(df: pd.DataFrame, symbol: str, interval: str, valida
     """
     Validates intraday DataFrame for zero/negative prices, frozen feeds, and stale quotes.
     Returns empty DataFrame if validation fails.
+    Quarantines symbol on persistent data failures to suppress log spam.
     """
     if df is None or df.empty:
+        return pd.DataFrame()
+
+    def _quarantine(reason: str) -> pd.DataFrame:
+        """Helper: quarantine and return empty df."""
+        try:
+            quarantine(symbol, reason=reason)
+        except Exception:
+            pass
         return pd.DataFrame()
 
     try:
@@ -172,20 +260,27 @@ def _validate_intraday_data(df: pd.DataFrame, symbol: str, interval: str, valida
         if price_cols:
             if (df[price_cols] <= 0).any().any():
                 logger.warning("Data validation failed for %s: Non-positive price detected.", symbol)
-                return pd.DataFrame()
+                return _quarantine("non_positive_price")
 
         # 1.5. Price Integrity Check (High < Low)
         if 'high' in df.columns and 'low' in df.columns:
             if (df['high'] < df['low']).any():
                 logger.warning("Data validation failed for %s: High < Low inverted price detected.", symbol)
-                return pd.DataFrame()
+                return _quarantine("high_lt_low_inverted")
 
         # 1.6. Price Sanity & Discontinuity Guard (Single-bar jump/crash > 50%)
         if 'close' in df.columns and len(df) >= 2:
             pct_change = df['close'].pct_change().dropna()
             if (pct_change.abs() > 0.50).any():
+                # [SHADOW OBSERVABILITY]: Evaluate RVOL and Multi-bar surge for research audit
+                if 'volume' in df.columns and len(df) >= 5:
+                    recent_vol = float(df['volume'].tail(3).mean())
+                    avg_vol = float(df['volume'].tail(50).mean()) if len(df) >= 50 else float(df['volume'].mean())
+                    rvol = (recent_vol / avg_vol) if avg_vol > 0 else 0.0
+                    multi_bar = int((df['volume'].tail(3) > avg_vol * 2.0).sum()) if avg_vol > 0 else 0
+                    logger.info("[SHADOW CATALYST AUDIT] %s extreme move >50%% detected | RVOL=%.1fx | multi_bar_surge=%d/3 bars", symbol, rvol, multi_bar)
                 logger.warning("Data validation failed for %s: Extreme single-bar price discontinuity (>50%%) detected.", symbol)
-                return pd.DataFrame()
+                return _quarantine("price_discontinuity_gt50pct")
 
         # 1.7. Series-Wide Median Drift & Outlier Sanity Guard
         if 'close' in df.columns and len(df) >= 10:
@@ -196,14 +291,14 @@ def _validate_intraday_data(df: pd.DataFrame, symbol: str, interval: str, valida
                     "Data validation failed for %s: Extreme series-wide drift detected (Last: $%.2f vs Median: $%.2f).",
                     symbol, last_p, median_p
                 )
-                return pd.DataFrame()
+                return _quarantine("series_wide_drift")
 
         # 2. Frozen Feed Check (Constant close prices)
         if 'close' in df.columns and len(df) >= 10:
             recent_closes = df['close'].tail(10)
             if recent_closes.nunique() == 1:
                 logger.warning("Data validation failed for %s: True frozen price feed detected.", symbol)
-                return pd.DataFrame()
+                return _quarantine("frozen_price_feed")
 
         # 2.5. ATR & Feature Integrity Check
         if "atr" in df.columns and len(df) > 0:
@@ -211,7 +306,7 @@ def _validate_intraday_data(df: pd.DataFrame, symbol: str, interval: str, valida
             import numpy as np
             if np.isnan(last_atr) or last_atr <= 0:
                 logger.warning("Data validation failed for %s: Invalid ATR %.4f detected.", symbol, last_atr)
-                return pd.DataFrame()
+                return _quarantine("invalid_atr")
 
         # 3. Stale Quote Guard (Only for live real-time feeds when validate_staleness is True)
         if validate_staleness:
@@ -239,11 +334,12 @@ def _validate_intraday_data(df: pd.DataFrame, symbol: str, interval: str, valida
 
                 if staleness_seconds > max_stale:
                     msg = f"Data validation failed for {symbol}: Stale quote. Last bar was {staleness_seconds}s ago (Limit: {max_stale}s)."
-                    if _in_market_open_transition() or staleness_seconds > 1800:
+                    blacklist = set(getattr(config, "SYMBOL_STALE_QUOTE_BLACKLIST", []))
+                    if symbol in blacklist or _in_market_open_transition():
                         logger.debug("[STALE-QUOTE] %s", msg)
                     else:
                         logger.warning("%s", msg)
-                    return pd.DataFrame()
+                    return _quarantine(f"stale_quote_gt_{max_stale}s")
     except Exception as e:
         logger.error("Error checking validation for %s: %s", symbol, e)
         return pd.DataFrame()
@@ -386,6 +482,9 @@ def fetch_intraday(
     prepost: bool = False,
     bridge = None,
 ) -> pd.DataFrame:
+    if is_quarantined(symbol):
+        return pd.DataFrame()
+
     interval = interval or config.INTRADAY_INTERVAL
     lookback_days = lookback_days or config.INTRADAY_LOOKBACK_DAYS
 

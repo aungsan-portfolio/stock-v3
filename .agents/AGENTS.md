@@ -26,3 +26,21 @@ Before migrating the Day Trading strategy from paper trading to real money tradi
 3. **Win Rate**: $WR \ge 40\%$.
 4. **Drawdown Tolerance**: $\text{Max Drawdown} \le 5\%$ (calculated on a trade-by-trade intraday basis).
 5. **Slippage Audit**: $\text{Avg Slippage} \le 0.05\%$.
+
+## 4. TRANSITIONING Texture Filter — Research Findings
+* **Date**: 2026-08-31
+* **Sample**: $N = 322$ rejected signals (walk-forward 5m candle simulation)
+
+| Metric | Empirical Value | Gate Threshold | Gate Status |
+|---|---|---|---|
+| **Win Rate** | **32.3%** | $\ge 40\%$ | ❌ FAILED |
+| **Gross Profit Factor** | **1.10** | $\ge 1.25$ | ❌ FAILED |
+| **Reward / Risk** | **2.29 : 1** | $\ge 1.50 : 1$ | ✅ PASS |
+| **Avg Win / Avg Loss** | **+0.309% / -0.135%** | — | — |
+| **Net Expectancy** | **-0.0408% / trade** | $> 0.0\%$ | ❌ NEGATIVE |
+| **Expected Drawdown** | **-13.1% (over 322 trades)** | $\le 5.0\%$ | ❌ VIOLATION |
+
+> [!IMPORTANT]
+> **Decision Rule**: The `TRANSITIONING` texture filter is **mathematically justified and locked**.
+> **DO NOT** allow `MOMENTUM_SCALP` or `CANDLESTICK` in `TRANSITIONING` texture.
+> **Next Review Gate**: Only re-evaluate when $N \ge 500$ new sample signals are recorded or under a verified market regime transition.

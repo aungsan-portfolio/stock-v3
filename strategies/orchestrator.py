@@ -1,8 +1,9 @@
 from datetime import datetime, timezone
 import time
+import math
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, Tuple
 import sys
 
 import config
@@ -16,6 +17,7 @@ from strategies.intraday_data import fetch_intraday
 from strategies.order_manager import execute_signal
 from strategies.trade_journal import today_trade_count, today_pnl, day_trades_in_last_5_days
 from strategies.performance import profile_latency
+from strategies.position_sizer import calculate_shares, validate_executable_geometry
 
 logger = logging.getLogger(__name__)
 
@@ -58,11 +60,289 @@ def _extract_signal_rsi(sig: TradeSignal) -> float:
     return 50.0
 
 
+def _is_inverse_etf_signal(sig: TradeSignal) -> bool:
+    """Returns True if signal is for an inverse/bear ETF."""
+    inverse_etfs = getattr(config, "INVERSE_ETF_SYMBOLS", set())
+    return sig.symbol.upper().strip() in inverse_etfs
+
+
+def _inverse_etf_entry_allowed(regime_res, sig: TradeSignal) -> bool:
+    """
+    Determines if an inverse ETF long entry is allowed under current regime.
+    Inverse ETFs are 'long' buys that profit from market decline,
+    so they are VALID in RISK_OFF mode.
+    """
+    if not getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False):
+        return False
+    if not _is_inverse_etf_signal(sig):
+        return False
+    if regime_res is None:
+        return False
+    if sig.side.upper() not in ("BUY", "LONG"):
+        return False
+
+    if hasattr(regime_res, "allow_inverse_etf_longs") and regime_res.allow_inverse_etf_longs:
+        return True
+
+    from strategies.regime_engine import MODE_RISK_OFF, MODE_CAUTION
+    if getattr(regime_res, "mode", "") in (MODE_RISK_OFF, MODE_CAUTION):
+        return bool(getattr(regime_res, "halt_new_entries", False))
+    return False
+
+
 def _prepare_closed_bars(df):
-    """Ensure only fully closed bars are evaluated (removes current open bar)."""
+    """Ensure only fully closed bars are evaluated.
+    If the last bar in df is still actively forming (<5m old), remove it.
+    If the last bar is already a completed closed bar, preserve it.
+    """
     if df is not None and not df.empty and len(df) > 1:
-        return df.iloc[:-1]
+        try:
+            from strategies.session import now_eastern
+            now = now_eastern()
+            last_ts = df.index[-1]
+            if hasattr(last_ts, "tzinfo") and last_ts.tzinfo is not None:
+                last_ts_et = last_ts.astimezone(now.tzinfo)
+            else:
+                last_ts_et = last_ts
+            # If the last bar started less than 4.5 minutes ago, it's currently forming -> remove it
+            if hasattr(last_ts_et, "hour") and (now - last_ts_et).total_seconds() < 270:
+                return df.iloc[:-1]
+        except Exception:
+            return df.iloc[:-1]
     return df
+
+
+def expected_value_r(
+    win_rate: float,
+    avg_win_r: float,
+    avg_loss_r: float,
+    avg_cost_r: float = 0.08,
+) -> float:
+    """
+    Calculates Friction-Adjusted Net Expected Value (Net EV) in R-multiples:
+    Net EV (R) = (Pwin * AvgWinR) - (Ploss * AvgLossR) - AvgCostR
+    """
+    loss_rate = 1.0 - win_rate
+    return (win_rate * avg_win_r) - (loss_rate * abs(avg_loss_r)) - avg_cost_r
+
+
+def normalize_ev_score(
+    net_ev_r: float,
+    min_ev_r: float = -0.50,
+    max_ev_r: float = 1.00,
+) -> float:
+    """Normalizes Net EV (R) into a 0 - 100 continuous score."""
+    if max_ev_r <= min_ev_r:
+        raise ValueError("max_ev_r must be greater than min_ev_r")
+    raw_score = 100.0 * (net_ev_r - min_ev_r) / (max_ev_r - min_ev_r)
+    return max(0.0, min(100.0, raw_score))
+
+
+from numbers import Real
+
+
+def is_finite_real(value: object) -> bool:
+    """Validates that value is a real finite number and strictly not a boolean."""
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float, Real))
+        and math.isfinite(float(value))
+    )
+
+
+def decide_lunch_trade(
+    opportunity_score: float,
+    net_ev_r: float,
+    sample_count: int,
+    hard_safety_passed: bool = True,
+    regime_mult: float = 1.0,
+) -> Dict[str, Any]:
+    """
+    4-Component Multiplicative Risk Pipeline with Round-Down to Approved Tiers:
+    Final Risk Multiplier = Opportunity Tier Cap * EV Multiplier * Evidence Multiplier * Regime Multiplier
+    """
+    # ── Strict Numeric Input Validation (Fail-Closed) ──
+    if not is_finite_real(opportunity_score):
+        return {"decision": "REJECT", "risk_mult": 0.0, "raw_risk_mult": 0.0, "reason": "Opportunity score must be a finite real number"}
+    if not 0.0 <= float(opportunity_score) <= 100.0:
+        return {"decision": "REJECT", "risk_mult": 0.0, "raw_risk_mult": 0.0, "reason": f"Opportunity score outside 0-100: {opportunity_score}"}
+
+    if not is_finite_real(net_ev_r):
+        return {"decision": "REJECT", "risk_mult": 0.0, "raw_risk_mult": 0.0, "reason": "Net EV must be a finite real number"}
+
+    if isinstance(sample_count, bool) or not isinstance(sample_count, int):
+        return {"decision": "REJECT", "risk_mult": 0.0, "raw_risk_mult": 0.0, "reason": "Sample count must be an integer"}
+    if sample_count < 0:
+        return {"decision": "REJECT", "risk_mult": 0.0, "raw_risk_mult": 0.0, "reason": "Sample count cannot be negative"}
+
+    if not is_finite_real(regime_mult):
+        return {"decision": "REJECT", "risk_mult": 0.0, "raw_risk_mult": 0.0, "reason": "Regime multiplier must be a finite real number"}
+    if not 0.0 <= float(regime_mult) <= 1.0:
+        return {"decision": "REJECT", "risk_mult": 0.0, "raw_risk_mult": 0.0, "reason": f"Regime multiplier outside approved range ({regime_mult:.3f}, expected 0.0 to 1.0)"}
+
+    # ── Strict Boolean Check for Hard Safety ──
+    if not isinstance(hard_safety_passed, bool):
+        return {"decision": "REJECT", "risk_mult": 0.0, "raw_risk_mult": 0.0, "reason": "Hard safety status must be boolean"}
+    if not hard_safety_passed:
+        return {"decision": "REJECT", "risk_mult": 0.0, "raw_risk_mult": 0.0, "reason": "Hard safety gate failed"}
+
+    # ── Sequential Gate Hierarchy with Precise Audit Explanations ──
+    if opportunity_score < 60.0:
+        return {
+            "decision": "REJECT",
+            "risk_mult": 0.0,
+            "raw_risk_mult": 0.0,
+            "reason": f"Lunch opportunity score below minimum: {opportunity_score:.1f} < 60.0",
+        }
+    if net_ev_r <= 0.0:
+        return {
+            "decision": "REJECT",
+            "risk_mult": 0.0,
+            "raw_risk_mult": 0.0,
+            "reason": f"Historical net expected value is not positive: {net_ev_r:+.3f}R <= 0",
+        }
+    if sample_count < 30:
+        return {
+            "decision": "PAPER_ONLY",
+            "risk_mult": 0.0,
+            "raw_risk_mult": 0.0,
+            "reason": f"Insufficient historical evidence: N={sample_count} < 30",
+        }
+
+    # 1. Opportunity Tier Cap
+    if opportunity_score >= 85.0:
+        opportunity_cap = 0.75
+    elif opportunity_score >= 70.0:
+        opportunity_cap = 0.50
+    else:
+        opportunity_cap = 0.35
+
+    # 2. EV Multiplier
+    if net_ev_r >= 0.40:
+        ev_mult = 1.00
+    elif net_ev_r >= 0.20:
+        ev_mult = 0.85
+    else:
+        ev_mult = 0.60
+
+    # 3. Evidence Multiplier
+    if sample_count >= 100:
+        evidence_mult = 1.00
+    elif sample_count >= 50:
+        evidence_mult = 0.75
+    else:
+        evidence_mult = 0.50
+
+    raw_risk_mult = opportunity_cap * ev_mult * evidence_mult * regime_mult
+    approved_tiers = (0.0, 0.25, 0.35, 0.50, 0.75)
+    final_risk_mult = max(tier for tier in approved_tiers if tier <= raw_risk_mult)
+
+    if final_risk_mult == 0.0:
+        return {
+            "decision": "PAPER_ONLY",
+            "risk_mult": 0.0,
+            "raw_risk_mult": round(raw_risk_mult, 4),
+            "reason": f"Calculated risk multiplier is below the minimum live tier ({raw_risk_mult:.4f}x < 0.25x)",
+        }
+
+    tier_label = "Elite Midday Setup" if opportunity_score >= 85.0 else ("Strong Midday Trend" if opportunity_score >= 70.0 else "Defensive Midday Participation")
+    return {
+        "decision": "ALLOW",
+        "risk_mult": final_risk_mult,
+        "raw_risk_mult": round(raw_risk_mult, 4),
+        "reason": (
+            f"{tier_label}: Score={opportunity_score:.1f}, EV={net_ev_r:+.3f}R, "
+            f"N={sample_count}, Regime={regime_mult:.2f}x, Raw={raw_risk_mult:.4f}x, Approved={final_risk_mult:.2f}x"
+        ),
+    }
+
+
+def compute_lunch_opportunity_score(
+    sig: TradeSignal,
+    event_decision: Optional[object] = None,
+    rvol: float = 1.0,
+    spread_pct: float = 0.02,
+    sample_count: int = 100
+) -> Tuple[float, float, bool, str]:
+    """
+    Computes 5-Factor Lunch Alpha Allocation Score & Net EV Gate.
+    Returns: (score, size_multiplier, is_allowed, reason)
+    """
+    if sig is None:
+        return 0.0, 0.0, False, "Null signal"
+
+    # Factor 1: Signal Confidence (0 - 25 pts)
+    conf = float(getattr(sig, "confidence", 0.5) or 0.5)
+    if conf >= 0.85:
+        conf_pts = 25.0
+    elif conf >= 0.70:
+        conf_pts = 18.0
+    elif conf >= 0.60:
+        conf_pts = 10.0
+    else:
+        conf_pts = 4.0
+
+    # Factor 2: RVOL & Liquidity (0 - 25 pts)
+    sig_rvol = float(getattr(sig, "rvol", rvol) or rvol)
+    if sig_rvol >= 3.0:
+        rvol_pts = 25.0
+    elif sig_rvol >= 2.0:
+        rvol_pts = 18.0
+    elif sig_rvol >= 1.5:
+        rvol_pts = 10.0
+    else:
+        rvol_pts = 0.0
+
+    # Factor 3: Market Context & Trend Alignment (0 - 20 pts)
+    trend_pts = 15.0  # Default baseline for verified setup
+    if hasattr(sig, "metadata") and isinstance(sig.metadata, dict):
+        if sig.metadata.get("above_vwap") and sig.side.upper() in ("BUY", "LONG"):
+            trend_pts = 20.0
+        elif sig.metadata.get("below_vwap") and sig.side.upper() in ("SELL", "SHORT"):
+            trend_pts = 20.0
+
+    # Factor 4: Catalyst Strength (0 - 15 pts)
+    catalyst_pts = 0.0
+    cat_tag = "None"
+    if event_decision is not None:
+        affected = getattr(event_decision, "affected_symbols", None) or set()
+        if sig.symbol.upper().strip() in affected:
+            catalyst_pts = 15.0
+            cat_tag = getattr(event_decision, "tag", "CATALYST") or "CATALYST"
+
+    # Factor 5: Execution Quality & Spread (0 - 15 pts)
+    spread_pts = 15.0 if spread_pct <= 0.05 else (8.0 if spread_pct <= 0.10 else 0.0)
+
+    total_score = conf_pts + rvol_pts + trend_pts + catalyst_pts + spread_pts
+
+    # Estimate EV parameters based on score bucket
+    if total_score >= 85.0:
+        p_win, avg_w, avg_l = 0.62, 1.60, 0.85
+    elif total_score >= 70.0:
+        p_win, avg_w, avg_l = 0.55, 1.30, 0.90
+    elif total_score >= 60.0:
+        p_win, avg_w, avg_l = 0.55, 1.30, 0.85
+    else:
+        p_win, avg_w, avg_l = 0.39, 0.90, 1.05
+
+    net_ev = expected_value_r(p_win, avg_w, avg_l, avg_cost_r=0.08)
+    res = decide_lunch_trade(
+        opportunity_score=total_score,
+        net_ev_r=net_ev,
+        sample_count=sample_count,
+        hard_safety_passed=True,
+    )
+    is_allowed = res["decision"] == "ALLOW"
+    size_mult = res["risk_mult"]
+    reason = res["reason"]
+
+    return total_score, size_mult, is_allowed, reason
+
+
+def _should_bypass_lunch_chop(sig: TradeSignal, event_decision: Optional[object]) -> bool:
+    """Determine if a signal qualifies for Lunch Chop exception via Composite Score & Net EV."""
+    score, size_mult, is_allowed, _ = compute_lunch_opportunity_score(sig, event_decision)
+    return is_allowed
 
 
 def evaluate_symbol(symbol: str, bridge: object = None) -> List[TradeSignal]:
@@ -260,10 +540,17 @@ def apply_portfolio_correlation(signals: List[TradeSignal], open_positions: List
         bridge=bridge,
     ) if position_details else {}
 
+    from strategies.position_sizer import validate_executable_geometry
     for s in signals:
         if s.confidence <= 0:
             continue
             
+        geom_valid, geom_reason = validate_executable_geometry(s)
+        if not geom_valid:
+            logger.info("[PRE-SIZER REJECT] %s: %s", s.symbol, geom_reason)
+            s.confidence = 0
+            continue
+
         candidate_exposure = calculate_shares(s, equity) * s.entry_price
         allowed, penalty, max_corr, overlap_symbols = analyzer.check_portfolio_impact(
             s.symbol,
@@ -304,6 +591,8 @@ def evaluate_and_execute(
     global _consecutive_broker_failures
     broker_fetch_ok = True
 
+    broker_state_available = False
+    broker_pnl = 0.0
     cached_open_positions = []
     open_orders = []
     equity = config.PDT_MIN_EQUITY
@@ -316,6 +605,14 @@ def evaluate_and_execute(
     if not halt_manager.entries_allowed() or getattr(bridge, "_daytrade_suspended", False) is True:
         logger.warning("[ENTRY GUARD] Active entry halts present: %s", halt_manager.summary())
         allow_new_entries = False
+        try:
+            from observability import get_latch_state_machine
+            get_latch_state_machine().heartbeat_if_due(
+                interval_seconds=float(getattr(config, "LATCH_HEARTBEAT_SECONDS", 300)),
+                active_halts=list(halt_manager.active_halts()),
+            )
+        except Exception:
+            pass
     
     is_connected = getattr(bridge, "is_connected", False) or getattr(bridge, "_connected", False)
     if live_paper and not is_connected:
@@ -461,6 +758,9 @@ def evaluate_and_execute(
                 logger.critical("[DATA DEGRADED HALT] %s", regime_res.summary())
             else:
                 logger.warning("[MARKET REGIME RISK_OFF/HALT] New long day trades disabled (Score: %d). Summary: %s", regime_res.score, regime_res.summary())
+                inverse_exempt = getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
+                if inverse_exempt and regime_res is not None:
+                    logger.info("[INVERSE ETF EXEMPT] RISK_OFF active but inverse ETF entries remain eligible (SPDN/SQQQ/SH etc.)")
         elif regime_res.mode == MODE_CAUTION:
             logger.info("[MARKET REGIME CAUTION] Fallback watchlist active after 09:45 EST buffer (50%% sizing). Summary: %s", regime_res.summary())
     except Exception as r_exc:
@@ -480,6 +780,28 @@ def evaluate_and_execute(
             reasons=[f"Fallback regime on evaluation exception: {r_exc}"]
         )
         allow_new_entries = False
+
+    # Event Guard Layer (Macro & High-Impact Scheduled Events)
+    event_decision = None
+    try:
+        from strategies.event_guard import evaluate_event
+        from strategies.session import now_eastern
+        event_decision = evaluate_event(now_eastern())
+    except Exception as ev_exc:
+        logger.error("[EVENT GUARD] Evaluation error, failing CLOSED: %s", ev_exc)
+        from strategies.event_guard import EventDecision
+        event_decision = EventDecision(throttle=0.0, block_entries=True, atr_floor_mult=2.0, tag="EVAL_EXCEPTION_BLACKOUT")
+
+    halt_manager.apply_event_blackout(event_decision.block_entries, tag=event_decision.tag)
+
+    if event_decision.block_entries:
+        allow_new_entries = False
+        logger.warning("[EVENT GUARD BLACKOUT] %s: New entries hard blocked this cycle", event_decision.tag)
+    elif event_decision.tag:
+        logger.info(
+            "[EVENT GUARD] %s active: sizing throttle=%.2fx, atr_floor=%.2fx",
+            event_decision.tag, event_decision.throttle, event_decision.atr_floor_mult
+        )
 
 
     try:
@@ -517,6 +839,28 @@ def evaluate_and_execute(
                             current_price=price,
                             qty=p.position
                         )
+                        if state and state.active and getattr(state, "entry_time", 0) > 0:
+                            from strategies.trailing_stop import check_time_based_exit
+                            time_exit, time_reason = check_time_based_exit(
+                                symbol=sym,
+                                side=side,
+                                entry_price=state.entry_price,
+                                current_price=price,
+                                entry_timestamp=state.entry_time,
+                                peak_price=getattr(state, "peak_price", None),
+                            )
+                            if time_exit:
+                                logger.info(f"[TIME EXIT TRIGGER] {time_reason}")
+                                if live_paper:
+                                    closed = bridge.close_position(sym)
+                                    if closed:
+                                        manager.soft_reset(sym)
+                                    else:
+                                        logger.critical(f"[TIME EXIT FAILED] {sym} remains active because broker close was not confirmed")
+                                else:
+                                    manager.soft_reset(sym)
+                                continue
+
                         if state and state.active and state.order_id is None:
                             manager.handle_naked_position(
                                 symbol=sym,
@@ -525,7 +869,15 @@ def evaluate_and_execute(
                                 dry_run=not live_paper
                             )
                         else:
-                            manager.update_stop(sym, price, bridge=bridge, dry_run=not live_paper)
+                            sym_atr = None
+                            try:
+                                from strategies.intraday_data import get_intraday_features
+                                df_feat = get_intraday_features(sym, interval="5m")
+                                if df_feat is not None and not df_feat.empty and "atr" in df_feat.columns:
+                                    sym_atr = float(df_feat["atr"].iloc[-1])
+                            except Exception:
+                                pass
+                            manager.update_stop(sym, price, bridge=bridge, dry_run=not live_paper, current_atr=sym_atr)
     except Exception as e:
         logger.error(f"Failed to update trailing stops: {e}")
 
@@ -561,8 +913,12 @@ def evaluate_and_execute(
     if "_last_evaluated_5m_bar_str" not in globals():
         _last_evaluated_5m_bar_str = None
 
+    inverse_exempt = getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
+    has_inverse_in_watchlist = any(str(sym).upper().strip() in getattr(config, "INVERSE_ETF_SYMBOLS", set()) for sym in watchlist)
+    can_evaluate_signals = allow_new_entries or (inverse_exempt and has_inverse_in_watchlist)
+
     should_evaluate_5m_bar = False
-    if allow_new_entries:
+    if can_evaluate_signals:
         if _last_evaluated_5m_bar_str != completed_5m_bar_str:
             should_evaluate_5m_bar = True
             _last_evaluated_5m_bar_str = completed_5m_bar_str
@@ -585,9 +941,20 @@ def evaluate_and_execute(
         )
 
     market_tex = getattr(regime_res, "market_texture", "TRENDING") if regime_res else "TRENDING"
+    should_run_eval = bool(can_evaluate_signals and should_evaluate_5m_bar)
 
-    if allow_new_entries and should_evaluate_5m_bar:
+    if should_run_eval:
         all_signals = evaluate_symbols_parallel(watchlist, bridge=bridge, market_texture=market_tex)
+        # Filter: if normal entries halted, keep inverse ETF signals only
+        if not allow_new_entries and can_evaluate_signals:
+            inverse_set = set(getattr(config, "INVERSE_ETF_SYMBOLS", set()))
+            before_count = len(all_signals)
+            all_signals = [s for s in all_signals if s.symbol.upper().strip() in inverse_set]
+            if before_count != len(all_signals):
+                logger.info(
+                    "[INVERSE ETF FILTER] Kept %d/%d signals (inverse ETFs only, normal longs suppressed)",
+                    len(all_signals), before_count
+                )
     else:
         all_signals = []
     logger.debug("[HOOK] after fetch & evaluate_symbols_parallel")
@@ -632,8 +999,15 @@ def evaluate_and_execute(
 
         # Regime-aware strategy filtering
         tex_cfg = getattr(config, "MARKET_REGIME_SETTINGS", {}).get(market_tex, {})
-        allowed_strats = tex_cfg.get("allowed_strategies", None)
-        if allowed_strats is not None and sig.strategy not in allowed_strats:
+        raw_allowed = tex_cfg.get("allowed_strategies", None)
+        allowed_strats = raw_allowed if raw_allowed else None
+        is_inverse_exempt = _is_inverse_etf_signal(sig) and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
+        if is_inverse_exempt:
+            logger.info(
+                "[INVERSE ETF EXEMPT] Strategy texture filter bypassed for %s (%s in '%s' texture)",
+                sig.symbol, sig.strategy, market_tex
+            )
+        elif allowed_strats is not None and sig.strategy not in allowed_strats:
             logger.info("Skipped %s: strategy %s not allowed in market texture '%s'", sig.symbol, sig.strategy, market_tex)
             continue
         
@@ -651,6 +1025,28 @@ def evaluate_and_execute(
                     strat_cfg.entry_cutoff_time
                 )
                 continue
+
+        # ── Lunch Chop Filter (11:30 AM - 1:30 PM ET) ──
+        if getattr(config, "LUNCH_CHOP_FILTER_ENABLED", False):
+            from strategies.session import now_eastern
+            from datetime import time as dt_time
+            current_et = now_eastern().time()
+            lunch_start = dt_time(11, 30)
+            lunch_end = dt_time(13, 30)
+            if lunch_start <= current_et < lunch_end:
+                l_score, l_mult, l_allowed, l_reason = compute_lunch_opportunity_score(sig, event_decision)
+                if l_allowed:
+                    sig.lunch_size_mult = l_mult
+                    logger.info(
+                        "[LUNCH OPPORTUNITY ALLOWED] %s: Score=%.1f/100 (Sizing Multiplier: %.2fx) | %s",
+                        sig.symbol, l_score, l_mult, l_reason
+                    )
+                else:
+                    logger.info(
+                        "Skipped %s: Entry blocked during Midday Lunch Chop Zone (Score: %.1f/100 < 60) | %s",
+                        sig.symbol, l_score, l_reason
+                    )
+                    continue
 
                 
         if sym in active_symbols:
@@ -674,6 +1070,14 @@ def evaluate_and_execute(
         if sig.side.upper() in ("SELL", "SHORT") and sig_rsi <= rsi_min:
             logger.info("Skipped %s: RSI %.1f <= %.1f (Oversold SHORT entry filter)", sig.symbol, sig_rsi, rsi_min)
             continue
+        if _is_inverse_etf_signal(sig) and sig.side.upper() in ("SELL", "SHORT"):
+            logger.info("Skipped %s: Inverse ETFs cannot be sold short (Long-only hedge)", sig.symbol)
+            continue
+
+        geom_ok, geom_msg = validate_executable_geometry(sig)
+        if not geom_ok:
+            logger.info("[PRE-EXECUTION GEOMETRY VETO] %s: %s", sig.symbol, geom_msg)
+            continue
 
         deduped_signals.append(sig)
     all_signals = deduped_signals
@@ -686,14 +1090,53 @@ def evaluate_and_execute(
 
     logger.debug("[HOOK] before execute")
     for sig in all_signals:
-        if not allow_new_entries:
-            logger.info("Skipped execution of signal %s: new entries disabled this cycle", sig.symbol)
+        entry_allowed_for_sig = allow_new_entries or _inverse_etf_entry_allowed(regime_res, sig)
+        if not entry_allowed_for_sig:
+            logger.info(
+                "Skipped execution of signal %s: new entries disabled this cycle [allow_new_entries=%s, inverse_etf_allowed=%s, is_inverse=%s]",
+                sig.symbol,
+                allow_new_entries,
+                _inverse_etf_entry_allowed(regime_res, sig),
+                _is_inverse_etf_signal(sig),
+            )
             continue
+
+        effective_equity = equity
+        if hasattr(sig, "lunch_size_mult") and getattr(sig, "lunch_size_mult", 1.0) < 1.0:
+            l_mult = float(sig.lunch_size_mult)
+            effective_equity = min(effective_equity, effective_equity * l_mult)
+            logger.info(
+                "[LUNCH SIZING] Applying lunch risk sizing %.2fx: effective equity $%.2f for %s",
+                l_mult, effective_equity, sig.symbol
+            )
+
+        if event_decision and event_decision.throttle < 1.0:
+            effective_equity = min(effective_equity, effective_equity * event_decision.throttle)
+            logger.info(
+                "[EVENT GUARD] Applying event throttle %.2fx: effective equity $%.2f for %s",
+                event_decision.throttle, effective_equity, sig.symbol
+            )
+
+        if _is_inverse_etf_signal(sig) and not allow_new_entries:
+            sym_upper = sig.symbol.upper().strip()
+            leveraged_etfs = getattr(config, "LEVERAGED_INVERSE_ETF_SYMBOLS", set())
+            if sym_upper in leveraged_etfs:
+                max_pct = getattr(config, "LEVERAGED_INVERSE_ETF_MAX_SIZE_PCT", 2.0)
+                etf_type = "3x Leveraged"
+            else:
+                max_pct = getattr(config, "INVERSE_ETF_MAX_SIZE_PCT", 5.0)
+                etf_type = "1x Unleveraged"
+            effective_equity = min(equity, equity * (max_pct / 100.0))
+            logger.info(
+                "[INVERSE ETF] Applying %s reduced sizing: %.1f%% of equity = $%.2f for %s",
+                etf_type, max_pct, effective_equity, sig.symbol
+            )
+
         try:
             result = execute_signal(
                 signal=sig,
                 bridge=bridge,
-                equity=equity,
+                equity=effective_equity,
                 current_pnl=current_pnl,
                 day_trades_last_5_days=day_trades_in_last_5_days(bridge=bridge),
                 dry_run=not live_paper,

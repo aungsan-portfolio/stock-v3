@@ -25,6 +25,7 @@ def test_fixed_shares():
     signal = create_dummy_signal()
     with patch("config.SIZING_METHOD", "fixed_shares"), \
          patch("config.FIXED_SHARE_COUNT", 75), \
+         patch("config.MAX_RISK_PER_TRADE_DOLLARS", 10000.0), \
          patch("config.MAX_POSITION_SIZE_DOLLARS", 10000.0), \
          patch("config.MAX_POSITION_PCT_OF_EQUITY", 0.5):
         shares = calculate_shares(signal, equity=50000.0)
@@ -34,6 +35,7 @@ def test_fixed_dollars():
     signal = create_dummy_signal(entry=50.0)
     with patch("config.SIZING_METHOD", "fixed_dollars"), \
          patch("config.FIXED_DOLLAR_AMOUNT", 2000.0), \
+         patch("config.MAX_RISK_PER_TRADE_DOLLARS", 10000.0), \
          patch("config.MAX_POSITION_SIZE_DOLLARS", 10000.0), \
          patch("config.MAX_POSITION_PCT_OF_EQUITY", 0.5):
         shares = calculate_shares(signal, equity=50000.0)
@@ -43,6 +45,7 @@ def test_fixed_dollars():
 def test_risk_based():
     signal = create_dummy_signal(risk=2.0)
     with patch("config.SIZING_METHOD", "risk_based"), \
+         patch("config.MAX_RISK_PER_TRADE_DOLLARS", 10000.0), \
          patch("config.STRATEGY_SETTINGS", {StrategyName.MOMENTUM_SCALP: MagicMock(max_risk_pct=1.0)}, create=True), \
          patch("config.MAX_POSITION_SIZE_DOLLARS", 10000.0), \
          patch("config.MAX_POSITION_PCT_OF_EQUITY", 0.5):

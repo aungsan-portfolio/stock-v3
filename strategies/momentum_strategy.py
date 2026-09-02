@@ -75,14 +75,26 @@ class MomentumScalpStrategy(BaseStrategy):
 
         rel_vol = volume / vol_ma if vol_ma > 0 else 0
 
+        # Overextension check: if price is too far above EMA9, avoid buying at the exhaustion top
+        overextension_mult = float(getattr(config, "MOMENTUM_OVEREXTENSION_ATR_MULT", 1.25))
+        overextension_threshold = atr * overextension_mult
+
         if buy_checks >= 4:
+            if (price - ema9) > (overextension_threshold + 1e-4):
+                logger.info("Skipped %s: Overextended LONG (Price $%.2f is $%.2f > %.2fx ATR $%.2f above EMA9 $%.2f)",
+                            symbol, price, price - ema9, overextension_mult, atr, ema9)
+                return None
+
             swing_low = float(df["low"].tail(10).min())
-            stop = max(swing_low, ema20) - 0.01
-            risk = price - stop
+            structural_stop = max(swing_low, ema20) - 0.01
+            atr_stop_mult = float(getattr(config, "DAYTRADE_ATR_STOP_MULTIPLE", 1.25))
+            min_stop_distance = atr * atr_stop_mult
+            stop_distance = max(price - structural_stop, min_stop_distance)
+            stop = round(price - stop_distance, 4)
+            risk = round(price - stop, 4)
             if risk > 0:
-                atr_target = price + atr * config.DEFAULT_TARGET_RR_RATIO
-                rr_target = price + risk * config.DEFAULT_TARGET_RR_RATIO
-                target = max(atr_target, rr_target)
+                rr_ratio = float(getattr(config, "DEFAULT_TARGET_RR_RATIO", 1.5))
+                target = round(price + risk * rr_ratio, 4)
 
                 confidence = 0.4 + buy_checks * 0.10
                 if rel_vol > 2.0:
@@ -111,14 +123,26 @@ class MomentumScalpStrategy(BaseStrategy):
                 )
 
         allow_short = getattr(config, "ALLOW_SHORT", False)
+        inverse_etfs = getattr(config, "INVERSE_ETF_SYMBOLS", set())
+        if symbol.upper().strip() in inverse_etfs:
+            allow_short = False
+
         if allow_short and sell_checks >= 4:
+            if (ema9 - price) > (overextension_threshold + 1e-4):
+                logger.info("Skipped %s: Overextended SHORT (Price $%.2f is $%.2f > %.2fx ATR $%.2f below EMA9 $%.2f)",
+                            symbol, price, ema9 - price, overextension_mult, atr, ema9)
+                return None
+
             swing_high = float(df["high"].tail(10).max())
-            stop = min(swing_high, ema20) + 0.01
-            risk = stop - price
+            structural_stop = min(swing_high, ema20) + 0.01
+            atr_stop_mult = float(getattr(config, "DAYTRADE_ATR_STOP_MULTIPLE", 1.25))
+            min_stop_distance = atr * atr_stop_mult
+            stop_distance = max(structural_stop - price, min_stop_distance)
+            stop = round(price + stop_distance, 4)
+            risk = round(stop - price, 4)
             if risk > 0:
-                atr_target = price - atr * config.DEFAULT_TARGET_RR_RATIO
-                rr_target = price - risk * config.DEFAULT_TARGET_RR_RATIO
-                target = min(atr_target, rr_target)
+                rr_ratio = float(getattr(config, "DEFAULT_TARGET_RR_RATIO", 1.5))
+                target = round(price - risk * rr_ratio, 4)
 
                 confidence = 0.4 + sell_checks * 0.10
                 if rel_vol > 2.0:

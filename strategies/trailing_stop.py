@@ -74,6 +74,9 @@ class TrailingStopState:
     signal_id: Optional[str] = None
     target_price: Optional[float] = None
     entry_time: float = 0.0
+    partial_taken: bool = False
+    partial_qty: float = 0.0
+    partial_exit_price: float = 0.0
 
 
 MAX_HOLD_MINUTES = 25.0
@@ -87,10 +90,13 @@ def check_time_based_exit(
     entry_price: float,
     current_price: float,
     entry_timestamp: float,
-    cfg=None
+    cfg=None,
+    peak_price: Optional[float] = None,
 ) -> Tuple[bool, str]:
     """
-    Triggers time-based exit if scalp position held > 25 minutes and stagnant near breakeven (+-0.10%).
+    Triggers time-based exit if scalp position held >= max_hold (25m) under:
+    A. Stagnation exit: price stagnant near breakeven (+-0.10%).
+    B. Giveback exit: price peaked (>= 0.30% MFE) and gave back >= 25% of peak gains, returning near breakeven.
     """
     cfg = cfg or config
     enabled = getattr(cfg, "TIME_EXIT_CHECK_ENABLED", TIME_EXIT_CHECK_ENABLED)
@@ -107,16 +113,36 @@ def check_time_based_exit(
     pct_from_entry = ((current_price - entry_price) / entry_price) * 100.0 if entry_price > 0 else 0.0
     band_pct = getattr(cfg, "BREAKEVEN_BAND_PCT", BREAKEVEN_BAND_PCT)
 
-    if abs(pct_from_entry) > band_pct:
-        direction = "profit" if pct_from_entry > 0 else "loss"
-        return False, f"Time exit: {hold_minutes:.1f}m held but price moved {pct_from_entry:+.2f}% ({direction}) — let run"
+    # A. Stagnation Check
+    near_entry = abs(pct_from_entry) <= band_pct
 
-    reason = (
-        f"TIME EXIT TRIGGERED: {symbol} ({side}) held {hold_minutes:.1f}m "
-        f"with price {pct_from_entry:+.2f}% from entry — stagnant near breakeven. Closing to free capital."
-    )
-    logger.info("[TIME EXIT] %s", reason)
-    return True, reason
+    # B. Giveback Check
+    min_mfe_pct = float(getattr(cfg, "TIME_EXIT_MIN_MFE_PCT", 0.30))
+    max_giveback_pct = float(getattr(cfg, "TIME_EXIT_MAX_GIVEBACK_PCT", 25.0))
+    gave_back_profit = False
+
+    if peak_price and peak_price > 0 and entry_price > 0:
+        if side.upper() == "BUY":
+            peak_profit_pct = ((peak_price - entry_price) / entry_price) * 100.0
+            giveback_pct = ((peak_price - current_price) / peak_price) * 100.0
+        else:
+            peak_profit_pct = ((entry_price - peak_price) / entry_price) * 100.0
+            giveback_pct = ((current_price - peak_price) / peak_price) * 100.0
+
+        if peak_profit_pct >= min_mfe_pct and giveback_pct >= (max_giveback_pct / 100.0 * peak_profit_pct) and near_entry:
+            gave_back_profit = True
+
+    if gave_back_profit or near_entry:
+        reason_type = "gave back peak profits near breakeven" if gave_back_profit else "stagnant near breakeven"
+        reason = (
+            f"TIME EXIT TRIGGERED: {symbol} ({side}) held {hold_minutes:.1f}m "
+            f"with price {pct_from_entry:+.2f}% from entry — {reason_type}. Closing to free capital."
+        )
+        logger.info("[TIME EXIT] %s", reason)
+        return True, reason
+
+    direction = "profit" if pct_from_entry > 0 else "loss"
+    return False, f"Time exit: {hold_minutes:.1f}m held but price moved {pct_from_entry:+.2f}% ({direction}) — let run"
 
 
 def normalize_order_type(order_type: object) -> str:
@@ -208,27 +234,61 @@ class DynamicTrailingStopManager:
         except (json.JSONDecodeError, OSError) as e:
             logger.error(f"Failed to load trailing stop state: {e}")
 
-    def _save_state(self):
+    def _save_state(self) -> None:
+        import threading
+        tmp_file = f"{STATE_FILE}.tmp.{os.getpid()}.{threading.get_ident()}"
         try:
-            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-            with open(STATE_FILE, "w") as f:
-                json.dump({sym: asdict(state) for sym, state in self.states.items()}, f, indent=2)
-        except Exception as e:
-            logger.error(f"Failed to save trailing stop state: {e}")
+            state_dir = os.path.dirname(STATE_FILE)
+            os.makedirs(state_dir, exist_ok=True)
+            payload = {
+                sym: asdict(state)
+                for sym, state in self.states.items()
+            }
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_file, STATE_FILE)
+        except Exception:
+            logger.exception(
+                "Failed to save trailing stop state atomically: %s",
+                STATE_FILE,
+            )
+            try:
+                if os.path.exists(tmp_file):
+                    os.remove(tmp_file)
+            except OSError:
+                logger.debug(
+                    "Failed to remove temporary state file: %s",
+                    tmp_file,
+                    exc_info=True,
+                )
 
-    def reset(self, symbol: str):
-        """Reset trailing stop state for a symbol."""
+    def soft_reset(self, symbol: str) -> None:
+        """Deactivate state — preserves telemetry/audit trail."""
+        with self._lock:
+            state = self.states.get(symbol)
+            if state:
+                state.active = False
+                self._save_state()
+                logger.info(f"Soft reset trailing stop for {symbol} (state preserved, active=False)")
+
+    def hard_reset(self, symbol: str) -> None:
+        """Delete state entirely from memory + disk."""
         sym_upper = symbol.upper().strip()
         with self._lock:
             keys_to_del = [k for k in self.states if k.upper().strip() == sym_upper]
             for k in keys_to_del:
                 del self.states[k]
             self._save_state()
-            logger.info(f"Reset trailing stop state for {symbol}")
+            logger.info(f"Hard reset trailing stop for {symbol} (state deleted)")
+
+    def reset(self, symbol: str) -> None:
+        """Backward-compatible alias → hard_reset."""
+        self.hard_reset(symbol)
 
 
     def apply_confirmed_fill(
-
         self,
         signal: TradeSignal,
         average_fill_price: float,
@@ -240,25 +300,29 @@ class DynamicTrailingStopManager:
         """Apply a confirmed fill report to initialize or update position trailing state."""
         symbol = signal.symbol.upper().strip()
         with self._lock:
-            if symbol in self.states:
-                state = self.states[symbol]
-                state.entry_price = average_fill_price
-                state.qty = cumulative_qty
+            existing = self.states.get(symbol)
+            if existing and existing.active:
+                existing.entry_price = average_fill_price
+                existing.qty = cumulative_qty
                 if stop_order_id:
-                    state.order_id = stop_order_id
-                state.last_updated = time.time()
+                    existing.order_id = stop_order_id
+                existing.last_updated = time.time()
                 self._save_state()
                 logger.info(f"Updated Trailing Stop for {symbol}: fill=${average_fill_price:.4f}, cumulative_qty={cumulative_qty:.4f}")
-                return state
-            else:
-                return self.initialize_position(
-                    signal=signal,
-                    fill_price=average_fill_price,
-                    qty=cumulative_qty,
-                    stop_order_id=stop_order_id,
-                    bridge=bridge,
-                    tp_order_id=tp_order_id,
-                )
+                return existing
+
+            # Missing or inactive state means this is a new lifecycle!
+            if existing and not existing.active:
+                del self.states[symbol]
+
+            return self.initialize_position(
+                signal=signal,
+                fill_price=average_fill_price,
+                qty=cumulative_qty,
+                stop_order_id=stop_order_id,
+                bridge=bridge,
+                tp_order_id=tp_order_id,
+            )
 
     def initialize_position(self, signal: TradeSignal, fill_price: float, qty: float = 0.0, stop_order_id: Optional[str] = None, bridge: Optional[object] = None, tp_order_id: Optional[str] = None) -> TrailingStopState:
 
@@ -306,6 +370,7 @@ class DynamicTrailingStopManager:
                 qty=qty,
                 strategy=getattr(signal, "strategy", "UNKNOWN"),
                 signal_id=getattr(signal, "signal_id", None),
+                entry_time=time.time(),
                 active=True
             )
             self.states[signal.symbol] = state
@@ -450,7 +515,17 @@ class DynamicTrailingStopManager:
 
         return initial_stop
 
-    def ensure_initialized(self, symbol: str, side: str, avg_cost: float, open_orders: list, current_price: float, original_stop: Optional[float] = None, qty: float = 0.0) -> Optional[TrailingStopState]:
+    def ensure_initialized(
+        self,
+        symbol: str,
+        side: str,
+        avg_cost: float,
+        open_orders: list,
+        current_price: float,
+        original_stop: Optional[float] = None,
+        qty: float = 0.0,
+        original_entry_time: Optional[float] = None,
+    ) -> Optional[TrailingStopState]:
         """Ensure trailing stop state is initialized for an active position."""
         with self._lock:
             state = self.states.get(symbol)
@@ -528,6 +603,20 @@ class DynamicTrailingStopManager:
 
             mult = getattr(config, "TRAILING_STOP_ATR_MULTIPLE", 1.5)
 
+            existing = self.states.get(symbol)
+            reconciled_entry_time = None
+            if original_entry_time and original_entry_time > 0:
+                reconciled_entry_time = float(original_entry_time)
+            elif existing and getattr(existing, "entry_time", 0) > 0:
+                reconciled_entry_time = float(existing.entry_time)
+                logger.info(f"[ENTRY TIME RECONCILED] {symbol}: Recovered original entry timestamp {reconciled_entry_time} from persisted state")
+            else:
+                reconciled_entry_time = time.time()
+                logger.warning(
+                    f"[ENTRY TIME FALLBACK] {symbol} reconciled without original broker entry timestamp. "
+                    f"Time-exit clock starts from reconciliation time."
+                )
+
             state = TrailingStopState(
                 symbol=symbol,
                 side=side,
@@ -540,6 +629,7 @@ class DynamicTrailingStopManager:
                 order_id=stop_order_id,
                 qty=qty,
                 strategy="RECONCILED",
+                entry_time=reconciled_entry_time,
                 active=True
             )
             self.states[symbol] = state
@@ -626,8 +716,60 @@ class DynamicTrailingStopManager:
                 return True
         return False
 
-    def update_stop(self, symbol: str, current_price: float, bridge=None, dry_run=False) -> Optional[TrailingStopState]:
-        """Update the peak/trough and ratched the stop price if required."""
+    def _refresh_atr(
+        self,
+        state: TrailingStopState,
+        current_atr: Optional[float],
+    ) -> bool:
+        if current_atr is None or current_atr <= 0:
+            return False
+
+        old_atr = float(state.atr or 0.0)
+        if old_atr <= 0:
+            state.atr = float(current_atr)
+            return True
+
+        max_change_pct = float(
+            getattr(config, "TRAILING_ATR_MAX_REFRESH_CHANGE_PCT", 0.25)
+        )
+        smoothing = float(
+            getattr(config, "TRAILING_ATR_REFRESH_ALPHA", 0.25)
+        )
+
+        lower_bound = old_atr * (1.0 - max_change_pct)
+        upper_bound = old_atr * (1.0 + max_change_pct)
+        bounded_atr = min(max(float(current_atr), lower_bound), upper_bound)
+
+        refreshed_atr = (
+            old_atr * (1.0 - smoothing)
+            + bounded_atr * smoothing
+        )
+
+        import math
+        if math.isclose(old_atr, refreshed_atr, rel_tol=1e-6):
+            return False
+
+        state.atr = refreshed_atr
+
+        logger.info(
+            "[ATR REFRESH] %s: old=%.4f raw=%.4f bounded=%.4f new=%.4f",
+            state.symbol,
+            old_atr,
+            current_atr,
+            bounded_atr,
+            refreshed_atr,
+        )
+        return True
+
+    def update_stop(
+        self,
+        symbol: str,
+        current_price: float,
+        bridge=None,
+        dry_run=False,
+        current_atr: Optional[float] = None,
+    ) -> Optional[TrailingStopState]:
+        """Update the peak/trough and ratchet the stop price if required."""
         with self._lock:
             state = self.states.get(symbol)
             if not state or not state.active:
@@ -637,9 +779,34 @@ class DynamicTrailingStopManager:
                 return state
 
             now = time.time()
-            cooldown = getattr(config, "TRAILING_STOP_UPDATE_COOLDOWN_SECONDS", 30)
+            base_cooldown = float(getattr(config, "TRAILING_STOP_UPDATE_COOLDOWN_SECONDS", 30))
+            atr_pct = (
+                state.atr / current_price
+                if current_price > 0 and state.atr > 0
+                else 0.0
+            )
+            high_vol_threshold = float(
+                getattr(config, "TRAILING_HIGH_VOL_ATR_PCT", 0.008)
+            )
+            forced_fast_symbols = {
+                str(s).upper().strip()
+                for s in getattr(config, "TRAILING_FAST_UPDATE_SYMBOLS", {"NVDA", "TSLA", "AVGO", "AMD", "PLTR"})
+            }
+            is_fast_update = (
+                symbol.upper().strip() in forced_fast_symbols
+                or atr_pct >= high_vol_threshold
+            )
+            if is_fast_update:
+                min_cd = float(getattr(config, "TRAILING_STOP_MIN_COOLDOWN_SECONDS", 15.0))
+                cooldown = max(min_cd, base_cooldown * 0.5)
+            else:
+                cooldown = base_cooldown
+
             if (now - state.last_updated) < cooldown:
                 return state
+
+            # Refresh ATR with bounded change and smoothing
+            atr_changed = self._refresh_atr(state, current_atr)
 
             min_delta = getattr(config, "TRAILING_STOP_MIN_UPDATE_DELTA", 0.25)
             
@@ -729,6 +896,8 @@ class DynamicTrailingStopManager:
                     state.last_updated = now
                 else:
                     state.last_updated = 0
+                self._save_state()
+            elif atr_changed:
                 self._save_state()
 
             return state
@@ -1242,10 +1411,10 @@ class DynamicTrailingStopManager:
                 current_state.remediation_in_progress = False
             self._save_state()
 
-    def reset(self, symbol: str) -> None:
-        with self._lock:
-            if symbol in self.states:
-                self.states[symbol].active = False
-                self._save_state()
-
 manager = DynamicTrailingStopManager()
+
+
+def get_trailing_manager() -> DynamicTrailingStopManager:
+    """Returns the singleton DynamicTrailingStopManager instance."""
+    global manager
+    return manager

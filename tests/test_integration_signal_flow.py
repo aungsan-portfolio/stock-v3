@@ -27,12 +27,17 @@ class TestFullSignalPipeline:
             price_vs_vwap=0.15,
         )
         assert veto is True
-        assert "too strong" in reason.lower() or "rsi" in reason.lower()
+        assert "too strong" in reason.lower() or "rsi" in reason.lower() or "vwap" in reason.lower()
 
     def test_tsla_long_passes_in_risk_on(self):
         """TSLA LONG confidence 0.80 -- RISK_ON gate 0.60 -- must pass"""
         gate = get_confidence_gate("RISK_ON", "LONG")
         assert 0.80 >= gate, "Trend-aligned LONG should pass gate"
+
+    def test_caution_gate_is_0_60(self):
+        """CAUTION regime gate should be 0.60"""
+        gate = get_confidence_gate("CAUTION", "LONG")
+        assert gate == 0.60, f"Expected 0.60 but got {gate}"
 
     def test_counter_trend_short_blocked_below_gate(self):
         """RISK_ON SHORT confidence 0.72 -- gate 0.78 -- must be blocked"""

@@ -1,4 +1,4 @@
-﻿"""test_features_candlestick.py -- offline unit tests for candlestick pattern features.
+"""test_features_candlestick.py -- offline unit tests for candlestick pattern features.
 
 Tests follow the same pattern as test_features_regime.py: synthetic OHLCV data
 is fed through build_features() with USE_CANDLESTICK_FEATURES=True/False, and
@@ -46,9 +46,12 @@ class TestCandlestickFeatureColumns(unittest.TestCase):
 
     def setUp(self):
         self._orig_flag = getattr(config, "USE_CANDLESTICK_FEATURES", False)
+        self._orig_mkt = getattr(config, "USE_MARKET_RELATIVE_FEATURES", False)
+        config.USE_MARKET_RELATIVE_FEATURES = False
 
     def tearDown(self):
         config.USE_CANDLESTICK_FEATURES = self._orig_flag
+        config.USE_MARKET_RELATIVE_FEATURES = self._orig_mkt
 
     def test_base_columns_unchanged_when_flag_off(self):
         """USE_CANDLESTICK_FEATURES=False should return only base 14 columns."""
@@ -92,10 +95,13 @@ class TestCandlestickBuildFeatures(unittest.TestCase):
 
     def setUp(self):
         self._orig_flag = getattr(config, "USE_CANDLESTICK_FEATURES", False)
+        self._orig_mkt = getattr(config, "USE_MARKET_RELATIVE_FEATURES", False)
+        config.USE_MARKET_RELATIVE_FEATURES = False
         self.df = _make_ohlcv()
 
     def tearDown(self):
         config.USE_CANDLESTICK_FEATURES = self._orig_flag
+        config.USE_MARKET_RELATIVE_FEATURES = self._orig_mkt
 
     def test_build_features_no_candle_cols_when_off(self):
         """With flag OFF, output should have no candlestick columns."""
@@ -124,10 +130,10 @@ class TestCandlestickBuildFeatures(unittest.TestCase):
         self.assertIn("morning_star", result.columns)
 
     def test_candle_values_are_binary(self):
-        """All candlestick columns should be {0.0, 1.0} boolean flags."""
+        """All candlestick feature columns should contain only 0.0 or 1.0."""
         config.USE_CANDLESTICK_FEATURES = True
         result = data_manager.build_features(self.df)
-        candle_cols = [
+        candle_names = [
             "doji", "dragonfly_doji", "gravestone_doji",
             "white_marubozu", "black_marubozu",
             "hammer", "hanging_man", "shooting_star",
@@ -136,7 +142,7 @@ class TestCandlestickBuildFeatures(unittest.TestCase):
             "piercing_line", "dark_cloud_cover",
             "morning_star", "evening_star",
         ]
-        for cn in candle_cols:
+        for cn in candle_names:
             if cn in result.columns:
                 series = result[cn].dropna()
                 self.assertTrue(
@@ -167,6 +173,8 @@ class TestCandlestickAllColsPresent(unittest.TestCase):
 
     def setUp(self):
         self._orig_flag = getattr(config, "USE_CANDLESTICK_FEATURES", False)
+        self._orig_mkt = getattr(config, "USE_MARKET_RELATIVE_FEATURES", False)
+        config.USE_MARKET_RELATIVE_FEATURES = False
         rng = np.random.default_rng(42)
         ns = 300
         close = 100.0 + np.cumsum(rng.normal(0, 0.5, ns))

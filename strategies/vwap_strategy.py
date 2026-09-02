@@ -107,6 +107,10 @@ class VWAPBounceStrategy(BaseStrategy):
                     )
 
         allow_short = getattr(config, "ALLOW_SHORT", False)
+        inverse_etfs = getattr(config, "INVERSE_ETF_SYMBOLS", set())
+        if symbol.upper().strip() in inverse_etfs:
+            allow_short = False
+
         # SELL Logic
         if allow_short and rally_touched and held_below and rsi > config.VWAP_RSI_OVERSOLD:
             rally_high = float(tail["high"].iloc[-reclaim_bars - 2 : -1].max())

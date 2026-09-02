@@ -150,6 +150,108 @@ def reset_news_fail_counts():
     logger.info("[SCANNER] News fail counts reset for new session.")
 
 
+# ── Data Validation Quarantine Cache ──────────────────────────────────────
+# Symbols that fail data validation are quarantined for QUARANTINE_DURATION_S
+# to prevent redundant API calls and repeated WARNING log spam.
+_quarantine_cache: dict = {}           # {symbol: expiry_epoch_float}
+_quarantine_lock = threading.Lock()
+QUARANTINE_DURATION_S: float = 1800.0  # 30 minutes
+
+
+def quarantine_symbol(symbol: str, reason: str = "", now: Optional[float] = None) -> None:
+    """Mark a symbol as quarantined for QUARANTINE_DURATION_S seconds."""
+    current_time = now if now is not None else _time.time()
+    expiry = current_time + QUARANTINE_DURATION_S
+    with _quarantine_lock:
+        _quarantine_cache[symbol] = expiry
+    logger.debug(
+        "[QUARANTINE] %s quarantined for %.0f min. Reason: %s",
+        symbol, QUARANTINE_DURATION_S / 60, reason or "data_validation_failure",
+    )
+
+
+def is_quarantined(symbol: str, now: Optional[float] = None) -> bool:
+    """Returns True if symbol is currently quarantined (not yet expired)."""
+    current_time = now if now is not None else _time.time()
+    with _quarantine_lock:
+        expiry = _quarantine_cache.get(symbol)
+        if expiry is None:
+            return False
+        if current_time < expiry:
+            return True
+        # Expired — auto-evict
+        del _quarantine_cache[symbol]
+        logger.info("[QUARANTINE] %s released (TTL expired)", symbol)
+        return False
+
+
+def clear_quarantine() -> None:
+    """Clears all quarantine entries (call at session start)."""
+    with _quarantine_lock:
+        _quarantine_cache.clear()
+    logger.info("[QUARANTINE] Cache cleared.")
+
+
+# ── Universe Liquidity & Dollar-Volume Gate ────────────────────────────────
+MIN_DOLLAR_VOLUME: float = 1_000_000.0     # $1M daily turnover floor
+MIN_SHARE_VOLUME: float  = 500_000.0
+MIN_PRICE: float         = 3.00            # kill sub-$3 penny names
+
+# Watchlist symbols exempt from the liquidity gate.
+# IBIT/ETHA/BITO are ETFs, MARA is a large-cap miner — all liquid, but we
+# never want the filter to accidentally drop a core inverse/crypto name.
+LIQUIDITY_EXEMPT = {"SH", "SQQQ", "SOXS", "IBIT", "ETHA", "BITO", "MARA", "PSQ", "SPDN"}
+
+
+def passes_liquidity_gate(symbol: str, bar: Optional[Any] = None) -> tuple[bool, str]:
+    """Reject illiquid symbols using prior bar data before quote/API pull."""
+    sym = symbol.upper().strip()
+    if sym in LIQUIDITY_EXEMPT or sym in getattr(config, "INVERSE_ETF_SYMBOLS", set()):
+        return (True, "EXEMPT")
+    if bar is None:
+        return (False, "NO_BAR")
+
+    price = getattr(bar, "close", None)
+    volume = getattr(bar, "volume", None)
+    if price is None or volume is None:
+        return (False, "NO_BAR")
+
+    try:
+        price_f = float(price)
+        volume_f = float(volume)
+    except (ValueError, TypeError):
+        return (False, "INVALID_BAR")
+
+    if price_f < MIN_PRICE:
+        return (False, f"PRICE<{MIN_PRICE}")
+    if volume_f < MIN_SHARE_VOLUME:
+        return (False, f"SHVOL<{MIN_SHARE_VOLUME}")
+    if price_f * volume_f < MIN_DOLLAR_VOLUME:
+        return (False, f"$VOL<{MIN_DOLLAR_VOLUME}")
+
+    return (True, "OK")
+
+
+def build_universe(candidates: List[str], prev_day_bars: Optional[dict] = None) -> List[str]:
+    """Filter candidate universe by liquidity gate while preserving exempt symbols."""
+    clean = []
+    dropped = []
+    prev_bars = prev_day_bars or {}
+    for sym in candidates:
+        bar = prev_bars.get(sym)
+        ok, reason = passes_liquidity_gate(sym, bar)
+        if ok:
+            clean.append(sym)
+        else:
+            dropped.append((sym, reason))
+
+    logger.info("[UNIVERSE] kept=%d dropped=%d", len(clean), len(dropped))
+    if dropped:
+        logger.debug("[UNIVERSE] dropped: %s", dropped[:20])
+    return clean
+# ─────────────────────────────────────────────────────────────────────────
+
+
 _screener_cache = {"data": None, "fetched_at": 0}
 _cache_lock = threading.Lock()
 
@@ -182,7 +284,8 @@ def _load_universe() -> List[str]:
                     if "." in sym or "-" in sym or "/" in sym or "+" in sym:
                         return False
                     # Exclude 4 or 5-letter warrant/preferred share class suffixes (e.g. HUBCZ, CDIOW, TSIB)
-                    if len(sym) >= 4 and sym.endswith(("Z", "W", "R", "U", "C", "B")) and sym not in ("BAC", "UBER", "META", "AMZN", "AAPL", "MSFT", "GOOGL", "NVDA", "PLTR", "AVGO", "JPM", "NFLX", "COST", "XOM", "UNH", "QQQ", "SPY"):
+                    known_valid = set(getattr(config, "INVERSE_ETF_SYMBOLS", set())) | set(getattr(config, "LARGE_CAP_PIVOT_SYMBOLS", [])) | {"BAC", "UBER", "META", "AMZN", "AAPL", "MSFT", "GOOGL", "NVDA", "PLTR", "AVGO", "JPM", "NFLX", "COST", "XOM", "UNH", "QQQ", "SPY", "SDOW", "SPXU"}
+                    if len(sym) >= 4 and sym.endswith(("Z", "W", "R", "U", "C", "B")) and sym not in known_valid:
                         return False
                     if len(sym) > 4 and sym.endswith(("WS", "RT", "WW", "WT")):
                         return False
@@ -211,11 +314,18 @@ def _load_universe() -> List[str]:
                     
                 denylist = set(getattr(config, "SYMBOL_DENYLIST", []))
                 final_symbols = [s for s in symbols_pool if s not in denylist]
+
+                # Guarantee inverse ETFs are always in the final universe
+                if getattr(config, "INVERSE_ETF_SCANNER_EXEMPT", False):
+                    for etf in getattr(config, "INVERSE_ETF_SYMBOLS", set()):
+                        if etf not in denylist and etf not in final_symbols:
+                            final_symbols.append(etf)
+
                 if final_symbols:
                     logger.info("Fetched dynamic symbol universe from Alpaca (%d unique symbols)", len(final_symbols))
                     _screener_cache["data"] = final_symbols
                     _screener_cache["fetched_at"] = now
-                    return final_symbols
+                    return _inject_inverse_seeds(final_symbols)
                 else:
                     logger.warning("Dynamic screener returned empty lists (e.g. premarket stale). Falling back.")
             except Exception as e:
@@ -226,7 +336,7 @@ def _load_universe() -> List[str]:
     core_syms = getattr(config, "FULL_MARKET_CORE_SYMBOLS", []) or getattr(config, "WATCHLIST", [])
     if core_syms:
         logger.info("Falling back to core symbols/watchlist universe (%d symbols)", len(core_syms))
-        return [s for s in list(dict.fromkeys(core_syms)) if s not in denylist]
+        return _inject_inverse_seeds([s for s in list(dict.fromkeys(core_syms)) if s not in denylist])
 
     # 3rd -> SYMBOL_UNIVERSE_FILE (CSV)
     path = config.SYMBOL_UNIVERSE_FILE
@@ -239,9 +349,20 @@ def _load_universe() -> List[str]:
                 df = df[df["close"] >= 5.0]
             syms = df["symbol"].dropna().astype(str).str.upper().tolist()
             if syms:
-                return syms[:100]
+                return _inject_inverse_seeds(syms[:100])
 
-    return ["SPY", "QQQ", "AAPL", "NVDA", "MSFT", "AMZN", "AMD", "TSLA"]
+    return _inject_inverse_seeds(["SPY", "QQQ", "AAPL", "NVDA", "MSFT", "AMZN", "AMD", "TSLA"])
+
+
+def _inject_inverse_seeds(symbols: List[str]) -> List[str]:
+    """Ensures Inverse Bear ETFs are always included in the universe regardless of screener source."""
+    denylist = set(getattr(config, "SYMBOL_DENYLIST", []))
+    res = [s for s in list(dict.fromkeys(symbols)) if s not in denylist]
+    if getattr(config, "INVERSE_ETF_SCANNER_EXEMPT", False):
+        for etf in getattr(config, "INVERSE_ETF_SYMBOLS", set()):
+            if etf not in denylist and etf not in res:
+                res.append(etf)
+    return res
 
 
 def _as_et_index(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
@@ -410,8 +531,14 @@ def _passes_open_filters(
     reject_dict: dict = None,
     reject_lock: threading.Lock = None,
 ) -> bool:
+    # ── Inverse ETF exemption check ───────────────────────────────────
+    inverse_etfs = set(getattr(config, "INVERSE_ETF_SYMBOLS", set()))
+    is_inverse = symbol.upper().strip() in inverse_etfs
+    scanner_exempt = getattr(config, "INVERSE_ETF_SCANNER_EXEMPT", False)
+    # ─────────────────────────────────────────────────────────────────
+
     allow_short = getattr(config, "ALLOW_SHORT", False)
-    if move_pct < 0 and not allow_short:
+    if move_pct < 0 and not allow_short and not is_inverse:
         _record_rejection("down_move (ALLOW_SHORT=False)", symbol, reject_dict, reject_lock)
         return False
 
@@ -427,12 +554,20 @@ def _passes_open_filters(
     if volume < min_vol:
         _record_rejection(f"volume_too_small ({volume} < {min_vol})", symbol, reject_dict, reject_lock)
         return False
-    min_rvol = getattr(config, "SCAN_OPEN_MIN_RELATIVE_VOLUME", 0.05)
+
+    # ── Volume thresholds: relaxed for inverse ETFs ───────────────────
+    if is_inverse and scanner_exempt:
+        min_rvol = getattr(config, "INVERSE_ETF_MIN_RVOL", 0.30)
+        min_avg_vol = getattr(config, "INVERSE_ETF_MIN_AVG_DAILY_VOLUME", 200_000)
+    else:
+        min_rvol = getattr(config, "SCAN_OPEN_MIN_RELATIVE_VOLUME", 0.05)
+        min_avg_vol = getattr(config, "SCAN_MIN_AVG_DAILY_VOLUME", 750_000)
+    # ─────────────────────────────────────────────────────────────────
+
     if relative_volume < min_rvol:
         _record_rejection(f"rvol_too_small ({relative_volume:.2f} < {min_rvol})", symbol, reject_dict, reject_lock)
         return False
 
-    min_avg_vol = getattr(config, "SCAN_MIN_AVG_DAILY_VOLUME", 750_000)
     avg_vol = _average_daily_volume(symbol)
     if avg_vol > 0 and avg_vol < min_avg_vol:
         _record_rejection(f"avg_daily_vol_too_small ({avg_vol:.0f} < {min_avg_vol})", symbol, reject_dict, reject_lock)
@@ -454,6 +589,16 @@ def _compute_premarket_candidate(
     if prev is None or prev <= 0:
         _record_rejection("invalid_prev_close", symbol, reject_dict, reject_lock)
         return None
+
+    # ── Early price gate: skip API fetch entirely for sub-threshold stocks ──
+    early_price_floor = getattr(config, "SCAN_MIN_PRICE", 5.0) * 0.70
+    if prev < early_price_floor:
+        _record_rejection(
+            f"price_gate_early_exit (prev_close ${prev:.2f} < ${early_price_floor:.2f})",
+            symbol, reject_dict, reject_lock,
+        )
+        return None
+    # ────────────────────────────────────────────────────────────────────────
 
     df = fetch_intraday(
         symbol,
@@ -497,6 +642,16 @@ def _compute_open_candidate(
     if prev is None or prev <= 0:
         _record_rejection("invalid_prev_close", symbol, reject_dict, reject_lock)
         return None
+
+    # ── Early price gate: skip API fetch entirely for sub-threshold stocks ──
+    early_price_floor = getattr(config, "SCAN_MIN_PRICE", 5.0) * 0.70
+    if prev < early_price_floor:
+        _record_rejection(
+            f"price_gate_early_exit (prev_close ${prev:.2f} < ${early_price_floor:.2f})",
+            symbol, reject_dict, reject_lock,
+        )
+        return None
+    # ────────────────────────────────────────────────────────────────────────
 
     df = fetch_intraday(
         symbol,
@@ -566,6 +721,14 @@ def scan(symbols: List[str] = None, max_candidates: int = None) -> List[ScanCand
 
     def _eval_sym(sym: str) -> Optional[ScanCandidate]:
         symbol = str(sym).upper()
+
+        # ── Quarantine check ──
+        if is_quarantined(symbol):
+            with reject_lock:
+                reject_dict["quarantined_data_failure"] = reject_dict.get("quarantined_data_failure", 0) + 1
+            return None
+        # ─────────────────────
+
         if is_earnings_near(symbol, within_days=getattr(config, "EARNINGS_BLOCK_DAYS", 1)):
             with reject_lock:
                 reject_dict["earnings_within_1_day"] = reject_dict.get("earnings_within_1_day", 0) + 1
@@ -665,17 +828,19 @@ class BackgroundScanner:
         self.max_candidates = max_candidates
         self.watchlist = initial_watchlist or []
         self.last_scan_completed = _time.time() if initial_watchlist else 0.0
+        self.restart_count = 0
+        self.last_restart_time = 0.0
         self._lock = threading.Lock()
         self._thread = None
         self._stop_event = threading.Event()
         self._running = False
 
     def start(self):
-        if self._running:
+        if self._running and self._thread and self._thread.is_alive():
             return
         self._running = True
         self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="BackgroundScannerThread")
         self._thread.start()
         logger.info("[BackgroundScanner] Periodic background scanner thread started.")
 
@@ -690,43 +855,85 @@ class BackgroundScanner:
             self._thread = None
             logger.info("[BackgroundScanner] Periodic background scanner thread stopped.")
 
+    def ensure_running(self):
+        """Self-healing watchdog: restarts thread if dead or stale with capped crash-loop backoff."""
+        if not self._running or self._thread is None or not self._thread.is_alive():
+            now = _time.time()
+            if self.last_restart_time > 0 and (now - self.last_restart_time < 10.0):
+                # True exponential backoff (2s, 4s, 8s, 16s, 32s, max 60s) to avoid CPU spin
+                backoff_delay = min(float(2 ** min(self.restart_count, 6)), 60.0)
+                _time.sleep(backoff_delay)
+            self.restart_count += 1
+            self.last_restart_time = _time.time()
+            logger.warning(
+                "[BackgroundScanner] Watchdog detected dead/missing scanner thread (restart #%d). Restarting cleanly...",
+                self.restart_count
+            )
+            self.stop()
+            self.start()
+
+    def get_health_status(self) -> dict:
+        """Returns health diagnostics for observability and test verification."""
+        with self._lock:
+            age = _time.time() - self.last_scan_completed if self.last_scan_completed > 0 else -1.0
+            is_alive = self._thread is not None and self._thread.is_alive()
+            return {
+                "running": self._running,
+                "thread_alive": is_alive,
+                "last_scan_completed": self.last_scan_completed,
+                "scanner_age_seconds": round(age, 1) if age >= 0 else None,
+                "restart_count": self.restart_count,
+                "watchlist_size": len(self.watchlist),
+            }
+
     def _run_loop(self):
         from strategies.session import is_market_open, is_premarket
         was_market_open = False
         while self._running:
-            # Sleep in small steps to be responsive to stop requests
-            sleep_step = 5.0
-            elapsed = 0.0
-            currently_open = is_market_open()
-            
-            # Force immediate scan on market open transition or if stale
-            force_scan = (currently_open and not was_market_open) or (_time.time() - self.last_scan_completed > self.interval_seconds)
-            was_market_open = currently_open
+            try:
+                sleep_step = 5.0
+                elapsed = 0.0
+                currently_open = is_market_open()
 
-            if not force_scan:
-                while elapsed < self.interval_seconds:
-                    if not self._running:
-                        return
-                    if self._stop_event.wait(timeout=sleep_step):
-                        return
-                    elapsed += sleep_step
+                # Force immediate scan on market open transition or if stale
+                force_scan = (currently_open and not was_market_open) or (_time.time() - self.last_scan_completed > self.interval_seconds)
+                was_market_open = currently_open
 
-            if is_market_open() or is_premarket():
-                logger.info("[BackgroundScanner] Starting periodic background scan...")
-                try:
-                    candidates = scan(max_candidates=self.max_candidates)
-                    if candidates:
-                        new_watchlist = [c.symbol for c in candidates]
+                if not force_scan:
+                    while elapsed < self.interval_seconds:
+                        if not self._running:
+                            return
+                        if self._stop_event.wait(timeout=sleep_step):
+                            return
+                        elapsed += sleep_step
+
+                if is_market_open() or is_premarket():
+                    logger.info("[BackgroundScanner] Starting periodic background scan...")
+                    try:
+                        candidates = scan(max_candidates=self.max_candidates)
+                        if candidates:
+                            new_watchlist = [c.symbol for c in candidates]
+                            with self._lock:
+                                self.watchlist = new_watchlist
+                                self.last_scan_completed = _time.time()
+                            logger.info(f"[BackgroundScanner] Background scan completed. New watchlist: {self.watchlist}")
+                        else:
+                            with self._lock:
+                                self.last_scan_completed = _time.time()
+                            logger.info("[BackgroundScanner] Background scan completed with no candidates.")
+                    except Exception as e:
+                        logger.error(f"[BackgroundScanner] Error during periodic scan: {e}", exc_info=True)
                         with self._lock:
-                            self.watchlist = new_watchlist
+                            # Update timestamp on error to prevent runaway tight loops
                             self.last_scan_completed = _time.time()
-                        logger.info(f"[BackgroundScanner] Background scan completed. New watchlist: {self.watchlist}")
-                    else:
-                        with self._lock:
-                            self.last_scan_completed = _time.time()
-                        logger.info("[BackgroundScanner] Background scan completed with no candidates.")
-                except Exception as e:
-                    logger.error(f"[BackgroundScanner] Error during periodic scan: {e}", exc_info=True)
+                else:
+                    # Market closed / afterhours: update timestamp so stale guard doesn't fire erroneously
+                    with self._lock:
+                        self.last_scan_completed = _time.time()
+                    self._stop_event.wait(timeout=30.0)
+            except Exception as loop_err:
+                logger.error(f"[BackgroundScanner] Unhandled error in run loop: {loop_err}", exc_info=True)
+                self._stop_event.wait(timeout=10.0)
 
     def get_watchlist(self) -> List[str]:
         with self._lock:

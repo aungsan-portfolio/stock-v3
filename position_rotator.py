@@ -125,6 +125,26 @@ class RotationState:
         })
 
 
+# ── Ratchet configuration ──────────────────────────────────────────────────
+# (pnl_threshold, stop_offset_from_entry, label)
+_RATCHET_RULES: list[tuple[float, float, str]] = [
+    (0.05, 0.005, "breakeven+"),     # +5%  → entry + 0.5%
+    (0.08, 0.040, "lock-in-4pct"),   # +8%  → entry + 4.0%
+    (0.15, 0.100, "lock-in-10pct"),  # +15% → entry + 10.0%
+]
+
+
+@dataclass
+class RatchetResult:
+    symbol:       str
+    old_stop:     float
+    new_stop:     float
+    rule_applied: str
+    pnl_pct:      float
+    skipped:      bool
+    reason:       str
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Core Rotation Engine
 # ─────────────────────────────────────────────────────────────────────────────
@@ -133,7 +153,7 @@ class PositionRotator:
     """
     Usage (alpaca_bridge.py ထဲမှာ):
 
-        rotator = PositionRotator()           # session start တွင် တစ်ကြိမ်
+        rotator = PositionRotator(bridge=bridge)  # session start တွင် တစ်ကြိမ်
 
         # Scan cycle အစတွင်
         rotator.state.reset_cycle()
@@ -147,9 +167,148 @@ class PositionRotator:
             rotator.state.record_rotation(decision)
     """
 
-    def __init__(self):
+    def __init__(self, bridge=None):
         self.state = RotationState()
+        self.bridge = bridge
         logger.info("PositionRotator initialised.")
+
+    # ── Ratchet Stop Layer (Risk Protection) ──────────────────────────────────
+
+    def _ratchet_stops(
+        self,
+        positions: list[dict | OpenPosition | object],
+        dry_run: bool = False,
+        bridge=None,
+    ) -> list[RatchetResult]:
+        """
+        Profit-Lock Ratchet Layer — Risk/Safety မှ ဆင်းသည်၊ Strategy မဟုတ်။
+
+        Guarantees:
+          • Stop ကို NEVER ချနိုင် (one-direction only)
+          • Bridge failure → log + skip, trade block မဖြစ်
+          • dry_run=True → order မထုတ်, log သာ
+        """
+        active_bridge = bridge or self.bridge
+        results: list[RatchetResult] = []
+
+        for pos in positions:
+            if isinstance(pos, dict):
+                symbol = str(pos.get("symbol", "")).upper().strip()
+                entry = float(pos.get("avg_entry_price", 0.0) or 0.0)
+                current = float(pos.get("current_price", 0.0) or 0.0)
+            else:
+                symbol = str(getattr(pos, "symbol", "")).upper().strip()
+                entry = float(getattr(pos, "avg_entry_price", 0.0) or 0.0)
+                current = float(getattr(pos, "current_price", 0.0) or 0.0)
+
+            if entry <= 0:
+                continue
+
+            pnl_pct = (current - entry) / entry
+
+            # ── Rule ရှာသည် (highest threshold ဦးစွာ) ──────────────────
+            matched_offset: Optional[float] = None
+            matched_label: str = "none"
+
+            for threshold, offset, label in sorted(
+                _RATCHET_RULES, key=lambda r: r[0], reverse=True
+            ):
+                if pnl_pct >= (threshold - 1e-5):
+                    matched_offset = offset
+                    matched_label = label
+                    break
+
+            if matched_offset is None:
+                results.append(RatchetResult(
+                    symbol=symbol, old_stop=0.0, new_stop=0.0,
+                    rule_applied="none", pnl_pct=pnl_pct,
+                    skipped=True, reason=f"pnl {pnl_pct:.2%} below min threshold",
+                ))
+                continue
+
+            new_stop = round(entry * (1.0 + matched_offset), 2)
+            current_stop = None
+            if active_bridge is not None and hasattr(active_bridge, "get_current_stop"):
+                try:
+                    current_stop = active_bridge.get_current_stop(symbol)
+                except Exception as exc:
+                    logger.debug("[RATCHET] get_current_stop error for %s: %s", symbol, exc)
+
+            logger.info(
+                "[RATCHET EVAL] %-6s | rule=%-14s | entry=%7.2f | current_px=%7.2f (pnl=%+.2f%%) | resting_stop=%s | target_stop=%7.2f",
+                symbol, matched_label, entry, current, pnl_pct * 100,
+                f"{current_stop:.2f}" if current_stop is not None else "None", new_stop,
+            )
+
+            # ── One-direction guard ──────────────────────────────────────
+            if current_stop is not None and new_stop <= current_stop:
+                reason_str = f"already protected (resting_stop {current_stop:.2f} >= target_stop {new_stop:.2f})"
+                logger.info("[RATCHET SKIP] %-6s | %s", symbol, reason_str)
+                results.append(RatchetResult(
+                    symbol=symbol, old_stop=current_stop, new_stop=new_stop,
+                    rule_applied=matched_label, pnl_pct=pnl_pct,
+                    skipped=True,
+                    reason=reason_str,
+                ))
+                continue
+
+            # ── Dry-run path ─────────────────────────────────────────────
+            if dry_run:
+                logger.info(
+                    "[RATCHET DRY-RUN] %-6s | %-16s | %7.2f → %7.2f | pnl=%+.2f%%",
+                    symbol, matched_label,
+                    current_stop or 0.0, new_stop, pnl_pct * 100,
+                )
+                results.append(RatchetResult(
+                    symbol=symbol, old_stop=current_stop or 0.0, new_stop=new_stop,
+                    rule_applied=matched_label, pnl_pct=pnl_pct,
+                    skipped=False, reason="dry_run",
+                ))
+                continue
+
+            # ── Live path ────────────────────────────────────────────────
+            try:
+                if active_bridge is not None and hasattr(active_bridge, "replace_stop"):
+                    active_bridge.replace_stop(symbol=symbol, new_stop_price=new_stop)
+                logger.info(
+                    "[RATCHET] %-6s | %-16s | %7.2f → %7.2f | pnl=%+.2f%%",
+                    symbol, matched_label,
+                    current_stop or 0.0, new_stop, pnl_pct * 100,
+                )
+                results.append(RatchetResult(
+                    symbol=symbol, old_stop=current_stop or 0.0, new_stop=new_stop,
+                    rule_applied=matched_label, pnl_pct=pnl_pct,
+                    skipped=False, reason="ok",
+                ))
+            except Exception as exc:
+                logger.error("[RATCHET FAILED] %s | %s", symbol, exc)
+                results.append(RatchetResult(
+                    symbol=symbol, old_stop=current_stop or 0.0, new_stop=new_stop,
+                    rule_applied=matched_label, pnl_pct=pnl_pct,
+                    skipped=True, reason=f"bridge_error: {exc}",
+                ))
+
+        return results
+
+    def _log_ratchet_summary(self, results: list[RatchetResult]) -> None:
+        """Cycle တိုင်း telemetry snapshot — shadow log နှင့် compatible"""
+        acted = [r for r in results if not r.skipped]
+        skipped = [r for r in results if r.skipped]
+        logger.info(
+            "[RATCHET SUMMARY] acted=%d skipped=%d | %s",
+            len(acted), len(skipped),
+            {r.symbol: r.rule_applied for r in acted} or "none",
+        )
+
+    def run_cycle(self, dry_run: bool = False) -> None:
+        """Main rotation cycle — ratchet ကို FIRST run ရသည်"""
+        if not self.bridge or not hasattr(self.bridge, "get_positions"):
+            return
+        positions = self.bridge.get_positions()
+
+        # ── Step 1: Risk layer (ratchet) ────────────────────────────────
+        ratchet_results = self._ratchet_stops(positions, dry_run=dry_run)
+        self._log_ratchet_summary(ratchet_results)
 
     # ── Public API ────────────────────────────────────────────────────────────
 

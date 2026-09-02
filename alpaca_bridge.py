@@ -2478,9 +2478,16 @@ class AlpacaBridge:
         self._require_connection()
         try:
             self._cancel_all_orders_for_symbol(symbol)
-            self._client.close_position(symbol.upper().strip())
-            logger.info("Emergency closed position for %s", symbol)
-            return True
+            close_order = self._client.close_position(symbol.upper().strip())
+            order_id = getattr(close_order, "id", None)
+            if order_id and hasattr(self, "_await_order_outcome"):
+                res = self._await_order_outcome(str(order_id), timeout_seconds=15.0)
+                is_filled = res.has_fill or (res.outcome == order_exec.FILLED)
+                logger.info("Closed position for %s: outcome=%s, filled=%.0f", symbol, res.outcome, res.filled)
+                return is_filled
+            time.sleep(0.5)
+            pos = self.get_position(symbol)
+            return pos == 0
         except Exception as exc:
             logger.error("Failed to close position for %s: %s", symbol, exc)
             return False

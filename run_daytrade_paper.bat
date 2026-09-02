@@ -75,15 +75,26 @@ set "PY_EXE=python"
 if exist "%~dp0.venv\Scripts\python.exe" set "PY_EXE=%~dp0.venv\Scripts\python.exe"
 
 REM ---------------------------------------------------------
-REM 6. Masked Display and Launch
+REM 6. Masked Display and Launch with Persistent Logging
 REM ---------------------------------------------------------
 set "MASKED_KEY=!APCA_API_KEY_ID:~0,4!****************!APCA_API_KEY_ID:~-4!"
+set "LOG_DIR=%~dp0logs"
+if not exist "!LOG_DIR!" mkdir "!LOG_DIR!"
+
+for /f "tokens=2 delims==" %%I in ('wmic os get localdatetime /value 2^>nul') do set "DT=%%I"
+if defined DT (
+    set "DATE_STAMP=!DT:~0,4!-!DT:~4,2!-!DT:~6,2!"
+) else (
+    set "DATE_STAMP=current"
+)
+set "SESSION_LOG=!LOG_DIR!\daytrade_!DATE_STAMP!.log"
 
 echo =======================================================
 echo   Starting Day Trading Engine (Alpaca Paper Account)
 echo   Account Key: !MASKED_KEY!
 echo   Endpoint:    !APCA_API_BASE_URL!
 echo   Python:      !PY_EXE!
+echo   Session Log: !SESSION_LOG!
 echo =======================================================
 echo.
 
@@ -93,9 +104,16 @@ set "EXIT_CODE=%errorlevel%"
 REM Clean lock file on exit
 if exist "!LOCK_FILE!" del "!LOCK_FILE!"
 
-if %EXIT_CODE% neq 0 (
-    echo.
-    echo [ENGINE TERMINATED WITH ERROR CODE %EXIT_CODE%]
-    pause
+echo.
+echo =======================================================
+if %EXIT_CODE% equ 0 (
+    echo   Day Trading Session completed successfully (EOD Close).
+) else (
+    echo   [ENGINE TERMINATED WITH ERROR CODE %EXIT_CODE%]
 )
+echo   Session Log saved to: !SESSION_LOG! (and logs\stock_engine.log)
+echo   Window will stay OPEN so you can review session results.
+echo   Press any key to close this window when done...
+echo =======================================================
+pause
 exit /b %EXIT_CODE%

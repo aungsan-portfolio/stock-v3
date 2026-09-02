@@ -32,12 +32,14 @@ class TestRiskParitySizing(unittest.TestCase):
         )
         equity = 100000.0  # $100k equity
 
-        shares = calculate_shares(sig, equity)
-        risk_dollars = estimated_risk(sig, shares)
+        from unittest.mock import patch
+        with patch("config.MAX_RISK_PER_TRADE_DOLLARS", 25.0), patch("config.MAX_POSITION_SIZE_DOLLARS", 5000.0):
+            shares = calculate_shares(sig, equity)
+            risk_dollars = estimated_risk(sig, shares)
 
-        # Expected: max_risk = $25.00 -> shares = floor(25 / 0.11) = 227
-        self.assertLessEqual(risk_dollars, 25.0)
-        self.assertEqual(shares, 227)
+            # Expected: max_risk = $25.00 -> shares = floor(25 / 0.11) = 227
+            self.assertLessEqual(risk_dollars, 25.0)
+            self.assertEqual(shares, 227)
 
     def test_tsla_risk_parity_cap(self):
         # TSLA @ $332.07, stop $331.87 -> risk_per_share = $0.20
@@ -55,14 +57,16 @@ class TestRiskParitySizing(unittest.TestCase):
         )
         equity = 100000.0
 
-        shares = calculate_shares(sig, equity)
-        risk_dollars = estimated_risk(sig, shares)
+        from unittest.mock import patch
+        with patch("config.MAX_RISK_PER_TRADE_DOLLARS", 25.0), patch("config.MAX_POSITION_SIZE_DOLLARS", 5000.0):
+            shares = calculate_shares(sig, equity)
+            risk_dollars = estimated_risk(sig, shares)
 
-        # Expected: max_risk = $25.00 -> shares = floor(25 / 0.20) = 125
-        # Capital cap = floor(5000 / 332.07) = 15 shares
-        # Final qty = min(125, 15) = 15 shares
-        self.assertEqual(shares, 15)
-        self.assertLessEqual(risk_dollars, 25.0)
+            # Expected: max_risk = $25.00 -> shares = floor(25 / 0.20) = 125
+            # Capital cap = floor(5000 / 332.07) = 15 shares
+            # Final qty = min(125, 15) = 15 shares
+            self.assertEqual(shares, 15)
+            self.assertLessEqual(risk_dollars, 25.0)
 
     def test_noise_floor_hard_veto_ratio(self):
         # Configured noise floor ratio calibrated between 0.70 and 0.80
@@ -78,7 +82,7 @@ class TestRiskParitySizing(unittest.TestCase):
             strategy="MOMENTUM_SCALP",
             entry_price=175.0,
             stop_price=174.0,
-            target_price=177.0,
+            target_price=176.7,
             confidence=0.85,
             reason="Test",
             risk_per_share=1.00,

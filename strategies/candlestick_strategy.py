@@ -390,6 +390,10 @@ class CandlestickPatternStrategy(BaseStrategy):
             return self._build_signal(symbol, row, atr, rsi, sma20, "BUY", bullish_patterns)
         
         allow_short = getattr(config, "ALLOW_SHORT", False)
+        inverse_etfs = getattr(config, "INVERSE_ETF_SYMBOLS", set())
+        if symbol.upper().strip() in inverse_etfs:
+            allow_short = False
+
         if allow_short and len(bearish_patterns) >= self.min_patterns:
             return self._build_signal(symbol, row, atr, rsi, sma20, "SELL", bearish_patterns)
 

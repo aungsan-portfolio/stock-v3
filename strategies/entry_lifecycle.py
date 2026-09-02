@@ -159,30 +159,37 @@ class EntryOrderLifecycle:
                 return getattr(snapshot, name)
         return default
 
-    def _protective_order_covers_fill(self, bridge: object, order_id: Optional[str], filled_qty: float) -> bool:
+    def _protective_order_covers_fill(self, bridge: object, order_id: Optional[str], filled_qty: float, order_label: str = "child") -> bool:
         if not order_id:
+            logger.warning("[ENTRY LIFECYCLE] %s order_id is missing/empty", order_label)
             return False
         getter = getattr(bridge, "get_order_snapshot", None)
         if not callable(getter):
-            logger.error("[ENTRY LIFECYCLE] Bridge has no get_order_snapshot; cannot verify protection")
+            logger.error("[ENTRY LIFECYCLE] Bridge has no get_order_snapshot; cannot verify protection for %s (%s)", order_label, order_id)
             return False
         try:
             snapshot = getter(order_id)
             if snapshot is None:
+                logger.warning("[ENTRY LIFECYCLE] Order snapshot returned None for %s (%s)", order_label, order_id)
                 return False
             status = str(self._field(snapshot, "status", default="")).lower()
-            quantity = self._field(snapshot, "qty", "quantity", "total_quantity", default=0.0)
-            return status not in _TERMINAL_STATUSES and float(quantity or 0.0) >= float(filled_qty)
+            quantity = float(self._field(snapshot, "qty", "quantity", "total_quantity", default=0.0) or 0.0)
+            if status in _TERMINAL_STATUSES:
+                logger.warning("[ENTRY LIFECYCLE] %s order (%s) has terminal status: %s", order_label, order_id, status)
+                return False
+            if quantity < float(filled_qty):
+                logger.warning("[ENTRY LIFECYCLE] %s order (%s) qty %.4f < filled_qty %.4f", order_label, order_id, quantity, float(filled_qty))
+                return False
+            return True
         except Exception:
-            logger.exception("[ENTRY LIFECYCLE] Failed protection lookup for order %s", order_id)
+            logger.exception("[ENTRY LIFECYCLE] Failed protection lookup for %s order %s", order_label, order_id)
             return False
 
     def _protection_covers_fill(self, bridge: object, entry: PendingEntry) -> bool:
         filled = entry.cumulative_filled_qty
-        return (
-            self._protective_order_covers_fill(bridge, entry.stop_order_id, filled)
-            and self._protective_order_covers_fill(bridge, entry.target_order_id, filled)
-        )
+        stop_ok = self._protective_order_covers_fill(bridge, entry.stop_order_id, filled, order_label=f"STOP:{entry.symbol}")
+        tp_ok = self._protective_order_covers_fill(bridge, entry.target_order_id, filled, order_label=f"TARGET:{entry.symbol}")
+        return stop_ok and tp_ok
 
     @staticmethod
     def _halt_entries(bridge: object, reason: str) -> None:
@@ -208,9 +215,37 @@ class EntryOrderLifecycle:
 
     def _fail_protection(self, bridge: object, entry: PendingEntry, reason: str) -> None:
         """Block entries and attempt a broker close when confirmed shares lack protection."""
-        msg = f"[PROTECTION FAILURE] {entry.symbol}: {reason}; new entries halted"
+        filled_qty = getattr(entry, "cumulative_filled_qty", 0.0)
+        avg_px = getattr(entry, "average_fill_price", 0.0)
+        stop_id = getattr(entry, "stop_order_id", "NONE")
+        tp_id = getattr(entry, "target_order_id", "NONE")
+        parent_id = getattr(entry, "parent_order_id", "NONE")
+
+        msg = (
+            f"[PROTECTION FAILURE] symbol={entry.symbol} parent={parent_id} "
+            f"filled_qty={filled_qty} avg_px={avg_px:.2f} stop_id={stop_id} tp_id={tp_id} "
+            f"reason='{reason}'; new entries halted"
+        )
         logger.critical(msg)
         self._halt_entries(bridge, msg)
+
+        # Trigger LatchStateMachine with structured context
+        try:
+            from observability import get_latch_state_machine, LatchTrigger
+            sm = get_latch_state_machine()
+            sm.latch(
+                LatchTrigger.UNPROTECTED_POSITION,
+                bridge=bridge,
+                symbol=getattr(entry, "symbol", None),
+                parent_order_id=str(parent_id) if parent_id else None,
+                stop_order_id=str(stop_id) if stop_id else None,
+                target_order_id=str(tp_id) if tp_id else None,
+                filled_qty=filled_qty,
+                reasons=[f"protection_failure: {reason}"],
+            )
+        except Exception as sm_exc:
+            logger.debug("[ENTRY LIFECYCLE] Observability latch hook non-fatal error: %s", sm_exc)
+
         try:
             send_discord_alert(msg)
         except Exception:
@@ -244,6 +279,21 @@ class EntryOrderLifecycle:
         msg = f"[ENTRY LIFECYCLE FAILURE] {signal.symbol}: {reason}; new entries halted"
         logger.critical(msg)
         self._halt_entries(bridge, msg)
+
+        # Trigger LatchStateMachine with structured context
+        try:
+            from observability import get_latch_state_machine, LatchTrigger
+            sm = get_latch_state_machine()
+            sm.latch(
+                LatchTrigger.ORDER_REJECT,
+                bridge=bridge,
+                symbol=getattr(signal, "symbol", None),
+                parent_order_id=str(parent_order_id) if parent_order_id else None,
+                reasons=[f"submission_tracking_failure: {reason}"],
+            )
+        except Exception as sm_exc:
+            logger.debug("[ENTRY LIFECYCLE] Observability latch hook non-fatal error: %s", sm_exc)
+
         try:
             send_discord_alert(msg)
         except Exception:
