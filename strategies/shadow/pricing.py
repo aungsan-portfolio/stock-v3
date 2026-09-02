@@ -84,6 +84,7 @@ def resolve_entry_price(
     reference_close: float,
     quote: Optional[dict],
     now_utc: pd.Timestamp,
+    min_quote_timestamp_utc: Optional[pd.Timestamp] = None,
     tick_size: float = 0.01,
     slippage_bps: float = 5.0,
     max_quote_age_seconds: float = 5.0,
@@ -95,6 +96,18 @@ def resolve_entry_price(
     """
     snapshot = validate_quote(quote, now_utc, max_age_seconds=max_quote_age_seconds)
     side_u = str(side or "BUY").upper().strip()
+
+    # Look-ahead prevention: quote timestamp must not predate signal bar close
+    if snapshot.is_valid and min_quote_timestamp_utc is not None:
+        if snapshot.timestamp_utc < min_quote_timestamp_utc:
+            snapshot = QuoteSnapshot(
+                snapshot.bid,
+                snapshot.ask,
+                snapshot.timestamp_utc,
+                snapshot.age_seconds,
+                False,
+                f"QUOTE_PREDATES_SIGNAL_CLOSE_{snapshot.timestamp_utc.isoformat()}_LT_{min_quote_timestamp_utc.isoformat()}",
+            )
 
     if snapshot.is_valid:
         if side_u == "BUY":

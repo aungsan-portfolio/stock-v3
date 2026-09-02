@@ -51,7 +51,27 @@ class ShadowLifecycleManager:
             logger.warning("[SHADOW DISABLED: LOCK UNAVAILABLE] Lifecycle manager disabled due to lock contention.")
         else:
             self._active_trades = self.storage.load_active_trades()
-            logger.info("[SHADOW LIFECYCLE] Loaded %d active shadow trade(s)", len(self._active_trades))
+            logger.info(
+                "[P1.6 SHADOW STARTUP]\n"
+                "  enabled=%s\n"
+                "  strategy=%s\n"
+                "  role=%s\n"
+                "  production_orb_enabled=%s\n"
+                "  broker_dependency=%s\n"
+                "  storage=%s\n"
+                "  lock_acquired=%s\n"
+                "  active_loaded=%d\n"
+                "  closed_loaded=%d",
+                getattr(config, "P1_6_ORB_SHADOW_ENABLED", False),
+                self.storage.strategy_version,
+                self.storage.role,
+                getattr(config, "STRATEGY_ORB_ENABLED", False),
+                False,
+                str(self.storage.dir_path),
+                self.storage.is_locked,
+                len(self._active_trades),
+                len(self.storage._closed_ids),
+            )
 
     @property
     def is_enabled(self) -> bool:
@@ -89,7 +109,7 @@ class ShadowLifecycleManager:
         # Invariant: Entry timestamp cannot precede signal bar close!
         entry_ts = max(now_utc, signal_bar_close)
 
-        # Resolve entry price with execution friction
+        # Resolve entry price with execution friction and quote timestamp ordering
         (
             entry_price,
             pricing_src,
@@ -103,6 +123,7 @@ class ShadowLifecycleManager:
             reference_close=candidate.reference_price,
             quote=quote,
             now_utc=now_utc,
+            min_quote_timestamp_utc=signal_bar_close,
             slippage_bps=float(getattr(config, "SHADOW_SLIPPAGE_BPS", 5.0)),
             max_quote_age_seconds=float(getattr(config, "SHADOW_QUOTE_MAX_AGE_SECONDS", 5.0)),
         )

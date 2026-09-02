@@ -987,6 +987,14 @@ def evaluate_and_execute(
         all_signals = []
     logger.debug("[HOOK] after fetch & evaluate_symbols_parallel")
 
+    # ── P1.6 ORB Shadow Cycle Rejection Summary Hook ──
+    if getattr(config, "P1_6_ORB_SHADOW_ENABLED", False):
+        try:
+            from strategies.shadow.orb_confirmed import get_confirmed_orb_strategy
+            get_confirmed_orb_strategy().log_cycle_summary()
+        except Exception:
+            pass
+
     all_signals = apply_portfolio_correlation(all_signals, cached_open_positions, bridge=bridge)
 
     def get_signal_sorting_key(sig):

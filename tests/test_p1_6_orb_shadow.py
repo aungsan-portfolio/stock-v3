@@ -963,3 +963,67 @@ def test_36_long_only_phase_rejects_short_candidate():
     cand = strat.evaluate_candidate("NVDA", df)
     if cand is not None:
         assert cand.side == "BUY"
+
+
+def test_37_quote_predating_signal_close_falls_back_to_synthetic():
+    signal_close = pd.Timestamp("2026-09-02T14:05:00Z")
+    now_utc = pd.Timestamp("2026-09-02T14:05:02Z")
+    # Quote timestamp is 14:04:59Z, which is before signal_close 14:05:00Z!
+    stale_ts_quote = {
+        "bid": 100.0,
+        "ask": 100.05,
+        "timestamp": "2026-09-02T14:04:59Z",
+    }
+    price, src, synth, _, _, q_ts, _ = resolve_entry_price(
+        side="BUY",
+        reference_close=100.0,
+        quote=stale_ts_quote,
+        now_utc=now_utc,
+        min_quote_timestamp_utc=signal_close,
+    )
+    # Must reject quote because it predates signal bar close!
+    assert src == PricingSource.SYNTHETIC_CLOSE_BPS.value
+    assert price > 100.0
+
+
+def test_38_mappingproxy_json_serializable():
+    cand = ShadowCandidate(
+        candidate_id="t38",
+        strategy_name="ORB",
+        strategy_version="V1",
+        symbol="SER",
+        side="BUY",
+        signal_timestamp_utc="2026-09-02T14:05:00Z",
+        signal_bar_start_utc="2026-09-02T14:00:00Z",
+        signal_bar_close_utc="2026-09-02T14:05:00Z",
+        session_date_et="2026-09-02",
+        reference_price=100.0,
+        stop_price=98.0,
+        target_price=104.0,
+        risk_per_share=2.0,
+        opening_range_high=99.0,
+        opening_range_low=95.0,
+        relative_volume=3.0,
+        breakout_volume_ratio=2.0,
+        price_vs_vwap=1.0,
+        vwap_slope=0.1,
+        ema9=99.5,
+        ema20=98.0,
+        atr=1.0,
+        atr_pct=0.01,
+        spread_pct=0.0005,
+        spy_alignment=AlignmentStatus.ALIGNED,
+        qqq_alignment=AlignmentStatus.ALIGNED,
+        sector_alignment=AlignmentStatus.FALLBACK_MARKET_CONFIRMED,
+        catalyst_type="EARNINGS",
+        premarket_gap_pct=3.0,
+        premarket_volume_ratio=2.5,
+        market_texture="TRENDING",
+        regime_mode="RISK_ON",
+        confidence=0.9,
+        context={"hello": "world"},
+    )
+    # Test JSON serialization of candidate and trade dictionaries
+    d = cand.to_dict()
+    encoded = json.dumps(d)
+    assert "world" in encoded

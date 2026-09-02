@@ -99,6 +99,17 @@ class ShadowCandidate:
         if not isinstance(self.context, MappingProxyType):
             object.__setattr__(self, "context", MappingProxyType(dict(self.context or {})))
 
+    def to_dict(self) -> dict:
+        out = {}
+        for k, v in self.__dict__.items():
+            if isinstance(v, (MappingProxyType, dict)):
+                out[k] = dict(v)
+            elif hasattr(v, "value"):
+                out[k] = v.value
+            else:
+                out[k] = v
+        return out
+
 
 @dataclass
 class ShadowTrade:
@@ -193,7 +204,15 @@ class ShadowTrade:
     ambiguous_intrabar: bool = False
 
     def to_dict(self) -> dict:
-        return {k: v for k, v in self.__dict__.items()}
+        out = {}
+        for k, v in self.__dict__.items():
+            if isinstance(v, (MappingProxyType, dict)):
+                out[k] = dict(v)
+            elif hasattr(v, "value"):
+                out[k] = v.value
+            else:
+                out[k] = v
+        return out
 
     @classmethod
     def from_dict(cls, data: dict) -> "ShadowTrade":
