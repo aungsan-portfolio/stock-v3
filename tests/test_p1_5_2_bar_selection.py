@@ -290,3 +290,26 @@ def test_integration_with_freshness_validator():
             df_future.copy(), symbol="AVGO", interval="5m", validate_staleness=True, purpose="ENTRY_SIGNAL"
         )
         assert res_fut.empty, "Future-dated bars must fail closed"
+
+
+# ---------------------------------------------------------------------------
+# Test 15: get_intraday_features truncates at completed bar
+# ---------------------------------------------------------------------------
+def test_get_intraday_features_truncates_at_completed_bar():
+    from strategies.intraday_data import get_intraday_features
+
+    ts_comp = pd.Timestamp("2026-09-02 15:20:00", tz="UTC")
+    ts_form = pd.Timestamp("2026-09-02 15:25:00", tz="UTC")
+    df = _make_df([ts_comp, ts_form], closes=[370.0, 372.0])
+
+    now_utc = pd.Timestamp("2026-09-02 15:27:25", tz="UTC")
+
+    with patch("strategies.intraday_data.fetch_intraday", return_value=df), \
+         patch("pandas.Timestamp.now", return_value=now_utc):
+        feat_df = get_intraday_features("AVGO", interval="5m", purpose="POSITION_MONITORING")
+
+        assert not feat_df.empty
+        # The last row of feat_df must be the completed bar (15:20), NOT the forming bar (15:25)
+        assert feat_df.index[-1] == ts_comp
+        assert feat_df["close"].iloc[-1] == 370.0
+

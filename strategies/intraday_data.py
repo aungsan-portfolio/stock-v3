@@ -1056,10 +1056,34 @@ def get_intraday_features(
     bridge = None,
     purpose: str = "POSITION_MONITORING",
 ) -> pd.DataFrame:
-    """Fetch intraday data with purpose-specific validation and compute indicators."""
+    """
+    Fetch intraday data with purpose-specific validation, truncate at latest completed bar,
+    and compute indicators so downstream features.iloc[-1] is guaranteed closed-bar truth.
+    """
     df = fetch_intraday(symbol, interval=interval, lookback_days=lookback_days, bridge=bridge, purpose=purpose)
     if df is None or df.empty:
         return pd.DataFrame()
+
+    try:
+        interval_seconds = 60
+        if "m" in interval:
+            interval_seconds = int(interval.replace("m", "")) * 60
+        elif "h" in interval:
+            interval_seconds = int(interval.replace("h", "")) * 3600
+
+        now_utc = pd.Timestamp.now(tz="UTC")
+        future_tolerance = float(getattr(config, "BAR_FUTURE_TOLERANCE_SECONDS", 5.0))
+        completed = select_last_completed_bar(
+            df,
+            interval_seconds=interval_seconds,
+            now_utc=now_utc,
+            close_tolerance_seconds=future_tolerance,
+        )
+        # Truncate at latest completed bar start time
+        df = df.loc[:completed.start_time].copy()
+    except Exception as exc:
+        logger.debug("Feature truncation at completed bar bypassed for %s: %s", symbol, exc)
+
     from strategies.indicators import add_all_indicators
     return add_all_indicators(df)
 
