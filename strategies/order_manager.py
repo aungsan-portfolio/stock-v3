@@ -668,6 +668,12 @@ def execute_signal(
     regime_result: Optional[object] = None,
 ) -> dict:
     """Execute a trade signal through the full pipeline."""
+    from strategies.base import TradeSignal
+    if not isinstance(signal, TradeSignal):
+        raise TypeError(f"Production execute_signal accepts TradeSignal only; received {type(signal).__name__}")
+    if hasattr(signal, "candidate_id") or type(signal).__name__ in ("ShadowCandidate", "ShadowTrade"):
+        raise RuntimeError("ShadowCandidate cannot enter production execution")
+
     if dry_run is None:
         dry_run = config.SCHEDULER_DRY_RUN_DEFAULT
 

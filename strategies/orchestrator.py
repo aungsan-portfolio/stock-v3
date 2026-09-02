@@ -368,6 +368,31 @@ def _evaluate_on_df(symbol: str, df, market_texture: str = "TRENDING") -> List[T
     signals = []
     failures = []
 
+    # ── P1.6 Confirmed ORB Shadow Pipeline Integration ──
+    if getattr(config, "P1_6_ORB_SHADOW_ENABLED", False):
+        try:
+            from strategies.shadow.lifecycle import get_shadow_lifecycle_manager
+            from strategies.shadow.orb_confirmed import get_confirmed_orb_strategy
+            shadow_mgr = get_shadow_lifecycle_manager()
+            if shadow_mgr.is_enabled:
+                # 1. Update existing active shadow trades on latest completed bar
+                shadow_mgr.update_active_trades(symbol, df.iloc[-1])
+                # 2. Evaluate new ORB shadow candidate
+                orb_strat = get_confirmed_orb_strategy()
+                shadow_cand = orb_strat.evaluate_candidate(
+                    symbol=symbol,
+                    df=df,
+                    candidate_meta={"market_texture": market_texture},
+                )
+                if shadow_cand is not None:
+                    shadow_mgr.register_candidate(shadow_cand)
+                    logger.info(
+                        "[ORB SHADOW CANDIDATE] Discovered %s %s @ %.2f (Candidate %s)",
+                        shadow_cand.side, shadow_cand.symbol, shadow_cand.reference_price, shadow_cand.candidate_id[:8]
+                    )
+        except Exception as shadow_err:
+            logger.warning("[ORB SHADOW ERROR] Shadow evaluation error on %s: %s", symbol, shadow_err)
+
     from strategies.scoring import RiskAdjustedSignalScorer
     scorer = RiskAdjustedSignalScorer()
 

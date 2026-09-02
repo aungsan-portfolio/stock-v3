@@ -520,6 +520,42 @@ STRATEGY_SETTINGS = {
 
 STRATEGY_MEAN_REVERSION_ENABLED = True  # Native high-win-rate strategy for SIDEWAYS regimes
 
+# =============================================================================
+# P1.6 SHADOW ALPHA RESEARCH & ORB CONFIGURATION
+# =============================================================================
+P1_6_ORB_SHADOW_ENABLED = True
+P1_6_SHADOW_BROKER_EXECUTION_ENABLED = False  # Hardcoded invariant: Never True
+
+# Existing production ORB remains strictly disabled
+STRATEGY_ORB_ENABLED = False
+
+ORB_RANGE_MINUTES = 15
+ORB_EARLIEST_ENTRY_TIME_ET = "10:00"
+ORB_LATEST_ENTRY_TIME_ET = "11:30"
+
+ORB_SHADOW_ALLOW_LONG = True
+ORB_SHADOW_ALLOW_SHORT = False  # Phase 1 is strictly Long-only
+
+ORB_MIN_RELATIVE_VOLUME = 2.0
+ORB_MIN_BREAKOUT_VOLUME_RATIO = 1.5
+ORB_MIN_PREMARKET_GAP_PCT = 2.0
+ORB_MIN_PREMARKET_VOLUME_RATIO = 2.0
+
+ORB_TARGET_R_MULTIPLE = 2.0
+ORB_MAX_ATR_EXTENSION = 1.25
+ORB_MIN_STOP_ATR_MULTIPLE = 0.50
+
+SHADOW_QUOTE_MAX_AGE_SECONDS = 5.0
+SHADOW_SLIPPAGE_BPS = 5.0
+SHADOW_STRATEGY_VERSION = "ORB_CONFIRMED_V1_FIXED_2R"
+
+SHADOW_BASE_DIR = "data/shadow"
+SHADOW_ENGINE_ROLE = "daytrade"
+
+# Direct constant fail-closed assertion (No getattr(config, ...) to prevent NameError)
+if P1_6_ORB_SHADOW_ENABLED and P1_6_SHADOW_BROKER_EXECUTION_ENABLED:
+    raise RuntimeError("Invalid configuration: P1.6 shadow mode cannot enable broker execution")
+
 
 ORB_MIN_VOLUME_RATIO = 1.5
 ORB_MIN_RANGE_ATR_RATIO = 0.5
