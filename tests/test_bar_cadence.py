@@ -22,7 +22,8 @@ def test_5m_bar_cadence_gate():
         eval_count += 1
         return []
 
-    with patch("strategies.orchestrator.evaluate_symbols_parallel", side_effect=mock_eval_parallel):
+    with patch("strategies.orchestrator.evaluate_symbols_parallel", side_effect=mock_eval_parallel), \
+         patch("strategies.session.is_past_opening_buffer", return_value=True):
         # Tick 1: 20:30:00 (5m boundary)
         t1 = datetime(2026, 7, 24, 20, 30, 0, tzinfo=timezone.utc)
         with patch("strategies.orchestrator.datetime") as mock_dt:

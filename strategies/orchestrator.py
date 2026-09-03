@@ -613,6 +613,12 @@ def evaluate_and_execute(
     logger.info(f"[ORCHESTRATOR POLL] Polling cycle started for {len(watchlist)} watchlist symbols | allow_new_entries={allow_new_entries}")
     print(f"[ORCHESTRATOR POLL] Polling cycle started for {len(watchlist)} watchlist symbols | allow_new_entries={allow_new_entries}")
     
+    try:
+        from strategies.watchdog import touch_orchestrator_heartbeat
+        touch_orchestrator_heartbeat()
+    except Exception:
+        pass
+    
     global _consecutive_broker_failures
     broker_fetch_ok = True
 

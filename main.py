@@ -2786,6 +2786,14 @@ def cmd_daytrade_bot(args) -> int:
         )
         bg_scanner.start()
 
+    watchdog = None
+    try:
+        from strategies.watchdog import get_eod_watchdog
+        watchdog = get_eod_watchdog()
+        watchdog.start()
+    except Exception as wd_exc:
+        print(f"Warning: Failed to start EOD watchdog: {wd_exc}")
+
     _already_flattened = False
     _flatten_lock = threading.Lock()
 
@@ -2795,6 +2803,12 @@ def cmd_daytrade_bot(args) -> int:
             print(f"⚠️ Signal {signum} received again — forcing immediate exit.")
             import os as os_module
             os_module._exit(0)
+
+        if watchdog:
+            try:
+                watchdog.stop()
+            except Exception:
+                pass
 
         if bg_scanner:
             try:
@@ -2826,6 +2840,12 @@ def cmd_daytrade_bot(args) -> int:
         _scanner_stale_blocked = False
         while True:
             current_time = time.time()
+            if watchdog:
+                try:
+                    from strategies.watchdog import touch_orchestrator_heartbeat
+                    touch_orchestrator_heartbeat()
+                except Exception:
+                    pass
             if not is_market_open():
                 from strategies.session import is_postmarket
                 if is_postmarket():
@@ -2924,6 +2944,11 @@ def cmd_daytrade_bot(args) -> int:
             time.sleep(30)
             
     except KeyboardInterrupt:
+        if watchdog:
+            try:
+                watchdog.stop()
+            except Exception:
+                pass
         if not _already_flattened:
             _already_flattened = True
             try:
@@ -2939,6 +2964,11 @@ def cmd_daytrade_bot(args) -> int:
             pass
         sys.exit(0)
     except Exception as exc:
+        if watchdog:
+            try:
+                watchdog.stop()
+            except Exception:
+                pass
         if not _already_flattened:
             _already_flattened = True
             try:

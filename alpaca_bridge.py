@@ -22,6 +22,9 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
+
 from dataclasses import dataclass
 from enum import Enum
 
@@ -38,6 +41,58 @@ from predictor import Signal
 from position_rotator import PositionRotator, OpenPosition, IncomingSignal
 
 logger = logging.getLogger(__name__)
+
+
+class TimeoutHTTPAdapter(HTTPAdapter):
+    """HTTP adapter enforcing hard connect and read timeouts and exponential backoff retries."""
+
+    def __init__(
+        self,
+        connect_timeout: float = 5.0,
+        read_timeout: float = 10.0,
+        max_retries: Optional[Retry] = None,
+        **kwargs,
+    ):
+        self.connect_timeout = float(connect_timeout)
+        self.read_timeout = float(read_timeout)
+        if max_retries is None:
+            max_retries = Retry(
+                total=3,
+                backoff_factor=0.5,
+                status_forcelist=[429, 500, 502, 503, 504],
+                raise_on_status=False,
+            )
+        super().__init__(max_retries=max_retries, **kwargs)
+
+    def send(self, request, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = (self.connect_timeout, self.read_timeout)
+        return super().send(request, **kwargs)
+
+
+def configure_session_timeouts(
+    session,
+    connect_timeout: float = 5.0,
+    read_timeout: float = 10.0,
+    total_retries: int = 3,
+    backoff_factor: float = 0.5,
+) -> None:
+    """Mount TimeoutHTTPAdapter on a requests.Session for both http:// and https:// prefixes."""
+    if session is None or not hasattr(session, "mount"):
+        return
+    retries = Retry(
+        total=total_retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=[429, 500, 502, 503, 504],
+        raise_on_status=False,
+    )
+    adapter = TimeoutHTTPAdapter(
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+        max_retries=retries,
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
 
 
 class StreamState(Enum):
@@ -473,6 +528,10 @@ class AlpacaBridge:
         try:
             self._client = TradingClient(key, secret, paper=True)
             self._data_client = StockHistoricalDataClient(key, secret)
+
+            # Hardened Network Timeout & Retry Layer (connect=5.0s, read=10.0s, retries=3)
+            configure_session_timeouts(getattr(self._client, "_session", None), connect_timeout=5.0, read_timeout=10.0)
+            configure_session_timeouts(getattr(self._data_client, "_session", None), connect_timeout=5.0, read_timeout=10.0)
 
             # Validate account status
             acct = self._client.get_account()
