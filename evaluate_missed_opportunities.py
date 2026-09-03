@@ -214,10 +214,35 @@ def generate_report(events: dict, closed_trades: List[dict]):
         gross_loss = abs(sum((t.get("realized_pnl") or 0.0) for t in losses))
         pf = (gross_profit / gross_loss) if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0)
 
+        # Calculate R-multiples if stop_price is available
+        r_multiples = []
+        for t in matched_trades:
+            entry = float(t.get("entry_price") or 0.0)
+            exit_px = float(t.get("exit_price") or 0.0)
+            stop = float(t.get("stop_price") or 0.0)
+            side = str(t.get("side") or "BUY").upper()
+            risk_unit = abs(entry - stop)
+            if risk_unit > 0.01:
+                pnl_per_share = (exit_px - entry) if side == "BUY" else (entry - exit_px)
+                r_val = pnl_per_share / risk_unit
+                r_multiples.append(r_val)
+
+        r_wins = [r for r in r_multiples if r > 0]
+        r_losses = [abs(r) for r in r_multiples if r < 0]
+        avg_win_r = (sum(r_wins) / len(r_wins)) if r_wins else 0.0
+        avg_loss_r = (sum(r_losses) / len(r_losses)) if r_losses else 0.0
+        win_rate_dec = len(wins) / len(matched_trades) if matched_trades else 0.0
+        loss_rate_dec = len(losses) / len(matched_trades) if matched_trades else 0.0
+        expectancy_r = (win_rate_dec * avg_win_r) - (loss_rate_dec * avg_loss_r)
+
         print(f"  Matched Closed Trades : {len(matched_trades)}")
         print(f"  Win Rate              : {wr:.1f}% ({len(wins)}W / {len(losses)}L)")
         print(f"  Gross Profit Factor   : {pf:.2f}")
         print(f"  Total Realized PnL    : ${total_pnl:+.2f}")
+        if r_multiples:
+            print(f"  Avg Win in R          : +{avg_win_r:.2f}R")
+            print(f"  Avg Loss in R         : -{avg_loss_r:.2f}R")
+            print(f"  Net Expectancy in R   : {expectancy_r:+.2f}R per trade")
         for t in matched_trades:
             sym = t.get("symbol")
             side = t.get("side")
