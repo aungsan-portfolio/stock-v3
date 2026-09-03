@@ -25,21 +25,49 @@ from strategies.webhook import send_discord_alert
 logger = logging.getLogger(__name__)
 
 _session_skip_counts = defaultdict(int)
-_session_suppressed = set()
+_session_suppressed_until = {}
+_session_cooldown_counts = defaultdict(int)
+_session_permanently_suppressed = set()
 
 
 def _get_skip_limit() -> int:
     return getattr(config, "HARD_VETO_SKIP_LIMIT", 5)
 
 
+def _get_cooldown_seconds() -> float:
+    return float(getattr(config, "SESSION_SUPPRESSION_COOLDOWN_SECONDS", 2700.0))
+
+
+def _get_max_cooldown_cycles() -> int:
+    return int(getattr(config, "MAX_DAILY_COOLDOWN_CYCLES", 3))
+
+
 def check_session_suppression(symbol: str) -> Tuple[bool, str]:
-    """Checks if a symbol has been hard-vetoed >= skip limit times in a session."""
+    """Checks if a symbol is actively suppressed or in cooldown."""
     if not getattr(config, "SKIP_SUPPRESSOR_ENABLED", True):
         return False, ""
     sym = symbol.upper().strip()
-    limit = _get_skip_limit()
-    if sym in _session_suppressed:
-        return True, f"[SESSION SUPPRESSED] {sym}: suppressed this session (skip count >= {limit})"
+
+    # 1. Check permanent full-day suppression (exceeded max cooldown cycles)
+    if sym in _session_permanently_suppressed:
+        max_cycles = _get_max_cooldown_cycles()
+        return True, f"[SESSION SUPPRESSED] {sym}: permanently suppressed this session (exceeded {max_cycles} cooldown cycles)"
+
+    # 2. Check dynamic cooldown window
+    if sym in _session_suppressed_until:
+        now = time.time()
+        until = _session_suppressed_until[sym]
+        if now < until:
+            remaining_min = (until - now) / 60.0
+            cycle = _session_cooldown_counts[sym]
+            return True, f"[SESSION SUPPRESSED] {sym}: cooldown active ({remaining_min:.1f}m remaining, Cycle #{cycle})"
+        else:
+            # Cooldown expired! Restore symbol to active evaluation
+            cycle = _session_cooldown_counts[sym]
+            logger.info("[COOLDOWN EXPIRE] %s: Cooldown period ended (Cycle #%d). Symbol restored to active evaluation.", sym, cycle)
+            del _session_suppressed_until[sym]
+            return False, ""
+
     return False, ""
 
 
@@ -70,15 +98,38 @@ def record_hard_veto_skip(symbol: str, reason: str, bar_timestamp: str = ""):
     logger.info("[SKIP COUNTER] %s: Hard veto skip #%d/%d — reason: %s", sym, count, limit, reason)
 
     if count >= limit:
-        _session_suppressed.add(sym)
-        logger.warning("[SESSION SUPPRESS] %s: Suppressed for remainder of session after %d hard vetoes.", sym, count)
+        max_cycles = _get_max_cooldown_cycles()
+        current_cycles = _session_cooldown_counts[sym]
+
+        # Safeguard #1: Cooldown Cycle Cap (Max 3 cycles before full-day permanent suppression)
+        if current_cycles >= max_cycles:
+            _session_permanently_suppressed.add(sym)
+            _session_skip_counts[sym] = 0
+            logger.warning(
+                "🚨 [SESSION SUPPRESS PERMANENT] %s: Suppressed for remainder of session after reaching max cooldown cycles (%d/%d).",
+                sym, current_cycles, max_cycles,
+            )
+        else:
+            cooldown_sec = _get_cooldown_seconds()
+            cooldown_until = now + cooldown_sec
+            _session_suppressed_until[sym] = cooldown_until
+            _session_cooldown_counts[sym] += 1
+            _session_skip_counts[sym] = 0  # Counter reset for fresh post-cooldown budget
+            cooldown_min = cooldown_sec / 60.0
+            resume_str = time.strftime("%H:%M:%S", time.localtime(cooldown_until))
+            logger.warning(
+                "⏳ [COOLDOWN START] %s: Suppressed for %.1fm cooldown (Cycle #%d/%d) after %d hard vetoes. Active again at %s.",
+                sym, cooldown_min, _session_cooldown_counts[sym], max_cycles, count, resume_str,
+            )
 
 
 def reset_session_skip_state():
     """Resets session skip state for new trading sessions."""
-    global _session_skip_counts, _session_suppressed, _seen_veto_fingerprints
+    global _session_skip_counts, _session_suppressed_until, _session_cooldown_counts, _session_permanently_suppressed, _seen_veto_fingerprints
     _session_skip_counts = defaultdict(int)
-    _session_suppressed = set()
+    _session_suppressed_until = {}
+    _session_cooldown_counts = defaultdict(int)
+    _session_permanently_suppressed = set()
     _seen_veto_fingerprints = {}
     logger.info("[ORDER MANAGER] Session skip state reset.")
 
@@ -1061,6 +1112,13 @@ def execute_signal(
         signal.stop_price, signal.target_price,
         risk_dollars, cost, signal.confidence, min_confidence, signal.reason,
     )
+
+    sym_clean = signal.symbol.upper().strip()
+    if _session_cooldown_counts.get(sym_clean, 0) > 0:
+        logger.info(
+            "🌟 [POST-COOLDOWN OPPORTUNITY] %s | Cooldown Cycle: %d | Trade Taken: YES | side=%s shares=%d price=%.2f",
+            sym_clean, _session_cooldown_counts[sym_clean], signal.side, shares, executable_signal.entry_price,
+        )
 
     if dry_run:
         idempotency_manager.release(signal.symbol, side=signal.side, reason="dry_run")
