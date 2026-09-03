@@ -376,6 +376,9 @@ MARKET_CLOSE = _dt.time(16, 0)
 POSTMARKET_END = _dt.time(20, 0)
 TIMEZONE = "US/Eastern"
 
+# Autonomous EOD Flatten Buffer (seconds before 16:00 ET close, default 120s -> 15:58:00 ET)
+EOD_FLATTEN_BUFFER_SECONDS: float = float(os.getenv("EOD_FLATTEN_BUFFER_SECONDS", "120.0"))
+
 ORB_WINDOW_MINUTES = 15
 ORB_EXTENDED_MINUTES = 30
 

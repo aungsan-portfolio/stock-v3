@@ -58,14 +58,25 @@ class EODFlattenWatchdog:
         poll_interval_seconds: float = 5.0,
         stale_alarm_seconds: float = 120.0,
         stale_alert_seconds: float = 300.0,
-        eod_flatten_buffer_seconds: float = 120.0,  # 15:58:00 ET (2 min before 16:00 close)
+        eod_flatten_buffer_seconds: Optional[float] = None,
+        alarm_cooldown_seconds: float = 60.0,
         auto_exit_on_clean_eod: bool = False,
         trading_client: Optional[TradingClient] = None,
     ):
         self.poll_interval = float(poll_interval_seconds)
         self.stale_alarm_seconds = float(stale_alarm_seconds)
         self.stale_alert_seconds = float(stale_alert_seconds)
-        self.eod_flatten_buffer_seconds = float(eod_flatten_buffer_seconds)
+        self.alarm_cooldown_seconds = float(alarm_cooldown_seconds)
+
+        if eod_flatten_buffer_seconds is not None:
+            self.eod_flatten_buffer_seconds = float(eod_flatten_buffer_seconds)
+        else:
+            try:
+                import config
+                self.eod_flatten_buffer_seconds = float(getattr(config, "EOD_FLATTEN_BUFFER_SECONDS", 120.0))
+            except Exception:
+                self.eod_flatten_buffer_seconds = 120.0
+
         self.auto_exit_on_clean_eod = bool(auto_exit_on_clean_eod)
 
         self._stop_event = threading.Event()
@@ -73,6 +84,8 @@ class EODFlattenWatchdog:
         self._flatten_executed: bool = False
         self._tier1_alarm_logged: bool = False
         self._tier2_alert_logged: bool = False
+        self._last_tier1_alarm_time: float = 0.0
+        self._last_tier2_alert_time: float = 0.0
 
         # Independent Broker Client (Separate Failure Domain)
         if trading_client is not None:
@@ -160,9 +173,10 @@ class EODFlattenWatchdog:
 
         # ── 1. Liveness Monitoring ──
         age = status["heartbeat_age"]
+        now_ts = time.time()
         if age > self.stale_alert_seconds:
             status["tier2_alert"] = True
-            if not self._tier2_alert_logged:
+            if not self._tier2_alert_logged or (now_ts - self._last_tier2_alert_time) >= self.alarm_cooldown_seconds:
                 logger.critical(
                     "🚨 [WATCHDOG TIER-2 ALERT] Main orchestrator thread appears frozen! "
                     "Last heartbeat was %.1f seconds ago (threshold: %.0fs).",
@@ -170,14 +184,16 @@ class EODFlattenWatchdog:
                 )
                 self._send_alert(f"🚨 [WATCHDOG CRITICAL] Main trading bot frozen for {age:.0f}s!")
                 self._tier2_alert_logged = True
+                self._last_tier2_alert_time = now_ts
         elif age > self.stale_alarm_seconds:
             status["tier1_alarm"] = True
-            if not self._tier1_alarm_logged:
+            if not self._tier1_alarm_logged or (now_ts - self._last_tier1_alarm_time) >= self.alarm_cooldown_seconds:
                 logger.warning(
                     "⚠️ [WATCHDOG ALARM] Main orchestrator heartbeat delayed: %.1f seconds (threshold: %.0fs).",
                     age, self.stale_alarm_seconds,
                 )
                 self._tier1_alarm_logged = True
+                self._last_tier1_alarm_time = now_ts
         else:
             # Heartbeat is healthy -> reset alarm latching
             self._tier1_alarm_logged = False
