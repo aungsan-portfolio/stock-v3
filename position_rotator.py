@@ -130,7 +130,9 @@ class RotationState:
 _RATCHET_RULES: list[tuple[float, float, str]] = [
     (0.05, 0.005, "breakeven+"),     # +5%  → entry + 0.5%
     (0.08, 0.040, "lock-in-4pct"),   # +8%  → entry + 4.0%
+    (0.12, 0.070, "lock-in-7pct"),   # +12% → entry + 7.0%
     (0.15, 0.100, "lock-in-10pct"),  # +15% → entry + 10.0%
+    (0.20, 0.150, "lock-in-15pct"),  # +20% → entry + 15.0%
 ]
 
 
@@ -242,7 +244,10 @@ class PositionRotator:
 
             # ── One-direction guard ──────────────────────────────────────
             if current_stop is not None and new_stop <= current_stop:
-                reason_str = f"already protected (resting_stop {current_stop:.2f} >= target_stop {new_stop:.2f})"
+                reason_str = (
+                    f"already protected at {current_stop:.2f}, above/equal target {new_stop:.2f} "
+                    f"for current PnL {pnl_pct * 100:+.2f}%; no stop downgrade permitted"
+                )
                 logger.info("[RATCHET SKIP] %-6s | %s", symbol, reason_str)
                 results.append(RatchetResult(
                     symbol=symbol, old_stop=current_stop, new_stop=new_stop,

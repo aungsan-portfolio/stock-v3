@@ -277,8 +277,21 @@ ALPACA_TOTAL_RETRIES                      = int(os.environ.get("ALPACA_TOTAL_RET
 ALPACA_RETRY_BACKOFF_FACTOR               = float(os.environ.get("ALPACA_RETRY_BACKOFF_FACTOR", 0.5))
 ALPACA_CONNECT_MAX_ATTEMPTS               = int(os.environ.get("ALPACA_CONNECT_MAX_ATTEMPTS", 3))
 
-# Swing Trading daily loss limit (used in risk_state.py)
-MAX_DAILY_LOSS_SWING   = 150.0
+# Swing Trading daily loss & protection configuration
+SWING_MAX_DAILY_LOSS_PCT = float(os.environ.get("SWING_MAX_DAILY_LOSS_PCT", "0.01"))
+SWING_MAX_DAILY_LOSS_DOLLAR_CAP = float(os.environ.get("SWING_MAX_DAILY_LOSS_DOLLAR_CAP", "0.0"))
+SWING_PROTECTED_SYMBOLS = {
+    s.strip().upper()
+    for s in os.environ.get("SWING_PROTECTED_SYMBOLS", "SPY").split(",")
+    if s.strip()
+}
+
+if not 0 < SWING_MAX_DAILY_LOSS_PCT <= 0.10:
+    raise ValueError("SWING_MAX_DAILY_LOSS_PCT must be between 0 and 0.10")
+if SWING_MAX_DAILY_LOSS_DOLLAR_CAP < 0:
+    raise ValueError("SWING_MAX_DAILY_LOSS_DOLLAR_CAP cannot be negative")
+
+MAX_DAILY_LOSS_SWING   = float(os.environ.get("MAX_DAILY_LOSS_SWING", "150.0"))
 MAX_DAILY_LOSS_DAYTRADE = 300.0  # Expanded limit for tonight per trader instruction ($300.00)
 MAX_DAILY_LOSS_DOLLARS  = MAX_DAILY_LOSS_DAYTRADE
 MAX_DAILY_LOSS_USD     = MAX_DAILY_LOSS_SWING

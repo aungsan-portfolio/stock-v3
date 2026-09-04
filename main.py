@@ -415,6 +415,22 @@ def cmd_paper(args) -> int:
         recon = _run_paper_startup_checks(bridge)
         _print_startup_reconciliation(recon)
 
+        try:
+            import config as app_cfg
+            mode_str = getattr(bridge, "mode", "swing").upper()
+            sod_eq = getattr(bridge, "_start_of_day_equity", 0.0) or acct_equity
+            swing_pct = float(getattr(app_cfg, "SWING_MAX_DAILY_LOSS_PCT", 0.01)) * 100.0
+            dollar_cap = float(getattr(app_cfg, "SWING_MAX_DAILY_LOSS_DOLLAR_CAP", 0.0))
+            cap_str = f"${dollar_cap:.2f}" if dollar_cap > 0 else "disabled"
+            prot_syms = sorted(getattr(app_cfg, "SWING_PROTECTED_SYMBOLS", {"SPY"}))
+            tif_val = bridge._entry_time_in_force()
+            tif_str = getattr(tif_val, "value", str(tif_val))
+            print(f"  [STARTUP CONFIG] Mode: {mode_str} | Entry TIF: {tif_str}")
+            print(f"  [STARTUP CONFIG] Swing Risk Guard: {swing_pct:.2f}% of start-of-day equity (~${sod_eq * (swing_pct/100):.2f}) | Dollar Cap: {cap_str}")
+            print(f"  [STARTUP CONFIG] Protected Symbols: {prot_syms}\n")
+        except Exception as cfg_log_err:
+            pass
+
     shutdown_event = threading.Event()
     cycle = 0
     try:
@@ -424,9 +440,24 @@ def cmd_paper(args) -> int:
             now_str = now_dt.strftime('%Y-%m-%d %H:%M:%S %Z')
             print(f"\n--- [SWING SCAN CYCLE #{cycle}] {now_str} ---")
 
+            sleep_duration = float(interval)
             if not is_market_open():
                 print("  [MARKET CLOSED] US Stock Market is currently closed.")
-                print(f"  Sleeping for {interval//60} minutes ({interval}s) until next checkpoint...")
+                if bridge is not None and hasattr(bridge, "get_market_clock"):
+                    try:
+                        clock = bridge.get_market_clock()
+                        if clock and not getattr(clock, "is_open", False):
+                            now_ts = getattr(clock, "timestamp", None)
+                            next_open_ts = getattr(clock, "next_open", None)
+                            if now_ts and next_open_ts:
+                                sec_to_open = max(0.0, (next_open_ts - now_ts).total_seconds())
+                                if 0.0 < sec_to_open < float(interval):
+                                    sleep_duration = max(1.0, min(float(interval), sec_to_open + 5.0))
+                                    print(f"  [MARKET SCHEDULER] Market opens in {sec_to_open:.0f}s. Aligning next scan in {sleep_duration:.0f}s...")
+                    except Exception as clk_err:
+                        pass
+                if sleep_duration == float(interval):
+                    print(f"  Sleeping for {interval//60} minutes ({interval}s) until next checkpoint...")
             else:
                 print("  [MARKET OPEN] Running Swing ML Predictions & Rebalancing...")
                 try:
@@ -439,8 +470,8 @@ def cmd_paper(args) -> int:
                 except Exception as cycle_err:
                     print(f"  ERROR during swing scan cycle #{cycle}: {cycle_err}")
 
-            print(f"\n  Next Swing Scan in {interval//60} minutes ({interval}s). Press Ctrl+C to exit.\n")
-            if shutdown_event.wait(timeout=interval):
+            print(f"\n  Next Swing Scan in {int(sleep_duration)//60}m {int(sleep_duration)%60}s ({int(sleep_duration)}s). Press Ctrl+C to exit.\n")
+            if shutdown_event.wait(timeout=sleep_duration):
                 break
     except KeyboardInterrupt:
         print("\n\nSwing Trading Scheduler stopping by user. Exiting cleanly...")

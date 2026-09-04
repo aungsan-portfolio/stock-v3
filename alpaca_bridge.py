@@ -368,12 +368,25 @@ class EntryGateMock:
         if self.bridge is not None:
             try:
                 daily_pnl = self.bridge.account_daily_pnl()
-                max_loss = float(getattr(config_module, "MAX_DAILY_LOSS_SWING", 1000.0))
-                if daily_pnl < -abs(max_loss):
+                mode = getattr(self.bridge, "mode", "daytrade").lower()
+                if mode == "swing":
+                    sod_equity = getattr(self.bridge, "_start_of_day_equity", 0.0)
+                    if sod_equity <= 0.0:
+                        sod_equity = self.bridge.get_net_liquidation()
+                    if sod_equity <= 0.0:
+                        logger.warning("Risk baseline unavailable; blocking new entries only. Protective exits remain enabled.")
+                        return True, "Risk baseline unavailable (blocking new entries only; protective exits remain enabled)"
+                    pct_limit = abs(sod_equity * float(getattr(config_module, "SWING_MAX_DAILY_LOSS_PCT", 0.01)))
+                    dollar_cap = float(getattr(config_module, "SWING_MAX_DAILY_LOSS_DOLLAR_CAP", 0.0))
+                    max_loss = min(pct_limit, dollar_cap) if dollar_cap > 0 else pct_limit
+                else:
+                    max_loss = float(getattr(config_module, "MAX_DAILY_LOSS_DAYTRADE", 300.0))
+                if round(daily_pnl, 2) < -round(abs(max_loss), 2):
                     self.halt()
                     return True, f"Max daily loss limit reached (${daily_pnl:.2f} < -${max_loss:.2f})"
             except Exception as e:
-                logger.error("Error checking daily loss limit in EntryGateMock: %s", e)
+                logger.error("Error checking daily loss limit in EntryGateMock: %s; blocking new entries only. Protective exits remain enabled.", e)
+                return True, f"Risk check error: {e} (blocking new entries only)"
         return False, ""
 
 
@@ -1210,6 +1223,10 @@ class AlpacaBridge:
             logger.error("get_net_liquidation failed: %s", exc)
             return 0.0
 
+    def get_market_clock(self):
+        self._require_connection()
+        return self._call_with_retry(lambda: self._client.get_clock())
+
     def account_daily_pnl(self) -> float:
         if getattr(self, "_start_of_day_equity", 0.0) <= 0.0:
             return 0.0
@@ -1446,6 +1463,10 @@ class AlpacaBridge:
             tp = float(self._c("TAKE_PROFIT_PCT", 0.015))
         return _round_price(price * (1 + tp)) if action == "BUY" else _round_price(price * (1 - tp))
 
+    def _entry_time_in_force(self) -> TimeInForce:
+        mode = str(getattr(self, "mode", "daytrade")).strip().lower()
+        return TimeInForce.GTC if mode == "swing" else TimeInForce.DAY
+
     # ── Placement & Execution ────────────────────────────────────
     def _place_open_bracket(
         self, symbol: str, action: str, qty: int, price: float, confidence: float,
@@ -1474,7 +1495,7 @@ class AlpacaBridge:
             qty=qty, limit_price=limit_price, confidence=confidence, order_ref=client_order_id,
         )
 
-        tif = TimeInForce.DAY
+        tif = self._entry_time_in_force()
         try:
             order = self._client.submit_order(LimitOrderRequest(
                 symbol=symbol, qty=qty,
@@ -1871,6 +1892,15 @@ class AlpacaBridge:
         protect = {"checked": 0, "unprotected": [], "repaired": [], "failed": []}
         if snapshot["unprotected_longs"]:
             protect = self.ensure_protective_stops()
+            if protect.get("repaired"):
+                positions = self.positions_plain()
+                working = self.working_orders_plain()
+                snapshot = reconciliation.build_snapshot(positions, working)
+                if snapshot.get("unprotected_longs"):
+                    time.sleep(0.5)
+                    positions = self.positions_plain()
+                    working = self.working_orders_plain()
+                    snapshot = reconciliation.build_snapshot(positions, working)
 
         auto_cleaned_orphans = []
         if snapshot["orphan_exits"]:
@@ -2315,7 +2345,7 @@ class AlpacaBridge:
             "symbol": symbol.upper().strip(),
             "qty": qty,
             "side": OrderSide.BUY if side.upper() == "BUY" else OrderSide.SELL,
-            "time_in_force": TimeInForce.DAY,
+            "time_in_force": self._entry_time_in_force(),
             "limit_price": entry_p,
             "order_class": OrderClass.BRACKET,
             "take_profit": TakeProfitRequest(limit_price=target_p),
@@ -2419,7 +2449,8 @@ class AlpacaBridge:
             for order in self._get_active_orders():
                 if str(getattr(order, "symbol", "")).upper().strip() != sym:
                     continue
-                otype = str(getattr(order, "order_type", "")).lower().replace("ordertype.", "")
+                raw_type = getattr(order, "order_type", getattr(order, "type", ""))
+                otype = str(getattr(raw_type, "value", raw_type)).strip().lower().replace("ordertype.", "")
                 if otype in ("stop", "stop_limit", "trailing_stop"):
                     price = getattr(order, "stop_price", None)
                     return float(price) if price is not None else None
@@ -2441,7 +2472,8 @@ class AlpacaBridge:
             for order in self._get_active_orders():
                 if str(getattr(order, "symbol", "")).upper().strip() != sym:
                     continue
-                otype = str(getattr(order, "order_type", "")).lower().replace("ordertype.", "")
+                raw_type = getattr(order, "order_type", getattr(order, "type", ""))
+                otype = str(getattr(raw_type, "value", raw_type)).strip().lower().replace("ordertype.", "")
                 if otype in ("stop", "stop_limit", "trailing_stop"):
                     return self.modify_stop_order(
                         order_id=str(order.id),
@@ -2880,7 +2912,10 @@ class AlpacaBridge:
                 for s in signals
             }
 
-            protected_syms = set(getattr(self, "protected_symbols", []))
+            cfg_prot = getattr(config_module, "SWING_PROTECTED_SYMBOLS", {"SPY"})
+            protected_syms = {s.upper().strip() for s in cfg_prot} | {
+                s.upper().strip() for s in getattr(self, "protected_symbols", [])
+            }
             open_pos = []
             for raw in raw_positions:
                 qty = float(raw.qty)
