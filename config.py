@@ -270,6 +270,13 @@ TRADE_STREAM_RECONNECT_BASE_DELAY_SECONDS = 1.0
 TRADE_STREAM_RECONNECT_MAX_DELAY_SECONDS  = 30.0
 TRADE_STREAM_RECONNECT_JITTER_RATIO       = 0.20
 
+# ── Alpaca Network & HTTP Resilience ────────────
+ALPACA_CONNECT_TIMEOUT_SECONDS            = float(os.environ.get("ALPACA_CONNECT_TIMEOUT", 15.0))
+ALPACA_READ_TIMEOUT_SECONDS               = float(os.environ.get("ALPACA_READ_TIMEOUT", 30.0))
+ALPACA_TOTAL_RETRIES                      = int(os.environ.get("ALPACA_TOTAL_RETRIES", 3))
+ALPACA_RETRY_BACKOFF_FACTOR               = float(os.environ.get("ALPACA_RETRY_BACKOFF_FACTOR", 0.5))
+ALPACA_CONNECT_MAX_ATTEMPTS               = int(os.environ.get("ALPACA_CONNECT_MAX_ATTEMPTS", 3))
+
 # Swing Trading daily loss limit (used in risk_state.py)
 MAX_DAILY_LOSS_SWING   = 150.0
 MAX_DAILY_LOSS_DAYTRADE = 300.0  # Expanded limit for tonight per trader instruction ($300.00)
@@ -577,6 +584,9 @@ SKIP_SUPPRESSOR_ENABLED = True
 HARD_VETO_SKIP_LIMIT = 5
 SESSION_SUPPRESSION_COOLDOWN_SECONDS = float(os.getenv("SESSION_SUPPRESSION_COOLDOWN_SECONDS", "2700.0"))  # 45m cooldown
 MAX_DAILY_COOLDOWN_CYCLES = int(os.getenv("MAX_DAILY_COOLDOWN_CYCLES", "3"))  # Max 3 cooldowns before full-day lock
+VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED = os.getenv("VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED", "True").lower() in ("true", "1", "yes")
+VWAP_BOUNCE_SOXX_VETO_THRESHOLD = float(os.getenv("VWAP_BOUNCE_SOXX_VETO_THRESHOLD", "-1.50"))
+VWAP_BOUNCE_BLOCKED_REGIMES = ("CAUTION", "RISK_OFF", "DATA_DEGRADED")
 NEWS_HYGIENE_ENABLED = True
 TIME_EXIT_CHECK_ENABLED = True
 BREAKEVEN_BAND_PCT = 0.20
@@ -967,6 +977,11 @@ class Settings:
     TRADE_STREAM_RECONNECT_BASE_DELAY_SECONDS: float = TRADE_STREAM_RECONNECT_BASE_DELAY_SECONDS
     TRADE_STREAM_RECONNECT_MAX_DELAY_SECONDS: float = TRADE_STREAM_RECONNECT_MAX_DELAY_SECONDS
     TRADE_STREAM_RECONNECT_JITTER_RATIO: float = TRADE_STREAM_RECONNECT_JITTER_RATIO
+    ALPACA_CONNECT_TIMEOUT_SECONDS: float = ALPACA_CONNECT_TIMEOUT_SECONDS
+    ALPACA_READ_TIMEOUT_SECONDS: float = ALPACA_READ_TIMEOUT_SECONDS
+    ALPACA_TOTAL_RETRIES: int = ALPACA_TOTAL_RETRIES
+    ALPACA_RETRY_BACKOFF_FACTOR: float = ALPACA_RETRY_BACKOFF_FACTOR
+    ALPACA_CONNECT_MAX_ATTEMPTS: int = ALPACA_CONNECT_MAX_ATTEMPTS
 
 
     # Logging
@@ -1210,6 +1225,16 @@ class Settings:
             for k, v in mod.__dict__.items():
                 if k.isupper() and not k.startswith("_") and not hasattr(self, k):
                     setattr(self, k, v)
+        if "ALPACA_CONNECT_TIMEOUT" in os.environ:
+            try:
+                self.ALPACA_CONNECT_TIMEOUT_SECONDS = float(os.environ["ALPACA_CONNECT_TIMEOUT"])
+            except ValueError:
+                pass
+        if "ALPACA_READ_TIMEOUT" in os.environ:
+            try:
+                self.ALPACA_READ_TIMEOUT_SECONDS = float(os.environ["ALPACA_READ_TIMEOUT"])
+            except ValueError:
+                pass
 
     def __getattr__(self, name: str):
         import sys

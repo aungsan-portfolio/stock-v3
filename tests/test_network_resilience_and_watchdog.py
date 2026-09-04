@@ -224,3 +224,103 @@ def test_incident_reproduction_shared_client_hang_watchdog_flattens():
     assert cycle["recheck_passed"] is True
     # 4. The hung main bridge was NEVER called by the watchdog (zero failure propagation)
     assert hung_bridge._client.get_all_positions.call_count == 0
+
+
+# ── Test 8: Transient Network Error Retries and Succeeds on Attempt #3 ──
+def test_connect_retries_transient_network_error_and_succeeds(monkeypatch):
+    bridge = AlpacaBridge()
+    monkeypatch.setenv("APCA_API_KEY_ID", "PKTEST1234567890")
+    monkeypatch.setenv("APCA_API_SECRET_KEY", "SKTEST1234567890")
+    monkeypatch.setenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+    monkeypatch.setenv("ALPACA_CONNECT_MAX_ATTEMPTS", "3")
+
+    mock_client = MagicMock()
+    mock_acct = MagicMock()
+    mock_acct.status = "ACTIVE"
+    mock_acct.account_blocked = False
+    mock_acct.trading_blocked = False
+    mock_acct.equity = "100000.00"
+    mock_acct.account_number = "PA_TEST_123"
+
+    # Fails twice with ConnectionError, succeeds on 3rd try
+    mock_client.get_account.side_effect = [
+        requests.exceptions.ConnectionError("Handshake timed out (attempt 1)"),
+        requests.exceptions.ConnectionError("Handshake timed out (attempt 2)"),
+        mock_acct,
+    ]
+
+    with patch("alpaca_bridge.TradingClient", return_value=mock_client), \
+         patch("alpaca_bridge.StockHistoricalDataClient", return_value=MagicMock()), \
+         patch.object(bridge, "_start_trade_stream", return_value=None), \
+         patch("time.sleep", return_value=None):
+        result = bridge.connect()
+
+    assert result is True
+    assert mock_client.get_account.call_count == 3
+    assert bridge._connected is True
+
+
+# ── Test 9: Fatal 401/403 Fails Immediately Without Retrying ──
+def test_connect_fails_immediately_on_fatal_auth_401(monkeypatch):
+    bridge = AlpacaBridge()
+    monkeypatch.setenv("APCA_API_KEY_ID", "PKINVALID")
+    monkeypatch.setenv("APCA_API_SECRET_KEY", "SKINVALID")
+    monkeypatch.setenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+    monkeypatch.setenv("ALPACA_CONNECT_MAX_ATTEMPTS", "3")
+
+    mock_client = MagicMock()
+    # Simulate HTTP 401 Unauthorized
+    resp_401 = requests.Response()
+    resp_401.status_code = 401
+    mock_client.get_account.side_effect = requests.exceptions.HTTPError("401 Client Error: Unauthorized for url", response=resp_401)
+
+    with patch("alpaca_bridge.TradingClient", return_value=mock_client), \
+         patch("alpaca_bridge.StockHistoricalDataClient", return_value=MagicMock()), \
+         patch("time.sleep", return_value=None):
+        result = bridge.connect()
+
+    # Must fail immediately on attempt 1 without wasteful retries
+    assert result is False
+    assert mock_client.get_account.call_count == 1
+    assert "FATAL_AUTH_OR_CONFIG_ERROR" in bridge._conn_health.last_error
+
+
+# ── Test 10: Circuit Breaker Triggers After Max Attempts ──
+def test_connect_circuit_breaker_triggers_after_max_attempts(monkeypatch, caplog):
+    bridge = AlpacaBridge()
+    monkeypatch.setenv("APCA_API_KEY_ID", "PKTEST1234567890")
+    monkeypatch.setenv("APCA_API_SECRET_KEY", "SKTEST1234567890")
+    monkeypatch.setenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+    monkeypatch.setenv("ALPACA_CONNECT_MAX_ATTEMPTS", "3")
+
+    mock_client = MagicMock()
+    mock_client.get_account.side_effect = requests.exceptions.ReadTimeout("Read timed out after 30s")
+
+    with patch("alpaca_bridge.TradingClient", return_value=mock_client), \
+         patch("alpaca_bridge.StockHistoricalDataClient", return_value=MagicMock()), \
+         patch("time.sleep", return_value=None), \
+         caplog.at_level("CRITICAL"):
+        result = bridge.connect()
+
+    assert result is False
+    assert mock_client.get_account.call_count == 3
+    assert "BROKER_UNAVAILABLE" in bridge._conn_health.last_error
+    # Verify critical circuit breaker log
+    assert any("[CIRCUIT BREAKER]" in record.message for record in caplog.records)
+
+
+# ── Test 11: Timeout Defaults and Config Customizability ──
+def test_timeout_defaults_and_env_customizability(monkeypatch):
+    # Default without env overrides
+    adapter_default = TimeoutHTTPAdapter()
+    assert adapter_default.connect_timeout == 15.0
+    assert adapter_default.read_timeout == 30.0
+
+    # Custom env overrides
+    monkeypatch.setenv("ALPACA_CONNECT_TIMEOUT", "25.0")
+    monkeypatch.setenv("ALPACA_READ_TIMEOUT", "45.0")
+
+    from config import Settings
+    s = Settings()
+    assert s.ALPACA_CONNECT_TIMEOUT_SECONDS == 25.0
+    assert s.ALPACA_READ_TIMEOUT_SECONDS == 45.0

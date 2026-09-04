@@ -112,11 +112,13 @@ class EODFlattenWatchdog:
                 return None
 
             client = TradingClient(key, secret, paper=True)
-            # Mount isolated TimeoutHTTPAdapter (connect=3.0s, read=5.0s, retries=2)
+            # Mount isolated TimeoutHTTPAdapter with bounded timeouts for emergency responsiveness
+            watchdog_connect = float(os.environ.get("ALPACA_WATCHDOG_CONNECT_TIMEOUT", 8.0))
+            watchdog_read = float(os.environ.get("ALPACA_WATCHDOG_READ_TIMEOUT", 10.0))
             configure_session_timeouts(
                 getattr(client, "_session", None),
-                connect_timeout=3.0,
-                read_timeout=5.0,
+                connect_timeout=watchdog_connect,
+                read_timeout=watchdog_read,
                 total_retries=2,
                 backoff_factor=0.3,
             )

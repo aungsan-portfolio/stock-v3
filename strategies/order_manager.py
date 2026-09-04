@@ -1032,6 +1032,40 @@ def execute_signal(
                     logger.info("Blocked %s: %s", signal.symbol, result["reason"])
                     return result
 
+                # Sprint P1.7: Macro Regime & SOXX Semiconductor Gate on VWAP_BOUNCE Longs
+                if getattr(config, "VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED", True):
+                    sig_strat = getattr(signal, "strategy", "")
+                    strat_name = sig_strat.value if hasattr(sig_strat, "value") else str(sig_strat)
+                    if strat_name.upper() == "VWAP_BOUNCE":
+                        regime_mode = getattr(regime_result, "mode", "UNKNOWN")
+                        blocked_regimes = getattr(config, "VWAP_BOUNCE_BLOCKED_REGIMES", ("CAUTION", "RISK_OFF", "DATA_DEGRADED"))
+                        if regime_mode in blocked_regimes:
+                            soxx_pct = None
+                            soxx_data = getattr(regime_result, "data", {}).get("SOXX", {}) if hasattr(regime_result, "data") else {}
+                            if isinstance(soxx_data, dict) and "pct" in soxx_data:
+                                soxx_pct = soxx_data.get("pct")
+                            if soxx_pct is None:
+                                from strategies.regime_engine import get_soxx_pct_change
+                                soxx_pct = get_soxx_pct_change()
+
+                            threshold = getattr(config, "VWAP_BOUNCE_SOXX_VETO_THRESHOLD", -1.50)
+                            if soxx_pct is None:
+                                logger.warning(
+                                    "[REGIME/SOXX GATE] SOXX data unavailable. Allowing %s VWAP_BOUNCE entry (fail-open).",
+                                    signal.symbol,
+                                )
+                            elif soxx_pct <= threshold:
+                                reason = (
+                                    f"Regime/SOXX Gate VETO: VWAP_BOUNCE Long blocked for {signal.symbol} during {regime_mode} "
+                                    f"with SOXX {soxx_pct:.2f}% (<= {threshold:.2f}%)"
+                                )
+                                logger.warning(
+                                    "[REGIME/SOXX VETO] symbol=%s strategy=%s regime=%s soxx=%.2f threshold=%.2f",
+                                    signal.symbol, strat_name, regime_mode, soxx_pct, threshold,
+                                )
+                                result["reason"] = reason
+                                return result
+
         if hasattr(regime_result, "max_trades_day") and regime_result.max_trades_day is not None:
             is_inverse = signal.symbol.upper().strip() in getattr(config, "INVERSE_ETF_SYMBOLS", set())
             inverse_exempt = is_inverse and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)

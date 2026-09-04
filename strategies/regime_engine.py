@@ -33,6 +33,15 @@ TEXTURE_SIDEWAYS = "SIDEWAYS"
 TEXTURE_VOLATILE = "VOLATILE"
 TEXTURE_TRANSITIONING = "TRANSITIONING"
 
+_last_soxx_lock = threading.Lock()
+_last_soxx_pct: Optional[float] = None
+
+
+def get_soxx_pct_change() -> Optional[float]:
+    """Return the latest cached percentage change for SOXX semiconductor ETF."""
+    with _last_soxx_lock:
+        return _last_soxx_pct
+
 
 def detect_market_texture(adx: float = 20.0, bb_width: float = 0.02, atr_ratio: float = 1.0, price_change_5m: float = 0.0) -> str:
     """
@@ -268,6 +277,9 @@ def evaluate_market_regime(
 
     # 2. Chip Sector Shock Check (SOXX) — Optional sector indicator (no penalty when missing, symmetric scoring)
     soxx_pct, soxx_source, _ = _get_premarket_pct_change("SOXX", bridge)
+    global _last_soxx_pct
+    with _last_soxx_lock:
+        _last_soxx_pct = soxx_pct
     data["SOXX"] = {"pct": soxx_pct, "source": soxx_source}
     if soxx_pct is not None:
         if soxx_pct < -3.00:

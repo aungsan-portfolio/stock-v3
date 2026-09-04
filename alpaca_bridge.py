@@ -43,13 +43,16 @@ from position_rotator import PositionRotator, OpenPosition, IncomingSignal
 logger = logging.getLogger(__name__)
 
 
+import requests
+import urllib3
+
 class TimeoutHTTPAdapter(HTTPAdapter):
     """HTTP adapter enforcing hard connect and read timeouts and exponential backoff retries."""
 
     def __init__(
         self,
-        connect_timeout: float = 5.0,
-        read_timeout: float = 10.0,
+        connect_timeout: float = 15.0,
+        read_timeout: float = 30.0,
         max_retries: Optional[Retry] = None,
         **kwargs,
     ):
@@ -72,8 +75,8 @@ class TimeoutHTTPAdapter(HTTPAdapter):
 
 def configure_session_timeouts(
     session,
-    connect_timeout: float = 5.0,
-    read_timeout: float = 10.0,
+    connect_timeout: float = 15.0,
+    read_timeout: float = 30.0,
     total_retries: int = 3,
     backoff_factor: float = 0.5,
 ) -> None:
@@ -313,12 +316,18 @@ class MockIB:
 class ConnectionHealth:
     def __init__(self):
         self.is_healthy = True
+        self.reason = ""
+        self.last_error = ""
 
     def mark_healthy(self, reason=None):
         self.is_healthy = True
+        self.reason = str(reason or "")
+        self.last_error = ""
 
     def mark_unhealthy(self, reason=None):
         self.is_healthy = False
+        self.reason = str(reason or "")
+        self.last_error = str(reason or "")
 
 
 class EntryGateMock:
@@ -525,16 +534,117 @@ class AlpacaBridge:
             self._conn_health.mark_unhealthy("Non-paper base URL detected")
             raise RuntimeError("Live trading is disabled. Endpoint must be https://paper-api.alpaca.markets")
 
+        connect_timeout = float(
+            os.environ.get(
+                "ALPACA_CONNECT_TIMEOUT",
+                getattr(config_module, "ALPACA_CONNECT_TIMEOUT_SECONDS", 15.0),
+            )
+        )
+        read_timeout = float(
+            os.environ.get(
+                "ALPACA_READ_TIMEOUT",
+                getattr(config_module, "ALPACA_READ_TIMEOUT_SECONDS", 30.0),
+            )
+        )
+        total_retries = int(
+            os.environ.get(
+                "ALPACA_TOTAL_RETRIES",
+                getattr(config_module, "ALPACA_TOTAL_RETRIES", 3),
+            )
+        )
+        backoff_factor = float(
+            os.environ.get(
+                "ALPACA_RETRY_BACKOFF_FACTOR",
+                getattr(config_module, "ALPACA_RETRY_BACKOFF_FACTOR", 0.5),
+            )
+        )
+        max_connect_attempts = int(
+            os.environ.get(
+                "ALPACA_CONNECT_MAX_ATTEMPTS",
+                getattr(config_module, "ALPACA_CONNECT_MAX_ATTEMPTS", 3),
+            )
+        )
+
         try:
             self._client = TradingClient(key, secret, paper=True)
             self._data_client = StockHistoricalDataClient(key, secret)
 
-            # Hardened Network Timeout & Retry Layer (connect=5.0s, read=10.0s, retries=3)
-            configure_session_timeouts(getattr(self._client, "_session", None), connect_timeout=5.0, read_timeout=10.0)
-            configure_session_timeouts(getattr(self._data_client, "_session", None), connect_timeout=5.0, read_timeout=10.0)
+            # Hardened Network Timeout & Retry Layer
+            configure_session_timeouts(
+                getattr(self._client, "_session", None),
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+                total_retries=total_retries,
+                backoff_factor=backoff_factor,
+            )
+            configure_session_timeouts(
+                getattr(self._data_client, "_session", None),
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+                total_retries=total_retries,
+                backoff_factor=backoff_factor,
+            )
+
+            # Retryable network exceptions only (transient connectivity / socket timeouts)
+            retryable_net_exceptions = (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectTimeout,
+                requests.exceptions.Timeout,
+                urllib3.exceptions.HTTPError,
+                TimeoutError,
+            )
+
+            acct = None
+            for attempt in range(1, max_connect_attempts + 1):
+                try:
+                    acct = self._client.get_account()
+                    break
+                except Exception as exc:
+                    # Check for fatal non-retryable auth/authorization errors (401, 403)
+                    status_code = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+                    err_msg = str(exc).lower()
+                    is_fatal_auth = status_code in (401, 403) or "401" in err_msg or "403" in err_msg or "unauthorized" in err_msg or "forbidden" in err_msg
+
+                    if is_fatal_auth or not isinstance(exc, retryable_net_exceptions):
+                        logger.error("[ALPACA BRIDGE] Fatal non-retryable error during connection: %s", exc)
+                        self._conn_health.mark_unhealthy(f"FATAL_AUTH_OR_CONFIG_ERROR: {exc}")
+                        self._connected = False
+                        self._stop_trade_stream()
+                        self._client = None
+                        self._data_client = None
+                        return False
+
+                    # Transient network error: retry if attempts remaining
+                    if attempt < max_connect_attempts:
+                        delay = 2.0 * attempt
+                        logger.warning(
+                            "[ALPACA BRIDGE] Initial connection attempt %d/%d encountered transient network error (%s). Retrying in %.1fs...",
+                            attempt,
+                            max_connect_attempts,
+                            exc,
+                            delay,
+                        )
+                        time.sleep(delay)
+                    else:
+                        # Circuit breaker trigger when all attempts exhausted
+                        logger.critical(
+                            "[CIRCUIT BREAKER] Alpaca broker unavailable after %d connection attempts: %s",
+                            max_connect_attempts,
+                            exc,
+                        )
+                        self._conn_health.mark_unhealthy(f"BROKER_UNAVAILABLE: {exc}")
+                        self._connected = False
+                        self._stop_trade_stream()
+                        self._client = None
+                        self._data_client = None
+                        return False
+
+            if acct is None:
+                self._conn_health.mark_unhealthy("BROKER_UNAVAILABLE: No account returned")
+                return False
 
             # Validate account status
-            acct = self._client.get_account()
             if getattr(acct, "status", None) != "ACTIVE" or getattr(acct, "account_blocked", False) or getattr(acct, "trading_blocked", False):
                 logger.error("Alpaca account is not active or is blocked. Status: %s", getattr(acct, "status", "UNKNOWN"))
                 self._conn_health.mark_unhealthy("Account blocked")

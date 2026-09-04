@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, time
 import logging
 from pathlib import Path
+import threading
 from types import MappingProxyType
 from typing import Dict, Optional, Tuple
 import numpy as np
@@ -118,61 +119,71 @@ class ConfirmedORBStrategy:
         self.min_premarket_vol_ratio = float(getattr(config, "ORB_MIN_PREMARKET_VOLUME_RATIO", 2.0))
         self.max_atr_extension = float(getattr(config, "ORB_MAX_ATR_EXTENSION", 1.25))
         self.min_stop_atr_multiple = float(getattr(config, "ORB_MIN_STOP_ATR_MULTIPLE", 0.50))
+        self._stats_lock = threading.Lock()
         self._cycle_stats = ORBCycleStats()
 
     def reset_cycle_stats(self) -> None:
-        self._cycle_stats = ORBCycleStats()
+        with self._stats_lock:
+            self._cycle_stats = ORBCycleStats()
 
     def get_cycle_stats(self) -> ORBCycleStats:
-        return self._cycle_stats
+        with self._stats_lock:
+            return self._cycle_stats
 
     def log_cycle_summary(self) -> None:
         """Logs aggregate rejection counters for completed evaluation cycle."""
-        stats = self._cycle_stats
-        if stats.evaluated == 0:
-            return
-        logger.info(
-            "[ORB SHADOW SUMMARY] evaluated=%d candidates=%d outside_window=%d incomplete_range=%d "
-            "no_breakout=%d below_vwap=%d negative_vwap_slope=%d low_breakout_vol=%d rvol_low=%d "
-            "stock_in_play_failed=%d market_unaligned=%d sector_unavailable=%d overextended=%d spread_failed=%d",
-            stats.evaluated,
-            stats.candidates,
-            stats.outside_window,
-            stats.incomplete_range,
-            stats.no_breakout,
-            stats.below_vwap,
-            stats.negative_vwap_slope,
-            stats.low_breakout_vol,
-            stats.rvol_low,
-            stats.stock_in_play_failed,
-            stats.market_unaligned,
-            stats.sector_unavailable,
-            stats.overextended,
-            stats.spread_failed,
-        )
-        accounted = (
-            stats.candidates
-            + stats.outside_window
-            + stats.incomplete_range
-            + stats.no_breakout
-            + stats.below_vwap
-            + stats.negative_vwap_slope
-            + stats.low_breakout_vol
-            + stats.rvol_low
-            + stats.stock_in_play_failed
-            + stats.market_unaligned
-            + stats.sector_unavailable
-            + stats.overextended
-            + stats.spread_failed
-            + stats.zero_risk
-        )
-        if accounted != stats.evaluated:
-            logger.error(
-                "[ORB SHADOW FUNNEL MISMATCH] evaluated=%d accounted=%d",
+        with self._stats_lock:
+            stats = self._cycle_stats
+            if stats.evaluated == 0:
+                return
+            logger.info(
+                "[ORB SHADOW SUMMARY] evaluated=%d candidates=%d outside_window=%d incomplete_range=%d "
+                "no_breakout=%d below_vwap=%d negative_vwap_slope=%d low_breakout_vol=%d rvol_low=%d "
+                "stock_in_play_failed=%d market_unaligned=%d sector_unavailable=%d overextended=%d spread_failed=%d",
                 stats.evaluated,
-                accounted,
+                stats.candidates,
+                stats.outside_window,
+                stats.incomplete_range,
+                stats.no_breakout,
+                stats.below_vwap,
+                stats.negative_vwap_slope,
+                stats.low_breakout_vol,
+                stats.rvol_low,
+                stats.stock_in_play_failed,
+                stats.market_unaligned,
+                stats.sector_unavailable,
+                stats.overextended,
+                stats.spread_failed,
             )
-        self._cycle_stats = ORBCycleStats()
+            accounted = (
+                stats.candidates
+                + stats.outside_window
+                + stats.incomplete_range
+                + stats.no_breakout
+                + stats.below_vwap
+                + stats.negative_vwap_slope
+                + stats.low_breakout_vol
+                + stats.rvol_low
+                + stats.stock_in_play_failed
+                + stats.market_unaligned
+                + stats.sector_unavailable
+                + stats.overextended
+                + stats.spread_failed
+                + stats.zero_risk
+            )
+            if accounted != stats.evaluated:
+                logger.error(
+                    "[ORB SHADOW FUNNEL MISMATCH] evaluated=%d accounted=%d",
+                    stats.evaluated,
+                    accounted,
+                )
+            else:
+                logger.debug(
+                    "[ORB FUNNEL PASS] evaluated=%d accounted=%d",
+                    stats.evaluated,
+                    accounted,
+                )
+            self._cycle_stats = ORBCycleStats()
 
     def evaluate_candidate(
         self,
@@ -189,9 +200,12 @@ class ConfirmedORBStrategy:
         if not self.allow_long:
             return None
 
-        self._cycle_stats.evaluated += 1
+        with self._stats_lock:
+            self._cycle_stats.evaluated += 1
 
-        if df is None or df.empty or len(df) < self.range_minutes + 10:
+        if df is None or df.empty:
+            with self._stats_lock:
+                self._cycle_stats.incomplete_range += 1
             return None
 
         # Convert index to America/New_York
@@ -201,6 +215,19 @@ class ConfirmedORBStrategy:
         else:
             idx_et = idx.tz_convert("America/New_York")
 
+        # Detect resolution: 5m vs 1m bars
+        is_5m = False
+        if len(idx_et) >= 2:
+            step_sec = (idx_et[1] - idx_et[0]).total_seconds()
+            if step_sec >= 240:
+                is_5m = True
+
+        min_bars = 4 if is_5m else (self.range_minutes + 10)
+        if len(df) < min_bars:
+            with self._stats_lock:
+                self._cycle_stats.incomplete_range += 1
+            return None
+
         session_date_et = str(idx_et[-1].date())
         current_time_et = idx_et[-1].time()
 
@@ -208,13 +235,15 @@ class ConfirmedORBStrategy:
         earliest_time = datetime.strptime(self.earliest_entry_str, "%H:%M").time()
         latest_time = datetime.strptime(self.latest_entry_str, "%H:%M").time()
         if not (earliest_time <= current_time_et < latest_time):
-            self._cycle_stats.outside_window += 1
+            with self._stats_lock:
+                self._cycle_stats.outside_window += 1
             return None
 
-        # ── Opening Range Construction (Strict 15/15 Completed 1m Bars) ──
+        # ── Opening Range Construction (Strict 15m Range from 09:30 to 09:45 ET) ──
         orb_range_res = self._compute_opening_range(df, idx_et, session_date_et)
         if orb_range_res is None:
-            self._cycle_stats.incomplete_range += 1
+            with self._stats_lock:
+                self._cycle_stats.incomplete_range += 1
             return None
         orb_high, orb_low, orb_range = orb_range_res
 
@@ -230,23 +259,28 @@ class ConfirmedORBStrategy:
         ema20 = float(last_bar.get("ema20", 0.0) or 0.0)
 
         if close <= 0 or vwap <= 0 or atr <= 0:
+            with self._stats_lock:
+                self._cycle_stats.zero_risk += 1
             return None
 
         # Condition 1: Completed candle closes above 15m ORB high
         if close <= orb_high:
-            self._cycle_stats.no_breakout += 1
+            with self._stats_lock:
+                self._cycle_stats.no_breakout += 1
             return None
 
         # Condition 2: Price above VWAP
         if close <= vwap:
-            self._cycle_stats.below_vwap += 1
+            with self._stats_lock:
+                self._cycle_stats.below_vwap += 1
             return None
 
         # Condition 3: VWAP slope is positive (over prior 3 bars)
         if len(df) >= 4:
             prior_vwap = float(df["vwap"].iloc[-4])
             if vwap <= prior_vwap:
-                self._cycle_stats.negative_vwap_slope += 1
+                with self._stats_lock:
+                    self._cycle_stats.negative_vwap_slope += 1
                 return None
         vwap_slope = (vwap - float(df["vwap"].iloc[-4])) if len(df) >= 4 else 0.0
 
@@ -255,14 +289,16 @@ class ConfirmedORBStrategy:
         avg_vol_20 = float(vol_window.mean()) if len(vol_window) >= 10 else 0.0
         breakout_vol_ratio = (volume / avg_vol_20) if avg_vol_20 > 0 else 0.0
         if breakout_vol_ratio < self.min_breakout_vol_ratio:
-            self._cycle_stats.low_breakout_vol += 1
+            with self._stats_lock:
+                self._cycle_stats.low_breakout_vol += 1
             return None
 
         # Condition 5 & 11: Stock in Play & Relative Volume (RVOL >= 2.0)
         meta = resolve_candidate_metadata(symbol, df, candidate_meta)
         rvol = float(meta.get("relative_volume", 0.0) or last_bar.get("relative_volume", 0.0) or breakout_vol_ratio)
         if rvol < self.min_rvol:
-            self._cycle_stats.rvol_low += 1
+            with self._stats_lock:
+                self._cycle_stats.rvol_low += 1
             return None
 
         catalyst = meta.get("catalyst_type") or meta.get("catalyst")
@@ -276,7 +312,8 @@ class ConfirmedORBStrategy:
             or (pre_vol_ratio >= self.min_premarket_vol_ratio)
         )
         if not is_stock_in_play:
-            self._cycle_stats.stock_in_play_failed += 1
+            with self._stats_lock:
+                self._cycle_stats.stock_in_play_failed += 1
             logger.debug(
                 "[ORB SHADOW FILTER] symbol=%s rvol=%.2f gap_pct=%.2f premarket_volume_ratio=%.2f catalyst=%s accepted=false reason=STOCK_IN_PLAY_FAILED",
                 symbol, rvol, gap_pct, pre_vol_ratio, catalyst or "NONE"
@@ -286,24 +323,29 @@ class ConfirmedORBStrategy:
         # Condition 6 & 7: Market & Sector Benchmark Alignment
         spy_status, qqq_status, sector_status = self._check_market_alignment(market_data, symbol)
         if spy_status != AlignmentStatus.ALIGNED or qqq_status != AlignmentStatus.ALIGNED:
-            self._cycle_stats.market_unaligned += 1
+            with self._stats_lock:
+                self._cycle_stats.market_unaligned += 1
             return None
         if sector_status in (AlignmentStatus.OPPOSED, AlignmentStatus.STALE, AlignmentStatus.UNAVAILABLE):
-            self._cycle_stats.sector_unavailable += 1
+            with self._stats_lock:
+                self._cycle_stats.sector_unavailable += 1
             return None
 
         # Condition 8: Overextension Guard (Close <= EMA9 + 1.25*ATR and <= ORB_high + 1.25*ATR)
         if ema9 > 0 and (close > ema9 + (self.max_atr_extension * atr)):
-            self._cycle_stats.overextended += 1
+            with self._stats_lock:
+                self._cycle_stats.overextended += 1
             return None
         if close > orb_high + (self.max_atr_extension * atr):
-            self._cycle_stats.overextended += 1
+            with self._stats_lock:
+                self._cycle_stats.overextended += 1
             return None
 
         # Condition 9: Spread Check Passes Execution Gate (<= 0.15%)
         spread_pct = float(last_bar.get("spread_pct", 0.0) or meta.get("spread_pct", 0.0005))
         if spread_pct > 0.0015:  # 0.15% max spread
-            self._cycle_stats.spread_failed += 1
+            with self._stats_lock:
+                self._cycle_stats.spread_failed += 1
             return None
 
         # Condition 10: Stop Geometry with Noise Floor & Fixed 2R Target
@@ -323,7 +365,8 @@ class ConfirmedORBStrategy:
 
         risk = round(close - stop_price, 4)
         if risk <= 0:
-            self._cycle_stats.zero_risk += 1
+            with self._stats_lock:
+                self._cycle_stats.zero_risk += 1
             return None
 
         target_price = round(close + (self.target_r_multiple * risk), 4)
@@ -344,7 +387,8 @@ class ConfirmedORBStrategy:
             session_date_et=session_date_et,
         )
 
-        self._cycle_stats.candidates += 1
+        with self._stats_lock:
+            self._cycle_stats.candidates += 1
         logger.debug(
             "[ORB SHADOW FILTER] symbol=%s rvol=%.2f gap_pct=%.2f premarket_volume_ratio=%.2f catalyst=%s accepted=true reason=ACCEPTED",
             symbol, rvol, gap_pct, pre_vol_ratio, catalyst or "NONE"
@@ -408,11 +452,19 @@ class ConfirmedORBStrategy:
         range_mask = (day_idx_et.time >= time(9, 30)) & (day_idx_et.time < time(9, 45))
         range_bars = day_df.loc[range_mask]
 
-        if len(range_bars) != self.range_minutes:
+        is_5m = False
+        if len(day_idx_et) >= 2:
+            step_sec = (day_idx_et[1] - day_idx_et[0]).total_seconds()
+            if step_sec >= 240:
+                is_5m = True
+
+        expected_bars = (self.range_minutes // 5) if is_5m else self.range_minutes
+        if len(range_bars) < expected_bars:
             return None
 
-        orb_h = float(range_bars["high"].max())
-        orb_l = float(range_bars["low"].min())
+        bars_to_use = range_bars.iloc[:expected_bars]
+        orb_h = float(bars_to_use["high"].max())
+        orb_l = float(bars_to_use["low"].min())
         orb_range = orb_h - orb_l
         if orb_h <= 0 or orb_l <= 0 or orb_range <= 0:
             return None

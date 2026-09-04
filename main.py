@@ -381,6 +381,7 @@ def cmd_paper(args) -> int:
     print(f"{'='*65}\n")
 
     import threading
+    import time
     from strategies.session import is_market_open, now_eastern
 
     bridge = None
@@ -390,7 +391,18 @@ def cmd_paper(args) -> int:
         print(f"\n{'='*60}")
         print("  SWING TRADING ENGINE (ALPACA SWING SUB-ACCOUNT)")
         print(f"{'='*60}\n")
-        if not bridge.connect():
+
+        connected = False
+        max_loop_connect_attempts = 3 if loop_mode else 1
+        for conn_attempt in range(1, max_loop_connect_attempts + 1):
+            if bridge.connect():
+                connected = True
+                break
+            if conn_attempt < max_loop_connect_attempts:
+                print(f"⚠️  Broker connection attempt {conn_attempt}/{max_loop_connect_attempts} failed. Retrying in 5s...")
+                time.sleep(5)
+
+        if not connected:
             print("❌ Could not connect to Alpaca Paper Broker.")
             return 1
         try:
