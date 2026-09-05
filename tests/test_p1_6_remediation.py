@@ -849,3 +849,153 @@ def test_stale_transition_save_failure_remains_blocked(tmp_path):
     # Must remain blocked
     reserved_next, _ = store.reserve("NVDA", side="BUY")
     assert reserved_next is False
+
+
+def test_full_strategy_name_participates_in_digest():
+    """Invariant I-4: Strategies with same 4-letter prefix must produce distinct client_order_ids via full strategy name."""
+    from strategies.order_idempotency import build_client_order_id
+
+    id_bounce = build_client_order_id(
+        symbol="SPY",
+        side="BUY",
+        session_date="20260905",
+        strategy="VWAP_BOUNCE",
+        bar_timestamp_utc="2026-09-05T14:30:00Z",
+    )
+    id_breakout = build_client_order_id(
+        symbol="SPY",
+        side="BUY",
+        session_date="20260905",
+        strategy="VWAP_BREAKOUT",
+        bar_timestamp_utc="2026-09-05T14:30:00Z",
+    )
+    # Both start with se3-SPY-B-vwap-20260905-
+    assert id_bounce.startswith("se3-SPY-B-vwap-20260905-")
+    assert id_breakout.startswith("se3-SPY-B-vwap-20260905-")
+    # But because full strategy participated in digest, the digests must NOT collide
+    assert id_bounce != id_breakout, f"VWAP_BOUNCE and VWAP_BREAKOUT must not collide: {id_bounce} == {id_breakout}"
+
+
+def test_invalid_side_is_rejected():
+    """Exact Identity Invariant: Side must strictly be 'BUY' or 'SELL', any invalid side raises ValueError."""
+    import pytest
+    from strategies.order_idempotency import build_client_order_id
+
+    with pytest.raises(ValueError, match="Invalid order side"):
+        build_client_order_id("AAPL", "HOLD")
+
+    with pytest.raises(ValueError, match="Side must be a non-empty string"):
+        build_client_order_id("AAPL", "")
+
+    with pytest.raises(ValueError, match="Invalid order side"):
+        build_client_order_id("AAPL", "INVALID")
+
+
+def test_empty_symbol_is_rejected():
+    """Exact Identity Invariant: Symbol must be non-empty string with valid characters."""
+    import pytest
+    from strategies.order_idempotency import build_client_order_id
+
+    with pytest.raises(ValueError, match="Symbol must be a non-empty string"):
+        build_client_order_id("", "BUY")
+
+    with pytest.raises(ValueError, match="Symbol must be a non-empty string"):
+        build_client_order_id("   ", "BUY")
+
+    with pytest.raises(ValueError, match="Invalid characters in symbol"):
+        build_client_order_id("AAPL/USD!@#", "BUY")
+
+
+def test_negative_entry_attempt_is_rejected():
+    """Exact Identity Invariant: Attempt counters must be non-negative integers."""
+    import pytest
+    from strategies.order_idempotency import build_client_order_id
+
+    with pytest.raises(ValueError, match="entry_attempt must be >= 0"):
+        build_client_order_id("AAPL", "BUY", attempt=-1)
+
+    with pytest.raises(ValueError, match="entry_attempt must be >= 0"):
+        build_client_order_id("AAPL", "BUY", strategy_entry_attempt=-2)
+
+    with pytest.raises(ValueError, match="submission_retry_attempt must be >= 0"):
+        build_client_order_id("AAPL", "BUY", submission_retry_attempt=-1)
+
+
+def test_client_order_id_respects_broker_constraints():
+    """Broker Constraint Invariant: Generated client_order_id must be <= 128 chars and contain only [A-Za-z0-9_-]."""
+    import re
+    from strategies.order_idempotency import build_client_order_id
+
+    # Normal symbol
+    cid = build_client_order_id("NVDA", "BUY", strategy="MEAN_REVERSION")
+    assert len(cid) <= 128
+    assert re.match(r"^[A-Za-z0-9_-]+$", cid)
+
+    # Symbol with dot (e.g. BRK.B)
+    cid_dot = build_client_order_id("BRK.B", "BUY", strategy="VWAP_BOUNCE")
+    assert len(cid_dot) <= 128
+    assert re.match(r"^[A-Za-z0-9_-]+$", cid_dot)
+    assert "BRK_B" in cid_dot
+
+
+def test_transport_retry_preserves_client_order_id():
+    """Invariant I-3: Transport retry attempts strictly preserve the exact same client_order_id."""
+    from strategies.order_idempotency import build_client_order_id
+
+    base_id = build_client_order_id(
+        symbol="MSFT",
+        side="BUY",
+        session_date="20260905",
+        strategy="VWAP_BOUNCE",
+        bar_timestamp_utc="2026-09-05T14:30:00Z",
+        submission_retry_attempt=0,
+    )
+    retry_1 = build_client_order_id(
+        symbol="MSFT",
+        side="BUY",
+        session_date="20260905",
+        strategy="VWAP_BOUNCE",
+        bar_timestamp_utc="2026-09-05T14:30:00Z",
+        submission_retry_attempt=1,
+    )
+    retry_2 = build_client_order_id(
+        symbol="MSFT",
+        side="BUY",
+        session_date="20260905",
+        strategy="VWAP_BOUNCE",
+        bar_timestamp_utc="2026-09-05T14:30:00Z",
+        submission_retry_attempt=2,
+    )
+    assert base_id == retry_1 == retry_2
+
+
+def test_strategy_reentry_changes_client_order_id():
+    """Invariant I-4: Deliberate strategy re-entry or scale-in increments entry_attempt and changes client_order_id."""
+    from strategies.order_idempotency import build_client_order_id
+
+    entry_0 = build_client_order_id(
+        symbol="MSFT",
+        side="BUY",
+        session_date="20260905",
+        strategy="VWAP_BOUNCE",
+        bar_timestamp_utc="2026-09-05T14:30:00Z",
+        strategy_entry_attempt=0,
+    )
+    entry_1 = build_client_order_id(
+        symbol="MSFT",
+        side="BUY",
+        session_date="20260905",
+        strategy="VWAP_BOUNCE",
+        bar_timestamp_utc="2026-09-05T14:30:00Z",
+        strategy_entry_attempt=1,
+    )
+    assert entry_0 != entry_1
+
+
+def test_intent_nonce_changes_client_order_id():
+    """Exact Identity Invariant: Distinct intent nonces produce distinct client_order_id."""
+    from strategies.order_idempotency import build_client_order_id
+
+    cid_a = build_client_order_id("TSLA", "BUY", intent_nonce="intent-alpha-1")
+    cid_b = build_client_order_id("TSLA", "BUY", intent_nonce="intent-beta-2")
+    assert cid_a != cid_b

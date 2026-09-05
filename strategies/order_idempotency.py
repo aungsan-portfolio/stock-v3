@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -52,10 +53,47 @@ def build_client_order_id(
 
     Outputs: se3-{SYMBOL}-{SIDE[:1]}-{STRAT[:4]}-{SESSION_DATE}-{DIGEST[:16]}
     """
+    if not isinstance(symbol, str) or not symbol.strip():
+        raise ValueError(f"Symbol must be a non-empty string, got {symbol!r}")
     sym = symbol.upper().strip()
+    if not re.match(r"^[A-Za-z0-9_.-]+$", sym):
+        raise ValueError(f"Invalid characters in symbol: {symbol!r}")
+    clean_sym = sym.replace(".", "_")
+
+    if not isinstance(side, str) or not side.strip():
+        raise ValueError(f"Side must be a non-empty string, got {side!r}")
     s_side = side.upper().strip()
-    side_code = s_side[:1] if s_side else "B"
-    strat_code = str(strategy or "ord").replace("StrategyName.", "").replace("_", "").lower()[:4]
+    if s_side not in {"BUY", "SELL"}:
+        raise ValueError(f"Invalid order side: {side!r}. Must be 'BUY' or 'SELL'")
+    side_code = s_side[:1]
+
+    # Normalize strategy: full canonical name participates in hash digest to prevent collision
+    # across strategies sharing the same 4-letter prefix (e.g. VWAP_BOUNCE vs VWAP_BREAKOUT)
+    strategy_str = str(strategy or "ord").replace("StrategyName.", "").strip().lower()
+    strategy_full = re.sub(r"[^a-z0-9_]", "", strategy_str) or "ord"
+    strat_code = strategy_full.replace("_", "")[:4] or "ord"
+
+    if strategy_entry_attempt is not None:
+        try:
+            entry_attempt = int(strategy_entry_attempt)
+        except (ValueError, TypeError):
+            raise ValueError(f"strategy_entry_attempt must be an integer >= 0, got {strategy_entry_attempt!r}")
+    else:
+        try:
+            entry_attempt = int(attempt if attempt is not None else 0)
+        except (ValueError, TypeError):
+            raise ValueError(f"attempt must be an integer >= 0, got {attempt!r}")
+
+    if entry_attempt < 0:
+        raise ValueError(f"entry_attempt must be >= 0, got {entry_attempt}")
+
+    try:
+        retry_attempt = int(submission_retry_attempt if submission_retry_attempt is not None else 0)
+    except (ValueError, TypeError):
+        raise ValueError(f"submission_retry_attempt must be an integer >= 0, got {submission_retry_attempt!r}")
+
+    if retry_attempt < 0:
+        raise ValueError(f"submission_retry_attempt must be >= 0, got {retry_attempt}")
 
     now_utc = datetime.now(timezone.utc)
     s_date = str(session_date or "").strip()
@@ -74,19 +112,21 @@ def build_client_order_id(
 
     sig_hash = str(signal_hash or "").strip()
     nonce = str(intent_nonce or "").strip()
-    # Parameter semantics:
-    # - strategy_entry_attempt (preferred) or legacy `attempt` represents strategy-level entry sequence/re-entry/scale-in.
-    # - submission_retry_attempt represents transport/HTTP-level retry and is NEVER included in the digest.
-    if strategy_entry_attempt is not None:
-        entry_attempt = int(strategy_entry_attempt)
-    else:
-        # Legacy fallback: 'attempt' is treated strictly as strategy-level entry attempt (default 0)
-        entry_attempt = int(attempt or 0)
 
-    # submission_retry_attempt is intentionally omitted from raw so transport retries do not alter order identity
-    raw = f"{sym}|{s_side}|{strat_code}|{s_date}|{bar_ts}|{sig_hash}|{nonce}|{entry_attempt}"
+    # Parameter semantics:
+    # - strategy_full participates in raw digest to guarantee unique keys across distinct strategies
+    # - strategy_entry_attempt represents strategy-level entry sequence/re-entry/scale-in and alters client_order_id
+    # - submission_retry_attempt represents transport/HTTP retry and is NEVER included in the digest
+    raw = f"{clean_sym}|{s_side}|{strategy_full}|{s_date}|{bar_ts}|{sig_hash}|{nonce}|{entry_attempt}"
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-    return f"se3-{sym}-{side_code}-{strat_code}-{s_date}-{digest}"
+    client_order_id = f"se3-{clean_sym}-{side_code}-{strat_code}-{s_date}-{digest}"
+
+    if len(client_order_id) > 128:
+        raise ValueError(f"client_order_id exceeds Alpaca limit (128 chars): {len(client_order_id)} chars ({client_order_id})")
+    if not re.match(r"^[A-Za-z0-9_-]+$", client_order_id):
+        raise ValueError(f"client_order_id contains invalid broker characters: {client_order_id}")
+
+    return client_order_id
 
 
 @dataclass
