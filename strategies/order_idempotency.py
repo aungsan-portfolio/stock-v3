@@ -23,6 +23,11 @@ from datetime import datetime, timezone
 logger = logging.getLogger(__name__)
 
 IDEMPOTENCY_FILE = DATA_DIR / "order_idempotency_state.json"
+
+STATUS_PENDING = "PENDING"
+STATUS_ACKNOWLEDGED = "ACKNOWLEDGED"
+STATUS_RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
+
 TERMINAL_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired", "done_for_day"}
 
 
@@ -91,16 +96,18 @@ class OrderReservation:
     side: str
     parent_order_id: Optional[str] = None
     created_at: float = field(default_factory=time.time)
-    status: str = "PENDING"  # PENDING, ACKNOWLEDGED, TERMINAL
+    status: str = STATUS_PENDING
 
 
 class EntryIdempotencyStore:
-    """Thread-safe persistent order idempotency reservation store."""
+    """Thread-safe persistent order idempotency reservation store enforcing fail-closed invariants."""
 
     def __init__(self, storage_path: Path = IDEMPOTENCY_FILE):
         self.storage_path = Path(storage_path)
         self._lock = threading.RLock()
         self.reservations: Dict[str, OrderReservation] = {}
+        self.is_healthy: bool = True
+        self.health_reason: str = "OK"
         self._load_state()
 
     def _load_state(self) -> None:
@@ -114,7 +121,9 @@ class EntryIdempotencyStore:
                         self.reservations[key] = OrderReservation(**item)
                 logger.info(f"[IDEMPOTENCY] Loaded {len(self.reservations)} active order reservations")
             except Exception as e:
-                logger.error(f"[IDEMPOTENCY] Failed to load reservation state: {e}")
+                self.is_healthy = False
+                self.health_reason = "LOAD_FAILURE"
+                logger.exception(f"[IDEMPOTENCY] Failed to load reservation state from {self.storage_path}: {e}")
 
     def _save_state(self) -> None:
         with self._lock:
@@ -123,9 +132,15 @@ class EntryIdempotencyStore:
                 temp_path = self.storage_path.with_suffix(".tmp")
                 with open(temp_path, "w", encoding="utf-8") as f:
                     json.dump({k: asdict(v) for k, v in self.reservations.items()}, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
                 os.replace(temp_path, self.storage_path)
-            except Exception as e:
-                logger.error(f"[IDEMPOTENCY] Failed to save reservation state: {e}")
+            except Exception:
+                logger.exception(
+                    "[IDEMPOTENCY] Failed to persist reservation state path=%s",
+                    self.storage_path,
+                )
+                raise
 
     def reserve(
         self,
@@ -156,45 +171,89 @@ class EntryIdempotencyStore:
             key = f"{sym}_{s_side}"
 
         with self._lock:
-            if key in self.reservations:
-                res = self.reservations[key]
-                if res.status != "TERMINAL":
-                    if not res.parent_order_id and (now - res.created_at) > ttl_seconds:
-                        logger.warning(f"[IDEMPOTENCY] Expired stale un-acknowledged reservation for {key}")
-                        del self.reservations[key]
-                        self._save_state()
-                    else:
-                        msg = f"[IDEMPOTENCY] Active reservation blocks {key} (status={res.status}, order={res.parent_order_id})"
-                        logger.info(msg)
-                        return False, msg
+            if not self.is_healthy:
+                return False, "IDEMPOTENCY_STORE_UNHEALTHY"
 
-            self.reservations[key] = OrderReservation(
+            existing = self.reservations.get(key)
+
+            if existing and existing.status == STATUS_ACKNOWLEDGED:
+                return False, "ACTIVE_ACKNOWLEDGED_RESERVATION"
+
+            if existing and existing.status == STATUS_RECONCILIATION_REQUIRED:
+                return False, "RECONCILIATION_REQUIRED"
+
+            if existing and existing.status == STATUS_PENDING:
+                age = now - existing.created_at
+
+                if age <= ttl_seconds:
+                    return False, "ACTIVE_PENDING_RESERVATION"
+
+                old_status = existing.status
+                existing.status = STATUS_RECONCILIATION_REQUIRED
+
+                try:
+                    self._save_state()
+                except Exception:
+                    existing.status = old_status
+                    self.is_healthy = False
+                    self.health_reason = "PERSISTENCE_FAILURE"
+                    return False, "PERSISTENCE_FAILED"
+
+                return False, "RECONCILIATION_REQUIRED"
+
+            new_reservation = OrderReservation(
                 key=key,
                 symbol=sym,
                 side=s_side,
                 created_at=now,
-                status="PENDING",
+                status=STATUS_PENDING,
             )
-            self._save_state()
-            return True, "Reserved"
+
+            previous = self.reservations.get(key)
+            self.reservations[key] = new_reservation
+
+            try:
+                self._save_state()
+            except Exception:
+                if previous is None:
+                    self.reservations.pop(key, None)
+                else:
+                    self.reservations[key] = previous
+
+                self.is_healthy = False
+                self.health_reason = "PERSISTENCE_FAILURE"
+                return False, "PERSISTENCE_FAILED"
+
+            return True, "RESERVED"
 
     def bind_parent(self, reservation_key_or_symbol: str, parent_order_id: str) -> bool:
         """Bind parent order ID once broker acknowledges placement."""
         key = reservation_key_or_symbol.upper().strip()
         with self._lock:
+            target_key = None
             for k, res in self.reservations.items():
                 if k == key or res.symbol == key or res.key == key:
-                    res.parent_order_id = str(parent_order_id)
-                    res.status = "ACKNOWLEDGED"
+                    target_key = k
+                    break
+            if not target_key and key in self.reservations:
+                target_key = key
+
+            if target_key and target_key in self.reservations:
+                res = self.reservations[target_key]
+                old_parent = res.parent_order_id
+                old_status = res.status
+                res.parent_order_id = str(parent_order_id)
+                res.status = STATUS_ACKNOWLEDGED
+                try:
                     self._save_state()
-                    logger.info(f"[IDEMPOTENCY] Bound parent order {parent_order_id} to reservation {k}")
+                    logger.info(f"[IDEMPOTENCY] Bound parent order {parent_order_id} to reservation {target_key}")
                     return True
-            # Fallback if key not formatted with underscore
-            if key in self.reservations:
-                self.reservations[key].parent_order_id = str(parent_order_id)
-                self.reservations[key].status = "ACKNOWLEDGED"
-                self._save_state()
-                return True
+                except Exception:
+                    res.parent_order_id = old_parent
+                    res.status = old_status
+                    self.is_healthy = False
+                    self.health_reason = "PERSISTENCE_FAILURE"
+                    return False
         return False
 
     def attach_parent_order(self, symbol: str, side: str, parent_order_id: str) -> None:
@@ -214,13 +273,22 @@ class EntryIdempotencyStore:
                 k for k, v in self.reservations.items()
                 if v.parent_order_id == str(parent_order_id)
             ]
+            if not keys_to_release:
+                return False
+
+            backup = {k: self.reservations[k] for k in keys_to_release}
             for k in keys_to_release:
                 del self.reservations[k]
                 logger.info(f"[IDEMPOTENCY] Completed reservation {k} for terminal order {parent_order_id} ({terminal_status})")
-            if keys_to_release:
+            try:
                 self._save_state()
                 return True
-        return False
+            except Exception:
+                for k, v in backup.items():
+                    self.reservations[k] = v
+                self.is_healthy = False
+                self.health_reason = "PERSISTENCE_FAILURE"
+                return False
 
     def release(self, symbol: str, side: str = "BUY", reason: str = "") -> bool:
         """Release reservation if order placement was aborted before broker parent ID attachment."""
@@ -228,16 +296,66 @@ class EntryIdempotencyStore:
         s_side = side.upper().strip()
         key = f"{sym}_{s_side}"
         with self._lock:
+            res = self.reservations.get(key)
+            if res is None:
+                return False
+
+            if res.status != STATUS_PENDING or res.parent_order_id is not None:
+                logger.error(
+                    "[IDEMPOTENCY] Unsafe release refused "
+                    "key=%s status=%s parent_order_id=%s reason=%s",
+                    key,
+                    res.status,
+                    res.parent_order_id,
+                    reason,
+                )
+                return False
+
+            del self.reservations[key]
+            try:
+                self._save_state()
+            except Exception:
+                self.reservations[key] = res
+                self.is_healthy = False
+                self.health_reason = "PERSISTENCE_FAILURE"
+                return False
+
+            logger.info(f"[IDEMPOTENCY] Released reservation for {key} (reason: {reason})")
+            return True
+
+    def release_after_reconciliation(self, symbol: str, side: str = "BUY", reason: str = "") -> bool:
+        """Audited administrative release after broker reconciliation confirms order is absent/terminal."""
+        sym = symbol.upper().strip()
+        s_side = side.upper().strip()
+        key = f"{sym}_{s_side}"
+        with self._lock:
             if key in self.reservations:
                 del self.reservations[key]
-                self._save_state()
-                logger.info(f"[IDEMPOTENCY] Released reservation for {key} (reason: {reason})")
-                return True
+                try:
+                    self._save_state()
+                    logger.info(f"[IDEMPOTENCY] Reconciled and released reservation for {key} (reason: {reason})")
+                    return True
+                except Exception:
+                    self.is_healthy = False
+                    self.health_reason = "PERSISTENCE_FAILURE"
+                    return False
         return False
 
     def release_on_terminal(self, parent_order_id: str, status: str) -> None:
         """Alias for complete for entry_lifecycle compatibility."""
         self.complete(parent_order_id, status)
+
+    def clear(self) -> None:
+        """Reset in-memory and persisted reservation store (for tests and administrative maintenance)."""
+        with self._lock:
+            self.reservations.clear()
+            self.is_healthy = True
+            self.health_reason = "OK"
+            try:
+                self._save_state()
+            except Exception:
+                self.is_healthy = False
+                self.health_reason = "PERSISTENCE_FAILURE"
 
 
 OrderIdempotencyManager = EntryIdempotencyStore

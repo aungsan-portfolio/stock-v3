@@ -152,7 +152,7 @@ def test_422_broker_order_recovery_adoption():
         "tp_order_id": "tp-recov-123",
     })
 
-    idempotency_manager.release("BAC", side="BUY", reason="test_init")
+    idempotency_manager.release_after_reconciliation("BAC", side="BUY", reason="test_init")
 
     with patch("strategies.order_manager.calculate_shares", return_value=63), \
          patch("strategies.execution_quote.validate_execution_quote", return_value=MagicMock(valid=True, quote=MagicMock(last=62.69))), \
@@ -161,7 +161,7 @@ def test_422_broker_order_recovery_adoption():
         assert res["status"] == "PLACED"
         assert res["order"]["id"] == "order-recov-123"
         bridge.get_order_by_client_id.assert_called_once()
-        idempotency_manager.release("BAC", side="BUY", reason="test_cleanup")
+        idempotency_manager.release_after_reconciliation("BAC", side="BUY", reason="test_cleanup")
 
 
 def test_422_broker_order_not_found_clean_release():
@@ -379,7 +379,7 @@ def test_422_order_visible_on_second_lookup_is_adopted():
     ]
     bridge.get_order_by_client_id = MagicMock(side_effect=lookup_results)
 
-    idempotency_manager.release("BAC", side="BUY", reason="test_init")
+    idempotency_manager.release_after_reconciliation("BAC", side="BUY", reason="test_init")
 
     with patch("strategies.order_manager.calculate_shares", return_value=63), \
          patch("strategies.execution_quote.validate_execution_quote", return_value=MagicMock(valid=True, quote=MagicMock(last=62.69))), \
@@ -388,7 +388,7 @@ def test_422_order_visible_on_second_lookup_is_adopted():
         assert res["status"] == "PLACED"
         assert res["order"]["id"] == "order-recov-attempt-2"
         assert bridge.get_order_by_client_id.call_count == 2
-        idempotency_manager.release("BAC", side="BUY", reason="test_cleanup")
+        idempotency_manager.release_after_reconciliation("BAC", side="BUY", reason="test_cleanup")
 
 
 def test_vwap_spread_floor_can_exceed_atr_floor():
@@ -734,3 +734,118 @@ def test_vwap_geometry_numerical_safety_invariants():
     )
 
 
+def test_persistence_failure_blocks_submission(tmp_path):
+    """Invariant I-1: Failure to persist reservation to disk must fail-closed, roll back memory, and mark store unhealthy."""
+    from unittest.mock import patch
+    from strategies.order_idempotency import EntryIdempotencyStore
+
+    state_file = tmp_path / "test_idempotency.json"
+    store = EntryIdempotencyStore(storage_path=state_file)
+
+    # Mock _save_state to fail
+    with patch.object(store, "_save_state", side_effect=IOError("Simulated disk write failure")):
+        reserved, reason = store.reserve("NVDA", side="BUY")
+        assert reserved is False
+        assert reason == "PERSISTENCE_FAILED"
+        assert "NVDA_BUY" not in store.reservations
+        assert store.is_healthy is False
+        assert store.health_reason == "PERSISTENCE_FAILURE"
+
+    # Subsequent reserve attempts must also fail-closed while store is unhealthy
+    reserved_subseq, reason_subseq = store.reserve("AAPL", side="BUY")
+    assert reserved_subseq is False
+    assert reason_subseq == "IDEMPOTENCY_STORE_UNHEALTHY"
+
+
+def test_corrupt_state_fails_closed(tmp_path):
+    """Invariant I-6: Corrupt persisted state file must mark store unhealthy and reject all submissions."""
+    from strategies.order_idempotency import EntryIdempotencyStore
+
+    state_file = tmp_path / "corrupt_idempotency.json"
+    state_file.write_text("NOT_VALID_JSON{{{corrupt", encoding="utf-8")
+
+    store = EntryIdempotencyStore(storage_path=state_file)
+    assert store.is_healthy is False
+    assert store.health_reason == "LOAD_FAILURE"
+
+    reserved, reason = store.reserve("NVDA", side="BUY")
+    assert reserved is False
+    assert reason == "IDEMPOTENCY_STORE_UNHEALTHY"
+
+
+def test_acknowledged_reservation_cannot_be_manually_released(tmp_path):
+    """Invariant I-5: An ACKNOWLEDGED reservation with active broker order cannot be released via ordinary release()."""
+    from strategies.order_idempotency import EntryIdempotencyStore, STATUS_ACKNOWLEDGED
+
+    state_file = tmp_path / "ack_idempotency.json"
+    store = EntryIdempotencyStore(storage_path=state_file)
+
+    # Reserve and acknowledge
+    reserved, _ = store.reserve("NVDA", side="BUY")
+    assert reserved is True
+    bound = store.bind_parent("NVDA_BUY", "order-parent-999")
+    assert bound is True
+
+    before = store.reservations["NVDA_BUY"]
+    assert before.status == STATUS_ACKNOWLEDGED
+    assert before.parent_order_id == "order-parent-999"
+
+    # Attempt ordinary release
+    released = store.release("NVDA", side="BUY", reason="test_accidental_release")
+    assert released is False
+    assert "NVDA_BUY" in store.reservations
+    assert store.reservations["NVDA_BUY"] is before
+    assert store.reservations["NVDA_BUY"].parent_order_id == "order-parent-999"
+    assert store.reservations["NVDA_BUY"].status == STATUS_ACKNOWLEDGED
+
+
+def test_stale_unacknowledged_transitions_to_reconciliation_required(tmp_path):
+    """Invariant I-2: Unacknowledged reservation exceeding TTL transitions to RECONCILIATION_REQUIRED and remains blocked."""
+    import time
+    from unittest.mock import patch
+    from strategies.order_idempotency import EntryIdempotencyStore, STATUS_RECONCILIATION_REQUIRED
+
+    state_file = tmp_path / "stale_idempotency.json"
+    store = EntryIdempotencyStore(storage_path=state_file)
+
+    reserved, _ = store.reserve("NVDA", side="BUY", ttl_seconds=30.0)
+    assert reserved is True
+
+    # Advance time beyond 30s TTL
+    future_time = time.time() + 35.0
+    with patch("time.time", return_value=future_time):
+        reserved_second, reason_second = store.reserve("NVDA", side="BUY", ttl_seconds=30.0)
+        assert reserved_second is False
+        assert reason_second == "RECONCILIATION_REQUIRED"
+        assert store.reservations["NVDA_BUY"].status == STATUS_RECONCILIATION_REQUIRED
+
+        # Subsequent attempts must continue to be blocked
+        reserved_again, reason_again = store.reserve("NVDA", side="BUY")
+        assert reserved_again is False
+        assert reason_again == "RECONCILIATION_REQUIRED"
+
+
+def test_stale_transition_save_failure_remains_blocked(tmp_path):
+    """Invariant I-1/I-2: Persistence failure during stale transition must roll back mutation and remain blocked."""
+    import time
+    from unittest.mock import patch
+    from strategies.order_idempotency import EntryIdempotencyStore
+
+    state_file = tmp_path / "stale_save_fail_idempotency.json"
+    store = EntryIdempotencyStore(storage_path=state_file)
+
+    reserved, _ = store.reserve("NVDA", side="BUY", ttl_seconds=30.0)
+    assert reserved is True
+
+    future_time = time.time() + 35.0
+    with patch("time.time", return_value=future_time), \
+         patch.object(store, "_save_state", side_effect=IOError("Disk error on stale transition")):
+        reserved_stale, reason_stale = store.reserve("NVDA", side="BUY", ttl_seconds=30.0)
+        assert reserved_stale is False
+        assert reason_stale == "PERSISTENCE_FAILED"
+        assert store.is_healthy is False
+        assert store.health_reason == "PERSISTENCE_FAILURE"
+
+    # Must remain blocked
+    reserved_next, _ = store.reserve("NVDA", side="BUY")
+    assert reserved_next is False

@@ -386,7 +386,7 @@ def test_h3_lifecycle_registration_failure_is_fail_closed():
     finally:
         eq.validate_execution_quote = orig_validate
         om.register_pending_order = orig_reg
-        idempotency_manager.release("GOOGL", "BUY", "cleanup_test")
+        idempotency_manager.release_after_reconciliation("GOOGL", "BUY", "cleanup_test")
 
 
 def test_entry_gate_halt_blocks_order_placement_defense_in_depth():
@@ -487,7 +487,7 @@ def test_execute_signal_cache_key_defined():
         config.SPY_TREND_GUARD_ENABLED = orig_spy_guard
         eq.validate_execution_quote = orig_validate
         from strategies.order_idempotency import idempotency_manager
-        idempotency_manager.release("SMCI", "BUY", "cleanup_test")
+        idempotency_manager.release_after_reconciliation("SMCI", "BUY", "cleanup_test")
 
 
 def test_build_client_order_id_determinism_and_length():
