@@ -18,6 +18,8 @@ from typing import Dict, Optional, Set, Tuple
 
 from config import DATA_DIR
 
+from datetime import datetime, timezone
+
 logger = logging.getLogger(__name__)
 
 IDEMPOTENCY_FILE = DATA_DIR / "order_idempotency_state.json"
@@ -30,20 +32,56 @@ def build_client_order_id(
     bar_timestamp_utc: str = "",
     signal_hash: str = "",
     attempt: int = 0,
+    strategy: str = "ord",
+    session_date: str = "",
+    intent_nonce: str = "",
+    strategy_entry_attempt: Optional[int] = None,
+    submission_retry_attempt: int = 0,
 ) -> str:
     """
     Broker-level deterministic idempotency key. (Alpaca client_order_id <= 128 chars).
     
-    Combines symbol, side, bar timestamp, signal hash, and attempt counter.
-    Outputs: se3-{SYMBOL}-{DIGEST[:24]}
+    Combines symbol, side, strategy, session date, bar timestamp, signal hash, intent nonce,
+    and strategy-level re-entry attempt. Transport retries (submission_retry_attempt) are explicitly
+    excluded from the digest so repeated transport submissions maintain identical client_order_id.
+
+    Outputs: se3-{SYMBOL}-{SIDE[:1]}-{STRAT[:4]}-{SESSION_DATE}-{DIGEST[:16]}
     """
     sym = symbol.upper().strip()
     s_side = side.upper().strip()
+    side_code = s_side[:1] if s_side else "B"
+    strat_code = str(strategy or "ord").replace("StrategyName.", "").replace("_", "").lower()[:4]
+
+    now_utc = datetime.now(timezone.utc)
+    s_date = str(session_date or "").strip()
     bar_ts = str(bar_timestamp_utc or "").strip()
+
+    if not s_date:
+        if bar_ts and len(bar_ts) >= 10 and bar_ts[:4].isdigit():
+            s_date = bar_ts[:10].replace("-", "")
+        else:
+            s_date = now_utc.strftime("%Y%m%d")
+
+    if not bar_ts:
+        # Fallback to 5-minute bucket of current time so it's deterministic within candle
+        bucket_min = (now_utc.minute // 5) * 5
+        bar_ts = now_utc.replace(minute=bucket_min, second=0, microsecond=0).strftime("%Y%m%d_%H%M")
+
     sig_hash = str(signal_hash or "").strip()
-    raw = f"{sym}|{s_side}|{bar_ts}|{sig_hash}|{int(attempt)}"
-    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
-    return f"se3-{sym}-{digest}"
+    nonce = str(intent_nonce or "").strip()
+    # Parameter semantics:
+    # - strategy_entry_attempt (preferred) or legacy `attempt` represents strategy-level entry sequence/re-entry/scale-in.
+    # - submission_retry_attempt represents transport/HTTP-level retry and is NEVER included in the digest.
+    if strategy_entry_attempt is not None:
+        entry_attempt = int(strategy_entry_attempt)
+    else:
+        # Legacy fallback: 'attempt' is treated strictly as strategy-level entry attempt (default 0)
+        entry_attempt = int(attempt or 0)
+
+    # submission_retry_attempt is intentionally omitted from raw so transport retries do not alter order identity
+    raw = f"{sym}|{s_side}|{strat_code}|{s_date}|{bar_ts}|{sig_hash}|{nonce}|{entry_attempt}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return f"se3-{sym}-{side_code}-{strat_code}-{s_date}-{digest}"
 
 
 @dataclass

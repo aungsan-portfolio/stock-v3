@@ -45,6 +45,7 @@ archive_cleanup_*/
 .coverage
 .pytest_cache/
 .pytest_tmp/
+pytest_tmp/
 .mypy_cache/
 .ruff_cache/
 .cache_data/

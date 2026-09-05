@@ -181,6 +181,7 @@ def _extract_order_info(o: object) -> dict:
         raw_type = o.get("order_type") or o.get("type") or o.get("orderType")
         o_stop = o.get("stop_price") if o.get("stop_price") is not None else o.get("stopPrice")
         o_status = str(o.get("status") or "").lower()
+        raw_qty = o.get("qty") or o.get("quantity") or o.get("totalQuantity")
     else:
         o_id = str(getattr(o, "id", getattr(o, "order_id", "")) or "")
         contract = getattr(o, "contract", None)
@@ -197,6 +198,7 @@ def _extract_order_info(o: object) -> dict:
 
         o_status_obj = getattr(o, "status", getattr(getattr(o, "orderState", None), "status", getattr(getattr(o, "orderStatus", None), "status", None)))
         o_status = str(getattr(o_status_obj, "value", o_status_obj) or "").lower()
+        raw_qty = getattr(o, "qty", getattr(o, "quantity", getattr(o, "totalQuantity", None)))
 
     s_side = str(raw_side).lower().strip()
     if s_side in {"buy"}:
@@ -208,6 +210,10 @@ def _extract_order_info(o: object) -> dict:
 
     o_type = normalize_order_type(raw_type)
     stop_val = float(o_stop) if o_stop is not None else None
+    try:
+        qty_val = float(raw_qty) if raw_qty is not None else None
+    except (TypeError, ValueError):
+        qty_val = None
 
     return {
         "id": o_id,
@@ -215,6 +221,7 @@ def _extract_order_info(o: object) -> dict:
         "side": norm_side,
         "type": o_type,
         "stop_price": stop_val,
+        "qty": qty_val,
         "status": o_status
     }
 
@@ -688,6 +695,7 @@ class DynamicTrailingStopManager:
                 peak_price=max(avg_cost, current_price) if side == "BUY" else min(avg_cost, current_price),
                 atr=atr,
                 stop_price=final_stop,
+                desired_stop_price=final_stop,
                 trail_multiple=mult,
                 last_updated=time.time(),
                 order_id=stop_order_id,
@@ -701,16 +709,30 @@ class DynamicTrailingStopManager:
             logger.info(f"Auto-initialized Trailing Stop for {symbol} from broker: Entry ${avg_cost:.2f}, Stop ${final_stop:.2f}, Order ID {stop_order_id}")
             return state
 
-    def _is_valid_stop_order(self, o: object, target_side: str) -> bool:
-        """Verify order is a valid active stop loss order for target side."""
+    def _is_valid_stop_order(
+        self,
+        o: object,
+        target_side: str,
+        required_qty: float = 0,
+        expected_symbol: str = "",
+    ) -> bool:
+        """Verify order is a valid active stop loss order for target side, symbol, and covers required quantity."""
         if not o:
             return False
         info = _extract_order_info(o)
         o_id = info["id"]
+        o_sym = str(info.get("symbol") or "").upper().strip()
         o_side = info["side"]
         o_type = info["type"]
         o_stop = info["stop_price"]
         o_status = info["status"]
+        o_qty = info.get("qty")
+
+        if expected_symbol:
+            sym_expected = expected_symbol.upper().strip()
+            if o_sym and o_sym != sym_expected:
+                logger.debug(f"[RECONCILE EVAL] Order ID {o_id}: symbol '{o_sym}' != expected '{sym_expected}' -> Rejecting candidate.")
+                return False
 
         if o_status in {"canceled", "cancelled", "filled", "expired", "rejected"}:
             logger.debug(f"[RECONCILE EVAL] Order ID {o_id}: status '{o_status}' is CLOSED/DEAD -> Rejecting candidate.")
@@ -720,12 +742,18 @@ class DynamicTrailingStopManager:
         is_side_match = (o_side == target_side_norm)
         is_stop_type = is_stop_order_type(o_type, has_stop_price=(o_stop is not None))
 
+        qty_match = True
+        if required_qty > 0 and o_qty is not None:
+            qty_match = (float(o_qty) >= float(required_qty) - 1e-4)
+            if not qty_match:
+                logger.debug(f"[RECONCILE EVAL] Order ID {o_id}: qty {o_qty} < required {required_qty} -> Rejecting candidate.")
+
         logger.debug(
-            f"[RECONCILE EVAL] Order ID {o_id}: side='{o_side}' (target='{target_side_norm}'), "
-            f"type='{o_type}', stop_price={o_stop} -> side_match={is_side_match}, stop_type={is_stop_type}"
+            f"[RECONCILE EVAL] Order ID {o_id}: sym='{o_sym}' (exp='{expected_symbol}'), side='{o_side}' (target='{target_side_norm}'), "
+            f"type='{o_type}', stop_price={o_stop}, qty={o_qty} -> side_match={is_side_match}, stop_type={is_stop_type}, qty_match={qty_match}"
         )
 
-        return is_side_match and is_stop_type
+        return is_side_match and is_stop_type and qty_match
 
     def _extract_all_orders_including_legs(self, open_orders: list) -> list:
         """Flatten open orders list to include nested bracket child legs if present."""
@@ -757,7 +785,9 @@ class DynamicTrailingStopManager:
         all_orders = self._extract_all_orders_including_legs(open_orders)
         for o in all_orders:
             info = _extract_order_info(o)
-            if info["symbol"] == state.symbol.upper().strip() and self._is_valid_stop_order(o, target_side):
+            if info["symbol"] == state.symbol.upper().strip() and self._is_valid_stop_order(
+                o, target_side, required_qty=getattr(state, "qty", getattr(state, "shares", 0.0))
+            ):
                 o_stop = info["stop_price"]
                 o_type = info["type"]
                 broker_stop_price = float(o_stop) if o_stop is not None else state.stop_price
@@ -770,6 +800,32 @@ class DynamicTrailingStopManager:
                 if o_stop is not None:
                     state.confirmed_broker_stop_price = broker_stop_price
                     state.stop_price = broker_stop_price  # Broker truth is the effective resting stop
+
+                    # Note ① Fix & Stop Monotonicity Invariant:
+                    # Long protective stop must never be loosened (lowered) by fallback reconciliation
+                    # Short protective stop must never be loosened (raised) by fallback reconciliation
+                    if state.side == "BUY":
+                        if state.strategy == "RECONCILED" and state.desired_stop_price is not None:
+                            effective_stop = max(broker_stop_price, state.desired_stop_price)
+                            if abs(state.desired_stop_price - effective_stop) > 0.001:
+                                logger.info(
+                                    f"[RECONCILE MONOTONICITY LONG] {state.symbol}: Adopting tighter stop ${effective_stop:.2f} "
+                                    f"(broker=${broker_stop_price:.2f}, previous desired=${state.desired_stop_price:.2f})"
+                                )
+                                state.desired_stop_price = effective_stop
+                        elif state.desired_stop_price is None:
+                            state.desired_stop_price = broker_stop_price
+                    else:  # SELL / SHORT
+                        if state.strategy == "RECONCILED" and state.desired_stop_price is not None:
+                            effective_stop = min(broker_stop_price, state.desired_stop_price)
+                            if abs(state.desired_stop_price - effective_stop) > 0.001:
+                                logger.info(
+                                    f"[RECONCILE MONOTONICITY SHORT] {state.symbol}: Adopting tighter stop ${effective_stop:.2f} "
+                                    f"(broker=${broker_stop_price:.2f}, previous desired=${state.desired_stop_price:.2f})"
+                                )
+                                state.desired_stop_price = effective_stop
+                        elif state.desired_stop_price is None:
+                            state.desired_stop_price = broker_stop_price
 
                     desired = state.desired_stop_price if state.desired_stop_price is not None else broker_stop_price
                     tick_size = 0.01 if max(state.entry_price, broker_stop_price) >= 1.0 else 0.0001
@@ -926,9 +982,15 @@ class DynamicTrailingStopManager:
                 if breakeven_enabled and state.atr > 0 and profit_atr >= breakeven_threshold_atr:
                     breakeven_stop = state.entry_price + cushion
                     if breakeven_stop > new_stop:
+                        old_stop_disp = new_stop
                         new_stop = breakeven_stop
                         should_update = True
-                        logger.info(f"[BREAKEVEN LOCK] {symbol}: Profit {profit_atr:.2f}x >= {breakeven_threshold_atr}x ATR. Locking stop at ${breakeven_stop:.2f}")
+                        unrealized_profit = state.peak_price - state.entry_price
+                        logger.info(
+                            f"[BREAKEVEN LOCK] {symbol} (BUY): entry=${state.entry_price:.2f} peak=${state.peak_price:.2f} "
+                            f"unrealized=${unrealized_profit:.4f} atr=${state.atr:.4f} (profit_atr={profit_atr:.2f}x >= threshold {breakeven_threshold_atr:.2f}x). "
+                            f"Locking stop at ${breakeven_stop:.2f} (old_stop=${old_stop_disp:.2f})"
+                        )
 
                 if not (breakeven_enabled and state.atr > 0 and profit_atr >= breakeven_threshold_atr and new_stop >= state.entry_price):
                     if profit_pct >= min_profit_pct:
@@ -948,9 +1010,15 @@ class DynamicTrailingStopManager:
                 if breakeven_enabled and state.atr > 0 and profit_atr >= breakeven_threshold_atr:
                     breakeven_stop = state.entry_price - cushion
                     if breakeven_stop < new_stop:
+                        old_stop_disp = new_stop
                         new_stop = breakeven_stop
                         should_update = True
-                        logger.info(f"[BREAKEVEN LOCK] {symbol}: Profit {profit_atr:.2f}x >= {breakeven_threshold_atr}x ATR. Locking stop at ${breakeven_stop:.2f}")
+                        unrealized_profit = state.entry_price - state.peak_price
+                        logger.info(
+                            f"[BREAKEVEN LOCK] {symbol} (SELL): entry=${state.entry_price:.2f} peak=${state.peak_price:.2f} "
+                            f"unrealized=${unrealized_profit:.4f} atr=${state.atr:.4f} (profit_atr={profit_atr:.2f}x >= threshold {breakeven_threshold_atr:.2f}x). "
+                            f"Locking stop at ${breakeven_stop:.2f} (old_stop=${old_stop_disp:.2f})"
+                        )
 
                 if not (breakeven_enabled and state.atr > 0 and profit_atr >= breakeven_threshold_atr and new_stop <= state.entry_price):
                     if profit_pct >= min_profit_pct:
@@ -1280,8 +1348,11 @@ class DynamicTrailingStopManager:
                                     rel_o = bridge._client.get_order_by_id(rel_id, GetOrderByIdRequest(nested=True))
                                     candidates = [rel_o] + (getattr(rel_o, "legs", []) or [])
                                     for candidate in candidates:
+                                        cand_sym = str(getattr(candidate, "symbol", getattr(rel_o, "symbol", symbol))).upper().strip()
+                                        if cand_sym and cand_sym != symbol.upper().strip():
+                                            continue
                                         classification = _classify_held_order(candidate)
-                                        if classification == "stop" or self._is_valid_stop_order(candidate, target_side):
+                                        if classification == "stop" or self._is_valid_stop_order(candidate, target_side, expected_symbol=symbol):
                                             cand_id = str(getattr(candidate, "id", rel_id))
                                             o_type = str(getattr(candidate, "order_type", getattr(candidate, "type", ""))).lower()
                                             with self._lock:

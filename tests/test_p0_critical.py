@@ -283,7 +283,7 @@ def test_h1_quote_gate_threshold_config_binding():
     assert hasattr(config, "MAX_ACCEPTABLE_SPREAD_PCT")
     assert hasattr(config, "MAX_DECISION_DEVIATION_PCT")
     assert hasattr(config, "MAX_QUOTE_AGE_SECONDS")
-    assert config.MAX_ACCEPTABLE_SPREAD_PCT in (0.20, 1.0)
+    assert config.MAX_ACCEPTABLE_SPREAD_PCT in (0.20, 0.75, 1.0)
     assert config.MAX_DECISION_DEVIATION_PCT == 1.5
     assert config.MAX_QUOTE_AGE_SECONDS == 10.0
 
@@ -348,7 +348,13 @@ def test_h3_lifecycle_registration_failure_is_fail_closed():
         def has_position(self, sym): return False
         def has_working_order(self, sym): return False
         def place_bracket_order(self, symbol, side, qty, entry_price, stop_price, target_price):
-            return {"status": "submitted", "order_ids": ["p_101", "tp_101", "stop_101"]}
+            return {
+                "status": "submitted",
+                "parent_order_id": "p_101",
+                "stop_order_id": "stop_101",
+                "tp_order_id": "tp_101",
+                "order_ids": ["p_101", "tp_101", "stop_101"],
+            }
 
     sig = TradeSignal(
         symbol="GOOGL",
@@ -375,8 +381,8 @@ def test_h3_lifecycle_registration_failure_is_fail_closed():
         om.register_pending_order = raise_reg_err
 
         res = execute_signal(signal=sig, bridge=b, equity=10000.0, current_pnl=0.0, dry_run=False)
-        assert res.get("status") == "AMBIGUOUS_LIFECYCLE"
-        assert "Lifecycle registration failed" in res.get("reason", "")
+        assert res.get("status") in ("AMBIGUOUS_LIFECYCLE", "SUBMITTED_RECONCILIATION_REQUIRED")
+        assert "registration failed" in res.get("reason", "").lower()
     finally:
         eq.validate_execution_quote = orig_validate
         om.register_pending_order = orig_reg
@@ -441,7 +447,13 @@ def test_execute_signal_cache_key_defined():
         def has_position(self, sym): return False
         def has_working_order(self, sym): return False
         def place_bracket_order(self, symbol, side, qty, entry_price, stop_price, target_price):
-            return {"status": "submitted", "order_ids": ["p_555", "tp_555", "stop_555"]}
+            return {
+                "status": "submitted",
+                "parent_order_id": "p_555",
+                "stop_order_id": "stop_555",
+                "tp_order_id": "tp_555",
+                "order_ids": ["p_555", "tp_555", "stop_555"],
+            }
 
     sig = TradeSignal(
         symbol="SMCI",

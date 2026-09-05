@@ -2800,6 +2800,65 @@ def cmd_daytrade_bot(args) -> int:
     except Exception as recon_err:
         print(f"  WARNING: Startup reconciliation failed: {recon_err}. Halting new entries.")
         bridge.entry_gate.halt("Startup reconciliation failure")
+
+    from strategies.session import is_market_day, _nyse_holidays
+    today_et = now_eastern().date()
+    feed_name = str(getattr(config, "ALPACA_DATA_FEED", "iex")).upper()
+
+    broker_calendar_status = "UNKNOWN"
+    calendar_agreement = "UNKNOWN"
+    if bridge and hasattr(bridge, "get_market_clock"):
+        try:
+            clk = bridge.get_market_clock()
+            broker_calendar_status = "OPEN" if getattr(clk, "is_open", False) else "CLOSED"
+        except Exception:
+            pass
+
+    if not is_market_day(today_et):
+        holidays_today = _nyse_holidays(today_et.year)
+        if today_et in holidays_today:
+            closure_reason = "LABOR_DAY" if (today_et.month == 9 and today_et.weekday() == 0 and today_et.day <= 7) else "MARKET_HOLIDAY"
+        elif today_et.weekday() >= 5:
+            closure_reason = "WEEKEND"
+        else:
+            closure_reason = "MARKET_CLOSED"
+
+        if broker_calendar_status != "UNKNOWN":
+            calendar_agreement = str(broker_calendar_status == "CLOSED").lower()
+
+        print(f"\n{'='*60}")
+        print(f"[DEPLOYMENT IDENTITY]")
+        print(f"account_mode=PAPER")
+        print(f"market_date={today_et}")
+        print(f"market_status=CLOSED")
+        print(f"closure_reason={closure_reason}")
+        print(f"local_calendar_status=CLOSED")
+        print(f"broker_calendar_status={broker_calendar_status}")
+        print(f"calendar_agreement={calendar_agreement}")
+        print(f"\n[MARKET DATA IDENTITY]")
+        print(f"account_mode=PAPER")
+        print(f"configured_feed={feed_name}")
+        print(f"subscription_tier=FREE")
+        print(f"quote_source={feed_name}")
+        print(f"consolidated_nbbo=false")
+        print(f"\n[SESSION GUARD]")
+        print(f"scanner_started=false")
+        print(f"signal_generation_started=false")
+        print(f"orders_submitted=0")
+        print(f"positions_opened=0")
+        print(f"\n[SHUTDOWN]")
+        print(f"reason={closure_reason}")
+        print(f"exit_code=0")
+        print(f"{'='*60}\n")
+        logger.info(f"[SESSION GUARD] Market closed today ({closure_reason}). Clean holiday exit.")
+        return 0
+
+    print(f"\n[MARKET DATA IDENTITY]")
+    print(f"account_mode=PAPER")
+    print(f"configured_feed={feed_name}")
+    print(f"subscription_tier=FREE")
+    print(f"quote_source={feed_name}")
+    print(f"consolidated_nbbo=false\n")
             
     watchlist = list(getattr(config, "DAYTRADE_WATCHLIST", []))
     last_known_open_symbols = []

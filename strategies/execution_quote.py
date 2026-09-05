@@ -137,11 +137,16 @@ def validate_execution_quote(
         )
 
     mid = (bid + ask) / 2.0
-    spread_pct = ((ask - bid) / mid) * 100.0
+    spread_dollars = ask - bid
+    spread_pct = (spread_dollars / mid) * 100.0
     if spread_pct > max_spread_pct:
+        age_str = f"{age:.3f}s" if age is not None else "unknown"
         return QuoteValidationResult(
             valid=False,
-            reason=f"Spread too wide for {symbol}: {spread_pct:.2f}% > limit {max_spread_pct:.2f}%",
+            reason=(
+                f"Spread too wide for {symbol}: {spread_pct:.2f}% > limit {max_spread_pct:.2f}% "
+                f"[bid=${bid:.2f}, ask=${ask:.2f}, mid=${mid:.2f}, spread_dollars=${spread_dollars:.4f}, age={age_str}]"
+            ),
             quote=quote,
         )
 

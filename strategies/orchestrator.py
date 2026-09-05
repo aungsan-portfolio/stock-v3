@@ -13,8 +13,9 @@ from strategies.vwap_strategy import VWAPBounceStrategy
 from strategies.gap_strategy import GapAndGoStrategy
 from strategies.momentum_strategy import MomentumScalpStrategy
 from strategies.candlestick_strategy import CandlestickPatternStrategy
+from strategies.constants import StrategyName
 from strategies.intraday_data import fetch_intraday
-from strategies.order_manager import execute_signal
+from strategies.order_manager import execute_signal, _min_confidence_for
 from strategies.trade_journal import today_trade_count, today_pnl, day_trades_in_last_5_days
 from strategies.performance import profile_latency
 from strategies.position_sizer import calculate_shares, validate_executable_geometry
@@ -1006,6 +1007,8 @@ def evaluate_and_execute(
     def get_signal_sorting_key(sig):
         strat_cfg = getattr(config, "STRATEGY_SETTINGS", {}).get(sig.strategy)
         priority = getattr(strat_cfg, "priority", 10) if strat_cfg else 10
+        if market_tex == "SIDEWAYS" and getattr(sig, "strategy", None) == StrategyName.MEAN_REVERSION:
+            priority = 1
         return (priority, -sig.confidence)
 
     all_signals.sort(key=get_signal_sorting_key)
@@ -1098,8 +1101,30 @@ def evaluate_and_execute(
             logger.info("Skipped %s: working order already pending", sig.symbol)
             continue
 
+        # Viability Gate: check strategy/regime confidence floor before deduplication
+        # so unviable signals cannot claim the symbol and suppress viable candidates.
+        is_inverse = sym in set(getattr(config, "INVERSE_ETF_SYMBOLS", set()))
+        if is_inverse and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False):
+            min_conf = float(getattr(config, "INVERSE_ETF_MIN_CONFIDENCE", 0.65))
+        else:
+            min_conf = _min_confidence_for(sig, regime_result=regime_res)
+            if regime_res and getattr(regime_res, "confidence_boost", 0.0) > 0:
+                min_conf += float(regime_res.confidence_boost)
+
+        if sig.confidence < (min_conf - 1e-4):
+            reg_mode = getattr(regime_res, "mode", "NEUTRAL") if regime_res else "NEUTRAL"
+            side_norm = sig.side.upper().strip()
+            is_counter = (reg_mode == "RISK_ON" and side_norm in ("SELL", "SHORT")) or (reg_mode == "RISK_OFF" and side_norm in ("BUY", "LONG"))
+            alignment = "COUNTER_TREND" if is_counter else "TREND_ALIGNED"
+            strat_name = getattr(sig.strategy, "name", str(sig.strategy))
+            logger.info(
+                "[SIGNAL DISPOSITION] Skipped %s: Confidence %.3f < %.2f (%s | side=%s | regime=%s | alignment=%s)",
+                sig.symbol, sig.confidence, min_conf, strat_name, side_norm, reg_mode, alignment
+            )
+            continue
+
         if sym in seen_symbols:
-            logger.debug("Skipped %s: duplicate signal in this cycle", sym)
+            logger.info("[SIGNAL DISPOSITION] Skipped %s: duplicate signal in this cycle (superseded by previous candidate)", sym)
             continue
         seen_symbols.add(sym)
 

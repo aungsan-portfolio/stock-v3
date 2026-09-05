@@ -456,13 +456,13 @@ def _validate_intraday_data(
                 delay_seconds = completed_bar.post_close_delay_seconds
 
                 if delay_seconds > grace_seconds:
-                    msg = f"Data validation failed for {symbol}: Stale completed bar: post-close delay={delay_seconds:.1f}s (grace={grace_seconds:.1f}s, purpose={purpose})."
+                    msg = f"Data validation: {symbol} completed bar is stale: post-close delay={delay_seconds:.1f}s (grace={grace_seconds:.1f}s, purpose={purpose}). Skipping candle for this cycle."
                     blacklist = set(getattr(config, "SYMBOL_STALE_QUOTE_BLACKLIST", []))
                     if symbol in blacklist or _in_market_open_transition():
-                        logger.debug("[STALE-QUOTE] %s", msg)
+                        logger.debug("[STALE-QUOTE-SKIP] %s", msg)
                     else:
-                        logger.warning("%s", msg)
-                    return _quarantine(f"stale_completed_bar_gt_{int(grace_seconds)}s")
+                        logger.warning("[STALE-BAR-SKIP] %s", msg)
+                    return pd.DataFrame()
     except Exception as e:
         logger.error("Error checking validation for %s: %s", symbol, e)
         return pd.DataFrame()

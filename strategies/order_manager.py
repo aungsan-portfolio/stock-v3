@@ -852,7 +852,17 @@ def execute_signal(
                             signal.symbol, guard_sym, last_close, last_open
                         )
                 else:
+                    candle_drop = last_open - last_close
+                    spy_atr = float(spy_df["atr"].iloc[-1]) if "atr" in spy_df.columns else (last_close * 0.001)
+                    drop_atr_ratio = (candle_drop / spy_atr) if spy_atr > 0 else 0.0
+                    shadow_allowed = (candle_drop <= 0) or (drop_atr_ratio < 0.15)
+                    shadow_decision = "ALLOW_WITH_PENALTY" if (last_close < last_open and shadow_allowed) else ("BLOCK" if last_close < last_open else "ALLOW")
+
                     if last_close < last_open:
+                        logger.info(
+                            "[SPY TREND GUARD SHADOW] %s: legacy_decision=BLOCK shadow_decision=%s drop=$%.4f (%.2fx ATR)",
+                            signal.symbol, shadow_decision, candle_drop, drop_atr_ratio
+                        )
                         guard_reason = (
                             f"SPY Trend Guard: {guard_sym} 5m candle bearish "
                             f"(Close ${last_close:.2f} < Open ${last_open:.2f}). "
@@ -861,6 +871,11 @@ def execute_signal(
                         logger.info("[SPY TREND GUARD] Blocked %s: %s", signal.symbol, guard_reason)
                         result["reason"] = guard_reason
                         return result
+                    else:
+                        logger.debug(
+                            "[SPY TREND GUARD SHADOW] %s: legacy_decision=ALLOW shadow_decision=%s",
+                            signal.symbol, shadow_decision
+                        )
             elif is_inverse_exempt:
                 # Conservative safety: block inverse ETF if benchmark data is unavailable
                 guard_reason = f"Trend Guard: Benchmark {guard_sym} intraday data unavailable for {signal.symbol}. Entry blocked for safety."
@@ -1123,12 +1138,15 @@ def execute_signal(
     from strategies.order_idempotency import build_client_order_id
     bar_ts = getattr(signal, "bar_timestamp", "") or ""
     sig_hash = getattr(signal, "signal_hash", "") or ""
+    intent_nonce = getattr(signal, "signal_id", "") or ""
     client_order_id = build_client_order_id(
         symbol=signal.symbol,
         side=signal.side,
         bar_timestamp_utc=bar_ts,
         signal_hash=sig_hash,
         attempt=0,
+        strategy=getattr(signal.strategy, "name", str(signal.strategy)),
+        intent_nonce=intent_nonce,
     )
     res_ok, res_reason = idempotency_manager.reserve(signal.symbol, side=signal.side)
     if not res_ok:
@@ -1211,6 +1229,10 @@ def execute_signal(
             limit_price = quote_res.quote.last
             stop_price = round(limit_price - offset_stop, 2)
             target_price = round(limit_price + offset_target, 2)
+            logger.info(
+                "[PRE-SUBMIT OFFSET ADJUST] %s: signal entry $%.2f -> live limit $%.2f | stop $%.2f -> $%.2f (offset $%.2f preserved)",
+                signal.symbol, signal.entry_price, limit_price, signal.stop_price, stop_price, offset_stop
+            )
 
     # Phase B: Broker Submission (Deterministic single call)
     try:
@@ -1225,23 +1247,57 @@ def execute_signal(
             client_order_id=client_order_id,
         )
     except Exception as submit_exc:
-        definitely_rejected = bool(getattr(submit_exc, "definitely_rejected", False))
-        if definitely_rejected:
-            idempotency_manager.release(
-                signal.symbol,
-                side=signal.side,
-                reason=f"definite_submit_rejection:{submit_exc}",
+        exc_str = str(submit_exc).lower()
+        is_client_id_collision = "client_order_id must be unique" in exc_str or "42210000" in exc_str
+        order = None
+        if is_client_id_collision and bridge:
+            logger.warning(
+                "[422 DUPLICATE RECOVERY] %s: Broker reported duplicate client_order_id '%s'. Querying broker...",
+                signal.symbol, client_order_id
             )
-            result["status"] = "REJECTED"
-            result["reason"] = f"Broker definitely rejected order: {submit_exc}"
-        else:
-            result["status"] = "AMBIGUOUS_SUBMIT"
-            result["reason"] = (
-                f"Broker submission outcome is uncertain: {submit_exc}. "
-                "Idempotency lock retained for broker reconciliation."
-            )
-        logger.exception("[BROKER SUBMISSION] %s: %s", signal.symbol, result["reason"])
-        return result
+            for lookup_attempt in range(1, 4):
+                try:
+                    if hasattr(bridge, "get_order_by_client_id"):
+                        recovered = bridge.get_order_by_client_id(client_order_id)
+                    elif hasattr(bridge, "_client") and hasattr(bridge._client, "get_order_by_client_id"):
+                        raw_ord = bridge._client.get_order_by_client_id(client_order_id)
+                        if raw_ord:
+                            recovered = {"order_id": str(getattr(raw_ord, "id", "")), "status": str(getattr(raw_ord, "status", ""))}
+                    else:
+                        recovered = None
+
+                    if recovered and isinstance(recovered, dict) and (recovered.get("order_id") or recovered.get("id")):
+                        order = recovered
+                        logger.info(
+                            "[422 RECOVERY SUCCESS] %s: Recovered existing broker order '%s' (status=%s, attempt=%d). Adopting context.",
+                            signal.symbol, order.get("order_id") or order.get("id"), order.get("status"), lookup_attempt
+                        )
+                        break
+                except Exception as lookup_err:
+                    logger.warning("[422 RECOVERY LOOKUP FAILED] %s (attempt %d/3): %s", signal.symbol, lookup_attempt, lookup_err)
+
+                if lookup_attempt < 3:
+                    time.sleep(0.05 * lookup_attempt)
+
+        if order is None:
+            definitely_rejected = bool(getattr(submit_exc, "definitely_rejected", False))
+            if definitely_rejected or is_client_id_collision:
+                rel_reason = f"definite_submit_rejection:{submit_exc}" if definitely_rejected else f"duplicate_client_id_rejection:{submit_exc}"
+                idempotency_manager.release(
+                    signal.symbol,
+                    side=signal.side,
+                    reason=rel_reason,
+                )
+                result["status"] = "REJECTED"
+                result["reason"] = f"Broker definitely rejected order: {submit_exc}"
+            else:
+                result["status"] = "AMBIGUOUS_SUBMIT"
+                result["reason"] = (
+                    f"Broker submission outcome is uncertain: {submit_exc}. "
+                    "Idempotency lock retained for broker reconciliation."
+                )
+            logger.exception("[BROKER SUBMISSION] %s: %s", signal.symbol, result["reason"])
+            return result
 
     # Phase C: Broker Response Validation
     if not isinstance(order, dict):

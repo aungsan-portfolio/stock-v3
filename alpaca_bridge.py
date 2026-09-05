@@ -2394,6 +2394,40 @@ class AlpacaBridge:
             logger.error("get_order_snapshot failed for %s: %s", order_id, exc)
             return None
 
+    def get_order_by_client_id(self, client_order_id: str) -> Optional[dict]:
+        try:
+            order = self._client.get_order_by_client_id(client_order_id)
+            if not order:
+                return None
+            status = order.status.value if hasattr(order.status, "value") else str(order.status)
+            qty = float(order.qty) if getattr(order, "qty", None) is not None else 0.0
+            order_id = str(order.id)
+            legs = getattr(order, "legs", None)
+            leg_ids = [str(getattr(leg, "id", "")) for leg in legs] if legs else []
+            stop_leg_id = None
+            tp_leg_id = None
+            if legs:
+                for leg in legs:
+                    leg_type = str(getattr(leg, "order_type", getattr(leg, "type", "")) or "").lower()
+                    if "stop" in leg_type:
+                        stop_leg_id = str(getattr(leg, "id", ""))
+                    elif "limit" in leg_type:
+                        tp_leg_id = str(getattr(leg, "id", ""))
+            return {
+                "id": order_id,
+                "order_id": order_id,
+                "parent_order_id": order_id,
+                "stop_order_id": stop_leg_id,
+                "tp_order_id": tp_leg_id,
+                "order_ids": [order_id] + leg_ids,
+                "status": status,
+                "qty": qty,
+                "legs": legs,
+            }
+        except Exception as exc:
+            logger.warning("get_order_by_client_id failed for %s: %s", client_order_id, exc)
+            return None
+
     def place_stop_order(self, symbol: str, side: str, qty: float, stop_price: float) -> dict:
         self._require_connection()
         min_shares = getattr(config_module, "MIN_SHARE_COUNT", 1)

@@ -534,11 +534,11 @@ class StrategyConfig:
 from strategies.constants import StrategyName
 STRATEGY_SETTINGS = {
     StrategyName.ORB: StrategyConfig(confidence_min=0.55, max_risk_pct=1.0, priority=1),
-    StrategyName.VWAP_BOUNCE: StrategyConfig(confidence_min=0.50, max_risk_pct=1.0, priority=2),
-    StrategyName.MOMENTUM_SCALP: StrategyConfig(confidence_min=0.58, max_risk_pct=1.0, priority=3),
-    StrategyName.GAP_AND_GO: StrategyConfig(confidence_min=0.55, max_risk_pct=1.0, priority=4, entry_cutoff_time="10:30"),
-    StrategyName.CANDLESTICK: StrategyConfig(confidence_min=0.40, max_risk_pct=0.5, priority=5),
-    StrategyName.MEAN_REVERSION: StrategyConfig(confidence_min=0.50, max_risk_pct=1.0, priority=6),
+    StrategyName.MEAN_REVERSION: StrategyConfig(confidence_min=0.50, max_risk_pct=1.0, priority=2),
+    StrategyName.VWAP_BOUNCE: StrategyConfig(confidence_min=0.50, max_risk_pct=1.0, priority=3),
+    StrategyName.MOMENTUM_SCALP: StrategyConfig(confidence_min=0.58, max_risk_pct=1.0, priority=4),
+    StrategyName.GAP_AND_GO: StrategyConfig(confidence_min=0.55, max_risk_pct=1.0, priority=5, entry_cutoff_time="10:30"),
+    StrategyName.CANDLESTICK: StrategyConfig(confidence_min=0.40, max_risk_pct=0.5, priority=6),
 }
 
 STRATEGY_MEAN_REVERSION_ENABLED = True  # Native high-win-rate strategy for SIDEWAYS regimes
@@ -719,7 +719,7 @@ DAYTRADE_MIN_RR                    = 2.0
 DAYTRADE_ATR_STOP_MULTIPLE         = 1.25
 DAYTRADE_MAX_PAPER_TRADES_PER_RUN  = 1
 MOMENTUM_OVEREXTENSION_ATR_MULT    = 1.25
-MAX_ACCEPTABLE_SPREAD_PCT          = 0.20  # Max bid-ask spread (0.20%) allowed for liquid execution
+MAX_ACCEPTABLE_SPREAD_PCT          = 0.75  # Max bid-ask spread (0.75%) allowed for liquid execution (paper trading calibrated)
 
 # ── Scheduler ────────────────────────────────────
 SCHEDULER_ENABLED            = True
