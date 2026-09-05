@@ -4,11 +4,30 @@ execution_quote.py -- M-01 Execution Quote Verification Module
 Validates fresh broker quote, data provenance, spread, staleness, and decision-to-execution price deviation before order entry.
 """
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_bool(value: Any) -> Optional[bool]:
+    """Strictly parse boolean from bool, int (0, 1), or case-insensitive string."""
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+
+    return None
 
 
 @dataclass
@@ -54,11 +73,36 @@ def validate_execution_quote(
     max_deviation_pct: float = 1.5,
     max_age_seconds: float = 10.0,
 ) -> QuoteValidationResult:
-
     """
     Validate that a fresh, real-time broker quote is available and within acceptable risk parameters.
     Fail-closed: Returns valid=False if quote is missing, stale, inverted, wide-spread, or deviates from decision price.
     """
+    try:
+        max_spread_pct = float(max_spread_pct)
+        max_deviation_pct = float(max_deviation_pct)
+        max_age_seconds = float(max_age_seconds)
+        decision_price = float(decision_price)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return QuoteValidationResult(
+            valid=False,
+            reason=f"Invalid quote-validation configuration: {exc}",
+        )
+
+    if (
+        not math.isfinite(max_spread_pct)
+        or not math.isfinite(max_deviation_pct)
+        or not math.isfinite(max_age_seconds)
+        or not math.isfinite(decision_price)
+        or max_spread_pct < 0
+        or max_deviation_pct < 0
+        or max_age_seconds <= 0
+        or decision_price < 0
+    ):
+        return QuoteValidationResult(
+            valid=False,
+            reason="Invalid quote-validation configuration",
+        )
+
     get_quote_fn = getattr(bridge, "get_quote", None)
     if not callable(get_quote_fn):
         return QuoteValidationResult(
@@ -80,21 +124,54 @@ def validate_execution_quote(
             reason=f"Broker returned empty/null quote for {symbol}",
         )
 
-    # Standardize mapping or dataclass
-    if isinstance(raw_quote, dict):
-        bid = float(raw_quote.get("bid", 0.0) or 0.0)
-        ask = float(raw_quote.get("ask", 0.0) or 0.0)
-        last = float(raw_quote.get("last", 0.0) or 0.0)
-        ts = float(raw_quote.get("timestamp", 0.0) or 0.0)
-        source = str(raw_quote.get("source", "broker"))
-        is_realtime = bool(raw_quote.get("is_realtime", True))
-    else:
-        bid = float(getattr(raw_quote, "bid", 0.0) or 0.0)
-        ask = float(getattr(raw_quote, "ask", 0.0) or 0.0)
-        last = float(getattr(raw_quote, "last", 0.0) or 0.0)
-        ts = float(getattr(raw_quote, "timestamp", 0.0) or 0.0)
-        source = str(getattr(raw_quote, "source", "broker"))
-        is_realtime = bool(getattr(raw_quote, "is_realtime", True))
+    # Standardize mapping or dataclass with fail-closed conversion
+    try:
+        if isinstance(raw_quote, dict):
+            bid = float(raw_quote.get("bid", 0.0) or 0.0)
+            ask = float(raw_quote.get("ask", 0.0) or 0.0)
+            last = float(raw_quote.get("last", 0.0) or 0.0)
+            ts = float(raw_quote.get("timestamp", 0.0) or 0.0)
+            source = str(raw_quote.get("source", "broker"))
+            is_realtime_raw = raw_quote.get("is_realtime", True)
+        else:
+            bid = float(getattr(raw_quote, "bid", 0.0) or 0.0)
+            ask = float(getattr(raw_quote, "ask", 0.0) or 0.0)
+            last = float(getattr(raw_quote, "last", 0.0) or 0.0)
+            ts = float(getattr(raw_quote, "timestamp", 0.0) or 0.0)
+            source = str(getattr(raw_quote, "source", "broker"))
+            is_realtime_raw = getattr(raw_quote, "is_realtime", True)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return QuoteValidationResult(
+            valid=False,
+            reason=f"Malformed broker quote for {symbol}: {exc}",
+        )
+
+    is_realtime = _parse_bool(is_realtime_raw)
+    if is_realtime is None:
+        return QuoteValidationResult(
+            valid=False,
+            reason=f"Invalid is_realtime flag for {symbol}: {is_realtime_raw!r}",
+        )
+
+    numeric_fields = {
+        "bid": bid,
+        "ask": ask,
+        "last": last,
+        "timestamp": ts,
+    }
+    invalid_fields = [
+        name
+        for name, value in numeric_fields.items()
+        if not math.isfinite(value)
+    ]
+    if invalid_fields:
+        return QuoteValidationResult(
+            valid=False,
+            reason=(
+                f"Non-finite broker quote fields for {symbol}: "
+                f"{', '.join(invalid_fields)}"
+            ),
+        )
 
     quote = BrokerQuote(
         symbol=symbol.upper().strip(),
@@ -114,11 +191,34 @@ def validate_execution_quote(
         )
 
     now = time.time()
-    if ts <= 0 or (now - ts) > max_age_seconds:
-        age_str = f"{(now - ts):.1f}s" if ts > 0 else "unknown"
+    age_seconds = now - ts
+    future_tolerance_seconds = 2.0
+
+    if ts <= 0:
         return QuoteValidationResult(
             valid=False,
-            reason=f"Quote for {symbol} is stale (age={age_str} > limit={max_age_seconds}s)",
+            reason=f"Quote timestamp missing or invalid for {symbol}",
+            quote=quote,
+        )
+
+    if age_seconds < -future_tolerance_seconds:
+        return QuoteValidationResult(
+            valid=False,
+            reason=(
+                f"Quote timestamp for {symbol} is "
+                f"{abs(age_seconds):.1f}s in the future"
+            ),
+            quote=quote,
+        )
+
+    if age_seconds > max_age_seconds:
+        return QuoteValidationResult(
+            valid=False,
+            reason=(
+                f"Quote for {symbol} is stale "
+                f"(age={age_seconds:.1f}s > "
+                f"limit={max_age_seconds:.1f}s)"
+            ),
             quote=quote,
         )
 
@@ -140,8 +240,7 @@ def validate_execution_quote(
     spread_dollars = ask - bid
     spread_pct = (spread_dollars / mid) * 100.0
     if spread_pct > max_spread_pct:
-        age = (now - ts) if ts > 0 else None
-        age_str = f"{age:.3f}s" if age is not None else "unknown"
+        age_str = f"{age_seconds:.3f}s"
         return QuoteValidationResult(
             valid=False,
             reason=(
