@@ -623,3 +623,114 @@ def test_labor_day_2026_market_holiday_handling():
         assert ret_code == 0, f"cmd_daytrade_bot must return 0 on holiday, got {ret_code}"
         mock_scan.assert_not_called()
 
+
+def test_vwap_geometry_numerical_safety_invariants():
+    """Release Gate Test: Verify all 5 numerical safety invariants in VWAP strategy:
+    1. Structure-first target validation (rejection of insufficient structural reward without force-extension).
+    2. Pre-rounding vs post-rounding risk consistency (risk_per_share matches actual rounded stop distance).
+    3. Direction-aware tick rounding (long stop floors down, short stop ceils up, never breaches noise floor).
+    4. Negative structural risk rejection (no masking of inverted structure).
+    5. Positivity and ordering invariant: 0 < stop < price < target (BUY) and 0 < target < price < stop (SELL).
+    """
+    from strategies.vwap_strategy import VWAPBounceStrategy
+
+    strat = VWAPBounceStrategy()
+    dates = pd.date_range("2026-09-04 09:30", periods=40, freq="5min", tz="UTC")
+
+    # --- CASE 1: Valid BUY Signal (All invariants hold) ---
+    df_buy = pd.DataFrame({
+        "open": [100.0] * 40,
+        "high": [100.5] * 40,
+        "low": [99.70] * 40,  # pullback_low = 99.70
+        "close": [100.0] * 40,
+        "volume": [10000] * 40,
+        "vwap": [100.0] * 40,
+        "vwap_lower": [99.60] * 40,
+        "vwap_upper": [101.50] * 40,
+        "rsi": [45.0] * 40,
+        "atr": [0.50] * 40,  # Noise floor = 0.75 * 0.50 = 0.375
+        "volume_ma": [5000] * 40,
+    }, index=dates)
+
+    sig_buy = strat.evaluate("TEST_BUY", df_buy)
+    assert sig_buy is not None, "Valid BUY setup must generate a signal"
+    assert sig_buy.side == "BUY"
+
+    # Invariant 5: Positivity and ordering
+    assert 0 < sig_buy.stop_price < sig_buy.entry_price < sig_buy.target_price, (
+        f"Long ordering breached: stop={sig_buy.stop_price}, entry={sig_buy.entry_price}, target={sig_buy.target_price}"
+    )
+
+    # Invariant 2: Pre-rounding vs post-rounding consistency
+    actual_buy_risk = round(sig_buy.entry_price - sig_buy.stop_price, 2)
+    assert sig_buy.risk_per_share == pytest.approx(actual_buy_risk, abs=1e-4), (
+        f"risk_per_share ({sig_buy.risk_per_share}) must match actual stop distance ({actual_buy_risk})"
+    )
+
+    # Invariant 3: Direction-aware floor rounding preserves noise floor
+    expected_atr_floor = 0.50 * 0.75  # 0.375
+    assert sig_buy.risk_per_share >= (expected_atr_floor - 1e-4), (
+        f"Risk per share ({sig_buy.risk_per_share}) fell below noise floor ({expected_atr_floor})"
+    )
+
+    # Invariant 1: Structural R:R between min_rr and max_rr
+    actual_buy_rr = round(sig_buy.target_price - sig_buy.entry_price, 2) / sig_buy.risk_per_share
+    assert actual_buy_rr >= (float(config.MIN_RR_RATIO) - 1e-4)
+    assert actual_buy_rr <= float(config.MAX_TARGET_RR_RATIO)
+
+    # --- CASE 2: Valid SELL Signal (All invariants hold) ---
+    df_sell = pd.DataFrame({
+        "open": [100.0] * 40,
+        "high": [100.30] * 40,  # rally_high = 100.30
+        "low": [99.50] * 40,
+        "close": [100.0] * 40,
+        "volume": [10000] * 40,
+        "vwap": [100.0] * 40,
+        "vwap_lower": [98.50] * 40,
+        "vwap_upper": [100.40] * 40,
+        "rsi": [75.0] * 40,  # High RSI for sell rejection
+        "atr": [0.50] * 40,
+        "volume_ma": [5000] * 40,
+    }, index=dates)
+
+    with patch.object(config, "ALLOW_SHORT", True):
+        sig_sell = strat.evaluate("TEST_SELL", df_sell)
+        assert sig_sell is not None, "Valid SELL setup must generate a signal"
+        assert sig_sell.side == "SELL"
+
+        # Invariant 5: Positivity and ordering
+        assert 0 < sig_sell.target_price < sig_sell.entry_price < sig_sell.stop_price, (
+            f"Short ordering breached: target={sig_sell.target_price}, entry={sig_sell.entry_price}, stop={sig_sell.stop_price}"
+        )
+
+        # Invariant 2: Pre-rounding vs post-rounding consistency
+        actual_sell_risk = round(sig_sell.stop_price - sig_sell.entry_price, 2)
+        assert sig_sell.risk_per_share == pytest.approx(actual_sell_risk, abs=1e-4), (
+            f"risk_per_share ({sig_sell.risk_per_share}) must match actual stop distance ({actual_sell_risk})"
+        )
+
+        # Invariant 3: Direction-aware ceil rounding preserves noise floor
+        assert sig_sell.risk_per_share >= (expected_atr_floor - 1e-4)
+
+        # Invariant 1: Structural R:R between min_rr and max_rr
+        actual_sell_rr = round(sig_sell.entry_price - sig_sell.target_price, 2) / sig_sell.risk_per_share
+        assert actual_sell_rr >= (float(config.MIN_RR_RATIO) - 1e-4)
+        assert actual_sell_rr <= float(config.MAX_TARGET_RR_RATIO)
+
+    # --- CASE 3: Inverted/Negative Structural Risk Rejection (Defect 4) ---
+    df_inverted = df_buy.copy()
+    # Pullback low above price: structural_stop > price -> raw_risk <= 0
+    df_inverted["low"] = 100.50
+    sig_inv = strat.evaluate("TEST_INV", df_inverted)
+    assert sig_inv is None, "Inverted structural stop (raw_risk <= 0) must be rejected immediately"
+
+    # --- CASE 4: Insufficient Structural Reward Rejection (Defect 1: Structure-First) ---
+    df_poor_reward = df_buy.copy()
+    # vwap_upper is only 2 cents above price, while risk is >= 0.375 -> structural RR ~ 0.05 << min_rr 1.0
+    df_poor_reward["vwap_upper"] = 100.02
+    sig_poor = strat.evaluate("TEST_POOR_RR", df_poor_reward)
+    assert sig_poor is None, (
+        "Setup with insufficient structural reward (RR < min_rr) must be rejected under Structure-First policy"
+    )
+
+

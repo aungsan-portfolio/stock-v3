@@ -2,6 +2,7 @@
 vwap_strategy.py -- VWAP Bounce / Reclaim strategy.
 """
 import logging
+import math
 from typing import Optional
 
 import numpy as np
@@ -13,6 +14,18 @@ from strategies.base import BaseStrategy, TradeSignal
 from strategies.indicators import add_all_indicators
 
 logger = logging.getLogger(__name__)
+
+
+def _floor_to_tick(val: float, tick_size: float) -> float:
+    """Round down to nearest tick grid, directionally protective for long stops / short targets."""
+    precision = 2 if tick_size >= 0.01 else 4
+    return round(math.floor(val / tick_size + 1e-9) * tick_size, precision)
+
+
+def _ceil_to_tick(val: float, tick_size: float) -> float:
+    """Round up to nearest tick grid, directionally protective for short stops / long targets."""
+    precision = 2 if tick_size >= 0.01 else 4
+    return round(math.ceil(val / tick_size - 1e-9) * tick_size, precision)
 
 
 class VWAPBounceStrategy(BaseStrategy):
@@ -89,44 +102,59 @@ class VWAPBounceStrategy(BaseStrategy):
 
         # BUY Logic
         if pullback_touched and held_above and rsi < config.VWAP_RSI_OVERBOUGHT:
+            tick_size = 0.01 if price >= 1.0 else 0.0001
+            precision = 2 if price >= 1.0 else 4
             pullback_low = float(tail["low"].iloc[-reclaim_bars - 2 : -1].min())
-            structural_stop = max(pullback_low, vwap_lower) - 0.01
+            structural_stop = max(pullback_low, vwap_lower) - tick_size
             raw_risk = price - structural_stop
 
-            # P1 Upstream Geometry Normalization: max(0.75 * ATR, 1.5 * spread, tick_size)
-            tick_size = 0.01 if price >= 1.0 else 0.0001
-            noise_floor_ratio = float(getattr(config, "NOISE_FLOOR_HARD_VETO_RATIO", 0.75))
-            atr_floor = atr * noise_floor_ratio
-            spread_mult = float(getattr(config, "GEOMETRY_SPREAD_MULTIPLIER", 1.5))
-            spread_floor = (float(spread_dollars) * spread_mult) if (spread_dollars is not None and float(spread_dollars) > 0) else 0.0
-            min_stop_distance = max(atr_floor, spread_floor, tick_size)
+            # Defect 4: Validate raw structural risk (reject if negative, zero, or non-finite)
+            if not np.isfinite(raw_risk) or raw_risk <= 0:
+                logger.debug(
+                    "[SIGNAL GEOMETRY] symbol=%s side=BUY rejected | invalid raw structural risk: price=%.4f structural_stop=%.4f raw_risk=%.4f",
+                    symbol, price, structural_stop, raw_risk
+                )
+            else:
+                # P1 Upstream Geometry Normalization: max(0.75 * ATR, 1.5 * spread, tick_size)
+                noise_floor_ratio = float(getattr(config, "NOISE_FLOOR_HARD_VETO_RATIO", 0.75))
+                atr_floor = atr * noise_floor_ratio
+                spread_mult = float(getattr(config, "GEOMETRY_SPREAD_MULTIPLIER", 1.5))
+                spread_floor = (float(spread_dollars) * spread_mult) if (spread_dollars is not None and float(spread_dollars) > 0) else 0.0
+                min_stop_distance = max(atr_floor, spread_floor, tick_size)
 
-            final_risk = max(raw_risk, min_stop_distance)
-            stop = round(price - final_risk, 2 if price >= 1.0 else 4)
+                proposed_risk = max(raw_risk, min_stop_distance)
+                # Defect 3: Direction-aware tick rounding for Long stop (floor away from price)
+                stop = _floor_to_tick(price - proposed_risk, tick_size)
 
-            if final_risk > 0 and stop < price:
+                # Defect 2: Pre-rounding vs post-rounding risk consistency
+                actual_risk = round(price - stop, precision)
+
                 max_rr = float(getattr(config, "MAX_TARGET_RR_RATIO", 5.0))
                 min_rr = float(getattr(config, "MIN_RR_RATIO", 1.0))
                 default_rr = float(getattr(config, "DEFAULT_TARGET_RR_RATIO", 2.0))
 
-                structural_target_dist = vwap_upper - price if vwap_upper > price else (final_risk * default_rr)
-                max_target_dist = final_risk * (max_rr - 0.5)
+                # Structural target calculation
+                structural_target_dist = (vwap_upper - price) if (vwap_upper > price and np.isfinite(vwap_upper)) else (actual_risk * default_rr)
+                max_target_dist = actual_risk * (max_rr - 0.5)
                 target_dist = min(structural_target_dist, max_target_dist)
-                target_dist = max(target_dist, final_risk * min_rr)
-                target = round(price + target_dist, 2 if price >= 1.0 else 4)
 
-                raw_target_dist = vwap_upper - price if vwap_upper > price else (final_risk * default_rr)
-                raw_rr = raw_target_dist / raw_risk if raw_risk > 0 else 0.0
-                final_rr = (target - price) / final_risk if final_risk > 0 else 0.0
+                # Defect 1: Structure-First target validation (NO artificial force-extension)
+                target = _floor_to_tick(price + target_dist, tick_size)
+                actual_reward = round(target - price, precision)
+                actual_rr = actual_reward / actual_risk if actual_risk > 0 else 0.0
 
-                if target > price and final_rr >= (min_rr - 1e-4):
+                # Defect 5: Positivity & Ordering Invariant: 0 < stop < price < target
+                ordering_valid = (0 < stop < price < target)
+                rr_valid = (actual_rr >= (min_rr - 1e-4))
+
+                if ordering_valid and rr_valid:
                     logger.info(
                         "[SIGNAL GEOMETRY] symbol=%s side=BUY entry=%.2f stop=%.2f target=%.2f | "
-                        "structural_stop_distance=%.4f atr_floor=%.4f spread_floor=%.4f tick_floor=%.4f final_stop_distance=%.4f | "
-                        "projected_rr_raw=%.2f projected_rr_final=%.2f result=ACCEPTED",
+                        "structural_stop_distance=%.4f atr_floor=%.4f spread_floor=%.4f tick_floor=%.4f | "
+                        "actual_risk=%.4f actual_reward=%.4f actual_rr=%.2f result=ACCEPTED",
                         symbol, price, stop, target,
-                        raw_risk, atr_floor, spread_floor, tick_size, final_risk,
-                        raw_rr, final_rr
+                        raw_risk, atr_floor, spread_floor, tick_size,
+                        actual_risk, actual_reward, actual_rr
                     )
                     confidence = 0.5
                     if rsi < config.VWAP_RSI_OVERSOLD:
@@ -146,15 +174,21 @@ class VWAPBounceStrategy(BaseStrategy):
                         stop_price=stop,
                         target_price=target,
                         atr=atr,
-                        risk_per_share=final_risk,
+                        risk_per_share=actual_risk,
                         bar_timestamp=bar_ts,
                         reason=f"VWAP bounce reclaim | RSI {rsi:.0f} | held {reclaim_bars} bars",
-                        metadata={"vwap": vwap, "pullback_low": pullback_low, "normalized_risk": final_risk},
+                        metadata={
+                            "vwap": vwap,
+                            "pullback_low": pullback_low,
+                            "normalized_risk": actual_risk,
+                            "actual_rr": actual_rr,
+                            "raw_risk": raw_risk,
+                        },
                     )
                 else:
                     logger.debug(
-                        "[SIGNAL GEOMETRY] symbol=%s side=BUY rejected | raw_risk=%.4f final_risk=%.4f final_rr=%.2f < min_rr=%.2f",
-                        symbol, raw_risk, final_risk, final_rr, min_rr
+                        "[SIGNAL GEOMETRY] symbol=%s side=BUY rejected | ordering_valid=%s actual_risk=%.4f actual_reward=%.4f actual_rr=%.2f < min_rr=%.2f",
+                        symbol, ordering_valid, actual_risk, actual_reward, actual_rr, min_rr
                     )
 
         allow_short = getattr(config, "ALLOW_SHORT", False)
@@ -164,44 +198,59 @@ class VWAPBounceStrategy(BaseStrategy):
 
         # SELL Logic
         if allow_short and rally_touched and held_below and rsi > config.VWAP_RSI_OVERSOLD:
+            tick_size = 0.01 if price >= 1.0 else 0.0001
+            precision = 2 if price >= 1.0 else 4
             rally_high = float(tail["high"].iloc[-reclaim_bars - 2 : -1].max())
-            structural_stop = min(rally_high, vwap_upper) + 0.01
+            structural_stop = min(rally_high, vwap_upper) + tick_size
             raw_risk = structural_stop - price
 
-            # P1 Upstream Geometry Normalization: max(0.75 * ATR, 1.5 * spread, tick_size)
-            tick_size = 0.01 if price >= 1.0 else 0.0001
-            noise_floor_ratio = float(getattr(config, "NOISE_FLOOR_HARD_VETO_RATIO", 0.75))
-            atr_floor = atr * noise_floor_ratio
-            spread_mult = float(getattr(config, "GEOMETRY_SPREAD_MULTIPLIER", 1.5))
-            spread_floor = (float(spread_dollars) * spread_mult) if (spread_dollars is not None and float(spread_dollars) > 0) else 0.0
-            min_stop_distance = max(atr_floor, spread_floor, tick_size)
+            # Defect 4: Validate raw structural risk (reject if negative, zero, or non-finite)
+            if not np.isfinite(raw_risk) or raw_risk <= 0:
+                logger.debug(
+                    "[SIGNAL GEOMETRY] symbol=%s side=SELL rejected | invalid raw structural risk: price=%.4f structural_stop=%.4f raw_risk=%.4f",
+                    symbol, price, structural_stop, raw_risk
+                )
+            else:
+                # P1 Upstream Geometry Normalization: max(0.75 * ATR, 1.5 * spread, tick_size)
+                noise_floor_ratio = float(getattr(config, "NOISE_FLOOR_HARD_VETO_RATIO", 0.75))
+                atr_floor = atr * noise_floor_ratio
+                spread_mult = float(getattr(config, "GEOMETRY_SPREAD_MULTIPLIER", 1.5))
+                spread_floor = (float(spread_dollars) * spread_mult) if (spread_dollars is not None and float(spread_dollars) > 0) else 0.0
+                min_stop_distance = max(atr_floor, spread_floor, tick_size)
 
-            final_risk = max(raw_risk, min_stop_distance)
-            stop = round(price + final_risk, 2 if price >= 1.0 else 4)
+                proposed_risk = max(raw_risk, min_stop_distance)
+                # Defect 3: Direction-aware tick rounding for Short stop (ceil away from price)
+                stop = _ceil_to_tick(price + proposed_risk, tick_size)
 
-            if final_risk > 0 and stop > price:
+                # Defect 2: Pre-rounding vs post-rounding risk consistency
+                actual_risk = round(stop - price, precision)
+
                 max_rr = float(getattr(config, "MAX_TARGET_RR_RATIO", 5.0))
                 min_rr = float(getattr(config, "MIN_RR_RATIO", 1.0))
                 default_rr = float(getattr(config, "DEFAULT_TARGET_RR_RATIO", 2.0))
 
-                structural_target_dist = price - vwap_lower if vwap_lower < price else (final_risk * default_rr)
-                max_target_dist = final_risk * (max_rr - 0.5)
+                # Structural target calculation
+                structural_target_dist = (price - vwap_lower) if (vwap_lower < price and np.isfinite(vwap_lower)) else (actual_risk * default_rr)
+                max_target_dist = actual_risk * (max_rr - 0.5)
                 target_dist = min(structural_target_dist, max_target_dist)
-                target_dist = max(target_dist, final_risk * min_rr)
-                target = round(price - target_dist, 2 if price >= 1.0 else 4)
 
-                raw_target_dist = price - vwap_lower if vwap_lower < price else (final_risk * default_rr)
-                raw_rr = raw_target_dist / raw_risk if raw_risk > 0 else 0.0
-                final_rr = (price - target) / final_risk if final_risk > 0 else 0.0
+                # Defect 1: Structure-First target validation (NO artificial force-extension)
+                target = _ceil_to_tick(price - target_dist, tick_size)
+                actual_reward = round(price - target, precision)
+                actual_rr = actual_reward / actual_risk if actual_risk > 0 else 0.0
 
-                if target < price and final_rr >= (min_rr - 1e-4):
+                # Defect 5: Positivity & Ordering Invariant: 0 < target < price < stop
+                ordering_valid = (0 < target < price < stop)
+                rr_valid = (actual_rr >= (min_rr - 1e-4))
+
+                if ordering_valid and rr_valid:
                     logger.info(
                         "[SIGNAL GEOMETRY] symbol=%s side=SELL entry=%.2f stop=%.2f target=%.2f | "
-                        "structural_stop_distance=%.4f atr_floor=%.4f spread_floor=%.4f tick_floor=%.4f final_stop_distance=%.4f | "
-                        "projected_rr_raw=%.2f projected_rr_final=%.2f result=ACCEPTED",
+                        "structural_stop_distance=%.4f atr_floor=%.4f spread_floor=%.4f tick_floor=%.4f | "
+                        "actual_risk=%.4f actual_reward=%.4f actual_rr=%.2f result=ACCEPTED",
                         symbol, price, stop, target,
-                        raw_risk, atr_floor, spread_floor, tick_size, final_risk,
-                        raw_rr, final_rr
+                        raw_risk, atr_floor, spread_floor, tick_size,
+                        actual_risk, actual_reward, actual_rr
                     )
                     confidence = 0.5
                     if rsi > config.VWAP_RSI_OVERBOUGHT:
@@ -221,15 +270,21 @@ class VWAPBounceStrategy(BaseStrategy):
                         stop_price=stop,
                         target_price=target,
                         atr=atr,
-                        risk_per_share=final_risk,
+                        risk_per_share=actual_risk,
                         bar_timestamp=bar_ts,
                         reason=f"VWAP rejection | RSI {rsi:.0f} | held below {reclaim_bars} bars",
-                        metadata={"vwap": vwap, "rally_high": rally_high, "normalized_risk": final_risk},
+                        metadata={
+                            "vwap": vwap,
+                            "rally_high": rally_high,
+                            "normalized_risk": actual_risk,
+                            "actual_rr": actual_rr,
+                            "raw_risk": raw_risk,
+                        },
                     )
                 else:
                     logger.debug(
-                        "[SIGNAL GEOMETRY] symbol=%s side=SELL rejected | raw_risk=%.4f final_risk=%.4f final_rr=%.2f < min_rr=%.2f",
-                        symbol, raw_risk, final_risk, final_rr, min_rr
+                        "[SIGNAL GEOMETRY] symbol=%s side=SELL rejected | ordering_valid=%s actual_risk=%.4f actual_reward=%.4f actual_rr=%.2f < min_rr=%.2f",
+                        symbol, ordering_valid, actual_risk, actual_reward, actual_rr, min_rr
                     )
 
         return None
