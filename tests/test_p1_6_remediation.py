@@ -999,3 +999,103 @@ def test_intent_nonce_changes_client_order_id():
     cid_a = build_client_order_id("TSLA", "BUY", intent_nonce="intent-alpha-1")
     cid_b = build_client_order_id("TSLA", "BUY", intent_nonce="intent-beta-2")
     assert cid_a != cid_b
+
+
+def test_bind_parent_exact_key_matching(tmp_path):
+    """Commit 3B Invariant: bind_parent must match exact reservation key and never mutate other side or cross-symbol."""
+    from strategies.order_idempotency import EntryIdempotencyStore, STATUS_ACKNOWLEDGED, STATUS_PENDING
+
+    state_file = tmp_path / "exact_bind_idempotency.json"
+    store = EntryIdempotencyStore(storage_path=state_file)
+
+    # Reserve both BUY and SELL for AAPL
+    res_buy, _ = store.reserve("AAPL", side="BUY")
+    res_sell, _ = store.reserve("AAPL", side="SELL")
+    assert res_buy is True and res_sell is True
+
+    # Bind parent to AAPL_BUY only
+    bound = store.bind_parent("AAPL_BUY", "order-parent-buy-123")
+    assert bound is True
+
+    # BUY reservation must be ACKNOWLEDGED with parent order
+    assert store.reservations["AAPL_BUY"].status == STATUS_ACKNOWLEDGED
+    assert store.reservations["AAPL_BUY"].parent_order_id == "order-parent-buy-123"
+
+    # SELL reservation must NOT be altered
+    assert store.reservations["AAPL_SELL"].status == STATUS_PENDING
+    assert store.reservations["AAPL_SELL"].parent_order_id is None
+
+
+def test_bind_parent_idempotent_same_parent(tmp_path):
+    """Commit 3B Invariant: Repeated bind_parent calls with identical parent_order_id are idempotent and succeed."""
+    from strategies.order_idempotency import EntryIdempotencyStore, STATUS_ACKNOWLEDGED
+
+    state_file = tmp_path / "idempotent_bind.json"
+    store = EntryIdempotencyStore(storage_path=state_file)
+
+    store.reserve("NVDA", side="BUY")
+    bound_1 = store.bind_parent("NVDA_BUY", "order-parent-nvda-1")
+    assert bound_1 is True
+
+    # Repeated identical bind
+    bound_2 = store.bind_parent("NVDA_BUY", "order-parent-nvda-1")
+    assert bound_2 is True
+    assert store.reservations["NVDA_BUY"].parent_order_id == "order-parent-nvda-1"
+    assert store.reservations["NVDA_BUY"].status == STATUS_ACKNOWLEDGED
+
+
+def test_bind_parent_conflict_rejection(tmp_path):
+    """Commit 3B Invariant: Binding conflict to a different parent_order_id must be rejected without mutating state."""
+    from strategies.order_idempotency import EntryIdempotencyStore, STATUS_ACKNOWLEDGED
+
+    state_file = tmp_path / "conflict_bind.json"
+    store = EntryIdempotencyStore(storage_path=state_file)
+
+    store.reserve("NVDA", side="BUY")
+    bound_1 = store.bind_parent("NVDA_BUY", "order-parent-nvda-1")
+    assert bound_1 is True
+
+    # Attempt to bind conflicting parent ID
+    conflict_bound = store.bind_parent("NVDA_BUY", "order-parent-CONFLICT-999")
+    assert conflict_bound is False
+    # Original parent binding preserved
+    assert store.reservations["NVDA_BUY"].parent_order_id == "order-parent-nvda-1"
+    assert store.reservations["NVDA_BUY"].status == STATUS_ACKNOWLEDGED
+
+
+def test_bind_parent_persistence_failure_rollback(tmp_path):
+    """Commit 3B Invariant: Persistence failure during bind_parent rolls back mutation and marks store unhealthy."""
+    from unittest.mock import patch
+    from strategies.order_idempotency import EntryIdempotencyStore, STATUS_PENDING
+
+    state_file = tmp_path / "fail_bind.json"
+    store = EntryIdempotencyStore(storage_path=state_file)
+
+    store.reserve("NVDA", side="BUY")
+    assert store.reservations["NVDA_BUY"].status == STATUS_PENDING
+    assert store.reservations["NVDA_BUY"].parent_order_id is None
+
+    # Force persistence failure
+    with patch.object(store, "_save_state", side_effect=IOError("Disk write failed during bind_parent")):
+        bound = store.bind_parent("NVDA_BUY", "order-parent-fail")
+        assert bound is False
+        # In-memory rollback verification
+        assert store.reservations["NVDA_BUY"].status == STATUS_PENDING
+        assert store.reservations["NVDA_BUY"].parent_order_id is None
+        assert store.is_healthy is False
+        assert store.health_reason == "PERSISTENCE_FAILURE"
+
+
+def test_attach_parent_order_raises_on_failure(tmp_path):
+    """Commit 3B Invariant: attach_parent_order must raise RuntimeError on failure so callers trigger reconciliation."""
+    import pytest
+    from unittest.mock import patch
+    from strategies.order_idempotency import EntryIdempotencyStore
+
+    state_file = tmp_path / "attach_fail.json"
+    store = EntryIdempotencyStore(storage_path=state_file)
+
+    store.reserve("NVDA", side="BUY")
+    with patch.object(store, "_save_state", side_effect=IOError("Disk write failed")):
+        with pytest.raises(RuntimeError, match="Failed to attach parent order"):
+            store.attach_parent_order("NVDA", "BUY", "order-fail-parent")

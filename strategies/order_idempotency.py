@@ -266,41 +266,82 @@ class EntryIdempotencyStore:
 
             return True, "RESERVED"
 
-    def bind_parent(self, reservation_key_or_symbol: str, parent_order_id: str) -> bool:
-        """Bind parent order ID once broker acknowledges placement."""
-        key = reservation_key_or_symbol.upper().strip()
-        with self._lock:
-            target_key = None
-            for k, res in self.reservations.items():
-                if k == key or res.symbol == key or res.key == key:
-                    target_key = k
-                    break
-            if not target_key and key in self.reservations:
-                target_key = key
+    def bind_parent(
+        self,
+        reservation_key_or_symbol: str,
+        parent_order_id: str,
+        side: Optional[str] = None,
+    ) -> bool:
+        """
+        Bind broker parent order ID once broker acknowledges placement.
+        Enforces exact reservation key lookup (no fuzzy symbol iteration) and rejects binding conflicts.
+        """
+        if not parent_order_id:
+            logger.error("[IDEMPOTENCY] bind_parent rejected: empty parent_order_id")
+            return False
 
-            if target_key and target_key in self.reservations:
-                res = self.reservations[target_key]
-                old_parent = res.parent_order_id
-                old_status = res.status
-                res.parent_order_id = str(parent_order_id)
-                res.status = STATUS_ACKNOWLEDGED
-                try:
-                    self._save_state()
-                    logger.info(f"[IDEMPOTENCY] Bound parent order {parent_order_id} to reservation {target_key}")
-                    return True
-                except Exception:
-                    res.parent_order_id = old_parent
-                    res.status = old_status
-                    self.is_healthy = False
-                    self.health_reason = "PERSISTENCE_FAILURE"
-                    return False
-        return False
+        p_id = str(parent_order_id).strip()
+        raw_key = reservation_key_or_symbol.upper().strip()
+
+        if side:
+            key = f"{raw_key}_{side.upper().strip()}"
+        elif "_" in raw_key:
+            key = raw_key
+        else:
+            # If bare symbol without explicit side, default to BUY for backwards compatibility
+            key = f"{raw_key}_BUY"
+
+        with self._lock:
+            if not self.is_healthy:
+                logger.error(f"[IDEMPOTENCY] bind_parent rejected: store is unhealthy ({self.health_reason})")
+                return False
+
+            if key not in self.reservations:
+                logger.error(f"[IDEMPOTENCY] bind_parent failed: reservation key '{key}' not found in active reservations")
+                return False
+
+            res = self.reservations[key]
+
+            # Idempotent re-binding of the same parent order is permitted
+            if res.parent_order_id == p_id:
+                logger.info(f"[IDEMPOTENCY] Reservation {key} already bound to parent order {p_id}")
+                return True
+
+            # Invariant: Reject binding conflict if already bound to a DIFFERENT parent order
+            if res.parent_order_id is not None and res.parent_order_id != p_id:
+                logger.error(
+                    f"[IDEMPOTENCY] Binding conflict on {key}: already bound to parent '{res.parent_order_id}', "
+                    f"refusing new parent '{p_id}'"
+                )
+                return False
+
+            old_parent = res.parent_order_id
+            old_status = res.status
+            res.parent_order_id = p_id
+            res.status = STATUS_ACKNOWLEDGED
+
+            try:
+                self._save_state()
+                logger.info(f"[IDEMPOTENCY] Bound parent order {p_id} to reservation {key}")
+                return True
+            except Exception:
+                res.parent_order_id = old_parent
+                res.status = old_status
+                self.is_healthy = False
+                self.health_reason = "PERSISTENCE_FAILURE"
+                logger.exception(f"[IDEMPOTENCY] Persistence failed while binding parent {p_id} to {key}")
+                return False
 
     def attach_parent_order(self, symbol: str, side: str, parent_order_id: str) -> None:
-        """Alias for bind_parent for order_manager compatibility."""
+        """Alias for bind_parent for order_manager compatibility. Raises RuntimeError on persistence failure or conflict."""
         sym = symbol.upper().strip()
         s_side = side.upper().strip()
-        self.bind_parent(f"{sym}_{s_side}", parent_order_id)
+        ok = self.bind_parent(f"{sym}_{s_side}", parent_order_id)
+        if not ok:
+            raise RuntimeError(
+                f"Failed to attach parent order {parent_order_id} to {sym}_{s_side} "
+                f"(healthy={self.is_healthy}, reason={self.health_reason})"
+            )
 
     def complete(self, parent_order_id: str, terminal_status: str) -> bool:
         """Complete and release reservation when parent order reaches broker terminal state."""
