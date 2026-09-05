@@ -99,9 +99,19 @@ def build_client_order_id(
     s_date = str(session_date or "").strip()
     bar_ts = str(bar_timestamp_utc or "").strip()
 
+    if bar_ts:
+        # Canonicalize ISO timestamps to deterministic UTC string (%Y%m%d_%H%M%S)
+        try:
+            ts_str = bar_ts.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(ts_str)
+            dt_utc = dt.astimezone(timezone.utc)
+            bar_ts = dt_utc.strftime("%Y%m%d_%H%M%S")
+        except Exception:
+            bar_ts = bar_ts.strip()
+
     if not s_date:
-        if bar_ts and len(bar_ts) >= 10 and bar_ts[:4].isdigit():
-            s_date = bar_ts[:10].replace("-", "")
+        if bar_ts and len(bar_ts) >= 8 and bar_ts[:4].isdigit():
+            s_date = bar_ts[:8].replace("-", "")
         else:
             s_date = now_utc.strftime("%Y%m%d")
 
@@ -114,10 +124,12 @@ def build_client_order_id(
     nonce = str(intent_nonce or "").strip()
 
     # Parameter semantics:
+    # - sym (semantic symbol, e.g. BRK.B) is preserved in raw digest to differentiate from BRK_B
+    # - clean_sym (e.g. BRK_B) is strictly used for the broker wire-format client_order_id prefix
     # - strategy_full participates in raw digest to guarantee unique keys across distinct strategies
     # - strategy_entry_attempt represents strategy-level entry sequence/re-entry/scale-in and alters client_order_id
     # - submission_retry_attempt represents transport/HTTP retry and is NEVER included in the digest
-    raw = f"{clean_sym}|{s_side}|{strategy_full}|{s_date}|{bar_ts}|{sig_hash}|{nonce}|{entry_attempt}"
+    raw = f"{sym}|{s_side}|{strategy_full}|{s_date}|{bar_ts}|{sig_hash}|{nonce}|{entry_attempt}"
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
     client_order_id = f"se3-{clean_sym}-{side_code}-{strat_code}-{s_date}-{digest}"
 

@@ -1099,3 +1099,37 @@ def test_attach_parent_order_raises_on_failure(tmp_path):
     with patch.object(store, "_save_state", side_effect=IOError("Disk write failed")):
         with pytest.raises(RuntimeError, match="Failed to attach parent order"):
             store.attach_parent_order("NVDA", "BUY", "order-fail-parent")
+
+
+def test_symbol_canonical_semantic_digest_differentiation():
+    """Release Gate 3: Semantic symbol (BRK.B) is preserved in digest while prefix is broker-sanitized (BRK_B)."""
+    from strategies.order_idempotency import build_client_order_id
+
+    cid_dot = build_client_order_id("BRK.B", "BUY", strategy="VWAP_BOUNCE", session_date="20260908")
+    cid_under = build_client_order_id("BRK_B", "BUY", strategy="VWAP_BOUNCE", session_date="20260908")
+
+    # Both produce valid wire-format prefix
+    assert cid_dot.startswith("se3-BRK_B-B-vwap-20260908-")
+    assert cid_under.startswith("se3-BRK_B-B-vwap-20260908-")
+    # But because semantic symbols differ (BRK.B vs BRK_B), hash digests must NOT collide
+    assert cid_dot != cid_under, f"BRK.B and BRK_B must have distinct digests: {cid_dot} == {cid_under}"
+
+
+def test_timestamp_utc_canonicalization():
+    """Release Gate 5: Timezone-offset timestamps representing the same instant produce identical client_order_id."""
+    from strategies.order_idempotency import build_client_order_id
+
+    # 14:30 UTC == 10:30 EDT (UTC-4)
+    cid_utc = build_client_order_id(
+        "AAPL", "BUY",
+        bar_timestamp_utc="2026-09-08T14:30:00Z",
+        signal_hash="hash-abc",
+        strategy="VWAP_BOUNCE",
+    )
+    cid_edt = build_client_order_id(
+        "AAPL", "BUY",
+        bar_timestamp_utc="2026-09-08T10:30:00-04:00",
+        signal_hash="hash-abc",
+        strategy="VWAP_BOUNCE",
+    )
+    assert cid_utc == cid_edt, f"Equivalent UTC and offset timestamps must yield identical client_order_id: {cid_utc} != {cid_edt}"
