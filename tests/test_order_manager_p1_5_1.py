@@ -273,24 +273,25 @@ def test_single_submit_helper_passes_client_order_id_when_supported():
 
 
 def test_single_submit_helper_omits_client_order_id_when_unsupported():
-    """Test 7: Broker method without client_order_id does NOT receive client_order_id."""
+    """Test 7: Broker method without client_order_id raises BrokerIdempotencyUnsupported."""
     bridge = MagicMock()
     # Define method signature without client_order_id
     def mock_place(symbol, side, qty, entry_price, stop_price, target_price):
         return {"status": "ok", "received_symbol": symbol}
     bridge.place_bracket_order = mock_place
 
-    res = om._place_bracket_order_once(
-        bridge,
-        symbol="AAPL",
-        side="BUY",
-        qty=10,
-        entry_price=100.0,
-        stop_price=98.0,
-        target_price=105.0,
-        client_order_id="cid-123",
-    )
-    assert res["received_symbol"] == "AAPL"
+    with pytest.raises(om.BrokerIdempotencyUnsupported) as exc_info:
+        om._place_bracket_order_once(
+            bridge,
+            symbol="AAPL",
+            side="BUY",
+            qty=10,
+            entry_price=100.0,
+            stop_price=98.0,
+            target_price=105.0,
+            client_order_id="cid-123",
+        )
+    assert "does not support client_order_id" in str(exc_info.value)
 
 
 def test_typeerror_inside_broker_does_not_retry():

@@ -420,6 +420,16 @@ class AlpacaBridge:
         self.rotator = PositionRotator()
 
     @property
+    def is_paper(self) -> bool:
+        if self._client is not None:
+            return bool(getattr(self._client, "_paper", True))
+        return True
+
+    @property
+    def account_mode(self) -> str:
+        return "PAPER" if self.is_paper else "LIVE"
+
+    @property
     def stream_state(self) -> StreamState:
         with self._stream_state_lock:
             return self._stream_state

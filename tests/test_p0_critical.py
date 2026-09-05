@@ -302,7 +302,7 @@ def test_h2_ambiguous_submit_preserves_idempotency():
         def get_positions(self): return []
         def has_position(self, sym): return False
         def has_working_order(self, sym): return False
-        def place_bracket_order(self, symbol, side, qty, entry_price, stop_price, target_price):
+        def place_bracket_order(self, symbol, side, qty, entry_price, stop_price, target_price, **kwargs):
             return {"status": "submitted", "order_ids": []}  # Missing parent ID
 
     sig = TradeSignal(
@@ -347,7 +347,7 @@ def test_h3_lifecycle_registration_failure_is_fail_closed():
         def get_positions(self): return []
         def has_position(self, sym): return False
         def has_working_order(self, sym): return False
-        def place_bracket_order(self, symbol, side, qty, entry_price, stop_price, target_price):
+        def place_bracket_order(self, symbol, side, qty, entry_price, stop_price, target_price, **kwargs):
             return {
                 "status": "submitted",
                 "parent_order_id": "p_101",
@@ -410,7 +410,7 @@ def test_entry_gate_halt_blocks_order_placement_defense_in_depth():
         def get_positions(self): return []
         def has_position(self, sym): return False
         def has_working_order(self, sym): return False
-        def place_bracket_order(self, symbol, side, qty, entry_price, stop_price, target_price):
+        def place_bracket_order(self, symbol, side, qty, entry_price, stop_price, target_price, **kwargs):
             if self.entry_gate.halted:
                 raise RuntimeError("New entries blocked: startup reconciliation entry gate is halted")
             return {"status": "submitted"}
@@ -446,7 +446,7 @@ def test_execute_signal_cache_key_defined():
         def get_positions(self): return []
         def has_position(self, sym): return False
         def has_working_order(self, sym): return False
-        def place_bracket_order(self, symbol, side, qty, entry_price, stop_price, target_price):
+        def place_bracket_order(self, symbol, side, qty, entry_price, stop_price, target_price, **kwargs):
             return {
                 "status": "submitted",
                 "parent_order_id": "p_555",

@@ -1098,6 +1098,7 @@ def test_fault_injection_stale_data_quarantine_halt():
     """Fault Injection 3: Stale bar timestamps (>300s) trigger fail-closed quarantine and halt signals."""
     from strategies.intraday_data import _validate_intraday_data
     from datetime import datetime, timezone, timedelta
+    from unittest.mock import patch
 
     # 600-second old bar
     stale_time = datetime.now(timezone.utc) - timedelta(seconds=600)
@@ -1109,7 +1110,8 @@ def test_fault_injection_stale_data_quarantine_halt():
         "close": [100.5],
         "volume": [10000],
     })
-    cleaned = _validate_intraday_data(df, "AAPL", "5m", validate_staleness=True)
+    with patch("strategies.session.is_market_open", return_value=True):
+        cleaned = _validate_intraday_data(df, "AAPL", "5m", validate_staleness=True)
     # Stale data returns empty DataFrame (quarantined)
     assert cleaned.empty
 

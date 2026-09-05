@@ -164,8 +164,8 @@ def test_422_broker_order_recovery_adoption():
         idempotency_manager.release_after_reconciliation("BAC", side="BUY", reason="test_cleanup")
 
 
-def test_422_broker_order_not_found_clean_release():
-    """Verify 422 error where order is NOT found on broker releases idempotency cleanly."""
+def test_422_broker_order_not_found_retains_reservation():
+    """Verify 422 error where order is NOT found on broker retains reservation and requires reconciliation."""
     from strategies.order_manager import execute_signal, idempotency_manager
     from unittest.mock import MagicMock
 
@@ -193,14 +193,17 @@ def test_422_broker_order_not_found_clean_release():
 
     idempotency_manager.release("JPM", side="BUY", reason="test_init")
 
-    with patch("strategies.order_manager.calculate_shares", return_value=11), \
-         patch("strategies.execution_quote.validate_execution_quote", return_value=MagicMock(valid=True, quote=MagicMock(last=358.75))), \
-         patch.object(config, "SPY_TREND_GUARD_ENABLED", False):
-        res = execute_signal(signal=sig, bridge=bridge, equity=100000.0, current_pnl=0.0, dry_run=False)
-        assert res["status"] == "REJECTED"
-        # Verify reservation was released so symbol is not locked out
-        is_reserved, _ = idempotency_manager.reserve("JPM", side="BUY")
-        assert is_reserved is True
+    try:
+        with patch("strategies.order_manager.calculate_shares", return_value=11), \
+             patch("strategies.execution_quote.validate_execution_quote", return_value=MagicMock(valid=True, quote=MagicMock(last=358.75))), \
+             patch.object(config, "SPY_TREND_GUARD_ENABLED", False):
+            res = execute_signal(signal=sig, bridge=bridge, equity=100000.0, current_pnl=0.0, dry_run=False)
+            assert res["status"] == "SUBMITTED_RECONCILIATION_REQUIRED"
+            assert res["metadata"].get("reconciliation_reason") == "DUPLICATE_CLIENT_ORDER_ID"
+            # Verify reservation is retained so duplicate submissions remain blocked
+            is_reserved, _ = idempotency_manager.reserve("JPM", side="BUY")
+            assert is_reserved is False
+    finally:
         idempotency_manager.release("JPM", side="BUY", reason="test_cleanup")
 
 

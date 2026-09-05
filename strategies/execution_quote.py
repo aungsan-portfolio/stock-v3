@@ -140,6 +140,7 @@ def validate_execution_quote(
     spread_dollars = ask - bid
     spread_pct = (spread_dollars / mid) * 100.0
     if spread_pct > max_spread_pct:
+        age = (now - ts) if ts > 0 else None
         age_str = f"{age:.3f}s" if age is not None else "unknown"
         return QuoteValidationResult(
             valid=False,

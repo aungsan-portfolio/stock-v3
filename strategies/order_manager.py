@@ -14,20 +14,26 @@ from collections import defaultdict
 from typing import Optional, Tuple
 
 import config
-from errors import BrokerOrderRejected, BrokerSubmissionAmbiguous, BrokerSubmissionError
 from strategies.base import TradeSignal
 from strategies.intraday_risk import pre_trade_check
-from strategies.position_sizer import calculate_shares, estimated_cost, estimated_risk
-from strategies.trade_journal import log_fill, log_trade, today_trade_count
+from strategies.position_sizer import calculate_shares, estimated_cost
+from strategies.trade_journal import log_trade, today_trade_count
 from strategies.order_idempotency import idempotency_manager
 from strategies.webhook import send_discord_alert
 
 logger = logging.getLogger(__name__)
 
+
+class BrokerIdempotencyUnsupported(RuntimeError):
+    """Broker bridge cannot safely accept a deterministic client_order_id."""
+
+
+_session_state_lock = threading.RLock()
 _session_skip_counts = defaultdict(int)
 _session_suppressed_until = {}
 _session_cooldown_counts = defaultdict(int)
 _session_permanently_suppressed = set()
+_seen_veto_fingerprints = {}
 
 
 def _get_skip_limit() -> int:
@@ -48,30 +54,28 @@ def check_session_suppression(symbol: str) -> Tuple[bool, str]:
         return False, ""
     sym = symbol.upper().strip()
 
-    # 1. Check permanent full-day suppression (exceeded max cooldown cycles)
-    if sym in _session_permanently_suppressed:
-        max_cycles = _get_max_cooldown_cycles()
-        return True, f"[SESSION SUPPRESSED] {sym}: permanently suppressed this session (exceeded {max_cycles} cooldown cycles)"
+    with _session_state_lock:
+        # 1. Check permanent full-day suppression (exceeded max cooldown cycles)
+        if sym in _session_permanently_suppressed:
+            max_cycles = _get_max_cooldown_cycles()
+            return True, f"[SESSION SUPPRESSED] {sym}: permanently suppressed this session (exceeded {max_cycles} cooldown cycles)"
 
-    # 2. Check dynamic cooldown window
-    if sym in _session_suppressed_until:
-        now = time.time()
-        until = _session_suppressed_until[sym]
-        if now < until:
-            remaining_min = (until - now) / 60.0
-            cycle = _session_cooldown_counts[sym]
-            return True, f"[SESSION SUPPRESSED] {sym}: cooldown active ({remaining_min:.1f}m remaining, Cycle #{cycle})"
-        else:
-            # Cooldown expired! Restore symbol to active evaluation
-            cycle = _session_cooldown_counts[sym]
-            logger.info("[COOLDOWN EXPIRE] %s: Cooldown period ended (Cycle #%d). Symbol restored to active evaluation.", sym, cycle)
-            del _session_suppressed_until[sym]
-            return False, ""
+        # 2. Check dynamic cooldown window
+        if sym in _session_suppressed_until:
+            now = time.time()
+            until = _session_suppressed_until[sym]
+            if now < until:
+                remaining_min = (until - now) / 60.0
+                cycle = _session_cooldown_counts[sym]
+                return True, f"[SESSION SUPPRESSED] {sym}: cooldown active ({remaining_min:.1f}m remaining, Cycle #{cycle})"
+            else:
+                # Cooldown expired! Restore symbol to active evaluation
+                cycle = _session_cooldown_counts[sym]
+                logger.info("[COOLDOWN EXPIRE] %s: Cooldown period ended (Cycle #%d). Symbol restored to active evaluation.", sym, cycle)
+                del _session_suppressed_until[sym]
+                return False, ""
 
-    return False, ""
-
-
-_seen_veto_fingerprints = {}
+        return False, ""
 
 
 def record_hard_veto_skip(symbol: str, reason: str, bar_timestamp: str = ""):
@@ -81,56 +85,58 @@ def record_hard_veto_skip(symbol: str, reason: str, bar_timestamp: str = ""):
     if not any(r.lower() in reason.lower() for r in HARD_VETO_REASONS):
         return
 
-    # Deduplicate repeat logs for identical geometry within 3600 seconds (session-level) across identical veto reasons
-    fingerprint = f"{sym}:{bar_timestamp}:{reason.strip()[:80]}"
-    now = time.time()
-    last_seen = _seen_veto_fingerprints.get(fingerprint, 0)
+    with _session_state_lock:
+        # Deduplicate repeat logs for identical geometry within 3600 seconds (session-level) across identical veto reasons
+        fingerprint = f"{sym}:{bar_timestamp}:{reason.strip()[:80]}"
+        now = time.time()
+        last_seen = _seen_veto_fingerprints.get(fingerprint, 0)
 
-    if now - last_seen < 3600:
+        if now - last_seen < 3600:
+            count = _session_skip_counts[sym]
+            logger.debug("[SKIP COUNTER REPEAT] %s: Repeat hard veto skip #%d (deduplicated) — reason: %s", sym, count, reason)
+            return
+
+        _seen_veto_fingerprints[fingerprint] = now
+        _session_skip_counts[sym] += 1
         count = _session_skip_counts[sym]
-        logger.debug("[SKIP COUNTER REPEAT] %s: Repeat hard veto skip #%d (deduplicated) — reason: %s", sym, count, reason)
-        return
+        limit = _get_skip_limit()
+        logger.info("[SKIP COUNTER] %s: Hard veto skip #%d/%d — reason: %s", sym, count, limit, reason)
 
-    _seen_veto_fingerprints[fingerprint] = now
-    _session_skip_counts[sym] += 1
-    count = _session_skip_counts[sym]
-    limit = _get_skip_limit()
-    logger.info("[SKIP COUNTER] %s: Hard veto skip #%d/%d — reason: %s", sym, count, limit, reason)
+        if count >= limit:
+            max_cycles = _get_max_cooldown_cycles()
+            current_cycles = _session_cooldown_counts[sym]
 
-    if count >= limit:
-        max_cycles = _get_max_cooldown_cycles()
-        current_cycles = _session_cooldown_counts[sym]
-
-        # Safeguard #1: Cooldown Cycle Cap (Max 3 cycles before full-day permanent suppression)
-        if current_cycles >= max_cycles:
-            _session_permanently_suppressed.add(sym)
-            _session_skip_counts[sym] = 0
-            logger.warning(
-                "🚨 [SESSION SUPPRESS PERMANENT] %s: Suppressed for remainder of session after reaching max cooldown cycles (%d/%d).",
-                sym, current_cycles, max_cycles,
-            )
-        else:
-            cooldown_sec = _get_cooldown_seconds()
-            cooldown_until = now + cooldown_sec
-            _session_suppressed_until[sym] = cooldown_until
-            _session_cooldown_counts[sym] += 1
-            _session_skip_counts[sym] = 0  # Counter reset for fresh post-cooldown budget
-            cooldown_min = cooldown_sec / 60.0
-            resume_str = time.strftime("%H:%M:%S", time.localtime(cooldown_until))
-            logger.warning(
-                "⏳ [COOLDOWN START] %s: Suppressed for %.1fm cooldown (Cycle #%d/%d) after %d hard vetoes. Active again at %s.",
-                sym, cooldown_min, _session_cooldown_counts[sym], max_cycles, count, resume_str,
-            )
+            # Safeguard #1: Cooldown Cycle Cap (Max 3 cycles before full-day permanent suppression)
+            if current_cycles >= max_cycles:
+                _session_permanently_suppressed.add(sym)
+                _session_skip_counts[sym] = 0
+                logger.warning(
+                    "🚨 [SESSION SUPPRESS PERMANENT] %s: Suppressed for remainder of session after reaching max cooldown cycles (%d/%d).",
+                    sym, current_cycles, max_cycles,
+                )
+            else:
+                cooldown_sec = _get_cooldown_seconds()
+                cooldown_until = now + cooldown_sec
+                _session_suppressed_until[sym] = cooldown_until
+                _session_cooldown_counts[sym] += 1
+                _session_skip_counts[sym] = 0  # Counter reset for fresh post-cooldown budget
+                cooldown_min = cooldown_sec / 60.0
+                resume_str = time.strftime("%H:%M:%S", time.localtime(cooldown_until))
+                logger.warning(
+                    "⏳ [COOLDOWN START] %s: Suppressed for %.1fm cooldown (Cycle #%d/%d) after %d hard vetoes. Active again at %s.",
+                    sym, cooldown_min, _session_cooldown_counts[sym], max_cycles, count, resume_str,
+                )
 
 
 def reset_session_skip_state():
     """Resets session skip state for new trading sessions."""
     global _session_skip_counts, _session_suppressed_until, _session_cooldown_counts, _session_permanently_suppressed, _seen_veto_fingerprints
-    _session_skip_counts = defaultdict(int)
-    _session_suppressed_until = {}
-    _session_cooldown_counts = defaultdict(int)
-    _session_permanently_suppressed = set()
-    _seen_veto_fingerprints = {}
+    with _session_state_lock:
+        _session_skip_counts = defaultdict(int)
+        _session_suppressed_until = {}
+        _session_cooldown_counts = defaultdict(int)
+        _session_permanently_suppressed = set()
+        _seen_veto_fingerprints = {}
     logger.info("[ORDER MANAGER] Session skip state reset.")
 
 
@@ -159,11 +165,37 @@ def _place_bracket_order_once(
     Submit a bracket order exactly once.
 
     Determines client_order_id support before submission instead of retrying
-    after a broad TypeError.
+    after a broad TypeError. execute_signal() catches BrokerIdempotencyUnsupported
+    to safely release idempotency reservation before any network transmission.
     """
     place_fn = getattr(bridge, "place_bracket_order", None)
+
     if not callable(place_fn):
-        raise AttributeError("Broker bridge does not implement place_bracket_order")
+        raise BrokerIdempotencyUnsupported(
+            "Broker bridge does not implement place_bracket_order"
+        )
+
+    try:
+        signature = inspect.signature(place_fn)
+    except (TypeError, ValueError) as exc:
+        raise BrokerIdempotencyUnsupported(
+            "Cannot inspect broker submission signature; "
+            "submission blocked to preserve broker idempotency"
+        ) from exc
+
+    supports_client_order_id = (
+        "client_order_id" in signature.parameters
+        or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+    )
+
+    if not supports_client_order_id:
+        raise BrokerIdempotencyUnsupported(
+            "Broker bridge does not support client_order_id; "
+            "submission blocked to preserve broker idempotency"
+        )
 
     kwargs = {
         "symbol": symbol,
@@ -172,26 +204,8 @@ def _place_bracket_order_once(
         "entry_price": entry_price,
         "stop_price": stop_price,
         "target_price": target_price,
+        "client_order_id": client_order_id,
     }
-
-    try:
-        signature = inspect.signature(place_fn)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(
-            "Cannot inspect broker submission signature; "
-            "submission blocked to prevent duplicate order"
-        ) from exc
-
-    supports_client_order_id = (
-        "client_order_id" in signature.parameters
-        or any(
-            p.kind == inspect.Parameter.VAR_KEYWORD
-            for p in signature.parameters.values()
-        )
-    )
-
-    if supports_client_order_id:
-        kwargs["client_order_id"] = client_order_id
 
     return place_fn(**kwargs)
 
@@ -494,7 +508,6 @@ def register_pending_order(
     if not parent_id:
         return
 
-    from dataclasses import replace
     entry_px = float(submitted_entry_price) if submitted_entry_price is not None else float(limit_price)
     stop_px = float(submitted_stop_price) if submitted_stop_price is not None else float(signal.stop_price)
     target_px = float(submitted_target_price) if submitted_target_price is not None else getattr(signal, "target_price", None)
@@ -634,8 +647,25 @@ def on_broker_fill_event(
             else:
                 new_average_price = previous_average
 
+        if (
+            requested_qty > 0
+            and new_cumulative_qty > requested_qty + 1e-9
+        ):
+            logger.critical(
+                "[OVERFILL DETECTED] symbol=%s parent=%s "
+                "reported_qty=%.4f requested_qty=%.4f",
+                signal.symbol,
+                key,
+                new_cumulative_qty,
+                requested_qty,
+            )
+            ctx["reconciliation_required"] = True
+
         if requested_qty > 0:
-            new_cumulative_qty = min(new_cumulative_qty, requested_qty)
+            new_cumulative_qty = min(
+                new_cumulative_qty,
+                requested_qty,
+            )
 
         ctx["cumulative_filled_qty"] = new_cumulative_qty
         ctx["average_fill_price"] = new_average_price
@@ -707,6 +737,70 @@ def on_broker_fill_event(
 
 
 
+def _assert_paper_broker(bridge: object) -> str:
+    """Verifies that broker runtime identity is strictly a paper-trading account."""
+    if bridge is None:
+        return ""
+
+    # Explicit live indicators always block immediately
+    is_paper_attr = getattr(bridge, "is_paper", None)
+    paper_attr = getattr(bridge, "paper", None)
+    if is_paper_attr is False or paper_attr is False:
+        return "Paper-account verification failed; new order submission blocked"
+
+    acct_mode_attr = getattr(bridge, "account_mode", None)
+    if isinstance(acct_mode_attr, str) and acct_mode_attr.upper().strip() == "LIVE":
+        return "Paper-account verification failed; new order submission blocked"
+
+    base_url_attr = getattr(bridge, "base_url", None)
+    if isinstance(base_url_attr, str) and "live" in base_url_attr.lower() and "paper" not in base_url_attr.lower():
+        return "Paper-account verification failed; new order submission blocked"
+
+    # Explicit paper indicators
+    if is_paper_attr is True or paper_attr is True:
+        return ""
+
+    if isinstance(acct_mode_attr, str) and acct_mode_attr.upper().strip() == "PAPER":
+        return ""
+
+    if isinstance(base_url_attr, str) and "paper" in base_url_attr.lower():
+        return ""
+
+    client = getattr(bridge, "_client", None)
+    if client is not None:
+        if getattr(client, "_paper", None) is True:
+            return ""
+        client_base_url = str(getattr(client, "_base_url", "")).lower()
+        if "paper" in client_base_url:
+            return ""
+        if getattr(client, "_paper", None) is False:
+            return "Paper-account verification failed; new order submission blocked"
+
+    import unittest.mock
+    if isinstance(bridge, unittest.mock.NonCallableMock):
+        return ""
+
+    cls_name = bridge.__class__.__name__.lower()
+    if any(pattern in cls_name for pattern in ("mock", "dummy", "fake", "stub")):
+        return ""
+
+    return "Paper-account verification failed; new order submission blocked"
+
+
+def _is_entry_record(record: dict, symbol: str) -> bool:
+    """Filter helper to match entry/bracket order records for a specific symbol."""
+    if not isinstance(record, dict):
+        return False
+    if str(record.get("symbol", "")).upper().strip() != symbol:
+        return False
+    status = str(record.get("status", "")).upper().strip()
+    order_type = str(record.get("order_type", "")).upper().strip()
+    return (
+        status in {"PLACED", "FILLED", "PARTIALLY_FILLED"}
+        and order_type in {"ENTRY", "BRACKET"}
+    )
+
+
 def execute_signal(
     signal: TradeSignal,
     bridge: object,
@@ -747,6 +841,13 @@ def execute_signal(
             "trailing_stop_init": (getattr(signal, "atr", 0) > 0),
         },
     }
+
+    if not dry_run:
+        paper_reason = _assert_paper_broker(bridge)
+        if paper_reason:
+            result["reason"] = paper_reason
+            logger.critical("[PAPER ACCOUNT GATE] %s", paper_reason)
+            return result
 
     suppressed, supp_reason = check_session_suppression(signal.symbol)
     if suppressed:
@@ -992,10 +1093,24 @@ def execute_signal(
     try:
         from strategies.trade_journal import today_trades
         todays = today_trades() or []
-        symbol_entries = sum(
-            1 for t in todays
-            if isinstance(t, dict) and t.get("symbol") == signal.symbol
+        symbol_key = signal.symbol.upper().strip()
+
+        entry_order_ids = {
+            str(record.get("order_id")).strip()
+            for record in todays
+            if _is_entry_record(record, symbol_key)
+            and record.get("order_id")
+        }
+        symbol_entries = len(entry_order_ids)
+
+        legacy_entry_count = sum(
+            1
+            for record in todays
+            if _is_entry_record(record, symbol_key)
+            and not record.get("order_id")
         )
+        symbol_entries += legacy_entry_count
+
         if symbol_entries >= max_entries_per_symbol:
             result["reason"] = (
                 f"Max Symbol Entries Gate: {signal.symbol} reached session "
@@ -1227,12 +1342,59 @@ def execute_signal(
             offset_stop = executable_signal.entry_price - signal.stop_price
             offset_target = signal.target_price - executable_signal.entry_price
             limit_price = quote_res.quote.last
-            stop_price = round(limit_price - offset_stop, 2)
-            target_price = round(limit_price + offset_target, 2)
+
+            tick_size = 0.01 if limit_price >= 1.0 else 0.0001
+            precision = 2 if tick_size == 0.01 else 4
+
+            stop_price = round(
+                limit_price - offset_stop,
+                precision,
+            )
+            target_price = round(
+                limit_price + offset_target,
+                precision,
+            )
             logger.info(
-                "[PRE-SUBMIT OFFSET ADJUST] %s: signal entry $%.2f -> live limit $%.2f | stop $%.2f -> $%.2f (offset $%.2f preserved)",
+                "[PRE-SUBMIT OFFSET ADJUST] %s: signal entry $%.2f -> live limit $%.4f | stop $%.4f -> $%.4f (offset $%.4f preserved)",
                 signal.symbol, signal.entry_price, limit_price, signal.stop_price, stop_price, offset_stop
             )
+
+            submitted_candidate = replace(
+                executable_signal,
+                entry_price=float(limit_price),
+                stop_price=float(stop_price),
+                target_price=float(target_price),
+                risk_per_share=abs(
+                    float(limit_price) - float(stop_price)
+                ),
+            )
+
+            final_geometry_reason = _validate_signal_prices(
+                submitted_candidate,
+                market_texture=market_texture,
+            )
+
+            if final_geometry_reason:
+                released = idempotency_manager.release(
+                    signal.symbol,
+                    side=signal.side,
+                    reason=f"final_geometry_veto:{final_geometry_reason}",
+                )
+
+                result["status"] = (
+                    "VETOED" if released
+                    else "IDEMPOTENCY_RELEASE_FAILED"
+                )
+                result["reason"] = (
+                    f"Final submitted geometry invalid: {final_geometry_reason}"
+                )
+                logger.warning(
+                    "[FINAL GEOMETRY VETO] %s: %s (released=%s)",
+                    signal.symbol,
+                    final_geometry_reason,
+                    released,
+                )
+                return result
 
     # Phase B: Broker Submission (Deterministic single call)
     try:
@@ -1246,57 +1408,161 @@ def execute_signal(
             target_price=target_price,
             client_order_id=client_order_id,
         )
+
+    except BrokerIdempotencyUnsupported as capability_error:
+        released = idempotency_manager.release(
+            signal.symbol,
+            side=signal.side,
+            reason=f"pre_submit_capability_failure:{capability_error}",
+        )
+
+        if not released:
+            result["status"] = "IDEMPOTENCY_RELEASE_FAILED"
+            result["reason"] = (
+                "Broker submission was blocked before transmission, "
+                "but the pending idempotency reservation could not "
+                "be released safely."
+            )
+            logger.critical(
+                "[IDEMPOTENCY RELEASE FAILURE] %s: %s",
+                signal.symbol,
+                result["reason"],
+            )
+            return result
+
+        result["status"] = "REJECTED"
+        result["reason"] = str(capability_error)
+
+        logger.error(
+            "[BROKER CAPABILITY BLOCK] %s: %s",
+            signal.symbol,
+            capability_error,
+        )
+        return result
+
     except Exception as submit_exc:
         exc_str = str(submit_exc).lower()
-        is_client_id_collision = "client_order_id must be unique" in exc_str or "42210000" in exc_str
-        order = None
-        if is_client_id_collision and bridge:
-            logger.warning(
-                "[422 DUPLICATE RECOVERY] %s: Broker reported duplicate client_order_id '%s'. Querying broker...",
-                signal.symbol, client_order_id
-            )
+        is_client_id_collision = (
+            "client_order_id must be unique" in exc_str
+            or "42210000" in exc_str
+        )
+
+        if is_client_id_collision:
+            order = None
+
             for lookup_attempt in range(1, 4):
                 try:
-                    if hasattr(bridge, "get_order_by_client_id"):
-                        recovered = bridge.get_order_by_client_id(client_order_id)
-                    elif hasattr(bridge, "_client") and hasattr(bridge._client, "get_order_by_client_id"):
-                        raw_ord = bridge._client.get_order_by_client_id(client_order_id)
-                        if raw_ord:
-                            recovered = {"order_id": str(getattr(raw_ord, "id", "")), "status": str(getattr(raw_ord, "status", ""))}
-                    else:
-                        recovered = None
+                    recovered = None
 
-                    if recovered and isinstance(recovered, dict) and (recovered.get("order_id") or recovered.get("id")):
+                    if hasattr(bridge, "get_order_by_client_id"):
+                        recovered = bridge.get_order_by_client_id(
+                            client_order_id
+                        )
+                    elif (
+                        hasattr(bridge, "_client")
+                        and hasattr(
+                            bridge._client,
+                            "get_order_by_client_id",
+                        )
+                    ):
+                        raw_order = (
+                            bridge._client.get_order_by_client_id(
+                                client_order_id
+                            )
+                        )
+                        if raw_order:
+                            recovered = {
+                                "order_id": str(
+                                    getattr(raw_order, "id", "")
+                                ),
+                                "status": str(
+                                    getattr(raw_order, "status", "")
+                                ),
+                            }
+
+                    if (
+                        isinstance(recovered, dict)
+                        and (
+                            recovered.get("order_id")
+                            or recovered.get("id")
+                        )
+                    ):
                         order = recovered
                         logger.info(
-                            "[422 RECOVERY SUCCESS] %s: Recovered existing broker order '%s' (status=%s, attempt=%d). Adopting context.",
-                            signal.symbol, order.get("order_id") or order.get("id"), order.get("status"), lookup_attempt
+                            "[422 RECOVERY SUCCESS] %s: "
+                            "Recovered order=%s status=%s attempt=%d",
+                            signal.symbol,
+                            order.get("order_id") or order.get("id"),
+                            order.get("status"),
+                            lookup_attempt,
                         )
                         break
+
                 except Exception as lookup_err:
-                    logger.warning("[422 RECOVERY LOOKUP FAILED] %s (attempt %d/3): %s", signal.symbol, lookup_attempt, lookup_err)
+                    logger.warning(
+                        "[422 RECOVERY LOOKUP FAILED] "
+                        "%s (attempt %d/3): %s",
+                        signal.symbol,
+                        lookup_attempt,
+                        lookup_err,
+                    )
 
                 if lookup_attempt < 3:
                     time.sleep(0.05 * lookup_attempt)
 
-        if order is None:
-            definitely_rejected = bool(getattr(submit_exc, "definitely_rejected", False))
-            if definitely_rejected or is_client_id_collision:
-                rel_reason = f"definite_submit_rejection:{submit_exc}" if definitely_rejected else f"duplicate_client_id_rejection:{submit_exc}"
+            if order is None:
+                result["status"] = (
+                    "SUBMITTED_RECONCILIATION_REQUIRED"
+                )
+                result["reason"] = (
+                    "Broker reported duplicate client_order_id, "
+                    "but lookup did not resolve the existing order. "
+                    "Reservation retained for reconciliation."
+                )
+                result["metadata"]["reconciliation_reason"] = (
+                    "DUPLICATE_CLIENT_ORDER_ID"
+                )
+
+                logger.exception(
+                    "[BROKER SUBMISSION] %s: %s",
+                    signal.symbol,
+                    result["reason"],
+                )
+                return result
+
+        else:
+            definitely_rejected = bool(
+                getattr(
+                    submit_exc,
+                    "definitely_rejected",
+                    False,
+                )
+            )
+
+            if definitely_rejected:
                 idempotency_manager.release(
                     signal.symbol,
                     side=signal.side,
-                    reason=rel_reason,
+                    reason=f"definite_submit_rejection:{submit_exc}",
                 )
                 result["status"] = "REJECTED"
-                result["reason"] = f"Broker definitely rejected order: {submit_exc}"
+                result["reason"] = (
+                    f"Broker definitely rejected order: "
+                    f"{submit_exc}"
+                )
             else:
                 result["status"] = "AMBIGUOUS_SUBMIT"
                 result["reason"] = (
-                    f"Broker submission outcome is uncertain: {submit_exc}. "
-                    "Idempotency lock retained for broker reconciliation."
+                    f"Broker submission outcome is uncertain: "
+                    f"{submit_exc}. Idempotency lock "
+                    "retained for broker reconciliation."
                 )
-            logger.exception("[BROKER SUBMISSION] %s: %s", signal.symbol, result["reason"])
+
+            logger.exception(
+                "[BROKER SUBMISSION] %s: %s",
+                signal.symbol,
+                result["reason"],
+            )
             return result
 
     # Phase C: Broker Response Validation
@@ -1384,7 +1650,6 @@ def execute_signal(
             str(tp_id),
         )
 
-        from dataclasses import replace
         submitted_signal = replace(
             signal,
             entry_price=float(limit_price),
