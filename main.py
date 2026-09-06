@@ -296,6 +296,12 @@ def _place_paper_orders(signals, broker: str = "ibkr", bridge=None, dry_run: boo
             print(f"\n✅ Orders accepted : {result.get('placed', 0)}")
             print(f"   Skipped         : {result.get('skipped', 0)}")
             print(f"   Total signals   : {result.get('total', len(signals))}")
+            if hasattr(bridge, "mutation_counters"):
+                import json
+                ev_dir = pathlib.Path("evidence")
+                ev_dir.mkdir(exist_ok=True)
+                with open(ev_dir / "phase_g_mutation_counters.json", "w", encoding="utf-8") as mcf:
+                    json.dump(bridge.mutation_counters.to_dict(), mcf, indent=2)
 
             # Run post-scan cycle reconciliation before closing connection
             post_recon = bridge.reconcile_startup_state()
