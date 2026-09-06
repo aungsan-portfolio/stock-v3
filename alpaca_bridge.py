@@ -3252,7 +3252,10 @@ class AlpacaBridge:
         self._evaluate_and_execute_rotation(signals)
 
         open_positions = self.get_open_positions()
-        open_symbols = {s.upper() for s in open_positions.keys()}
+        if isinstance(open_positions, dict):
+            open_symbols = {str(s).upper() for s in open_positions.keys()}
+        else:
+            open_symbols = {str(s).upper() for s in open_positions}
         working_symbols = self.working_order_symbols()
         occupied_symbols = open_symbols | working_symbols
         planned_new_symbols: set = set()
