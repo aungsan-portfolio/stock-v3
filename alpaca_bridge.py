@@ -110,6 +110,44 @@ class StreamState(Enum):
     STOPPED = "STOPPED"
 
 
+
+@dataclass
+class MutationCounters:
+    mutation_attempts: int = 0
+    mutation_blocked: int = 0
+    mutation_passed_through: int = 0
+    submit_order_passed_through: int = 0
+    replace_order_passed_through: int = 0
+    cancel_order_passed_through: int = 0
+    close_position_passed_through: int = 0
+
+    def record(self, kind: str, dry_run: bool) -> bool:
+        self.mutation_attempts += 1
+        if dry_run:
+            self.mutation_blocked += 1
+            return True
+        self.mutation_passed_through += 1
+        if kind == "submit_order":
+            self.submit_order_passed_through += 1
+        elif kind == "replace_order":
+            self.replace_order_passed_through += 1
+        elif kind == "cancel_order":
+            self.cancel_order_passed_through += 1
+        elif kind == "close_position":
+            self.close_position_passed_through += 1
+        return False
+
+    def to_dict(self) -> dict:
+        return {
+            "mutation_attempts": self.mutation_attempts,
+            "mutation_blocked": self.mutation_blocked,
+            "mutation_passed_through": self.mutation_passed_through,
+            "submit_order_passed_through": self.submit_order_passed_through,
+            "replace_order_passed_through": self.replace_order_passed_through,
+            "cancel_order_passed_through": self.cancel_order_passed_through,
+            "close_position_passed_through": self.close_position_passed_through,
+        }
+
 class BrokerOrderCheck(Enum):
     WORKING_ORDER_EXISTS = "WORKING_ORDER_EXISTS"
     NO_WORKING_ORDER = "NO_WORKING_ORDER"
@@ -394,6 +432,7 @@ class AlpacaBridge:
     def __init__(self, cfg=None, mode: str = "daytrade", dry_run: bool = False) -> None:
         self.mode = str(mode or "daytrade").lower()
         self.dry_run = bool(dry_run)
+        self.mutation_counters = MutationCounters()
         self._cfg = cfg or config_module.get_settings()
         self._client: Optional[TradingClient] = None
         self._data_client: Optional[StockHistoricalDataClient] = None
@@ -2413,6 +2452,7 @@ class AlpacaBridge:
             request_kwargs["client_order_id"] = str(client_order_id)[:128]
 
         if getattr(self, "dry_run", False):
+            self.mutation_counters.record("submit_order", True)
             logger.info("[DRY-RUN MUTATION BLOCKED] place_bracket_order for %s %s qty=%d @ limit=%.2f", symbol, side, qty, entry_p)
             return {
                 "status": "dry_run_blocked",
@@ -2602,6 +2642,7 @@ class AlpacaBridge:
     def cancel_order(self, order_id: str) -> bool:
         self._require_connection()
         if getattr(self, "dry_run", False):
+            self.mutation_counters.record("cancel_order", True)
             logger.info("[DRY-RUN MUTATION BLOCKED] cancel_order %s", order_id)
             return True
         try:
@@ -2797,6 +2838,7 @@ class AlpacaBridge:
     def close_position(self, symbol: str) -> bool:
         self._require_connection()
         if getattr(self, "dry_run", False):
+            self.mutation_counters.record("close_position", True)
             logger.info("[DRY-RUN MUTATION BLOCKED] close_position %s", symbol)
             return True
         try:
@@ -2833,6 +2875,7 @@ class AlpacaBridge:
 
     def _cancel_working_entry_orders(self, symbol: str) -> None:
         if getattr(self, "dry_run", False):
+            self.mutation_counters.record("cancel_order", True)
             logger.info("[DRY-RUN MUTATION BLOCKED] _cancel_working_entry_orders %s", symbol)
             return
         try:
@@ -3208,15 +3251,13 @@ class AlpacaBridge:
     def execute_all(self, signals: List[Signal]) -> dict:
         self._evaluate_and_execute_rotation(signals)
 
-        open_symbols = {
-            p.symbol.upper()
-            for p in self._client.get_all_positions()
-            if float(p.qty) != 0.0
-        }
+        open_positions = self.get_open_positions()
+        open_symbols = {s.upper() for s in open_positions.keys()}
         working_symbols = self.working_order_symbols()
         occupied_symbols = open_symbols | working_symbols
         planned_new_symbols: set = set()
         placed, skipped = 0, 0
+        rejections = []
         allow_short = bool(self._c("ALLOW_SHORT", False))
 
         for signal in signals:
@@ -3253,6 +3294,7 @@ class AlpacaBridge:
                 if planned_total >= max_open:
                     logger.warning("Max positions (%d) reached — skipping %s", max_open, symbol)
                     skipped += 1
+                    rejections.append({"symbol": symbol, "reason": "MAX_CONCURRENT_POSITIONS_REACHED"})
                     continue
 
             if self.execute_signal(signal):
@@ -3262,7 +3304,7 @@ class AlpacaBridge:
             else:
                 skipped += 1
 
-        return {"placed": placed, "skipped": skipped, "total": len(signals)}
+        return {"placed": placed, "skipped": skipped, "total": len(signals), "rejections": rejections, "reason": rejections[0]["reason"] if rejections else None}
 
     @staticmethod
     def _today() -> str:

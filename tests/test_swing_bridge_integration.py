@@ -344,3 +344,49 @@ def test_swing_risk_basis_store_and_unrealized_r(tmp_path):
 
     remove_risk_basis('AAPL', path=store_file)
     assert 'AAPL' not in load_risk_store(path=store_file)
+
+
+# ─── 9. Permanent Max Concurrent Positions & Mutation Counters Tests ────────
+
+def test_eighth_position_is_rejected_at_stage0_limit():
+    bridge = AlpacaBridge(mode="swing", dry_run=True)
+    bridge._connected = True
+    bridge._client = MagicMock()
+    bridge._client.get_all_positions.return_value = []
+    # 7 positions already open
+    bridge.get_open_positions = MagicMock(return_value={
+        "MSFT": 4, "AVGO": 5, "BAC": 32, "JPM": 5, "SPY": 2, "V": 5, "AMZN": 7
+    })
+    bridge.has_working_order = MagicMock(return_value=False)
+    bridge.get_position = MagicMock(return_value=0)
+
+    sig_8 = Signal(
+        symbol="NVDA", action="BUY", confidence=0.85,
+        rf_score=0.8, lstm_score=0.8, xgb_score=0.8, trans_score=0.8, tech_score=0.8,
+        price=120.0, reason="test_8th"
+    )
+    res = bridge.execute_all([sig_8])
+    assert res["placed"] == 0
+    assert res["skipped"] == 1
+    assert res["reason"] == "MAX_CONCURRENT_POSITIONS_REACHED"
+    assert len(res["rejections"]) == 1
+    assert res["rejections"][0]["symbol"] == "NVDA"
+
+
+def test_runtime_mutation_counters_instrumentation():
+    bridge = AlpacaBridge(mode="swing", dry_run=True)
+    bridge._connected = True
+    bridge._client = MagicMock()
+    bridge._require_trade_stream = MagicMock()
+    bridge._require_new_entries_allowed = MagicMock()
+    
+    # Trigger blocked operations
+    bridge.cancel_order("order-123")
+    bridge.close_position("AAPL")
+    bridge.place_bracket_order("AAPL", "BUY", 10, 150.0, 145.0, 160.0)
+    
+    counters = bridge.mutation_counters.to_dict()
+    assert counters["mutation_attempts"] == 3
+    assert counters["mutation_blocked"] == 3
+    assert counters["mutation_passed_through"] == 0
+    assert counters["submit_order_passed_through"] == 0
