@@ -261,16 +261,16 @@ def _print_startup_reconciliation(recon: dict) -> None:
         print(f"Orphan exit order(s) with no covering long: {orphan_syms}")
 
 
-def _place_paper_orders(signals, broker: str = "ibkr", bridge=None) -> int:
+def _place_paper_orders(signals, broker: str = "ibkr", bridge=None, dry_run: bool = False) -> int:
     """Place signals on the PAPER account via IBKRBridge or AlpacaBridge."""
     if str(broker).lower() == "alpaca":
         from alpaca_bridge import AlpacaBridge
         own_bridge = False
         if bridge is None:
-            bridge = AlpacaBridge(mode="swing")
+            bridge = AlpacaBridge(mode="swing", dry_run=dry_run)
             own_bridge = True
             print(f"\n{'='*60}")
-            print("  SWING TRADING ENGINE (ALPACA SWING SUB-ACCOUNT)")
+            print(f"  SWING TRADING ENGINE (ALPACA SWING SUB-ACCOUNT) {'[DRY-RUN]' if dry_run else ''}")
             print(f"{'='*60}\n")
             if not bridge.connect():
                 print("❌ Could not connect to Alpaca Paper Broker.")
@@ -367,16 +367,46 @@ def cmd_paper(args) -> int:
     interval = int(getattr(args, "interval", 1800))
     broker = getattr(args, "broker", "ibkr")
 
-    if not loop_mode:
-        signals = Predictor().predict_all()
-        _print_paper_signals_table(signals)
-        if args.dry_run:
-            print("\n⚠️   Dry-run mode — no orders placed.")
-            return 0
-        return _place_paper_orders(signals, broker=broker)
+    lock_fd = None
+    lock_path = None
+    if str(broker).lower() == "alpaca":
+        from strategies.startup_security import acquire_atomic_process_lock, release_atomic_process_lock, ProcessLockMetadata
+        from pathlib import Path
+        import socket
+        from strategies.session import now_eastern
 
+        lock_path = Path("data/swing_bot.lock")
+        try:
+            lock_meta = ProcessLockMetadata(
+                pid=os.getpid(),
+                hostname=socket.gethostname(),
+                account=os.environ.get("SWING_ACCOUNT_ID", "PA3R71I7JFDZ"),
+                mode="swing",
+                branch="research/swing-atr-engine",
+                release_sha="c1fa450",
+                started_at_utc=now_eastern().isoformat(),
+            )
+            lock_fd = acquire_atomic_process_lock(lock_path, lock_meta)
+        except Exception as lock_exc:
+            print(f"❌ Could not acquire swing process lock: {lock_exc}")
+            return 1
+
+    try:
+        if not loop_mode:
+            signals = Predictor().predict_all()
+            _print_paper_signals_table(signals)
+            return _place_paper_orders(signals, broker=broker, dry_run=args.dry_run)
+        return _run_swing_scheduler_loop(args, interval, broker)
+    finally:
+        if lock_fd is not None and lock_path is not None:
+            from strategies.startup_security import release_atomic_process_lock
+            release_atomic_process_lock(lock_path, lock_fd)
+
+
+def _run_swing_scheduler_loop(args, interval: int, broker: str) -> int:
+    loop_mode = True
     print(f"\n{'='*65}")
-    print(f"  SWING TRADING ENGINE — CONTINUOUS SCHEDULER LOOP")
+    print(f"  SWING TRADING ENGINE — CONTINUOUS SCHEDULER LOOP {'[DRY-RUN]' if args.dry_run else ''}")
     print(f"  Scan Interval: {interval//60} minutes | Broker: {broker.upper()}")
     print(f"{'='*65}\n")
 
@@ -387,9 +417,9 @@ def cmd_paper(args) -> int:
     bridge = None
     if str(broker).lower() == "alpaca":
         from alpaca_bridge import AlpacaBridge
-        bridge = AlpacaBridge(mode="swing")
+        bridge = AlpacaBridge(mode="swing", dry_run=args.dry_run)
         print(f"\n{'='*60}")
-        print("  SWING TRADING ENGINE (ALPACA SWING SUB-ACCOUNT)")
+        print(f"  SWING TRADING ENGINE (ALPACA SWING SUB-ACCOUNT) {'[DRY-RUN]' if args.dry_run else ''}")
         print(f"{'='*60}\n")
 
         connected = False

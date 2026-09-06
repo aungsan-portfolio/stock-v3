@@ -123,3 +123,101 @@ def verify_startup_safety_configuration(
         hmac.compare_digest(actual_fingerprint, expected_fingerprint),
         "STARTUP_CREDENTIAL_SET_MISMATCH: Credential fingerprint mismatch! Refusing engine startup.",
     )
+
+
+import json
+import os
+from dataclasses import dataclass, asdict
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class ProcessLockMetadata:
+    pid: int
+    hostname: str
+    account: str
+    mode: str
+    branch: str
+    release_sha: str
+    started_at_utc: str
+
+
+def is_pid_active(pid: int) -> bool:
+    """Check if process with given pid is actively running."""
+    if pid <= 0:
+        return False
+    try:
+        import psutil
+        return psutil.pid_exists(pid)
+    except ImportError:
+        pass
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError, PermissionError):
+        return False
+
+
+def acquire_atomic_process_lock(
+    lock_path: Path,
+    metadata: ProcessLockMetadata,
+) -> int:
+    """
+    Acquire atomic single-instance process lock via exclusive file creation.
+    Returns file descriptor on success; raises StartupSafetyRejected on duplicate active instance.
+    """
+    lock_file = Path(lock_path)
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            payload = json.dumps(asdict(metadata), indent=2).encode("utf-8")
+            os.write(fd, payload)
+            if hasattr(os, "fsync"):
+                os.fsync(fd)
+        except Exception:
+            os.close(fd)
+            if lock_file.exists():
+                lock_file.unlink()
+            raise
+        return fd
+    except FileExistsError:
+        # Check if existing lock is stale
+        existing_meta = None
+        try:
+            with open(lock_file, "r", encoding="utf-8") as f:
+                existing_meta = json.load(f)
+        except Exception:
+            pass
+
+        if existing_meta and isinstance(existing_meta, dict):
+            existing_pid = int(existing_meta.get("pid", 0))
+            if existing_pid > 0 and not is_pid_active(existing_pid):
+                try:
+                    lock_file.unlink()
+                    return acquire_atomic_process_lock(lock_path, metadata)
+                except Exception as clean_exc:
+                    raise StartupSafetyRejected(
+                        f"STARTUP_LOCK_STALE_CLEANUP_FAILED: Could not remove stale lock for PID {existing_pid}: {clean_exc}"
+                    )
+
+        raise StartupSafetyRejected(
+            f"STARTUP_LOCK_COLLISION: Another engine instance is running with lock at {lock_file}"
+        )
+
+
+def release_atomic_process_lock(lock_path: Path, fd: Optional[int] = None) -> None:
+    """Safely close lock fd and remove lock file."""
+    if fd is not None and fd >= 0:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+    lock_file = Path(lock_path)
+    if lock_file.exists():
+        try:
+            lock_file.unlink()
+        except Exception:
+            pass
+

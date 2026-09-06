@@ -24,6 +24,16 @@ class MarketRegime(str, Enum):
 
 
 @dataclass(frozen=True)
+class RegimeDecision:
+    regime: str
+    allow_new_entries: bool
+    allow_position_additions: bool
+    allow_risk_reduction: bool
+    allow_exits: bool
+    reason: str
+
+
+@dataclass(frozen=True)
 class RegimeClassification:
     regime: MarketRegime
     adx: float
@@ -35,6 +45,16 @@ class RegimeClassification:
     consecutive_bear_sessions: int = 0
     allows_new_entries: bool = True
     reason: str = ""
+
+    def to_decision(self) -> RegimeDecision:
+        return RegimeDecision(
+            regime=self.regime.value,
+            allow_new_entries=self.allows_new_entries,
+            allow_position_additions=self.regime == MarketRegime.TRENDING_BULL,
+            allow_risk_reduction=True,
+            allow_exits=True,
+            reason=self.reason,
+        )
 
 
 def classify_market_regime(

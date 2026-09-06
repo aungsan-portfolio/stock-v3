@@ -391,8 +391,9 @@ class EntryGateMock:
 
 
 class AlpacaBridge:
-    def __init__(self, cfg=None, mode: str = "daytrade") -> None:
+    def __init__(self, cfg=None, mode: str = "daytrade", dry_run: bool = False) -> None:
         self.mode = str(mode or "daytrade").lower()
+        self.dry_run = bool(dry_run)
         self._cfg = cfg or config_module.get_settings()
         self._client: Optional[TradingClient] = None
         self._data_client: Optional[StockHistoricalDataClient] = None
@@ -674,6 +675,14 @@ class AlpacaBridge:
                 return False
 
             self._account_id = str(getattr(acct, "account_number", "") or getattr(acct, "id", "") or "default")
+            if self.mode == "swing":
+                from strategies.startup_security import verify_authenticated_account_identity
+                expected_acct = os.environ.get("SWING_ACCOUNT_ID", "PA3R71I7JFDZ")
+                verify_authenticated_account_identity(
+                    configured_account_id=expected_acct,
+                    authenticated_api_account_id=self._account_id,
+                    permitted_account_id="PA3R71I7JFDZ",
+                )
             logger.info("Connected to Alpaca Paper Account (%s) | Status: %s | Equity: %s", self._account_id, acct.status, acct.equity)
             from observability import get_build_provenance
             logger.info(get_build_provenance().marker_string())
@@ -1497,13 +1506,36 @@ class AlpacaBridge:
         take_profit_price = custom_target_price if custom_target_price is not None else self._take_profit_price(action, price, symbol=symbol)
         
         strat_tag = str(strategy_name or "UNKNOWN").replace("StrategyName.", "").upper()
-        from strategies.order_idempotency import build_client_order_id
-        client_order_id = build_client_order_id(symbol=symbol, side=action, bar_timestamp_utc="", signal_hash=f"{strat_tag}_{int(price*100)}_{int(time.time()//300)}", attempt=0)
+        if self.mode == "swing":
+            from strategies.swing_sizing import build_canonical_swing_order_id
+            from strategies.session import now_eastern
+            client_order_id = build_canonical_swing_order_id(
+                symbol=symbol,
+                side=action,
+                session_date=now_eastern().date().isoformat(),
+                bar_timestamp_utc=now_eastern().isoformat(),
+                signal_kind=strat_tag,
+                account_number=getattr(self, "_account_id", "PA3R71I7JFDZ"),
+            )
+        else:
+            from strategies.order_idempotency import build_client_order_id
+            client_order_id = build_client_order_id(symbol=symbol, side=action, bar_timestamp_utc="", signal_hash=f"{strat_tag}_{int(price*100)}_{int(time.time()//300)}", attempt=0)
 
         order_audit.log_event(
             order_audit.STAGE_SUBMIT, kind="open", symbol=symbol, action=action,
             qty=qty, limit_price=limit_price, confidence=confidence, order_ref=client_order_id,
         )
+
+        if getattr(self, "dry_run", False):
+            logger.info("[DRY-RUN MUTATION BLOCKED] _place_open_bracket for %s %s qty=%d limit=%.2f stop=%.2f tp=%.2f",
+                        symbol, action, qty, limit_price, stop_price, take_profit_price)
+            return order_exec.OrderResult(
+                outcome=order_exec.REJECTED,
+                status="DryRunBlocked",
+                filled=0.0,
+                remaining=float(qty),
+                avg_fill_price=0.0,
+            )
 
         tif = self._entry_time_in_force()
         try:
@@ -1707,6 +1739,22 @@ class AlpacaBridge:
             order_audit.STAGE_SUBMIT, kind="close", symbol=symbol, action=action,
             qty=qty, limit_price=price, note=note, order_ref=client_order_id,
         )
+
+        if self.mode == "swing" and action == "SELL":
+            pos_qty = self.get_position(symbol)
+            if qty > pos_qty:
+                logger.error("Stage 0 long-only safety violation: close qty %d exceeds verified long position %s for %s", qty, pos_qty, symbol)
+                return order_exec.OrderResult(outcome=order_exec.REJECTED, status="InvalidCloseQuantity", filled=0.0, remaining=float(qty))
+
+        if getattr(self, "dry_run", False):
+            logger.info("[DRY-RUN MUTATION BLOCKED] _close_position for %s %s x%d", symbol, action, qty)
+            return order_exec.OrderResult(
+                outcome=order_exec.REJECTED,
+                status="DryRunBlocked",
+                filled=0.0,
+                remaining=float(qty),
+                avg_fill_price=0.0,
+            )
 
         try:
             if not self._cancel_symbol_working_orders(symbol, timeout_seconds=10.0):
@@ -2364,6 +2412,18 @@ class AlpacaBridge:
         if client_order_id:
             request_kwargs["client_order_id"] = str(client_order_id)[:128]
 
+        if getattr(self, "dry_run", False):
+            logger.info("[DRY-RUN MUTATION BLOCKED] place_bracket_order for %s %s qty=%d @ limit=%.2f", symbol, side, qty, entry_p)
+            return {
+                "status": "dry_run_blocked",
+                "order_id": f"dry_{client_order_id or 'order'}",
+                "stop_order_id": None,
+                "tp_order_id": None,
+                "placed": False,
+                "submitted": False,
+                "reason": "DRY_RUN_MUTATION_BLOCKED",
+            }
+
         order = self._client.submit_order(LimitOrderRequest(**request_kwargs))
         parent_id = str(order.id)
         order_ids = [parent_id]
@@ -2442,6 +2502,9 @@ class AlpacaBridge:
         self._require_connection()
         min_shares = getattr(config_module, "MIN_SHARE_COUNT", 1)
         qty = max(int(qty), min_shares)
+        if getattr(self, "dry_run", False):
+            logger.info("[DRY-RUN MUTATION BLOCKED] place_stop_order for %s %s qty=%d @ stop=%.2f", symbol, side, qty, stop_price)
+            return {"order_id": f"dry_stop_{symbol}"}
         from alpaca.trading.requests import StopOrderRequest
         order = self._client.submit_order(StopOrderRequest(
             symbol=symbol.upper().strip(),
@@ -2454,6 +2517,9 @@ class AlpacaBridge:
 
     def modify_stop_order(self, order_id: str, new_stop: float, symbol: Optional[str] = None) -> Optional[str]:
         self._require_connection()
+        if getattr(self, "dry_run", False):
+            logger.info("[DRY-RUN MUTATION BLOCKED] modify_stop_order %s -> stop=%.2f", order_id, new_stop)
+            return f"dry_{order_id}"
         if symbol:
             try:
                 price = self.get_price(symbol)
@@ -2511,6 +2577,9 @@ class AlpacaBridge:
         Returns: order_id (str) on success, None on miss/failure
         """
         self._require_connection()
+        if getattr(self, "dry_run", False):
+            logger.info("[DRY-RUN MUTATION BLOCKED] replace_stop for %s -> stop=%.2f", symbol, new_stop_price)
+            return f"dry_stop_{symbol}"
         sym = symbol.upper().strip()
         try:
             for order in self._get_active_orders():
@@ -2532,6 +2601,9 @@ class AlpacaBridge:
 
     def cancel_order(self, order_id: str) -> bool:
         self._require_connection()
+        if getattr(self, "dry_run", False):
+            logger.info("[DRY-RUN MUTATION BLOCKED] cancel_order %s", order_id)
+            return True
         try:
             self._client.cancel_order_by_id(order_id)
             logger.info("Cancelled order %s", order_id)
@@ -2704,6 +2776,9 @@ class AlpacaBridge:
             return False
 
     def _cancel_all_orders_for_symbol(self, symbol: str) -> None:
+        if getattr(self, "dry_run", False):
+            logger.info("[DRY-RUN MUTATION BLOCKED] _cancel_all_orders_for_symbol %s", symbol)
+            return
         try:
             orders = self.working_orders_plain()
             sym_upper = symbol.upper().strip()
@@ -2721,6 +2796,9 @@ class AlpacaBridge:
 
     def close_position(self, symbol: str) -> bool:
         self._require_connection()
+        if getattr(self, "dry_run", False):
+            logger.info("[DRY-RUN MUTATION BLOCKED] close_position %s", symbol)
+            return True
         try:
             self._cancel_all_orders_for_symbol(symbol)
             close_order = self._client.close_position(symbol.upper().strip())
@@ -2754,6 +2832,9 @@ class AlpacaBridge:
             return None
 
     def _cancel_working_entry_orders(self, symbol: str) -> None:
+        if getattr(self, "dry_run", False):
+            logger.info("[DRY-RUN MUTATION BLOCKED] _cancel_working_entry_orders %s", symbol)
+            return
         try:
             al_orders = self._get_active_orders()
             active_statuses = {"new", "partially_filled", "submitted", "queued", "held", "accepted", "pending_new"}
@@ -2810,6 +2891,30 @@ class AlpacaBridge:
                     logger.warning("[PRE-SUBMISSION SOXX VETO] %s Long blocked: %s", symbol, soxx_reason)
                     return False
 
+            if self.mode == "swing":
+                from strategies.regime_classifier import classify_market_regime, MarketRegime
+                adx_val = getattr(signal, "adx", None)
+                vix_val = getattr(signal, "vix", None)
+                spy_px = getattr(signal, "spy_price", None) or (self.get_price("SPY") if hasattr(self, "get_price") else 500.0) or 500.0
+                spy_sma = getattr(signal, "spy_sma50", None) or (spy_px * 0.98)
+                sma_slope = getattr(signal, "sma50_slope", None) or 0.1
+
+                if adx_val is not None and vix_val is not None:
+                    reg_decision = classify_market_regime(
+                        adx=float(adx_val),
+                        vix=float(vix_val),
+                        spy_price=float(spy_px),
+                        spy_sma50=float(spy_sma),
+                        sma50_slope=float(sma_slope),
+                    )
+                    if not reg_decision.allows_new_entries:
+                        logger.warning("[REGIME FILTER VETO] Swing BUY for %s rejected under %s regime: %s",
+                                       symbol, reg_decision.regime.value, reg_decision.reason)
+                        return False
+                elif getattr(signal, "regime", None) in (MarketRegime.TRANSITIONING.value, MarketRegime.DATA_INVALID.value, MarketRegime.TRENDING_BEAR.value):
+                    logger.warning("[REGIME FILTER VETO] Swing BUY for %s rejected under %s regime", symbol, signal.regime)
+                    return False
+
             if self.has_working_order(symbol, action="BUY"):
                 logger.info("Working BUY order already exists for %s — skipping BUY", symbol)
                 return False
@@ -2830,35 +2935,92 @@ class AlpacaBridge:
             strat_name = getattr(signal, "strategy", getattr(signal, "strategy_name", ""))
             stop_price = getattr(signal, "stop_price", getattr(signal, "stop_loss", None))
             target_price = getattr(signal, "target_price", getattr(signal, "take_profit", None))
-            if stop_price is None or target_price is None:
-                stop_loss_pct = float(self._c("STOP_LOSS_PCT", 0.05))
-                take_profit_pct = float(self._c("TAKE_PROFIT_PCT", 0.10))
-                if stop_price is None:
-                    stop_price = round(price * (1.0 - stop_loss_pct), 2)
-                if target_price is None:
-                    target_price = round(price * (1.0 + take_profit_pct), 2)
-
-            if stop_price <= 0 or target_price <= 0 or stop_price >= price or target_price <= price:
-                logger.warning("Rejecting execute_signal for %s: invalid stop_loss/target_price geometry (stop=%s, target=%s, price=%.2f)", symbol, stop_price, target_price, price)
-                return False
-
-            # Risk-based sizing with account equity
-            risk_per_share = max(price - stop_price, 0.01)
-            max_risk_pct = float(self._c("MAX_RISK_PER_TRADE_PCT", 0.01))
-            risk_budget = equity * max_risk_pct
-            risk_cap = float(self._c("MAX_RISK_PER_TRADE_DOLLARS", 150.0))
-            risk_budget = min(risk_budget, risk_cap)
-            qty = max(int(risk_budget / risk_per_share), 0)
-
-            # Cap by maximum position allocation
-            max_pos_val = equity * float(self._c("MAX_POSITION_PCT", 0.08))
-            if qty * price > max_pos_val:
-                qty = max(int(max_pos_val / price), 0)
 
             min_shares = getattr(config_module, "MIN_SHARE_COUNT", 1)
-            if qty < min_shares:
-                logger.warning("Calculated qty=%d below min_shares=%d for BUY %s (risk_per_share=%.2f)", qty, min_shares, symbol, risk_per_share)
-                return False
+
+            if self.mode == "swing":
+                from strategies.swing_sizing import calculate_swing_position_size, calculate_swing_stop_price
+                from strategies.session import now_eastern
+
+                atr_val = getattr(signal, "atr_14", None) or getattr(signal, "atr", None) or (price * 0.02)
+                reg_name = getattr(signal, "regime", "TRENDING_BULL")
+                norm_stop, norm_stop_dist = calculate_swing_stop_price(
+                    entry_price=price,
+                    atr_14=atr_val,
+                    regime=str(reg_name),
+                    swing_low=getattr(signal, "swing_low", None),
+                )
+                stop_price = norm_stop
+                if target_price is None or target_price <= price:
+                    target_price = round(price + (2.0 * norm_stop_dist), 2)
+
+                try:
+                    all_pos = self._client.get_all_positions() if self._client else []
+                except Exception:
+                    all_pos = []
+                existing_sym_exp = sum(
+                    abs(float(p.qty)) * float(getattr(p, "current_price", getattr(p, "avg_entry_price", price)))
+                    for p in all_pos if getattr(p, "symbol", "").upper().strip() == symbol
+                )
+                existing_port_exp = sum(
+                    abs(float(p.qty)) * float(getattr(p, "current_price", getattr(p, "avg_entry_price", price)))
+                    for p in all_pos
+                )
+
+                bp = equity
+                try:
+                    acct = self._client.get_account() if self._client else None
+                    if acct:
+                        bp = float(getattr(acct, "buying_power", equity) or equity)
+                except Exception:
+                    bp = equity
+
+                adv_val = getattr(signal, "adv_shares_20", None) or getattr(signal, "volume", None)
+                sizing = calculate_swing_position_size(
+                    entry_price=price,
+                    stop_price=stop_price,
+                    account_equity=equity,
+                    available_buying_power=bp,
+                    existing_symbol_exposure=existing_sym_exp,
+                    existing_portfolio_exposure=existing_port_exp,
+                    adv_shares_20=adv_val,
+                )
+
+                if sizing.rejected or sizing.shares < min_shares:
+                    logger.warning("[SWING SIZING REJECTED] %s: %s (shares=%d, constraint=%s)",
+                                   symbol, sizing.rejection_reason or "Below min_shares", sizing.shares, sizing.binding_constraint)
+                    return False
+
+                qty = sizing.shares
+                logger.info("[SWING SIZING ACCEPTED] %s: shares=%d (constraint=%s, risk=$%.2f, notional=$%.2f, stop=$%.2f)",
+                            symbol, qty, sizing.binding_constraint, sizing.estimated_risk, sizing.gross_notional, stop_price)
+            else:
+                if stop_price is None or target_price is None:
+                    stop_loss_pct = float(self._c("STOP_LOSS_PCT", 0.05))
+                    take_profit_pct = float(self._c("TAKE_PROFIT_PCT", 0.10))
+                    if stop_price is None:
+                        stop_price = round(price * (1.0 - stop_loss_pct), 2)
+                    if target_price is None:
+                        target_price = round(price * (1.0 + take_profit_pct), 2)
+
+                if stop_price <= 0 or target_price <= 0 or stop_price >= price or target_price <= price:
+                    logger.warning("Rejecting execute_signal for %s: invalid stop_loss/target_price geometry (stop=%s, target=%s, price=%.2f)", symbol, stop_price, target_price, price)
+                    return False
+
+                risk_per_share = max(price - stop_price, 0.01)
+                max_risk_pct = float(self._c("MAX_RISK_PER_TRADE_PCT", 0.01))
+                risk_budget = equity * max_risk_pct
+                risk_cap = float(self._c("MAX_RISK_PER_TRADE_DOLLARS", 150.0))
+                risk_budget = min(risk_budget, risk_cap)
+                qty = max(int(risk_budget / risk_per_share), 0)
+
+                max_pos_val = equity * float(self._c("MAX_POSITION_PCT", 0.08))
+                if qty * price > max_pos_val:
+                    qty = max(int(max_pos_val / price), 0)
+
+                if qty < min_shares:
+                    logger.warning("Calculated qty=%d below min_shares=%d for BUY %s (risk_per_share=%.2f)", qty, min_shares, symbol, risk_per_share)
+                    return False
 
             result = self._place_open_bracket(
                 symbol, "BUY", qty, price, getattr(signal, "confidence", 1.0),
@@ -2870,6 +3032,23 @@ class AlpacaBridge:
                 signal, result,
                 order_ref=order_exec.deterministic_order_ref(self._today(), symbol, "BUY"),
             )
+
+            if self.mode == "swing" and result.occupies_slot:
+                try:
+                    from strategies.swing_risk_store import save_risk_basis, PositionRiskBasis
+                    from strategies.session import now_eastern
+                    save_risk_basis(PositionRiskBasis(
+                        symbol=symbol,
+                        entry_price=price,
+                        initial_stop_price=stop_price,
+                        initial_risk_per_share=price - stop_price,
+                        initial_total_risk=qty * (price - stop_price),
+                        shares=qty,
+                        entry_timestamp_utc=now_eastern().isoformat(),
+                    ))
+                except Exception as r_err:
+                    logger.warning("Could not persist risk basis for %s: %s", symbol, r_err)
+
             return result.occupies_slot
 
         # SELL
@@ -2880,8 +3059,8 @@ class AlpacaBridge:
         if position < 0:
             logger.info("Already short %s — skipping SELL", symbol)
             return False
-        if not allow_short:
-            logger.info("No long in %s — skipping SELL (ALLOW_SHORT=False)", symbol)
+        if not allow_short or self.mode == "swing":
+            logger.info("No long in %s — skipping SELL (Stage 0 swing is long-only / ALLOW_SHORT=False)", symbol)
             return False
 
         inverse_etfs = getattr(config, "INVERSE_ETF_SYMBOLS", set())
@@ -2946,7 +3125,7 @@ class AlpacaBridge:
 
             # ── Step 1: Risk layer (ratchet stops FIRST) ──────────────────
             try:
-                ratchet_results = self.rotator._ratchet_stops(raw_positions, bridge=self, dry_run=False)
+                ratchet_results = self.rotator._ratchet_stops(raw_positions, bridge=self, dry_run=getattr(self, "dry_run", False))
                 self.rotator._log_ratchet_summary(ratchet_results)
             except Exception as r_exc:
                 logger.error("[RATCHET EXECUTE ERROR] %s", r_exc)
@@ -2969,6 +3148,14 @@ class AlpacaBridge:
                 mkt_price = float(raw.current_price)
                 upnl = float(raw.unrealized_pl)
                 sym = raw.symbol.upper()
+                from strategies.swing_risk_store import get_unrealized_r
+                curr_stop = self.get_current_stop(sym)
+                u_r = get_unrealized_r(
+                    symbol=sym,
+                    current_price=mkt_price,
+                    avg_entry_price=avg_cost,
+                    current_stop_price=curr_stop,
+                )
                 pos = OpenPosition(
                     symbol=sym,
                     side=str(raw.side).lower(),
@@ -2976,6 +3163,7 @@ class AlpacaBridge:
                     avg_entry_price=avg_cost,
                     current_price=mkt_price,
                     unrealized_pnl=upnl,
+                    unrealized_r=u_r,
                     current_conf=conf_lookup.get(sym, 0.50),
                     is_protected=(sym in protected_syms),
                 )
@@ -2994,6 +3182,10 @@ class AlpacaBridge:
             if decision.should_rotate:
                 exit_sym = decision.exit_position.symbol
                 enter_sig = decision.enter_signal
+                if getattr(self, "dry_run", False):
+                    logger.info("[ROTATION DRY-RUN] Would rotate: Close %s -> Open %s (Simulated, no broker orders)",
+                                exit_sym, enter_sig.symbol)
+                    return
                 logger.info("[ROTATION EXECUTE] Closing %s → Opening %s", exit_sym, enter_sig.symbol)
                 try:
                     self.close_position(exit_sym)
@@ -3052,7 +3244,11 @@ class AlpacaBridge:
             )
 
             if opens_new:
-                max_open = int(getattr(config_module, "MAX_OPEN_POSITIONS", 5))
+                if self.mode == "swing":
+                    from strategies.rotation_config import MAX_CONCURRENT_POSITIONS
+                    max_open = int(MAX_CONCURRENT_POSITIONS)
+                else:
+                    max_open = int(getattr(config_module, "MAX_OPEN_POSITIONS", 5))
                 planned_total = len(occupied_symbols | planned_new_symbols)
                 if planned_total >= max_open:
                     logger.warning("Max positions (%d) reached — skipping %s", max_open, symbol)
