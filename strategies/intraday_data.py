@@ -13,6 +13,7 @@ from typing import Optional
 from dataclasses import dataclass
 
 import pandas as pd
+import numpy as np
 import yfinance as yf
 import os
 import threading
@@ -159,7 +160,12 @@ def is_quarantined(symbol: str, now: Optional[float] = None) -> bool:
     try:
         from strategies.scanner.premarket_scanner import is_quarantined as _scan_is_quarantined
         return _scan_is_quarantined(symbol, now=now)
-    except Exception:
+    except Exception as exc:
+        logger.exception(
+            "[QUARANTINE LOOKUP FAILURE] symbol=%s error=%s",
+            symbol,
+            exc,
+        )
         return False
 
 
@@ -209,7 +215,17 @@ def _bar_age(bars, now: Optional[float] = None) -> float:
         else:
             return 0.0
         cur_epoch = now if now is not None else _time.time()
-        return max(0.0, cur_epoch - bar_epoch)
+        age = cur_epoch - bar_epoch
+        future_tolerance = float(
+            getattr(
+                config,
+                "BAR_FUTURE_TOLERANCE_SECONDS",
+                5.0,
+            )
+        )
+        if age < -future_tolerance:
+            return float("inf")
+        return max(0.0, age)
     return 0.0
 
 
@@ -271,6 +287,50 @@ def _normalize_utc_index(index: pd.Index) -> pd.DatetimeIndex:
         else:
             raise ValueError("DataFrame index must be timezone-aware (or INTRADAY_DATA_SOURCE_TIMEZONE configured)")
     return index.tz_convert("UTC")
+
+
+def _parse_interval_seconds(interval: str) -> int:
+    """Parse interval string into duration in seconds, supporting standard aliases."""
+    normalized = str(interval).strip().lower()
+
+    aliases = {
+        "1min": "1m",
+        "5min": "5m",
+        "15min": "15m",
+        "30min": "30m",
+        "60min": "1h",
+    }
+
+    normalized = aliases.get(normalized, normalized)
+
+    try:
+        if normalized.endswith("m"):
+            value = int(normalized[:-1])
+            seconds = value * 60
+        elif normalized.endswith("h"):
+            value = int(normalized[:-1])
+            seconds = value * 3600
+        elif normalized.endswith("d"):
+            value = int(normalized[:-1])
+            seconds = value * 86400
+        elif normalized.endswith("s"):
+            value = int(normalized[:-1])
+            seconds = value
+        else:
+            raise ValueError(
+                f"Unsupported interval format: {interval!r}"
+            )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid interval: {interval!r}"
+        ) from exc
+
+    if seconds <= 0:
+        raise ValueError(
+            f"Interval must be positive: {interval!r}"
+        )
+
+    return seconds
 
 
 def select_last_completed_bar(
@@ -364,12 +424,78 @@ def _validate_intraday_data(
         return pd.DataFrame()
 
     try:
-        # 1. Price Sanitization Check (Non-positive prices)
+        # 0. Timestamp & Index Integrity Check (Duplicate / Non-monotonic index or column)
+        if df.index.has_duplicates:
+            logger.warning("Data validation failed for %s: Duplicate timestamp index detected.", symbol)
+            return _quarantine("duplicate_timestamp_index")
+
+        if not df.index.is_monotonic_increasing:
+            logger.warning("Data validation failed for %s: Non-monotonic timestamp index detected.", symbol)
+            return _quarantine("non_monotonic_timestamp_index")
+
+        if "timestamp" in df.columns:
+            ts_col = df["timestamp"]
+            if ts_col.duplicated().any():
+                logger.warning("Data validation failed for %s: Duplicate timestamp column detected.", symbol)
+                return _quarantine("duplicate_timestamp_column")
+            if not ts_col.is_monotonic_increasing:
+                logger.warning("Data validation failed for %s: Non-monotonic timestamp column detected.", symbol)
+                return _quarantine("non_monotonic_timestamp_column")
+
+        # 1. Price Sanitization & Non-Finite Check (NaN, Inf, Non-positive prices)
         price_cols = [col for col in ['open', 'high', 'low', 'close'] if col in df.columns]
         if price_cols:
-            if (df[price_cols] <= 0).any().any():
-                logger.warning("Data validation failed for %s: Non-positive price detected.", symbol)
+            try:
+                price_frame = df[price_cols].apply(
+                    pd.to_numeric,
+                    errors="coerce",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Data validation failed for %s: price conversion error: %s",
+                    symbol,
+                    exc,
+                )
+                return _quarantine("invalid_price_type")
+
+            finite_mask = np.isfinite(
+                price_frame.to_numpy(dtype=float)
+            )
+
+            if not finite_mask.all():
+                logger.warning(
+                    "Data validation failed for %s: NaN/Inf OHLC price detected.",
+                    symbol,
+                )
+                return _quarantine("non_finite_price")
+
+            if (price_frame <= 0).any().any():
+                logger.warning(
+                    "Data validation failed for %s: non-positive price detected.",
+                    symbol,
+                )
                 return _quarantine("non_positive_price")
+
+        # 1.1. Volume Sanitization & Non-Finite Check
+        if "volume" in df.columns:
+            try:
+                volume = pd.to_numeric(
+                    df["volume"],
+                    errors="coerce",
+                )
+                if not np.isfinite(volume.to_numpy(dtype=float)).all() or (volume < 0).any():
+                    logger.warning(
+                        "Data validation failed for %s: NaN/Inf or negative volume detected.",
+                        symbol,
+                    )
+                    return _quarantine("invalid_volume")
+            except Exception as exc:
+                logger.warning(
+                    "Data validation failed for %s: volume conversion error: %s",
+                    symbol,
+                    exc,
+                )
+                return _quarantine("invalid_volume")
 
         # 1.5. Price Integrity Check (High < Low)
         if 'high' in df.columns and 'low' in df.columns:
@@ -412,7 +538,6 @@ def _validate_intraday_data(
         # 2.5. ATR & Feature Integrity Check
         if "atr" in df.columns and len(df) > 0:
             last_atr = float(df["atr"].iloc[-1])
-            import numpy as np
             if np.isnan(last_atr) or last_atr <= 0:
                 logger.warning("Data validation failed for %s: Invalid ATR %.4f detected.", symbol, last_atr)
                 return _quarantine("invalid_atr")
@@ -421,11 +546,7 @@ def _validate_intraday_data(
         if validate_staleness:
             from strategies.session import is_market_open
             if is_market_open():
-                interval_seconds = 60 # Default to 1m
-                if "m" in interval:
-                    interval_seconds = int(interval.replace("m", "")) * 60
-                elif "h" in interval:
-                    interval_seconds = int(interval.replace("h", "")) * 3600
+                interval_seconds = _parse_interval_seconds(interval)
 
                 # Determine current UTC time
                 current_time = pd.Timestamp.now(tz="UTC")
@@ -510,7 +631,22 @@ def fetch_intraday_alpaca(
     key = _cache_key(symbol, interval, lookback_days, prepost, source="alpaca_api")
     cached_df = _read_cache(key)
     if cached_df is not None:
-        return cached_df.copy()
+        validated_cache = _validate_intraday_data(
+            cached_df.copy(),
+            symbol=symbol,
+            interval=interval,
+            validate_staleness=(
+                lookback_days is not None
+                and lookback_days <= 1
+            ),
+            purpose=purpose,
+        )
+        if not validated_cache.empty:
+            return validated_cache
+        logger.warning(
+            "[CACHE INVALIDATED] %s cached alpaca intraday data failed validation",
+            symbol,
+        )
 
     try:
         from alpaca.data.historical import StockHistoricalDataClient
@@ -624,7 +760,22 @@ def fetch_intraday(
     key = _cache_key(symbol, interval, lookback_days, prepost, source=source)
     cached_df = _read_cache(key)
     if cached_df is not None:
-        return cached_df.copy()
+        validated_cache = _validate_intraday_data(
+            cached_df.copy(),
+            symbol=symbol,
+            interval=interval,
+            validate_staleness=(
+                lookback_days is not None
+                and lookback_days <= 1
+            ),
+            purpose=purpose,
+        )
+        if not validated_cache.empty:
+            return validated_cache
+        logger.warning(
+            "[CACHE INVALIDATED] %s cached intraday data failed validation",
+            symbol,
+        )
 
     if bridge is None or not bridge.is_connected:
         df_alpaca = fetch_intraday_alpaca(symbol, interval, lookback_days, prepost, purpose=purpose)
@@ -641,7 +792,22 @@ def fetch_intraday(
     )
     fallback_df = _read_cache(fallback_key)
     if fallback_df is not None:
-        return fallback_df.copy()
+        validated_fallback = _validate_intraday_data(
+            fallback_df.copy(),
+            symbol=symbol,
+            interval=interval,
+            validate_staleness=(
+                lookback_days is not None
+                and lookback_days <= 1
+            ),
+            purpose=purpose,
+        )
+        if not validated_fallback.empty:
+            return validated_fallback
+        logger.warning(
+            "[CACHE INVALIDATED] %s cached fallback data failed validation",
+            symbol,
+        )
         
     try:
         bars = []
@@ -674,7 +840,7 @@ def fetch_intraday(
         return df
     except Exception as e:
         logger.exception("Failed to fetch broker data for %s: %s. Falling back to yfinance.", symbol, e)
-        df = fetch_intraday_yfinance(symbol, interval, lookback_days, prepost)
+        df = fetch_intraday_yfinance(symbol, interval, lookback_days, prepost, purpose=purpose)
         if not df.empty:
             _write_cache(fallback_key, df.copy())
         return df
@@ -685,6 +851,7 @@ def fetch_intraday_yfinance(
     interval: str = None,
     lookback_days: int = None,
     prepost: bool = False,
+    purpose: str = None,
 ) -> pd.DataFrame:
     interval = interval or config.INTRADAY_INTERVAL
     lookback_days = lookback_days or config.INTRADAY_LOOKBACK_DAYS
@@ -696,7 +863,22 @@ def fetch_intraday_yfinance(
     key = _cache_key(symbol, interval, lookback_days, prepost, source="yf")
     cached_df = _read_cache(key)
     if cached_df is not None:
-        return cached_df.copy()
+        validated_cache = _validate_intraday_data(
+            cached_df.copy(),
+            symbol=symbol,
+            interval=interval,
+            validate_staleness=(
+                lookback_days is not None
+                and lookback_days <= 1
+            ),
+            purpose=purpose,
+        )
+        if not validated_cache.empty:
+            return validated_cache
+        logger.warning(
+            "[CACHE INVALIDATED] %s cached yfinance intraday data failed validation",
+            symbol,
+        )
 
     yf_symbol = symbol.strip().upper().replace(".", "-")
     period = f"{lookback_days}d"
@@ -746,11 +928,11 @@ def fetch_intraday_yfinance(
             symbol, period, interval, str(e),
         )
         # Attempt Alpaca fallback on yfinance exception
-        return fetch_intraday_alpaca(symbol, interval, lookback_days, prepost)
+        return fetch_intraday_alpaca(symbol, interval, lookback_days, prepost, purpose=purpose)
 
     if df.empty:
         # Fallback to Alpaca data feed if yfinance is empty or rate-limited
-        df_alpaca = fetch_intraday_alpaca(symbol, interval, lookback_days, prepost)
+        df_alpaca = fetch_intraday_alpaca(symbol, interval, lookback_days, prepost, purpose=purpose)
         if not df_alpaca.empty:
             return df_alpaca
         logger.debug(
@@ -767,7 +949,7 @@ def fetch_intraday_yfinance(
 
     df = df.dropna(subset=["close"])
     validate_staleness = (lookback_days is not None and lookback_days <= 1)
-    df = _validate_intraday_data(df, symbol, interval, validate_staleness=validate_staleness)
+    df = _validate_intraday_data(df, symbol, interval, validate_staleness=validate_staleness, purpose=purpose)
     if not df.empty:
         _write_cache(key, df.copy())
     logger.debug(
@@ -1065,12 +1247,7 @@ def get_intraday_features(
         return pd.DataFrame()
 
     try:
-        interval_seconds = 60
-        if "m" in interval:
-            interval_seconds = int(interval.replace("m", "")) * 60
-        elif "h" in interval:
-            interval_seconds = int(interval.replace("h", "")) * 3600
-
+        interval_seconds = _parse_interval_seconds(interval)
         now_utc = pd.Timestamp.now(tz="UTC")
         future_tolerance = float(getattr(config, "BAR_FUTURE_TOLERANCE_SECONDS", 5.0))
         completed = select_last_completed_bar(
@@ -1079,11 +1256,28 @@ def get_intraday_features(
             now_utc=now_utc,
             close_tolerance_seconds=future_tolerance,
         )
-        # Truncate at latest completed bar start time
-        df = df.loc[:completed.start_time].copy()
+        normalized_index = _normalize_utc_index(df.index)
+        completed_positions = (normalized_index <= completed.start_time).nonzero()[0]
+        if len(completed_positions) == 0:
+            raise ValueError("Completed bar position could not be resolved")
+        selected_position = int(completed_positions[-1])
+        df = df.iloc[: selected_position + 1].copy()
     except Exception as exc:
-        logger.debug("Feature truncation at completed bar bypassed for %s: %s", symbol, exc)
+        logger.warning(
+            "[COMPLETED BAR FEATURE GATE] %s feature generation blocked: %s",
+            symbol,
+            exc,
+        )
+        return pd.DataFrame()
 
     from strategies.indicators import add_all_indicators
-    return add_all_indicators(df)
+    try:
+        features = add_all_indicators(df)
+    except Exception as exc:
+        logger.exception("[FEATURE COMPUTATION FAILURE] %s: %s", symbol, exc)
+        return pd.DataFrame()
+
+    if features is None or features.empty:
+        return pd.DataFrame()
+    return features
 
