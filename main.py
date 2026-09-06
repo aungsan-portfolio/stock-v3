@@ -372,6 +372,7 @@ def cmd_paper(args) -> int:
     if str(broker).lower() == "alpaca":
         from strategies.startup_security import acquire_atomic_process_lock, release_atomic_process_lock, ProcessLockMetadata
         from pathlib import Path
+        import os
         import socket
         from strategies.session import now_eastern
 
