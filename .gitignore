@@ -64,3 +64,8 @@ main.py.orig
 Thumbs.db
 .vscode/
 .idea/
+
+# Swing Research & Evidence Artifacts
+evidence/
+.pytest_temp/
+pytest_*.txt
