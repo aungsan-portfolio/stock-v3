@@ -45,6 +45,7 @@ class OpenPosition:
     current_price:   float
     unrealized_pnl:  float
     current_conf:    float = 0.0    # Re-scored confidence (predictor မှ)
+    unrealized_r:    float = 0.0    # Normalized R-multiple floating profit
     is_protected:    bool  = False  # alpaca_bridge ၏ protected list မှ
 
     @property
@@ -123,6 +124,28 @@ class RotationState:
             "enter_conf":   decision.enter_signal.confidence   if decision.enter_signal  else None,
             "reason":       decision.reason,
         })
+
+
+def calculate_net_replacement_advantage(
+    ev_new_r: float,
+    ev_current_r: float,
+    replacement_cost_r: float = 0.05,
+    se_ev_diff: float = 0.05,
+    z_score: float = 1.645,
+    hurdle_threshold_r: float = 0.20,
+) -> tuple[float, bool]:
+    """
+    Unified single-formulation rotator hurdle:
+      Delta EV raw = EV_new - EV_current
+      Delta EV after cost = Delta EV raw - replacement_cost_r
+      Lower-confidence advantage = Delta EV after cost - z * se_ev_diff
+      Rotate only if Lower-confidence advantage >= 0.20R
+    """
+    delta_ev_raw = ev_new_r - ev_current_r
+    delta_ev_after_cost = delta_ev_raw - replacement_cost_r
+    lower_conf_advantage = delta_ev_after_cost - (z_score * se_ev_diff)
+    should_rotate = lower_conf_advantage >= hurdle_threshold_r
+    return lower_conf_advantage, should_rotate
 
 
 # ── Ratchet configuration ──────────────────────────────────────────────────
@@ -415,13 +438,17 @@ class PositionRotator:
                 )
                 continue
 
-            # ── Skip: Winner Protection ──────────────────────────────────────
-            if pos.pnl_pct >= ROTATION_PROTECT_PROFIT_PCT:
+            # ── Skip: Protected from discretionary rotation (Profit Acceleration) ──
+            # Note: This protection never overrides stops, circuit breakers, or emergency liquidations.
+            is_profit_accelerating = (
+                getattr(pos, "unrealized_r", 0.0) >= 1.0
+                or pos.pnl_pct >= ROTATION_PROTECT_PROFIT_PCT
+            )
+            if is_profit_accelerating:
                 logger.info(
-                    "[ROTATION SKIP] %s — protected winner "
-                    "(pnl=%.2f%% ≥ %.0f%%)",
-                    pos.symbol, pos.pnl_pct * 100,
-                    ROTATION_PROTECT_PROFIT_PCT * 100
+                    "[ROTATION SKIP] %s — profit acceleration protected "
+                    "(unrealized_r=%.2f, pnl=%.2f%%)",
+                    pos.symbol, getattr(pos, "unrealized_r", 0.0), pos.pnl_pct * 100,
                 )
                 continue
 
