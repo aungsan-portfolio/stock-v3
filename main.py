@@ -3239,6 +3239,7 @@ def main() -> int:
     pp = sub.add_parser("paper", help="Execute signals on paper trading broker")
     pp.add_argument("--dry-run", action="store_true", help="Preview signals without placing orders")
     pp.add_argument("--broker", choices=["ibkr", "alpaca"], default="ibkr", help="Broker for paper orders (default: ibkr)")
+    pp.add_argument("--mode", choices=["swing", "daytrade"], default="swing", help="Trading mode")
     pp.add_argument("--loop", action="store_true", help="Run continuous scheduler loop during market hours")
     pp.add_argument("--interval", type=int, default=1800, help="Interval in seconds between scan cycles in loop mode (default: 1800s / 30m)")
 
