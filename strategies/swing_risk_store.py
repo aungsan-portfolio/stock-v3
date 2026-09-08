@@ -25,6 +25,10 @@ class PositionRiskBasis:
     initial_total_risk: float
     shares: int
     entry_timestamp_utc: str
+    basis_source: str = "INITIAL_STORE"
+    initial_r_available: bool = True
+    safety_eligible: bool = True
+    r_multiple_eligible: bool = True
 
 
 def load_risk_store(path: Optional[Path] = None) -> Dict[str, PositionRiskBasis]:
@@ -65,6 +69,37 @@ def remove_risk_basis(symbol: str, path: Optional[Path] = None) -> None:
         temp_path.replace(target_path)
 
 
+def reconstruct_risk_basis_from_broker(
+    symbol: str,
+    avg_entry_price: float,
+    current_stop_price: float,
+    shares: int,
+    entry_timestamp_utc: Optional[str] = None,
+) -> PositionRiskBasis:
+    """
+    Reconstructs risk basis from broker-authoritative position and resting stop.
+    Explicitly flags that initial R basis is unavailable (since stop may have trailed),
+    making it safety-eligible for portfolio heat calculation, but NOT eligible for
+    profit acceleration R-multiple exits.
+    """
+    from datetime import datetime, timezone
+    risk_per_share = max(0.01, avg_entry_price - current_stop_price)
+    ts = entry_timestamp_utc or datetime.now(timezone.utc).isoformat()
+    return PositionRiskBasis(
+        symbol=symbol.upper().strip(),
+        entry_price=avg_entry_price,
+        initial_stop_price=current_stop_price,
+        initial_risk_per_share=risk_per_share,
+        initial_total_risk=shares * risk_per_share,
+        shares=shares,
+        entry_timestamp_utc=ts,
+        basis_source="BROKER_CURRENT_STOP",
+        initial_r_available=False,
+        safety_eligible=True,
+        r_multiple_eligible=False,
+    )
+
+
 def get_unrealized_r(
     symbol: str,
     current_price: float,
@@ -88,6 +123,49 @@ def get_unrealized_r(
         if stop_dist > 0.0:
             return (current_price - avg_entry_price) / stop_dist
 
-    # Fallback to 2% proxy distance if stop unknown
+    # Fallback to 2% proxy distance if stop unknown (analytics only)
     proxy_dist = max(0.01, avg_entry_price * 0.02)
     return (current_price - avg_entry_price) / proxy_dist
+
+
+def get_unrealized_r_analytics(
+    symbol: str,
+    current_price: float,
+    avg_entry_price: float,
+    current_stop_price: Optional[float] = None,
+    path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Analytics-only reporting helper with explicit provenance tagging.
+    NEVER used for safety gates, risk bounds, or sizing decisions.
+    """
+    store = load_risk_store(path)
+    basis = store.get(symbol.upper())
+    if basis and basis.initial_risk_per_share > 0.0:
+        r_val = (current_price - basis.entry_price) / basis.initial_risk_per_share
+        return {
+            "r_value": round(r_val, 4),
+            "basis_source": basis.basis_source,
+            "safety_eligible": basis.safety_eligible,
+            "r_multiple_eligible": basis.r_multiple_eligible,
+        }
+
+    if current_stop_price is not None and current_stop_price < avg_entry_price:
+        stop_dist = avg_entry_price - current_stop_price
+        if stop_dist > 0.0:
+            r_val = (current_price - avg_entry_price) / stop_dist
+            return {
+                "r_value": round(r_val, 4),
+                "basis_source": "BROKER_CURRENT_STOP",
+                "safety_eligible": True,
+                "r_multiple_eligible": False,
+            }
+
+    proxy_dist = max(0.01, avg_entry_price * 0.02)
+    r_val = (current_price - avg_entry_price) / proxy_dist
+    return {
+        "r_value": round(r_val, 4),
+        "basis_source": "PROXY_2PCT",
+        "safety_eligible": False,
+        "r_multiple_eligible": False,
+    }

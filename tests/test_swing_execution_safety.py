@@ -280,33 +280,61 @@ def test_market_open_scheduler_alignment_calculation():
 
 
 def test_swing_loss_guard_three_point_boundary_simulation():
-    """Three-point boundary test for Swing Daily Loss Guard:
-    Strict inequality `daily_pnl < -abs(max_loss)` is used.
-    At SOD equity $100,308.00 and 1.0% limit, threshold is exactly $1,003.08:
-      - Loss $1,003.07 (-1003.07): entries allowed (not halted)
-      - Loss $1,003.08 (-1003.08): entries allowed (boundary condition)
-      - Loss $1,003.09 (-1003.09): entries blocked (strictly exceeds threshold)
+    """Boundary test for Swing Daily Loss Guard:
+    Enforces min(SOD * 1.0%, $300.00).
+    Case A: High SOD ($100,000.00) -> $300 cap binds.
+      - Loss $299.99 (-299.99): allowed
+      - Loss $300.00 (-300.00): blocked (limit reached)
+      - Loss $300.01 (-300.01): blocked
+    Case B: Low SOD ($20,000.00) -> 1.0% cap binds at $200.00 ($200 < $300).
+      - Loss $199.99 (-199.99): allowed
+      - Loss $200.00 (-200.00): blocked (limit reached)
+      - Loss $200.01 (-200.01): blocked
     """
     from alpaca_bridge import EntryGateMock
     bridge = AlpacaBridge(mode="swing")
     gate = EntryGateMock(bridge=bridge)
-    bridge._start_of_day_equity = 100308.0
 
-    # 1. Below boundary ($1,003.07 loss) -> Allowed
-    bridge.get_net_liquidation = MagicMock(return_value=100308.0 - 1003.07)
+    # Case A: SOD $100,000 ($300 cap)
+    bridge._start_of_day_equity = 100000.0
+
+    # 1. Below boundary ($299.99 loss) -> Allowed
+    bridge.get_net_liquidation = MagicMock(return_value=100000.0 - 299.99)
     gate.halted = False
+    gate.reasons = set()
     blocked, _ = gate.entry_blocked("AAPL", 1000.0, None, 150.0)
     assert blocked is False
 
-    # 2. Exactly at boundary ($1,003.08 loss) -> Allowed by strict inequality
-    bridge.get_net_liquidation = MagicMock(return_value=100308.0 - 1003.08)
+    # 2. Exactly at boundary ($300.00 loss) -> Blocked
+    bridge.get_net_liquidation = MagicMock(return_value=100000.0 - 300.00)
     gate.halted = False
+    gate.reasons = set()
+    blocked, reason = gate.entry_blocked("AAPL", 1000.0, None, 150.0)
+    assert blocked is True
+    assert "Max daily loss limit reached" in reason
+
+    # 3. Beyond boundary ($300.01 loss) -> Blocked
+    bridge.get_net_liquidation = MagicMock(return_value=100000.0 - 300.01)
+    gate.halted = False
+    gate.reasons = set()
+    blocked, reason = gate.entry_blocked("AAPL", 1000.0, None, 150.0)
+    assert blocked is True
+    assert "Max daily loss limit reached" in reason
+
+    # Case B: SOD $20,000 ($200 cap)
+    bridge._start_of_day_equity = 20000.0
+
+    # 4. Below boundary ($199.99 loss) -> Allowed
+    bridge.get_net_liquidation = MagicMock(return_value=20000.0 - 199.99)
+    gate.halted = False
+    gate.reasons = set()
     blocked, _ = gate.entry_blocked("AAPL", 1000.0, None, 150.0)
     assert blocked is False
 
-    # 3. Beyond boundary ($1,003.09 loss) -> Blocked
-    bridge.get_net_liquidation = MagicMock(return_value=100308.0 - 1003.09)
+    # 5. At boundary ($200.00 loss) -> Blocked
+    bridge.get_net_liquidation = MagicMock(return_value=20000.0 - 200.00)
     gate.halted = False
+    gate.reasons = set()
     blocked, reason = gate.entry_blocked("AAPL", 1000.0, None, 150.0)
     assert blocked is True
     assert "Max daily loss limit reached" in reason
@@ -610,4 +638,679 @@ def test_rotator_net_replacement_advantage_and_r_protection():
     assert len(candidates) == 0 # Skipped!
 
 
+# ─── 10. Canonical Risk Budget & Decimal Exact Boundary Tests ─────────────────
 
+def test_canonical_risk_budget_helper_and_boundaries():
+    from strategies.swing_sizing import (
+        get_trade_risk_budget,
+        validate_swing_order_safety,
+        SwingSizingRejected,
+        PositionIntent,
+    )
+
+    # 1. Progression: equity -> dollar risk cap
+    assert get_trade_risk_budget(50_000.0) == 250.00
+    assert pytest.approx(get_trade_risk_budget(99_999.0), 0.001) == 499.995
+    assert get_trade_risk_budget(100_000.0) == 500.00
+    assert get_trade_risk_budget(150_000.0) == 500.00  # Capped at $500
+    assert get_trade_risk_budget(200_000.0) == 500.00  # Capped at $500
+
+    # 2. Exact Decimal Boundary: $500.00 accepted, $500.01 rejected
+    # Effective risk: 10 * (100.00 - 50.06 + 0.01) + 0.50 = 10 * 49.95 + 0.50 = 499.50 + 0.50 = 500.00 exactly
+    base_args = dict(
+        client_order_id="BOUNDARY-500",
+        strategy_instance_id="SWING_TEST",
+        symbol="SPY",
+        signal_version="v1.0",
+        entry_price=100.00,
+        stop_price=50.06,
+        shares=10,
+        account_equity=100_000.0,  # budget = $500.00
+        available_buying_power=50_000.0,
+        current_open_stop_risk=0.0,
+        pending_entry_risk=0.0,
+        entry_slippage_per_share=0.01,
+        stop_slippage_per_share=0.00,
+        estimated_total_fees=0.50,
+        account_number="PA3R71I7JFDZ",
+        broker_account_number="PA3R71I7JFDZ",
+        current_position_count=0,
+        pending_open_position_count=0,
+        existing_position_symbols=set(),
+        intent=PositionIntent.OPEN_LONG,
+    )
+    validate_swing_order_safety(**base_args)
+
+    # 1 cent higher ($500.01) strictly rejected
+    bad_args = dict(base_args, estimated_total_fees=0.51)
+    with pytest.raises(SwingSizingRejected, match="strictly exceeds hard budget"):
+        validate_swing_order_safety(**bad_args)
+
+
+# ─── 11. Strict Types and Range Validation Tests ─────────────────────────────
+
+def test_validate_swing_order_safety_strict_types_and_ranges():
+    from strategies.swing_sizing import (
+        validate_swing_order_safety,
+        SwingSizingRejected,
+        PositionIntent,
+    )
+
+    base_args = dict(
+        client_order_id="TYPE-TEST-001",
+        strategy_instance_id="SWING_TEST",
+        symbol="MSFT",
+        signal_version="v1.0",
+        entry_price=400.0,
+        stop_price=390.0,
+        shares=10,
+        account_equity=100_000.0,
+        available_buying_power=50_000.0,
+        current_open_stop_risk=0.0,
+        pending_entry_risk=0.0,
+        account_number="PA3R71I7JFDZ",
+        broker_account_number="PA3R71I7JFDZ",
+        current_position_count=0,
+        pending_open_position_count=0,
+        existing_position_symbols=set(),
+        intent=PositionIntent.OPEN_LONG,
+    )
+
+    # 1. shares cannot be bool (e.g. True)
+    with pytest.raises(SwingSizingRejected, match="shares must be an integer"):
+        validate_swing_order_safety(**dict(base_args, shares=True))
+
+    # 2. current_position_count cannot be bool (e.g. False)
+    with pytest.raises(SwingSizingRejected, match="current_position_count must be an integer"):
+        validate_swing_order_safety(**dict(base_args, current_position_count=False))
+
+    # 3. Negative values rejected
+    with pytest.raises(SwingSizingRejected, match="current_open_stop_risk must be finite and non-negative"):
+        validate_swing_order_safety(**dict(base_args, current_open_stop_risk=-5.0))
+
+    with pytest.raises(SwingSizingRejected, match="pending_entry_risk must be finite and non-negative"):
+        validate_swing_order_safety(**dict(base_args, pending_entry_risk=-1.0))
+
+    with pytest.raises(SwingSizingRejected, match="quote_age_seconds must be finite and non-negative"):
+        validate_swing_order_safety(**dict(base_args, quote_age_seconds=-0.5))
+
+    # 4. Non-finite values (NaN, Inf) rejected
+    with pytest.raises(SwingSizingRejected, match="account_equity must be finite and positive"):
+        validate_swing_order_safety(**dict(base_args, account_equity=float("nan")))
+
+    with pytest.raises(SwingSizingRejected, match="account_equity must be finite and positive"):
+        validate_swing_order_safety(**dict(base_args, account_equity=float("inf")))
+
+
+# ─── 12. Intent Consistency and Position Capacity Tests ───────────────────────
+
+def test_validate_swing_order_safety_intent_and_capacity():
+    from strategies.swing_sizing import (
+        validate_swing_order_safety,
+        SwingSizingRejected,
+        PositionIntent,
+    )
+
+    base_args = dict(
+        client_order_id="INTENT-TEST-001",
+        strategy_instance_id="SWING_TEST",
+        symbol="AAPL",
+        signal_version="v1.0",
+        entry_price=150.0,
+        stop_price=145.0,
+        shares=10,
+        account_equity=100_000.0,
+        available_buying_power=50_000.0,
+        current_open_stop_risk=0.0,
+        pending_entry_risk=0.0,
+        account_number="PA3R71I7JFDZ",
+        broker_account_number="PA3R71I7JFDZ",
+    )
+
+    # 1. OPEN_LONG when symbol already exists in positions -> Rejected
+    with pytest.raises(SwingSizingRejected, match="OPEN_LONG rejected because AAPL already exists"):
+        validate_swing_order_safety(
+            **base_args,
+            current_position_count=1,
+            pending_open_position_count=0,
+            existing_position_symbols={"AAPL"},
+            intent=PositionIntent.OPEN_LONG,
+        )
+
+    # 2. ADD_LONG when symbol does NOT exist in positions -> Rejected
+    with pytest.raises(SwingSizingRejected, match="ADD_LONG rejected because AAPL does not exist"):
+        validate_swing_order_safety(
+            **base_args,
+            current_position_count=1,
+            pending_open_position_count=0,
+            existing_position_symbols={"MSFT"},
+            intent=PositionIntent.ADD_LONG,
+        )
+
+    # 3. Position state inconsistency: count != len(symbols)
+    with pytest.raises(SwingSizingRejected, match="POSITION_STATE_INCONSISTENT"):
+        validate_swing_order_safety(
+            **base_args,
+            current_position_count=2,
+            pending_open_position_count=0,
+            existing_position_symbols={"MSFT"},
+            intent=PositionIntent.OPEN_LONG,
+        )
+
+    # 4. Account mismatch: account_number != broker_account_number
+    with pytest.raises(SwingSizingRejected, match="ACCOUNT_STATE_MISMATCH"):
+        validate_swing_order_safety(
+            **dict(base_args, broker_account_number="PA3UODIC5JTA"),  # Daytrade account
+            current_position_count=0,
+            pending_open_position_count=0,
+            existing_position_symbols=set(),
+            intent=PositionIntent.OPEN_LONG,
+        )
+
+    # 5. Capacity: current=6, pending=0, new=1 (total 7) -> Allowed
+    validate_swing_order_safety(
+        **base_args,
+        current_position_count=6,
+        pending_open_position_count=0,
+        existing_position_symbols={"S1", "S2", "S3", "S4", "S5", "S6"},
+        intent=PositionIntent.OPEN_LONG,
+        max_concurrent_positions=7,
+    )
+
+    # 6. Capacity: current=6, pending=1, new=1 (total 8 > 7) -> Rejected
+    with pytest.raises(SwingSizingRejected, match="Projected position count 8 exceeds capacity 7"):
+        validate_swing_order_safety(
+            **base_args,
+            current_position_count=6,
+            pending_open_position_count=1,
+            existing_position_symbols={"S1", "S2", "S3", "S4", "S5", "S6"},
+            intent=PositionIntent.OPEN_LONG,
+            max_concurrent_positions=7,
+        )
+
+    # 7. Capacity: current=7, pending=0, OPEN_LONG (total 8 > 7) -> Rejected
+    with pytest.raises(SwingSizingRejected, match="Projected position count 8 exceeds capacity 7"):
+        validate_swing_order_safety(
+            **base_args,
+            current_position_count=7,
+            pending_open_position_count=0,
+            existing_position_symbols={"S1", "S2", "S3", "S4", "S5", "S6", "S7"},
+            intent=PositionIntent.OPEN_LONG,
+            max_concurrent_positions=7,
+        )
+
+    # 8. ADD_LONG does not increment capacity (current=7, ADD_LONG on existing symbol S1) -> Allowed
+    validate_swing_order_safety(
+        **dict(base_args, symbol="S1"),
+        current_position_count=7,
+        pending_open_position_count=0,
+        existing_position_symbols={"S1", "S2", "S3", "S4", "S5", "S6", "S7"},
+        intent=PositionIntent.ADD_LONG,
+        max_concurrent_positions=7,
+    )
+
+
+# ─── 13. Protective Stop Coverage & Account Short Guard Tests ────────────────
+
+def test_stop_quantity_coverage_and_shorts():
+    from alpaca_bridge import AlpacaBridge
+    from strategies.swing_sizing import SwingSizingRejected
+    from types import SimpleNamespace
+
+    bridge = AlpacaBridge(mode="swing", dry_run=True)
+
+    # 1. Full coverage: 100 shares long, 100 shares stop sell -> PASS
+    pos_full = [SimpleNamespace(symbol="AAPL", qty=100.0, avg_entry_price=150.0)]
+    orders_full = [SimpleNamespace(id="s1", symbol="AAPL", side="sell", order_type="stop", qty=100.0, stop_price=140.0)]
+    open_risk, pend_risk, active_syms, pend_syms = bridge.audit_swing_portfolio_safety(pos_full, orders_full)
+    assert "AAPL" in active_syms
+    assert open_risk > 0.0
+    assert pend_risk == 0.0
+
+    # 2. Under-coverage: 100 shares long, only 10 shares stop sell -> REJECTED
+    orders_under = [SimpleNamespace(id="s2", symbol="AAPL", side="sell", order_type="stop", qty=10.0, stop_price=140.0)]
+    with pytest.raises(SwingSizingRejected, match="INSUFFICIENT_STOP_COVERAGE: AAPL position=100.0, protected=10.0"):
+        bridge.audit_swing_portfolio_safety(pos_full, orders_under)
+
+    # 3. Multiple split stops: 100 shares long, 40 + 60 shares stops -> PASS
+    orders_split = [
+        SimpleNamespace(id="s3", symbol="AAPL", side="sell", order_type="stop", qty=40.0, stop_price=140.0),
+        SimpleNamespace(id="s4", symbol="AAPL", side="sell", order_type="stop", qty=60.0, stop_price=138.0),
+    ]
+    open_risk_split, _, _, _ = bridge.audit_swing_portfolio_safety(pos_full, orders_split)
+    assert open_risk_split > 0.0
+
+    # 4. Short position on account -> REJECTED (Fail-closed Stage 0)
+    pos_short = [SimpleNamespace(symbol="NVDA", qty=-50.0, avg_entry_price=120.0)]
+    with pytest.raises(SwingSizingRejected, match="UNSUPPORTED_ACCOUNT_SHORT_POSITION: NVDA"):
+        bridge.audit_swing_portfolio_safety(pos_short, [])
+
+    # 5. Pending swing entry lacking protective stop -> REJECTED
+    orders_pending_no_stop = [
+        SimpleNamespace(id="p1", client_order_id="swg_123456", symbol="MSFT", side="buy", qty=10.0, filled_qty=0.0, limit_price=400.0)
+    ]
+    with pytest.raises(SwingSizingRejected, match="PENDING_ENTRY_WITHOUT_PROTECTIVE_STOP: MSFT"):
+        bridge.audit_swing_portfolio_safety([], orders_pending_no_stop)
+
+    # 6. Pending swing entry with matching protective stop -> PASS
+    orders_pending_with_stop = [
+        SimpleNamespace(id="p1", client_order_id="swg_123456", symbol="MSFT", side="buy", qty=10.0, filled_qty=0.0, limit_price=400.0),
+        SimpleNamespace(id="p2", client_order_id="swg_stop_1", symbol="MSFT", side="sell", order_type="stop", qty=10.0, stop_price=380.0),
+    ]
+    _, pend_risk_ok, _, pend_syms_ok = bridge.audit_swing_portfolio_safety([], orders_pending_with_stop)
+    assert "MSFT" in pend_syms_ok
+    assert pend_risk_ok > 0.0
+
+
+# ─── 14. Enum Normalization and Bracket Leg Flattening Tests ──────────────────
+
+def test_enum_normalization_and_bracket_flattening():
+    from alpaca_bridge import normalize_enum_value, flatten_orders
+    from alpaca.trading.enums import OrderSide, OrderType
+    from types import SimpleNamespace
+
+    # 1. Enum normalization
+    assert normalize_enum_value(OrderSide.BUY) == "BUY"
+    assert normalize_enum_value(OrderSide.SELL) == "SELL"
+    assert normalize_enum_value(OrderType.STOP) == "STOP"
+    assert normalize_enum_value("buy") == "BUY"
+    assert normalize_enum_value(None) == ""
+
+    # 2. Nested bracket flattening and ID deduplication
+    child_stop = SimpleNamespace(id="child-stop-1", symbol="AMZN", side="sell", order_type="stop", stop_price=180.0)
+    child_tp = SimpleNamespace(id="child-tp-1", symbol="AMZN", side="sell", order_type="limit", limit_price=220.0)
+    parent = SimpleNamespace(id="parent-1", symbol="AMZN", side="buy", order_type="limit", limit_price=190.0, legs=[child_stop, child_tp])
+    duplicate_child = SimpleNamespace(id="child-stop-1", symbol="AMZN", side="sell", order_type="stop", stop_price=180.0)
+
+    flattened = flatten_orders([parent, duplicate_child])
+    ids = {getattr(o, "id") for o in flattened}
+    assert len(flattened) == 3
+    assert ids == {"parent-1", "child-stop-1", "child-tp-1"}
+
+
+# ─── 15. Behavioral Production Path & Concurrency Tests ───────────────────────
+
+def test_behavioral_production_path_and_concurrency():
+    import threading
+    import tempfile
+    from pathlib import Path
+    from alpaca_bridge import AlpacaBridge
+    from predictor import Signal
+    import config as config_mod
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.object(config_mod, "DATA_DIR", Path(tmpdir)):
+            bridge = AlpacaBridge(mode="swing", dry_run=True)
+            bridge._connected = True
+            bridge._client = MagicMock()
+            bridge._client.get_account.return_value = MagicMock(account_number="PA3R71I7JFDZ", equity=100_000.0, buying_power=100_000.0)
+            bridge.get_order_quote = MagicMock(return_value=MagicMock(ok=True, price=100.0))
+            bridge.get_net_liquidation = MagicMock(return_value=100_000.0)
+            bridge._client.get_all_positions.return_value = []
+            bridge._client.get_orders.return_value = []
+
+            def _make_test_signal(sym: str) -> Signal:
+                s = Signal(
+                    symbol=sym, action="BUY", confidence=0.75,
+                    rf_score=0.5, lstm_score=0.5, xgb_score=0.5, trans_score=0.5, tech_score=0.5,
+                    price=100.0, reason="test",
+                )
+                setattr(s, "atr_14", 2.0)
+                setattr(s, "regime", "TRENDING_BULL")
+                return s
+
+            sig = _make_test_signal("MSFT")
+
+            # 1. Verify deprecated calculate_swing_shares is NEVER called on production swing dispatch path
+            with patch("strategies.swing_sizing.calculate_swing_shares", side_effect=RuntimeError("DEPRECATED_CALLED")):
+                placed = bridge.execute_signal(sig)
+                assert placed is False  # dry_run returns False (DryRunBlocked) without calling calculate_swing_shares
+
+            # 2. Sequential Call-Order Tracing: validation occurs strictly before dispatch
+            call_order = []
+            with patch("strategies.swing_sizing.validate_swing_order_safety", side_effect=lambda **kw: call_order.append("validate")):
+                with patch.object(bridge, "_place_open_bracket", side_effect=lambda *a, **kw: call_order.append("dispatch") or MagicMock(occupies_slot=True)):
+                    bridge.execute_signal(sig)
+                    assert call_order == ["validate", "dispatch"]
+
+            # 3. Critical Section Serialization Barrier under _swing_dispatch_lock
+            lock_acquisitions = []
+            barrier = threading.Barrier(2)
+
+            with patch.object(bridge, "_place_open_bracket", side_effect=lambda *a, **kw: lock_acquisitions.append(a[0]) or MagicMock(occupies_slot=True)):
+                def worker(sym: str):
+                    s = _make_test_signal(sym)
+                    barrier.wait()
+                    bridge.execute_signal(s)
+
+                t1 = threading.Thread(target=worker, args=("MSFT",))
+                t2 = threading.Thread(target=worker, args=("AAPL",))
+                t1.start()
+                t2.start()
+                t1.join()
+                t2.join()
+
+            # Both threads ran through critical section in serialized order
+            assert len(lock_acquisitions) == 2
+
+
+# ─── 16. Comprehensive Behavioral Gate & Integrity Tests ─────────────────────
+
+def test_execute_signal_daily_loss_gate_behavioral():
+    import tempfile
+    from pathlib import Path
+    from alpaca_bridge import AlpacaBridge
+    from predictor import Signal
+    import config as config_mod
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        with patch.object(config_mod, "DATA_DIR", tmp_path):
+            bridge = AlpacaBridge(mode="swing", dry_run=False)
+            bridge._connected = True
+            bridge._client = MagicMock()
+            bridge.get_order_quote = MagicMock(return_value=MagicMock(ok=True, price=100.0))
+            bridge._client.get_all_positions.return_value = []
+            bridge._client.get_orders.return_value = []
+
+            def _make_signal(sym: str = "MSFT") -> Signal:
+                s = Signal(
+                    symbol=sym, action="BUY", confidence=0.75,
+                    rf_score=0.5, lstm_score=0.5, xgb_score=0.5, trans_score=0.5, tech_score=0.5,
+                    price=100.0, reason="test",
+                )
+                setattr(s, "atr_14", 2.0)
+                setattr(s, "regime", "TRENDING_BULL")
+                return s
+
+            sig = _make_signal("MSFT")
+
+            # Mock _place_open_bracket to track dispatches
+            dispatched = []
+            bridge._place_open_bracket = MagicMock(side_effect=lambda *a, **kw: dispatched.append(a) or MagicMock(occupies_slot=True))
+
+            # Case 1: High SOD $100,000, PnL = -$299.99 -> Allowed/dispatched
+            bridge._start_of_day_equity = 100000.0
+            bridge._client.get_account.return_value = MagicMock(
+                account_number="PA3R71I7JFDZ",
+                equity=100000.0 - 299.99,
+                buying_power=50000.0,
+                last_equity=100000.0,
+            )
+            bridge.get_net_liquidation = MagicMock(return_value=100000.0 - 299.99)
+            bridge.entry_gate.halted = False
+            bridge.entry_gate.reasons = set()
+            dispatched.clear()
+
+            res = bridge.execute_signal(sig)
+            assert res is True
+            assert len(dispatched) == 1
+
+            # Case 2: PnL = -$300.00 -> Blocked, 0 orders placed
+            bridge._client.get_account.return_value = MagicMock(
+                account_number="PA3R71I7JFDZ",
+                equity=100000.0 - 300.00,
+                buying_power=50000.0,
+                last_equity=100000.0,
+            )
+            bridge.get_net_liquidation = MagicMock(return_value=100000.0 - 300.00)
+            bridge.entry_gate.halted = False
+            bridge.entry_gate.reasons = set()
+            dispatched.clear()
+
+            res = bridge.execute_signal(sig)
+            assert res is False
+            assert len(dispatched) == 0
+
+            # Case 3: PnL = -$300.01 -> Blocked, 0 orders placed
+            bridge._client.get_account.return_value = MagicMock(
+                account_number="PA3R71I7JFDZ",
+                equity=100000.0 - 300.01,
+                buying_power=50000.0,
+                last_equity=100000.0,
+            )
+            bridge.get_net_liquidation = MagicMock(return_value=100000.0 - 300.01)
+            bridge.entry_gate.halted = False
+            bridge.entry_gate.reasons = set()
+            dispatched.clear()
+
+            res = bridge.execute_signal(sig)
+            assert res is False
+            assert len(dispatched) == 0
+
+            # Reset any halt file before Case 4 to test 1.0% cap independently
+            for hf in tmp_path.glob("swing_daily_loss_halt*.json"):
+                hf.unlink(missing_ok=True)
+            bridge.entry_gate.halted = False
+            bridge.entry_gate.reasons = set()
+
+            # Case 4: Low SOD $20,000, 1% cap is $200.00 (< $300 cap).
+            # PnL = -$200.00 -> Blocked by 1.0% cap
+            bridge._start_of_day_equity = 20000.0
+            bridge._client.get_account.return_value = MagicMock(
+                account_number="PA3R71I7JFDZ",
+                equity=20000.0 - 200.00,
+                buying_power=20000.0,
+                last_equity=20000.0,
+            )
+            bridge.get_net_liquidation = MagicMock(return_value=20000.0 - 200.00)
+            bridge.entry_gate.halted = False
+            bridge.entry_gate.reasons = set()
+            dispatched.clear()
+
+            res = bridge.execute_signal(sig)
+            assert res is False
+            assert len(dispatched) == 0
+
+
+
+def test_check_regular_market_hours_matrix():
+    from alpaca_bridge import check_regular_market_hours
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from types import SimpleNamespace
+
+    et_tz = ZoneInfo("America/New_York")
+
+    # Tuesday Sept 8, 2026:
+    # 09:15 ET (Pre-market)
+    dt_pre = datetime(2026, 9, 8, 9, 15, 0, tzinfo=et_tz)
+    mock_client = SimpleNamespace(get_clock=lambda: SimpleNamespace(is_open=True, timestamp=dt_pre))
+    ok, reason = check_regular_market_hours(mock_client)
+    assert ok is False
+    assert "PRE_MARKET_HOURS" in reason
+
+    # 09:30 ET (Market Open)
+    dt_open = datetime(2026, 9, 8, 9, 30, 0, tzinfo=et_tz)
+    mock_client = SimpleNamespace(get_clock=lambda: SimpleNamespace(is_open=True, timestamp=dt_open))
+    ok, reason = check_regular_market_hours(mock_client)
+    assert ok is True
+    assert reason == ""
+
+    # 14:00 ET (Regular Trading)
+    dt_mid = datetime(2026, 9, 8, 14, 0, 0, tzinfo=et_tz)
+    mock_client = SimpleNamespace(get_clock=lambda: SimpleNamespace(is_open=True, timestamp=dt_mid))
+    ok, reason = check_regular_market_hours(mock_client)
+    assert ok is True
+
+    # 15:54:59 ET (Just before cutoff)
+    dt_cutoff_before = datetime(2026, 9, 8, 15, 54, 59, tzinfo=et_tz)
+    mock_client = SimpleNamespace(get_clock=lambda: SimpleNamespace(is_open=True, timestamp=dt_cutoff_before))
+    ok, reason = check_regular_market_hours(mock_client)
+    assert ok is True
+
+    # 15:55:00 ET (Entry Cutoff Exceeded)
+    dt_cutoff = datetime(2026, 9, 8, 15, 55, 0, tzinfo=et_tz)
+    mock_client = SimpleNamespace(get_clock=lambda: SimpleNamespace(is_open=True, timestamp=dt_cutoff))
+    ok, reason = check_regular_market_hours(mock_client)
+    assert ok is False
+    assert "ENTRY_CUTOFF_EXCEEDED" in reason
+
+    # 16:30 ET (After hours)
+    dt_after = datetime(2026, 9, 8, 16, 30, 0, tzinfo=et_tz)
+    mock_client = SimpleNamespace(get_clock=lambda: SimpleNamespace(is_open=True, timestamp=dt_after))
+    ok, reason = check_regular_market_hours(mock_client)
+    assert ok is False
+    assert "ENTRY_CUTOFF_EXCEEDED" in reason
+
+    # Broker clock says closed
+    mock_closed = SimpleNamespace(get_clock=lambda: SimpleNamespace(is_open=False, timestamp=dt_mid))
+    ok, reason = check_regular_market_hours(mock_closed)
+    assert ok is False
+    assert reason == "BROKER_MARKET_CLOSED"
+
+    # Weekend (Saturday Sept 12, 2026 at 12:00 ET)
+    dt_weekend = datetime(2026, 9, 12, 12, 0, 0, tzinfo=et_tz)
+    mock_weekend = SimpleNamespace(get_clock=lambda: SimpleNamespace(is_open=True, timestamp=dt_weekend))
+    ok, reason = check_regular_market_hours(mock_weekend)
+    assert ok is False
+    assert "WEEKEND_HOURS" in reason
+
+
+def test_audit_swing_portfolio_safety_stop_types_rejection():
+    from alpaca_bridge import AlpacaBridge
+    from strategies.swing_sizing import SwingSizingRejected
+    from types import SimpleNamespace
+
+    bridge = AlpacaBridge(mode="swing", dry_run=True)
+    pos = [SimpleNamespace(symbol="AAPL", qty=100.0, avg_entry_price=150.0)]
+
+    # 1. Pure STOP order -> Accepted
+    orders_stop = [SimpleNamespace(id="s1", symbol="AAPL", side="sell", order_type="STOP", qty=100.0, stop_price=140.0)]
+    open_risk, _, active_syms, _ = bridge.audit_swing_portfolio_safety(pos, orders_stop)
+    assert "AAPL" in active_syms
+    assert open_risk > 0.0
+
+    # 2. STOP_LIMIT order -> Rejected (Fail-closed Stage 0)
+    orders_stop_limit = [SimpleNamespace(id="s2", symbol="AAPL", side="sell", order_type="STOP_LIMIT", qty=100.0, stop_price=140.0, limit_price=139.0)]
+    with pytest.raises(SwingSizingRejected, match="INSUFFICIENT_STOP_COVERAGE: AAPL"):
+        bridge.audit_swing_portfolio_safety(pos, orders_stop_limit)
+
+    # 3. TRAILING_STOP order -> Rejected
+    orders_trailing = [SimpleNamespace(id="s3", symbol="AAPL", side="sell", order_type="TRAILING_STOP", qty=100.0, stop_price=140.0)]
+    with pytest.raises(SwingSizingRejected, match="INSUFFICIENT_STOP_COVERAGE: AAPL"):
+        bridge.audit_swing_portfolio_safety(pos, orders_trailing)
+
+
+def test_sector_attribution_and_exposure_cap():
+    from alpaca_bridge import AlpacaBridge
+    from predictor import Signal
+    from strategies.swing_sizing import validate_swing_order_safety, SwingSizingRejected
+
+    bridge = AlpacaBridge(mode="swing", dry_run=True)
+    bridge._connected = True
+    bridge._client = MagicMock()
+    bridge._client.get_account.return_value = MagicMock(account_number="PA3R71I7JFDZ", equity=100_000.0, buying_power=100_000.0)
+    bridge.get_order_quote = MagicMock(return_value=MagicMock(ok=True, price=100.0))
+    bridge.get_net_liquidation = MagicMock(return_value=100_000.0)
+    bridge._client.get_all_positions.return_value = []
+    bridge._client.get_orders.return_value = []
+
+    # 1. Symbol missing in config.SECTOR_MAPPINGS
+    sig_unmapped = Signal(
+        symbol="UNMAPPED_TICKER", action="BUY", confidence=0.75,
+        rf_score=0.5, lstm_score=0.5, xgb_score=0.5, trans_score=0.5, tech_score=0.5,
+        price=100.0, reason="test",
+    )
+    setattr(sig_unmapped, "atr_14", 2.0)
+    setattr(sig_unmapped, "regime", "TRENDING_BULL")
+    assert bridge.execute_signal(sig_unmapped) is False
+
+    # 2. Signal sector mismatch with config
+    sig_mismatch = Signal(
+        symbol="AAPL", action="BUY", confidence=0.75,
+        rf_score=0.5, lstm_score=0.5, xgb_score=0.5, trans_score=0.5, tech_score=0.5,
+        price=100.0, reason="test",
+    )
+    setattr(sig_mismatch, "atr_14", 2.0)
+    setattr(sig_mismatch, "regime", "TRENDING_BULL")
+    setattr(sig_mismatch, "sector", "ENERGY")  # AAPL is INFORMATION_TECHNOLOGY
+    assert bridge.execute_signal(sig_mismatch) is False
+
+    # 3. Direct validator sector cap boundary: 25% of $100,000 = $25,000.00
+    base_args = {
+        "client_order_id": "swg_test_sector_1",
+        "strategy_instance_id": "SWING_BOT_PRO",
+        "symbol": "AAPL",
+        "signal_version": "v1.6-alpha",
+        "entry_price": 100.0,
+        "stop_price": 95.0,
+        "shares": 50,  # notional = $5,000
+        "account_equity": 100000.0,
+        "available_buying_power": 100000.0,
+        "current_open_stop_risk": 500.0,
+        "pending_entry_risk": 0.0,
+        "account_number": "PA3R71I7JFDZ",
+        "broker_account_number": "PA3R71I7JFDZ",
+        "current_position_count": 0,
+        "pending_open_position_count": 0,
+        "symbol_sector": "INFORMATION_TECHNOLOGY",
+        "max_sector_exposure_pct": 0.25,
+    }
+
+    # Exactly at boundary: $20,000 existing + $5,000 order = $25,000 <= $25,000 -> Accepted
+    validate_swing_order_safety(
+        **base_args,
+        existing_sector_exposure_by_sector={"INFORMATION_TECHNOLOGY": 20000.0},
+        pending_sector_exposure_by_sector={},
+    )
+
+    # Exceeding boundary by $0.01: $20,000.01 + $5,000 = $25,000.01 > $25,000 -> Rejected
+    with pytest.raises(SwingSizingRejected, match="SECTOR_EXPOSURE_LIMIT_EXCEEDED"):
+        validate_swing_order_safety(
+            **base_args,
+            existing_sector_exposure_by_sector={"INFORMATION_TECHNOLOGY": 20000.01},
+            pending_sector_exposure_by_sector={},
+        )
+
+
+def test_durable_daily_loss_halt_persistence_and_rollover():
+    import tempfile
+    import json
+    from pathlib import Path
+    from decimal import Decimal
+    from alpaca_bridge import EntryGateMock
+    import config as config_mod
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        with patch.object(config_mod, "DATA_DIR", tmp_path):
+            gate = EntryGateMock()
+            acct = "PA3R71I7JFDZ"
+            session_1 = "2026-09-08"
+            session_2 = "2026-09-09"
+
+            # 1. Persist halt state
+            pnl = Decimal("-300.00")
+            limit = Decimal("300.00")
+            gate.persist_daily_loss_halt(acct, session_1, pnl, limit)
+
+            halt_file = tmp_path / f"swing_daily_loss_halt_{acct}.json"
+            assert halt_file.exists()
+
+            # 2. Query within same session -> Halted
+            is_halted, reason = gate.check_daily_loss_halt_state(acct, session_1)
+            assert is_halted is True
+            assert "DAILY_LOSS_LIMIT_REACHED" in reason
+            assert gate.halted is True
+
+            # 3. Query in next session (rollover) -> Automatically reset
+            is_halted_next, reason_next = gate.check_daily_loss_halt_state(acct, session_2)
+            assert is_halted_next is False
+            assert reason_next == ""
+            assert gate.halted is False
+            assert not halt_file.exists()
+
+            # 4. Corrupted file fails closed
+            with open(halt_file, "w", encoding="utf-8") as f:
+                f.write("{invalid_json:")
+            is_halted_corrupt, reason_corrupt = gate.check_daily_loss_halt_state(acct, session_2)
+            assert is_halted_corrupt is True
+            assert "CORRUPTED_HALT_STATE" in reason_corrupt
+
+            # 5. Account mismatch in file fails closed
+            with open(halt_file, "w", encoding="utf-8") as f:
+                json.dump({"account_id": "WRONG_ACCOUNT", "session_date_et": session_2, "halted": True}, f)
+            is_halted_mismatch, reason_mismatch = gate.check_daily_loss_halt_state(acct, session_2)
+            assert is_halted_mismatch is True
+            assert "HALT_STATE_ACCOUNT_MISMATCH" in reason_mismatch

@@ -10,13 +10,19 @@ from __future__ import annotations
 
 import hashlib
 import math
+import warnings
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_FLOOR
 from enum import Enum
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Mapping, Optional, Set, Tuple
 
 
 class PositionIntent(str, Enum):
+    """
+    Position intent classification.
+    Stage 0 production broker dispatch strictly supports OPEN_LONG only (single position per symbol).
+    ADD_LONG is preserved at the validator layer exclusively for Stage 1 multi-tier entry research.
+    """
     OPEN_LONG = "OPEN_LONG"
     ADD_LONG = "ADD_LONG"
     REDUCE_LONG = "REDUCE_LONG"
@@ -31,15 +37,17 @@ class UnsupportedSwingDirection(RuntimeError):
 
 
 # Stage 0 Frozen Risk Constants
-RISK_FRACTION = 0.005  # 0.50% equity risk budget
-CONFIGURED_MAX_RISK_DOLLARS = 500.00  # Hard dollar ceiling at $100k equity
-TARGET_DEPLOYED_EXPOSURE_PCT = 0.10  # 10% target deployment
-STAGE_0_GROSS_EXPOSURE_PCT = 0.15   # 15% hard portfolio exposure ceiling
-MAX_SYMBOL_EXPOSURE_PCT = 0.10      # 10% max per symbol
-SECTOR_EXPOSURE_CAP_PCT = 0.25      # 25% max per sector
-AGGREGATE_OPEN_STOP_HEAT_PCT = 0.025 # 2.50% max total open risk
-MAX_CONCURRENT_POSITIONS = 7
-MAX_DAILY_LOSS_DOLLARS = 300.00
+RISK_FRACTION: float = 0.005  # 0.50% equity risk budget
+CONFIGURED_MAX_RISK_DOLLARS: float = 500.00  # Hard dollar ceiling at $100k equity (Hard enforced)
+TARGET_DEPLOYED_EXPOSURE_PCT: float = 0.10  # 10% target deployment (Soft guideline)
+STAGE_0_GROSS_EXPOSURE_PCT: float = 0.15   # 15% hard portfolio exposure ceiling (Hard enforced)
+MAX_SYMBOL_EXPOSURE_PCT: float = 0.10      # 10% max per symbol (Hard enforced)
+SECTOR_EXPOSURE_CAP_PCT: float = 0.25      # 25% max gross notional exposure per sector (Hard enforced)
+MAX_CLUSTER_RISK_PCT: float = 0.0125       # 1.25% max cumulative open stop risk per correlated cluster (Hard enforced)
+AGGREGATE_OPEN_STOP_HEAT_PCT: float = 0.025 # 2.50% max total open risk (Hard enforced)
+MAX_CONCURRENT_POSITIONS: int = 7          # Hard position count ceiling (Hard enforced)
+MAX_DAILY_LOSS_DOLLARS: float = 300.00     # Bridge circuit breaker ceiling (Hard enforced)
+MAX_ADV_PARTICIPATION_RATE: float = 0.01   # 1.00% ADV liquidity ceiling (Hard enforced)
 
 ATR_MULTIPLIER_BY_REGIME = {
     "TRENDING_BULL": 1.50,
@@ -61,13 +69,54 @@ def require(condition: bool, message: str) -> None:
         raise SwingSizingRejected(message)
 
 
+def require_strict_int(value: Any, name: str, min_value: int = 0) -> None:
+    """Validate that value is strictly an int (rejecting bool) and >= min_value."""
+    require(
+        isinstance(value, int) and not isinstance(value, bool) and value >= min_value,
+        f"{name} must be an integer >= {min_value}, got {value!r}"
+    )
+
+
+def require_finite_nonnegative(value: float, name: str) -> None:
+    """Validate that value is a finite float/int and >= 0.0."""
+    require(
+        isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0.0,
+        f"{name} must be finite and non-negative, got {value}"
+    )
+
+
+def require_finite_positive(value: float, name: str) -> None:
+    """Validate that value is a finite float/int and > 0.0."""
+    require(
+        isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0.0,
+        f"{name} must be finite and positive, got {value}"
+    )
+
+
+def get_trade_risk_budget(
+    account_equity: float,
+    risk_fraction: float = RISK_FRACTION,
+) -> float:
+    """
+    Canonical single source of truth for trade dollar risk budget.
+    Caps dollar risk at min(account_equity * risk_fraction, CONFIGURED_MAX_RISK_DOLLARS).
+    """
+    require_finite_positive(account_equity, "account_equity")
+    require(
+        isinstance(risk_fraction, (int, float)) and not isinstance(risk_fraction, bool)
+        and math.isfinite(risk_fraction) and 0.0 < risk_fraction <= RISK_FRACTION,
+        f"Invalid risk fraction: {risk_fraction}"
+    )
+    return min(account_equity * risk_fraction, CONFIGURED_MAX_RISK_DOLLARS)
+
+
 def normalize_long_stop_price(price: float, price_increment: float = 0.01) -> float:
     """
     Round price down conservatively to the valid asset price increment.
     Uses decimal floor arithmetic to avoid IEEE-754 floating point inaccuracies.
     """
-    require(math.isfinite(price) and price > 0.0, f"Invalid price for tick normalization: {price}")
-    require(math.isfinite(price_increment) and price_increment > 0.0, (
+    require(isinstance(price, (int, float)) and not isinstance(price, bool) and math.isfinite(price) and price > 0.0, f"Invalid price for tick normalization: {price}")
+    require(isinstance(price_increment, (int, float)) and not isinstance(price_increment, bool) and math.isfinite(price_increment) and price_increment > 0.0, (
         f"Invalid price increment: {price_increment}"
     ))
 
@@ -93,9 +142,12 @@ def calculate_swing_exit_lots(
         Disable partial target and execute as single-lot.
       - If initial_shares >= 2: floor integer split for Tier 1, remainder to runner.
     """
-    require(isinstance(initial_shares, int) and initial_shares >= 1, (
-        f"initial_shares must be integer >= 1, got {initial_shares}"
-    ))
+    require_strict_int(initial_shares, "initial_shares", min_value=1)
+    require(
+        isinstance(target_weight, (int, float)) and not isinstance(target_weight, bool)
+        and math.isfinite(target_weight) and 0.0 < target_weight < 1.0,
+        f"target_weight must be between 0 and 1, got {target_weight}"
+    )
 
     if initial_shares < 2:
         return {
@@ -127,22 +179,27 @@ def calculate_swing_shares(
     entry_price: float,
     stop_price: float,
     account_equity: float,
-    proposed_risk_pct: float = 0.005,
+    proposed_risk_pct: float = RISK_FRACTION,
     symbol_notional_cap: float = 12000.0,
     adv_shares_20: Optional[float] = None,
-    max_participation_rate: float = 0.01,
+    max_participation_rate: float = MAX_ADV_PARTICIPATION_RATE,
     price_increment: float = 0.01,
     entry_slippage_per_share: float = 0.02,
     stop_slippage_per_share: float = 0.04,
     estimated_total_fees: float = 0.50,
 ) -> int:
     """
-    Derive position share count strictly from account risk budget with pre-sizing headroom.
-    Sizing budget uses 99% of hard risk limit to guarantee zero overshoot after fees/slippage.
+    [DEPRECATED] Derive position share count strictly from account risk budget.
+    Use calculate_swing_position_size() instead.
     """
-    require(math.isfinite(entry_price) and entry_price > 0.0, f"Invalid entry price: {entry_price}")
-    require(math.isfinite(stop_price) and stop_price > 0.0, f"Invalid stop price: {stop_price}")
-    require(math.isfinite(account_equity) and account_equity > 0.0, f"Invalid equity: {account_equity}")
+    warnings.warn(
+        "calculate_swing_shares() is deprecated; use calculate_swing_position_size()",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    require_finite_positive(entry_price, "entry_price")
+    require_finite_positive(stop_price, "stop_price")
+    require_finite_positive(account_equity, "account_equity")
 
     normalized_stop = normalize_long_stop_price(stop_price, price_increment=price_increment)
     base_risk_per_share = entry_price - normalized_stop
@@ -151,8 +208,8 @@ def calculate_swing_shares(
     # Effective risk per share including slippage
     effective_risk_per_share = base_risk_per_share + entry_slippage_per_share + stop_slippage_per_share
 
-    # Pre-sizing headroom: 99% of hard risk ceiling to absorb fixed fees
-    hard_dollar_risk_limit = account_equity * proposed_risk_pct
+    # Canonical risk budget capped at CONFIGURED_MAX_RISK_DOLLARS
+    hard_dollar_risk_limit = get_trade_risk_budget(account_equity, proposed_risk_pct)
     sizing_budget = max(0.0, (hard_dollar_risk_limit * 0.99) - estimated_total_fees)
 
     raw_shares = int(math.floor(sizing_budget / effective_risk_per_share))
@@ -186,12 +243,12 @@ def validate_swing_order_safety(
     entry_intent_id: Optional[str] = None,
     active_entry_intents: Optional[Set[Tuple[str, str, str, str, str]]] = None,
     existing_working_symbols: Optional[Set[str]] = None,
-    proposed_risk_per_trade_pct: float = 0.005,
-    max_portfolio_heat_pct: float = 0.025,
+    proposed_risk_per_trade_pct: float = RISK_FRACTION,
+    max_portfolio_heat_pct: float = AGGREGATE_OPEN_STOP_HEAT_PCT,
     current_cluster_risk_pct: float = 0.0,
     max_cluster_risk_pct: float = 0.0125,
     adv_shares_20: float = 1_000_000.0,
-    max_participation_rate: float = 0.01,
+    max_participation_rate: float = MAX_ADV_PARTICIPATION_RATE,
     symbol_notional_cap: float = 12000.0,
     price_increment: float = 0.01,
     quote_age_seconds: float = 5.0,
@@ -199,39 +256,107 @@ def validate_swing_order_safety(
     entry_slippage_per_share: float = 0.02,
     stop_slippage_per_share: float = 0.04,
     estimated_total_fees: float = 0.50,
+    *,
+    account_number: str = "PA3R71I7JFDZ",
+    broker_account_number: str = "PA3R71I7JFDZ",
+    current_position_count: int = 0,
+    pending_open_position_count: int = 0,
+    existing_position_symbols: Optional[Set[str]] = None,
+    intent: PositionIntent = PositionIntent.OPEN_LONG,
+    max_concurrent_positions: int = MAX_CONCURRENT_POSITIONS,
+    symbol_sector: str = "INFORMATION_TECHNOLOGY",
+    existing_sector_exposure_by_sector: Optional[Mapping[str, Any]] = None,
+    pending_sector_exposure_by_sector: Optional[Mapping[str, Any]] = None,
+    max_sector_exposure_pct: float = SECTOR_EXPOSURE_CAP_PCT,
 ) -> None:
     """
     Production fail-closed validation for swing orders.
     Enforces exact risk ceilings (zero tolerance overshoot), composite idempotency keys,
-    whole-share integrity, and portfolio heat limits before any broker dispatch.
+    whole-share integrity, state attribution, and portfolio heat limits before any broker dispatch.
     """
-    # A. Account and buying power validation
-    require(math.isfinite(account_equity) and account_equity > 0.0, f"Invalid account equity: {account_equity}")
-    require(math.isfinite(available_buying_power) and available_buying_power >= 0.0, (
-        f"Invalid buying power: {available_buying_power}"
-    ))
+    # Strict type and non-negativity checks
+    require_strict_int(shares, "shares", min_value=1)
+    require_strict_int(current_position_count, "current_position_count", min_value=0)
+    require_strict_int(pending_open_position_count, "pending_open_position_count", min_value=0)
+    require_strict_int(max_concurrent_positions, "max_concurrent_positions", min_value=1)
 
-    # B. Risk parameter ranges
-    require(0.0 < proposed_risk_per_trade_pct <= 0.005, (
+    require_finite_positive(entry_price, "entry_price")
+    require_finite_positive(stop_price, "stop_price")
+    require_finite_positive(account_equity, "account_equity")
+    require_finite_nonnegative(available_buying_power, "available_buying_power")
+    require_finite_nonnegative(current_open_stop_risk, "current_open_stop_risk")
+    require_finite_nonnegative(pending_entry_risk, "pending_entry_risk")
+    require_finite_nonnegative(current_cluster_risk_pct, "current_cluster_risk_pct")
+    require_finite_nonnegative(quote_age_seconds, "quote_age_seconds")
+    require_finite_nonnegative(entry_slippage_per_share, "entry_slippage_per_share")
+    require_finite_nonnegative(stop_slippage_per_share, "stop_slippage_per_share")
+    require_finite_nonnegative(estimated_total_fees, "estimated_total_fees")
+    require_finite_positive(adv_shares_20, "adv_shares_20")
+
+    # Account consistency
+    require(isinstance(account_number, str) and bool(account_number.strip()), "account_number must be provided")
+    require(isinstance(broker_account_number, str) and bool(broker_account_number.strip()), "broker_account_number must be provided")
+    require(
+        account_number.strip().upper() == broker_account_number.strip().upper(),
+        f"ACCOUNT_STATE_MISMATCH: configured={account_number} vs broker={broker_account_number}"
+    )
+
+    # Side normalization (Stage 0 swing validator is strictly long-only BUY)
+    norm_side = str(side).upper().strip()
+    require(norm_side == "BUY", f"Stage 0 swing validator only supports BUY orders, got {norm_side}")
+
+    # Symbol normalization
+    require(isinstance(symbol, str) and bool(symbol.strip()), "symbol must be provided")
+    norm_sym = symbol.upper().strip()
+
+    # State & Intent consistency
+    if existing_position_symbols is None:
+        existing_position_symbols = set()
+    require(isinstance(existing_position_symbols, set), "existing_position_symbols must be a set")
+    norm_pos_symbols = {s.strip().upper() for s in existing_position_symbols if isinstance(s, str) and s.strip()}
+    require(
+        current_position_count == len(norm_pos_symbols),
+        f"POSITION_STATE_INCONSISTENT: count={current_position_count}, symbols={len(norm_pos_symbols)}"
+    )
+
+    if isinstance(intent, PositionIntent):
+        norm_intent = intent
+    else:
+        try:
+            norm_intent = PositionIntent(str(intent))
+        except Exception:
+            raise UnsupportedSwingDirection(f"Unsupported swing intent: {intent}")
+
+    symbol_exists = norm_sym in norm_pos_symbols
+    if norm_intent == PositionIntent.OPEN_LONG:
+        require(not symbol_exists, f"OPEN_LONG rejected because {norm_sym} already exists in positions")
+        projected_count = current_position_count + pending_open_position_count + 1
+        require(
+            projected_count <= max_concurrent_positions,
+            f"Projected position count {projected_count} exceeds capacity {max_concurrent_positions}"
+        )
+    elif norm_intent == PositionIntent.ADD_LONG:
+        require(symbol_exists, f"ADD_LONG rejected because {norm_sym} does not exist in positions")
+    else:
+        raise UnsupportedSwingDirection(f"Unsupported swing intent: {norm_intent}")
+
+    # Risk parameter ranges
+    require(0.0 < proposed_risk_per_trade_pct <= RISK_FRACTION, (
         f"Risk-per-trade exceeds research specification: {proposed_risk_per_trade_pct}"
     ))
-    require(0.0 < max_portfolio_heat_pct <= 0.025, (
+    require(0.0 < max_portfolio_heat_pct <= AGGREGATE_OPEN_STOP_HEAT_PCT, (
         f"Portfolio heat cap exceeds research specification: {max_portfolio_heat_pct}"
     ))
-    require(0.0 < max_participation_rate <= 0.01, (
+    require(0.0 < max_participation_rate <= MAX_ADV_PARTICIPATION_RATE, (
         f"Invalid participation rate: {max_participation_rate}"
     ))
 
-    # C. Order deduplication & composite idempotency
+    # Order deduplication & composite idempotency
     require(bool(client_order_id), "client_order_id must be provided")
     require(bool(strategy_instance_id), "strategy_instance_id must be provided")
     require(bool(signal_version), "signal_version must be provided")
 
-    norm_sym = symbol.upper().strip()
-    norm_side = side.upper().strip()
     intent_id = entry_intent_id or client_order_id
-
-    # Composite idempotency key: (strategy_instance_id, symbol, side, signal_version, entry_intent_id)
     idempotency_key = (strategy_instance_id, norm_sym, norm_side, signal_version, intent_id)
     if active_entry_intents is not None:
         require(idempotency_key not in active_entry_intents, (
@@ -243,21 +368,16 @@ def validate_swing_order_safety(
             f"Duplicate active working order rejected for symbol {norm_sym}"
         ))
 
-    # D. Price and stop geometry
-    require(math.isfinite(entry_price) and entry_price > 0.0, f"Invalid entry price: {entry_price}")
-    require(math.isfinite(stop_price) and stop_price > 0.0, f"Invalid stop price: {stop_price}")
-
+    # Price and stop geometry
     normalized_stop = normalize_long_stop_price(stop_price, price_increment=price_increment)
     require(entry_price > normalized_stop, f"Long entry {entry_price} must exceed stop {normalized_stop}")
-    require(isinstance(shares, int) and shares >= 1, f"Shares must be integer >= 1, got {shares}")
 
-    # E. ADV and quote freshness
-    require(math.isfinite(adv_shares_20) and adv_shares_20 > 0.0, f"Invalid ADV: {adv_shares_20}")
+    # ADV and quote freshness
     require(quote_age_seconds <= max_quote_age_seconds, (
         f"Stale quote: {quote_age_seconds}s > {max_quote_age_seconds}s"
     ))
 
-    # F. Notional limits
+    # Notional limits
     notional_value = shares * entry_price
     require(notional_value >= 500.0, f"Order notional ${notional_value:.2f} below $500 minimum")
     require(notional_value <= symbol_notional_cap, (
@@ -267,34 +387,62 @@ def validate_swing_order_safety(
         f"Notional ${notional_value:.2f} exceeds buying power ${available_buying_power:.2f}"
     ))
 
-    # G. Liquidity participation cap
+    # Liquidity participation cap
     max_shares_liquidity = int(math.floor(adv_shares_20 * max_participation_rate))
     require(shares <= max_shares_liquidity, (
         f"Shares {shares} exceeds ADV liquidity cap {max_shares_liquidity}"
     ))
 
-    # H. Effective trade risk (per-share slippage model, ZERO tolerance overshoot)
-    base_trade_risk = shares * (entry_price - normalized_stop)
-    slippage_risk = (shares * entry_slippage_per_share) + (shares * stop_slippage_per_share)
-    effective_trade_risk = base_trade_risk + slippage_risk + estimated_total_fees
+    # Sector notional exposure validation (Aggregating existing, pending, and proposed)
+    require(
+        isinstance(symbol_sector, str) and bool(symbol_sector.strip()),
+        f"SECTOR_ATTRIBUTION_REQUIRED: {norm_sym}"
+    )
+    norm_sec = symbol_sector.strip().upper()
+    sec_exist_map = existing_sector_exposure_by_sector if existing_sector_exposure_by_sector is not None else {}
+    sec_pend_map = pending_sector_exposure_by_sector if pending_sector_exposure_by_sector is not None else {}
+    d_exist_sec = Decimal(str(sec_exist_map.get(norm_sec, "0.0") or "0.0"))
+    d_pend_sec = Decimal(str(sec_pend_map.get(norm_sec, "0.0") or "0.0"))
+    d_notional = Decimal(str(notional_value))
+    d_projected_sec = d_exist_sec + d_pend_sec + d_notional
+    d_max_sec = Decimal(str(account_equity)) * Decimal(str(max_sector_exposure_pct))
+    require(
+        d_projected_sec <= d_max_sec,
+        f"SECTOR_EXPOSURE_LIMIT_EXCEEDED: sector={norm_sec} projected=${float(d_projected_sec):.2f} exceeds cap=${float(d_max_sec):.2f}"
+    )
 
-    hard_trade_dollar_risk = account_equity * proposed_risk_per_trade_pct
-    require(effective_trade_risk <= hard_trade_dollar_risk, (
-        f"Effective trade risk ${effective_trade_risk:.2f} strictly exceeds hard budget ${hard_trade_dollar_risk:.2f}"
-    ))
+    # Effective trade risk (per-share slippage model, ZERO tolerance overshoot)
+    # Uses exact Decimal arithmetic to prevent float epsilon inaccuracies on boundary conditions ($500.00)
+    d_entry = Decimal(str(entry_price))
+    d_stop = Decimal(str(normalized_stop))
+    d_slip = Decimal(str(entry_slippage_per_share)) + Decimal(str(stop_slippage_per_share))
+    d_fees = Decimal(str(estimated_total_fees))
+    d_shares = Decimal(str(shares))
+    d_effective_risk = (d_shares * (d_entry - d_stop + d_slip)) + d_fees
 
-    # I. Projected portfolio heat (including working entries, excluding unfilled exits)
-    projected_risk_heat = current_open_stop_risk + pending_entry_risk + effective_trade_risk
-    max_portfolio_risk = account_equity * max_portfolio_heat_pct
-    require(projected_risk_heat <= max_portfolio_risk, (
-        f"Projected portfolio heat ${projected_risk_heat:.2f} exceeds limit ${max_portfolio_risk:.2f}"
-    ))
+    hard_budget_float = get_trade_risk_budget(account_equity, proposed_risk_per_trade_pct)
+    d_hard_budget = Decimal(str(hard_budget_float))
+    require(
+        d_effective_risk <= d_hard_budget,
+        f"Effective trade risk ${float(d_effective_risk):.2f} strictly exceeds hard budget ${float(d_hard_budget):.2f}"
+    )
 
-    # J. Cluster risk check
-    projected_cluster_risk = current_cluster_risk_pct + (effective_trade_risk / account_equity)
-    require(projected_cluster_risk <= max_cluster_risk_pct, (
-        f"Cluster risk {projected_cluster_risk:.3f} exceeds cap {max_cluster_risk_pct:.3f}"
-    ))
+    # Projected portfolio heat (including working entries, excluding unfilled exits)
+    d_open_stop = Decimal(str(current_open_stop_risk))
+    d_pending = Decimal(str(pending_entry_risk))
+    d_projected_heat = d_open_stop + d_pending + d_effective_risk
+    d_max_portfolio_heat = Decimal(str(account_equity)) * Decimal(str(max_portfolio_heat_pct))
+    require(
+        d_projected_heat <= d_max_portfolio_heat,
+        f"Projected portfolio heat ${float(d_projected_heat):.2f} exceeds limit ${float(d_max_portfolio_heat):.2f}"
+    )
+
+    # Cluster risk check (cumulative open stop risk across correlated cluster assets)
+    projected_cluster_risk = current_cluster_risk_pct + (float(d_effective_risk) / account_equity)
+    require(
+        projected_cluster_risk <= max_cluster_risk_pct,
+        f"Cluster risk {projected_cluster_risk:.4f} exceeds cap {max_cluster_risk_pct:.4f}"
+    )
 
 
 @dataclass(frozen=True)
@@ -385,7 +533,7 @@ def calculate_swing_position_size(
     existing_portfolio_exposure: float = 0.0,
     reserved_portfolio_exposure: float = 0.0,
     adv_shares_20: Optional[float] = None,
-    max_participation_rate: float = 0.01,
+    max_participation_rate: float = MAX_ADV_PARTICIPATION_RATE,
     tick_size: float = 0.01,
     entry_slippage_per_share: float = 0.02,
     stop_slippage_per_share: float = 0.04,
@@ -407,8 +555,8 @@ def calculate_swing_position_size(
     if normalized_stop_distance <= 0.0:
         return SizingDecision.reject("STOP_NOT_BELOW_ENTRY", normalized_stop=normalized_stop)
 
-    # 1. Risk Budget Ceiling (0.50% equity risk, capped at $500)
-    risk_budget = min(account_equity * RISK_FRACTION, CONFIGURED_MAX_RISK_DOLLARS)
+    # 1. Risk Budget Ceiling (0.50% equity risk, capped at $500 via canonical helper)
+    risk_budget = get_trade_risk_budget(account_equity, RISK_FRACTION)
     per_share_risk = normalized_stop_distance + entry_slippage_per_share + stop_slippage_per_share
     effective_risk_budget = max(0.0, (risk_budget * 0.99) - estimated_total_fees)
     q_risk = int(math.floor(effective_risk_budget / per_share_risk))
@@ -497,6 +645,7 @@ def build_canonical_swing_order_id(
     Build canonical deterministic client order ID for swing trades.
     Format: 'swg_' + sha256(logical_order_key)[:16]
     """
+    require(isinstance(account_number, str) and bool(account_number.strip()), "account_number must be non-empty")
     logical_order_key = "|".join([
         "swing",
         account_number.strip().upper(),

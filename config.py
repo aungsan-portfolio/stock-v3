@@ -774,6 +774,40 @@ FORWARD_TEST_REPORT_JSON = REPORTS_DIR / "forward_test_metrics.json"
 FORWARD_TEST_REPORT_MD   = REPORTS_DIR / "forward_test_report.md"
 FORWARD_TEST_SESSION     = None
 
+# ── Swing Trading Hard Risk Ceilings & Sector Policies ──────────────
+SWING_MAX_DAILY_LOSS_DOLLAR_CAP: float = 300.00
+SWING_MAX_DAILY_LOSS_PCT: float        = 0.01
+SWING_ACCOUNT_ID: str                  = "PA3R71I7JFDZ"
+SECTOR_EXPOSURE_CAP_PCT: float         = 0.25
+MAX_CLUSTER_RISK_PCT: float            = 0.0125
+SWING_PROTECTED_SYMBOLS: set           = {"SPY", "QQQ"}
+
+# Authoritative sector attribution with source and versioning
+SECTOR_MAPPINGS: dict = {
+    "SPY": {"sector": "INDEX_ETF", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "QQQ": {"sector": "INDEX_ETF", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "VTI": {"sector": "INDEX_ETF", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "AAPL": {"sector": "INFORMATION_TECHNOLOGY", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "MSFT": {"sector": "INFORMATION_TECHNOLOGY", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "NVDA": {"sector": "INFORMATION_TECHNOLOGY", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "AMD": {"sector": "INFORMATION_TECHNOLOGY", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "AVGO": {"sector": "INFORMATION_TECHNOLOGY", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "TSLA": {"sector": "CONSUMER_DISCRETIONARY", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "AMZN": {"sector": "CONSUMER_DISCRETIONARY", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "META": {"sector": "COMMUNICATION_SERVICES", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "GOOGL": {"sector": "COMMUNICATION_SERVICES", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "NFLX": {"sector": "COMMUNICATION_SERVICES", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "COST": {"sector": "CONSUMER_STAPLES", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "JPM": {"sector": "FINANCIALS", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "BAC": {"sector": "FINANCIALS", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "V": {"sector": "FINANCIALS", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "XOM": {"sector": "ENERGY", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "UNH": {"sector": "HEALTHCARE", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "XLV": {"sector": "HEALTHCARE", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "CAT": {"sector": "INDUSTRIALS", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "LLY": {"sector": "HEALTHCARE", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+}
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Dataclass-based Settings (dependency-injection friendly)

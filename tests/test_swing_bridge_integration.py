@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pytest
@@ -283,67 +284,69 @@ def test_canonical_swing_order_id():
 
 # ─── 7. Atomic Process Lock Tests ────────────────────────────────────────────
 
-def test_atomic_process_lock_lifecycle(tmp_path):
-    lock_file = tmp_path / 'swing_bot.lock'
-    meta = ProcessLockMetadata(
-        pid=os.getpid(),
-        hostname='test-host',
-        account='PA3R71I7JFDZ',
-        mode='swing',
-        branch='research/swing-atr-engine',
-        release_sha='c1fa450',
-        started_at_utc='2026-09-06T13:00:00Z',
-    )
+def test_atomic_process_lock_lifecycle():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        lock_file = Path(tmp_dir) / 'swing_bot.lock'
+        meta = ProcessLockMetadata(
+            pid=os.getpid(),
+            hostname='test-host',
+            account='PA3R71I7JFDZ',
+            mode='swing',
+            branch='research/swing-atr-engine',
+            release_sha='c1fa450',
+            started_at_utc='2026-09-06T13:00:00Z',
+        )
 
-    # 1. Acquire lock
-    fd = acquire_atomic_process_lock(lock_file, meta)
-    assert fd >= 0
-    assert lock_file.exists()
+        # 1. Acquire lock
+        fd = acquire_atomic_process_lock(lock_file, meta)
+        assert fd >= 0
+        assert lock_file.exists()
 
-    # Verify content
-    with open(lock_file, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    assert data['account'] == 'PA3R71I7JFDZ'
-    assert data['pid'] == os.getpid()
+        # Verify content
+        with open(lock_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        assert data['account'] == 'PA3R71I7JFDZ'
+        assert data['pid'] == os.getpid()
 
-    # 2. Duplicate acquire fails
-    with pytest.raises(StartupSafetyRejected, match='STARTUP_LOCK_COLLISION'):
-        acquire_atomic_process_lock(lock_file, meta)
+        # 2. Duplicate acquire fails
+        with pytest.raises(StartupSafetyRejected, match='STARTUP_LOCK_COLLISION'):
+            acquire_atomic_process_lock(lock_file, meta)
 
-    # 3. Release lock
-    release_atomic_process_lock(lock_file, fd)
-    assert not lock_file.exists()
+        # 3. Release lock
+        release_atomic_process_lock(lock_file, fd)
+        assert not lock_file.exists()
 
 
 # ─── 8. Risk Basis Store Tests ───────────────────────────────────────────────
 
-def test_swing_risk_basis_store_and_unrealized_r(tmp_path):
-    store_file = tmp_path / 'swing_risk.json'
-    basis = PositionRiskBasis(
-        symbol='AAPL',
-        entry_price=150.0,
-        initial_stop_price=145.0,
-        initial_risk_per_share=5.0,
-        initial_total_risk=50.0,
-        shares=10,
-        entry_timestamp_utc='2026-09-06T13:00:00Z',
-    )
+def test_swing_risk_basis_store_and_unrealized_r():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_file = Path(tmp_dir) / 'swing_risk.json'
+        basis = PositionRiskBasis(
+            symbol='AAPL',
+            entry_price=150.0,
+            initial_stop_price=145.0,
+            initial_risk_per_share=5.0,
+            initial_total_risk=50.0,
+            shares=10,
+            entry_timestamp_utc='2026-09-06T13:00:00Z',
+        )
 
-    save_risk_basis(basis, path=store_file)
-    store = load_risk_store(path=store_file)
-    assert 'AAPL' in store
-    assert store['AAPL'].initial_risk_per_share == 5.0
+        save_risk_basis(basis, path=store_file)
+        store = load_risk_store(path=store_file)
+        assert 'AAPL' in store
+        assert store['AAPL'].initial_risk_per_share == 5.0
 
-    # At price 155 -> +5.0 profit / .0 risk = +1.0R
-    r_val = get_unrealized_r('AAPL', current_price=155.0, avg_entry_price=150.0, path=store_file)
-    assert pytest.approx(r_val, 0.01) == 1.0
+        # At price 155 -> +5.0 profit / .0 risk = +1.0R
+        r_val = get_unrealized_r('AAPL', current_price=155.0, avg_entry_price=150.0, path=store_file)
+        assert pytest.approx(r_val, 0.01) == 1.0
 
-    # At price 160 -> +10.0 profit / .0 risk = +2.0R
-    r_val_2 = get_unrealized_r('AAPL', current_price=160.0, avg_entry_price=150.0, path=store_file)
-    assert pytest.approx(r_val_2, 0.01) == 2.0
+        # At price 160 -> +10.0 profit / .0 risk = +2.0R
+        r_val_2 = get_unrealized_r('AAPL', current_price=160.0, avg_entry_price=150.0, path=store_file)
+        assert pytest.approx(r_val_2, 0.01) == 2.0
 
-    remove_risk_basis('AAPL', path=store_file)
-    assert 'AAPL' not in load_risk_store(path=store_file)
+        remove_risk_basis('AAPL', path=store_file)
+        assert 'AAPL' not in load_risk_store(path=store_file)
 
 
 # ─── 9. Permanent Max Concurrent Positions & Mutation Counters Tests ────────

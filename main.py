@@ -383,12 +383,13 @@ def cmd_paper(args) -> int:
         import socket
         from strategies.session import now_eastern
 
-        lock_path = Path("data/swing_bot.lock")
+        target_acct = os.environ.get("SWING_ACCOUNT_ID", "PA3R71I7JFDZ").strip().upper()
+        lock_path = Path("data") / f"swing_bot_{target_acct}.lock"
         try:
             lock_meta = ProcessLockMetadata(
                 pid=os.getpid(),
                 hostname=socket.gethostname(),
-                account=os.environ.get("SWING_ACCOUNT_ID", "PA3R71I7JFDZ"),
+                account=target_acct,
                 mode="swing",
                 branch="research/swing-atr-engine",
                 release_sha="c1fa450",

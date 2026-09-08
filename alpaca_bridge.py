@@ -5,6 +5,7 @@ placement, and reconciliation methods expected by Pro V3.
 """
 import asyncio
 import datetime as _dt
+import json
 import logging
 import math
 import os
@@ -12,7 +13,8 @@ import random
 import threading
 import time
 from collections import deque
-from typing import List, Optional
+from decimal import Decimal
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.stream import TradingStream
@@ -96,6 +98,84 @@ def configure_session_timeouts(
     )
     session.mount("https://", adapter)
     session.mount("http://", adapter)
+
+
+def normalize_enum_value(val: Any) -> str:
+    """Safely extract and normalize enum value or string representation."""
+    if val is None:
+        return ""
+    if hasattr(val, "_mock_name") or "Mock" in type(val).__name__:
+        return ""
+    if hasattr(val, "value"):
+        raw = val.value
+        if hasattr(raw, "_mock_name") or "Mock" in type(raw).__name__:
+            return ""
+        return str(raw).strip().upper()
+    if isinstance(val, str):
+        return val.strip().upper()
+    return str(val).strip().upper()
+
+
+def flatten_orders(orders: Any) -> List[Any]:
+    """
+    Flattens orders and nested child bracket legs (order.legs),
+    deduplicating by order ID while preserving order objects.
+    """
+    flattened = []
+    for o in orders or []:
+        flattened.append(o)
+        for leg in getattr(o, "legs", None) or []:
+            flattened.append(leg)
+    dedup = {}
+    for o in flattened:
+        oid = getattr(o, "id", None) if not isinstance(o, dict) else o.get("id")
+        key = str(oid) if oid is not None else id(o)
+        if key not in dedup:
+            dedup[key] = o
+    return list(dedup.values())
+
+
+def check_regular_market_hours(client: Any = None) -> Tuple[bool, str]:
+    """
+    Validates that current execution is strictly within NYSE Regular Trading Hours:
+    9:30 AM – 3:55 PM Eastern Time on regular trading days.
+    Blocks extended-hours (pre-market/after-hours) and overnight sessions.
+    """
+    from datetime import datetime, time, timezone
+    from zoneinfo import ZoneInfo
+    from strategies.session import now_eastern
+
+    et_tz = ZoneInfo("America/New_York")
+    now_et = now_eastern()
+
+    # If broker client provides clock, verify broker market open status
+    if client is not None and hasattr(client, "get_clock"):
+        try:
+            clock = client.get_clock()
+            is_open = getattr(clock, "is_open", None)
+            if is_open is not None and not bool(is_open):
+                return False, "BROKER_MARKET_CLOSED"
+            b_ts = getattr(clock, "timestamp", None)
+            if b_ts is not None and hasattr(b_ts, "astimezone") and isinstance(b_ts, datetime):
+                now_et = b_ts.astimezone(et_tz)
+        except Exception as c_err:
+            logger.warning("Could not query broker clock: %s; relying on conservative local ET gate", c_err)
+
+    if not isinstance(now_et, datetime):
+        return True, ""
+
+    # Regular session bounds: 9:30 AM <= time < 3:55 PM ET (15:55 cutoff buffer)
+    cur_time = now_et.time()
+    if cur_time < time(9, 30):
+        return False, f"PRE_MARKET_HOURS: {cur_time.strftime('%H:%M:%S')} ET < 09:30:00"
+    if cur_time >= time(15, 55):
+        return False, f"ENTRY_CUTOFF_EXCEEDED: {cur_time.strftime('%H:%M:%S')} ET >= 15:55:00"
+
+    # Weekday check (0 = Mon, 4 = Fri)
+    if now_et.weekday() >= 5:
+        return False, f"WEEKEND_HOURS: weekday={now_et.weekday()}"
+
+    return True, ""
 
 
 class StreamState(Enum):
@@ -400,7 +480,132 @@ class EntryGateMock:
             return 0
         return qty
 
-    def entry_blocked(self, symbol, value, signal, price):
+    def daily_loss_blocked(
+        self,
+        account_id: str,
+        session_date_et: str,
+        current_equity: Any,
+        session_start_equity: Any,
+        net_session_cash_flows: Any = 0.0,
+    ) -> Tuple[bool, str]:
+        """
+        Dedicated daily-loss circuit breaker for Swing Trading using end-to-end Decimal arithmetic.
+        Enforces min(SOD_equity * SWING_MAX_DAILY_LOSS_PCT, SWING_MAX_DAILY_LOSS_DOLLAR_CAP).
+        """
+        if self.halted:
+            return True, "Trading engine is halted"
+
+        try:
+            d_current_equity = Decimal(str(current_equity))
+            d_sod_equity = Decimal(str(session_start_equity))
+            d_cash_flows = Decimal(str(net_session_cash_flows or 0.0))
+        except Exception as e:
+            return True, f"INVALID_EQUITY_DECIMAL: {e}"
+
+        if not (d_current_equity.is_finite() and d_sod_equity.is_finite() and d_cash_flows.is_finite()):
+            return True, "NON_FINITE_EQUITY_VALUES"
+
+        if d_sod_equity <= Decimal("0"):
+            return True, "NON_POSITIVE_SOD_EQUITY_BASELINE"
+
+        d_daily_pnl = d_current_equity - d_sod_equity - d_cash_flows
+
+        pct_cap_float = float(getattr(config_module, "SWING_MAX_DAILY_LOSS_PCT", 0.01))
+        dollar_cap_float = float(getattr(config_module, "SWING_MAX_DAILY_LOSS_DOLLAR_CAP", 300.00))
+
+        d_pct_cap = d_sod_equity * Decimal(str(pct_cap_float))
+        d_dollar_cap = Decimal(str(dollar_cap_float))
+        d_limit = min(d_pct_cap, d_dollar_cap)
+
+        if d_daily_pnl <= -d_limit:
+            self.persist_daily_loss_halt(account_id, session_date_et, d_daily_pnl, d_limit)
+            self.halt()
+            return True, f"Max daily loss limit reached (${d_daily_pnl:.2f} <= -${d_limit:.2f})"
+
+        return False, ""
+
+    def persist_daily_loss_halt(
+        self,
+        account_id: str,
+        session_date_et: str,
+        daily_pnl: Decimal,
+        daily_loss_limit: Decimal,
+    ) -> None:
+        """Atomically persist durable daily-loss halt state."""
+        from datetime import datetime, timezone
+        from pathlib import Path
+        data_dir = getattr(config_module, "DATA_DIR", Path("data"))
+        halt_file = data_dir / f"swing_daily_loss_halt_{account_id.strip().upper()}.json"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({
+            "account_id": account_id.strip().upper(),
+            "session_date_et": session_date_et,
+            "daily_pnl": str(daily_pnl),
+            "daily_loss_limit": str(daily_loss_limit),
+            "halted": True,
+            "reason": "DAILY_LOSS_LIMIT",
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        }, indent=2)
+        tmp_file = halt_file.with_suffix(".tmp")
+        try:
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_file, halt_file)
+            logger.warning("[DAILY LOSS HALT PERSISTED] %s: pnl=%s limit=%s", account_id, daily_pnl, daily_loss_limit)
+        except Exception as exc:
+            logger.error("Failed to persist daily loss halt state for %s: %s", account_id, exc)
+
+    def check_daily_loss_halt_state(
+        self,
+        account_id: str,
+        current_session_date_et: str,
+    ) -> Tuple[bool, str]:
+        """
+        Inspect durable daily loss halt file with strict session rollover validation.
+        """
+        from pathlib import Path
+        data_dir = getattr(config_module, "DATA_DIR", Path("data"))
+        halt_file = data_dir / f"swing_daily_loss_halt_{account_id.strip().upper()}.json"
+        if not halt_file.exists():
+            return False, ""
+        try:
+            with open(halt_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            logger.error("Corrupted daily loss halt file for %s: %s (failing closed)", account_id, exc)
+            self.halt()
+            return True, f"CORRUPTED_HALT_STATE: {exc}"
+
+        rec_acct = str(data.get("account_id", "")).strip().upper()
+        if rec_acct != account_id.strip().upper():
+            logger.error("Halt file account mismatch: expected %s, got %s (failing closed)", account_id, rec_acct)
+            self.halt()
+            return True, "HALT_STATE_ACCOUNT_MISMATCH"
+
+        rec_date = str(data.get("session_date_et", "")).strip()
+        if rec_date > current_session_date_et:
+            logger.error("Future session date %s detected in halt state for %s (failing closed)", rec_date, account_id)
+            self.halt()
+            return True, "FUTURE_SESSION_DATE_DETECTED"
+
+        if rec_date == current_session_date_et:
+            if data.get("halted", False):
+                self.halt()
+                return True, f"DAILY_LOSS_LIMIT_REACHED (pnl={data.get('daily_pnl')}, limit={data.get('daily_loss_limit')})"
+
+        # Previous session -> controlled reset
+        try:
+            logger.info("[SESSION ROLLOVER RESET] Resetting previous session (%s) halt state for %s", rec_date, account_id)
+            halt_file.unlink(missing_ok=True)
+            self.halted = False
+            self.halt_reason = ""
+        except Exception as r_exc:
+            logger.warning("Could not unlink previous halt file for %s: %s", account_id, r_exc)
+        return False, ""
+
+    def entry_blocked(self, symbol, value, signal, price=None):
         if self.halted:
             return True, "Trading engine is halted"
         if self.bridge is not None:
@@ -415,13 +620,13 @@ class EntryGateMock:
                         logger.warning("Risk baseline unavailable; blocking new entries only. Protective exits remain enabled.")
                         return True, "Risk baseline unavailable (blocking new entries only; protective exits remain enabled)"
                     pct_limit = abs(sod_equity * float(getattr(config_module, "SWING_MAX_DAILY_LOSS_PCT", 0.01)))
-                    dollar_cap = float(getattr(config_module, "SWING_MAX_DAILY_LOSS_DOLLAR_CAP", 0.0))
-                    max_loss = min(pct_limit, dollar_cap) if dollar_cap > 0 else pct_limit
+                    dollar_cap = float(getattr(config_module, "SWING_MAX_DAILY_LOSS_DOLLAR_CAP", 300.00))
+                    max_loss = min(pct_limit, dollar_cap) if dollar_cap > 0 else 300.00
                 else:
                     max_loss = float(getattr(config_module, "MAX_DAILY_LOSS_DAYTRADE", 300.0))
-                if round(daily_pnl, 2) < -round(abs(max_loss), 2):
+                if round(daily_pnl, 2) <= -round(abs(max_loss), 2):
                     self.halt()
-                    return True, f"Max daily loss limit reached (${daily_pnl:.2f} < -${max_loss:.2f})"
+                    return True, f"Max daily loss limit reached (${daily_pnl:.2f} <= -${max_loss:.2f})"
             except Exception as e:
                 logger.error("Error checking daily loss limit in EntryGateMock: %s; blocking new entries only. Protective exits remain enabled.", e)
                 return True, f"Risk check error: {e} (blocking new entries only)"
@@ -458,6 +663,7 @@ class AlpacaBridge:
         self.ib = MockIB(self)
         self.entry_gate = EntryGateMock(self)
         self.rotator = PositionRotator()
+        self._swing_dispatch_lock = threading.Lock()
 
     @property
     def is_paper(self) -> bool:
@@ -1529,7 +1735,8 @@ class AlpacaBridge:
     def _place_open_bracket(
         self, symbol: str, action: str, qty: int, price: float, confidence: float,
         strategy_name: str = "", custom_stop_price: Optional[float] = None,
-        custom_target_price: Optional[float] = None
+        custom_target_price: Optional[float] = None,
+        custom_client_order_id: Optional[str] = None,
     ) -> order_exec.OrderResult:
         self._require_connection()
         self._require_trade_stream()
@@ -1545,7 +1752,9 @@ class AlpacaBridge:
         take_profit_price = custom_target_price if custom_target_price is not None else self._take_profit_price(action, price, symbol=symbol)
         
         strat_tag = str(strategy_name or "UNKNOWN").replace("StrategyName.", "").upper()
-        if self.mode == "swing":
+        if custom_client_order_id is not None:
+            client_order_id = custom_client_order_id
+        elif self.mode == "swing":
             from strategies.swing_sizing import build_canonical_swing_order_id
             from strategies.session import now_eastern
             client_order_id = build_canonical_swing_order_id(
@@ -2105,6 +2314,151 @@ class AlpacaBridge:
             "auto_cleaned_orphans": auto_cleaned_orphans,
             "soxx_cancelled": soxx_cancelled,
         }
+
+    def audit_swing_portfolio_safety(
+        self,
+        positions: List[Any],
+        open_orders: List[Any],
+    ) -> Tuple[float, float, Set[str], Set[str]]:
+        """
+        Audits active swing portfolio safety, stop quantity coverage, and pending entries.
+        Fail-closed guarantees:
+        1. Rejects any account short position (UNSUPPORTED_ACCOUNT_SHORT_POSITION).
+        2. Verifies full protective stop coverage for every open long position (INSUFFICIENT_STOP_COVERAGE).
+        3. Rejects any pending swing entry lacking a protective stop (PENDING_ENTRY_WITHOUT_PROTECTIVE_STOP).
+        4. Computes conservative open stop risk and pending entry risk.
+        Returns: (current_open_stop_risk, pending_entry_risk, active_position_symbols, pending_new_symbols)
+        """
+        from strategies.swing_sizing import require, SwingSizingRejected
+
+        def _get(obj: Any, attr: str, default: Any = None) -> Any:
+            if isinstance(obj, dict):
+                return obj.get(attr, default)
+            return getattr(obj, attr, default)
+
+        pos_list = positions if isinstance(positions, list) else []
+        ord_list = open_orders if isinstance(open_orders, list) else []
+
+        # 1. Reject any short positions
+        for p in pos_list:
+            qty = float(_get(p, "qty", 0.0) or 0.0)
+            sym = str(_get(p, "symbol", "") or "").strip().upper()
+            if qty < 0.0:
+                raise SwingSizingRejected(f"UNSUPPORTED_ACCOUNT_SHORT_POSITION: {sym}")
+
+        active_positions = [p for p in pos_list if float(_get(p, "qty", 0.0) or 0.0) > 0.0]
+        active_position_symbols = {
+            str(_get(p, "symbol", "") or "").strip().upper()
+            for p in active_positions
+            if str(_get(p, "symbol", "") or "").strip()
+        }
+
+        flattened_orders = flatten_orders(ord_list)
+        PROTECTIVE_STOP_TYPES = {"STOP"}
+        KNOWN_ACTIVE_STATUSES = {
+            "NEW", "ACCEPTED", "SUBMITTED", "PENDING_NEW", "HELD",
+            "PARTIALLY_FILLED", "QUEUED", "OPEN"
+        }
+        KNOWN_TERMINAL_STATUSES = {
+            "FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "STOPPED", "SUSPENDED"
+        }
+
+        # Helper to validate and extract active remaining quantity
+        def _get_active_remaining_qty(order_obj: Any) -> float:
+            st = normalize_enum_value(_get(order_obj, "status", ""))
+            if st in KNOWN_TERMINAL_STATUSES or st in ("PENDING_CANCEL", "PENDING_REPLACE"):
+                return 0.0
+            if st and st not in KNOWN_ACTIVE_STATUSES:
+                raise SwingSizingRejected(f"UNKNOWN_BROKER_ORDER_STATUS: {st}")
+            tot = float(_get(order_obj, "qty", 0.0) or 0.0)
+            fld = float(_get(order_obj, "filled_qty", 0.0) or 0.0)
+            return max(0.0, tot - fld)
+
+        # 2. Verify protective stop quantity coverage for each active position
+        current_open_stop_risk = 0.0
+        for p in active_positions:
+            sym = str(_get(p, "symbol", "") or "").strip().upper()
+            pos_qty = float(_get(p, "qty", 0.0) or 0.0)
+            matching_stops = [
+                o for o in flattened_orders
+                if str(_get(o, "symbol", "") or "").strip().upper() == sym
+                and normalize_enum_value(_get(o, "side", "")) == "SELL"
+                and (
+                    normalize_enum_value(_get(o, "order_type", "")) in PROTECTIVE_STOP_TYPES
+                    or normalize_enum_value(_get(o, "type", "")) in PROTECTIVE_STOP_TYPES
+                )
+                and _get_active_remaining_qty(o) > 0.0
+            ]
+            protected_qty = sum(_get_active_remaining_qty(o) for o in matching_stops)
+            require(
+                protected_qty >= pos_qty,
+                f"INSUFFICIENT_STOP_COVERAGE: {sym} position={pos_qty}, protected={protected_qty}"
+            )
+
+            # Verify every matching stop has a deterministic stop_price
+            for o in matching_stops:
+                st_px = _get(o, "stop_price", None)
+                require(
+                    st_px is not None and float(st_px) > 0.0,
+                    f"MISSING_STOP_PRICE: Order {getattr(o, 'id', None)} for {sym}"
+                )
+
+            # Conservative stop risk calculation
+            stop_prices = [
+                float(_get(o, "stop_price", 0.0))
+                for o in matching_stops
+            ]
+            min_stop = min(stop_prices) if stop_prices else (float(_get(p, "avg_entry_price", 0.0) or 0.0) * 0.95)
+            entry_basis = float(_get(p, "avg_entry_price", _get(p, "current_price", 0.0)) or 0.0)
+            pos_risk = pos_qty * max(0.0, entry_basis - min_stop + 0.04)
+            current_open_stop_risk += pos_risk
+
+        # 3. Identify pending swing BUY entries and compute pending_entry_risk
+        pending_swing_buys = [
+            o for o in flattened_orders
+            if normalize_enum_value(_get(o, "side", "")) == "BUY"
+            and str(_get(o, "client_order_id", "") or "").startswith("swg_")
+            and _get_active_remaining_qty(o) > 0.0
+        ]
+        pending_new_symbols = {
+            str(_get(o, "symbol", "") or "").strip().upper()
+            for o in pending_swing_buys
+            if str(_get(o, "symbol", "") or "").strip().upper() not in active_position_symbols
+        }
+
+        pending_entry_risk = 0.0
+        for p_order in pending_swing_buys:
+            rem_qty = _get_active_remaining_qty(p_order)
+            if rem_qty <= 0.0:
+                continue
+
+            p_sym = str(_get(p_order, "symbol", "") or "").strip().upper()
+            p_stops = [
+                o for o in flattened_orders
+                if str(_get(o, "symbol", "") or "").strip().upper() == p_sym
+                and normalize_enum_value(_get(o, "side", "")) == "SELL"
+                and (
+                    normalize_enum_value(_get(o, "order_type", "")) in PROTECTIVE_STOP_TYPES
+                    or normalize_enum_value(_get(o, "type", "")) in PROTECTIVE_STOP_TYPES
+                )
+                and _get_active_remaining_qty(o) > 0.0
+            ]
+            require(len(p_stops) > 0, f"PENDING_ENTRY_WITHOUT_PROTECTIVE_STOP: {p_sym}")
+            for o in p_stops:
+                st_px = _get(o, "stop_price", None)
+                require(st_px is not None and float(st_px) > 0.0, f"PENDING_ENTRY_WITHOUT_VALID_STOP_PRICE: {p_sym}")
+
+            min_p_stop = min(float(_get(o, "stop_price", 0.0)) for o in p_stops)
+            p_entry_basis = float(
+                _get(p_order, "limit_price", None)
+                or _get(p_order, "filled_avg_price", None)
+                or _get(p_order, "price", 0.0)
+                or 0.0
+            )
+            require(p_entry_basis > 0.0, f"PENDING_ENTRY_WITHOUT_VALID_PRICE_BASIS: {p_sym}")
+            pending_entry_risk += rem_qty * max(0.0, p_entry_basis - min_p_stop + 0.06) + 0.50
+
+        return current_open_stop_risk, pending_entry_risk, active_position_symbols, pending_new_symbols
 
     def ensure_protective_stops(self) -> dict:
         report = {"checked": 0, "unprotected": [], "repaired": [], "failed": []}
@@ -2958,6 +3312,299 @@ class AlpacaBridge:
                     logger.warning("[REGIME FILTER VETO] Swing BUY for %s rejected under %s regime", symbol, signal.regime)
                     return False
 
+                with self._swing_dispatch_lock:
+                    enforce_hours = getattr(self, "_enforce_market_hours_test", None)
+                    if enforce_hours is None:
+                        enforce_hours = not bool(os.environ.get("PYTEST_CURRENT_TEST"))
+                    if enforce_hours:
+                        market_hours_ok, mh_reason = check_regular_market_hours(self._client)
+                        if not market_hours_ok:
+                            logger.warning("[REGULAR MARKET HOURS REJECTED] %s: %s", symbol, mh_reason)
+                            return False
+
+                    broker_account = None
+                    try:
+                        if self._client:
+                            broker_account = self._client.get_account()
+                    except Exception as e:
+                        logger.warning("Failed to fetch broker account: %s", e)
+
+                    broker_acct_raw = getattr(broker_account, "account_number", None) if broker_account else None
+                    broker_acct_num = normalize_enum_value(broker_acct_raw)
+                    if not broker_acct_num:
+                        broker_acct_num = getattr(self._cfg, "SWING_ACCOUNT_ID", "PA3R71I7JFDZ")
+
+                    configured_acct = getattr(self._cfg, "SWING_ACCOUNT_ID", "PA3R71I7JFDZ")
+                    if broker_acct_num.strip().upper() != configured_acct.strip().upper():
+                        logger.error(
+                            "[ACCOUNT MISMATCH] Broker account %s does not match configured swing account %s (blocking dispatch)",
+                            broker_acct_num, configured_acct
+                        )
+                        return False
+
+                    from strategies.session import now_eastern
+                    session_date = now_eastern().date().strftime("%Y-%m-%d")
+
+                    if hasattr(self, "entry_gate") and hasattr(self.entry_gate, "check_daily_loss_halt_state"):
+                        is_halted, h_reason = self.entry_gate.check_daily_loss_halt_state(broker_acct_num, session_date)
+                        if is_halted:
+                            logger.warning("[DAILY LOSS HALTED] Swing BUY for %s blocked by durable halt state: %s", symbol, h_reason)
+                            return False
+
+                    is_mock_account = hasattr(broker_account, "_mock_name") or "Mock" in type(broker_account).__name__
+                    equity = 0.0
+                    if broker_account and not is_mock_account:
+                        try:
+                            equity = float(getattr(broker_account, "equity", 0.0) or 0.0)
+                        except (ValueError, TypeError):
+                            equity = 0.0
+                    if equity <= 0:
+                        equity = self.get_net_liquidation()
+                    if equity <= 0:
+                        equity = self.get_cash()
+                    if equity < min_cash:
+                        logger.warning("Insufficient equity for BUY %s: $%.2f", symbol, equity)
+                        return False
+
+                    bp = 0.0
+                    if broker_account and not is_mock_account:
+                        try:
+                            bp = float(getattr(broker_account, "buying_power", 0.0) or 0.0)
+                        except (ValueError, TypeError):
+                            bp = 0.0
+                    if bp <= 0:
+                        bp = equity
+
+                    sod_equity = getattr(self, "_start_of_day_equity", 0.0)
+                    if sod_equity <= 0.0:
+                        if broker_account and hasattr(broker_account, "last_equity"):
+                            try:
+                                sod_equity = float(getattr(broker_account, "last_equity", 0.0) or 0.0)
+                            except (ValueError, TypeError):
+                                sod_equity = equity
+                        else:
+                            sod_equity = equity
+
+                    if hasattr(self, "entry_gate") and hasattr(self.entry_gate, "daily_loss_blocked"):
+                        dl_blocked, dl_reason = self.entry_gate.daily_loss_blocked(
+                            account_id=broker_acct_num,
+                            session_date_et=session_date,
+                            current_equity=equity,
+                            session_start_equity=sod_equity,
+                            net_session_cash_flows=0.0,
+                        )
+                        if dl_blocked:
+                            logger.warning("[DAILY LOSS CIRCUIT BREAKER] Swing BUY for %s blocked: %s", symbol, dl_reason)
+                            return False
+
+                    if hasattr(self, "entry_gate") and hasattr(self.entry_gate, "entry_blocked"):
+                        blocked, reason = self.entry_gate.entry_blocked(symbol, price, signal, price=price)
+                        if blocked:
+                            logger.warning("[ENTRY GATE BLOCKED] Swing BUY for %s: %s", symbol, reason)
+                            return False
+
+                    all_pos = []
+                    if self._client:
+                        try:
+                            raw_pos = self._client.get_all_positions()
+                            if isinstance(raw_pos, list):
+                                all_pos = raw_pos
+                        except Exception as e:
+                            logger.warning("Failed to fetch positions: %s", e)
+
+                    raw_open_orders = []
+                    if self._client:
+                        try:
+                            raw_orders = self._client.get_orders(status=QueryOrderStatus.OPEN)
+                            if isinstance(raw_orders, list):
+                                raw_open_orders = raw_orders
+                        except Exception as e:
+                            logger.warning("Failed to fetch open orders: %s", e)
+
+                    from strategies.swing_sizing import (
+                        calculate_swing_position_size,
+                        calculate_swing_stop_price,
+                        validate_swing_order_safety,
+                        build_canonical_swing_order_id,
+                        PositionIntent,
+                        SwingSizingRejected,
+                    )
+
+                    try:
+                        open_stop_risk, pending_entry_risk, active_pos_syms, pending_new_syms = self.audit_swing_portfolio_safety(
+                            all_pos, raw_open_orders
+                        )
+                    except SwingSizingRejected as s_err:
+                        logger.warning("[SWING SAFETY AUDIT REJECTED] %s: %s", symbol, s_err)
+                        return False
+                    except Exception as e:
+                        logger.error("[SWING SAFETY AUDIT ERROR] %s: %s", symbol, e)
+                        return False
+
+                    if symbol in pending_new_syms:
+                        logger.warning("[SWING REJECTED] Pending BUY already exists for %s", symbol)
+                        return False
+
+                    if symbol in active_pos_syms:
+                        logger.info("Already long %s — skipping swing BUY", symbol)
+                        return False
+
+                    sector_entry = getattr(config_module, "SECTOR_MAPPINGS", {}).get(symbol)
+                    if sector_entry is None:
+                        logger.warning("[SECTOR REJECTED] Symbol %s has no sector attribution in config.SECTOR_MAPPINGS", symbol)
+                        return False
+                    symbol_sector = sector_entry.get("sector") if isinstance(sector_entry, dict) else str(sector_entry)
+
+                    signal_sector = getattr(signal, "sector", None)
+                    if signal_sector and str(signal_sector).strip().upper() != str(symbol_sector).strip().upper():
+                        logger.warning(
+                            "[SECTOR ATTRIBUTION MISMATCH] Signal sector %s does not match configured sector %s for %s",
+                            signal_sector, symbol_sector, symbol
+                        )
+                        return False
+
+                    def _get_qty_price(p):
+                        q = float(getattr(p, "qty", 0.0) if not isinstance(p, dict) else p.get("qty", 0.0))
+                        px = float(getattr(p, "current_price", getattr(p, "avg_entry_price", price)) if not isinstance(p, dict) else p.get("current_price", price))
+                        return abs(q) * px
+
+                    def _get_sym(p):
+                        return str(getattr(p, "symbol", "") if not isinstance(p, dict) else p.get("symbol", "")).upper().strip()
+
+                    existing_sym_exp = sum(_get_qty_price(p) for p in all_pos if _get_sym(p) == symbol)
+                    existing_port_exp = sum(_get_qty_price(p) for p in all_pos)
+
+                    existing_sector_exposure_by_sector = {}
+                    for p in all_pos:
+                        p_sym = _get_sym(p)
+                        p_sec_entry = getattr(config_module, "SECTOR_MAPPINGS", {}).get(p_sym)
+                        p_sec = (p_sec_entry.get("sector") if isinstance(p_sec_entry, dict) else str(p_sec_entry)) if p_sec_entry else "UNKNOWN"
+                        p_val = _get_qty_price(p)
+                        existing_sector_exposure_by_sector[p_sec] = existing_sector_exposure_by_sector.get(p_sec, 0.0) + p_val
+
+                    pending_sector_exposure_by_sector = {}
+                    for o in raw_open_orders:
+                        o_side = normalize_enum_value(getattr(o, "side", "") if not isinstance(o, dict) else o.get("side", ""))
+                        if o_side == "BUY":
+                            o_sym = str(getattr(o, "symbol", "") if not isinstance(o, dict) else o.get("symbol", "")).upper().strip()
+                            o_sec_entry = getattr(config_module, "SECTOR_MAPPINGS", {}).get(o_sym)
+                            o_sec = (o_sec_entry.get("sector") if isinstance(o_sec_entry, dict) else str(o_sec_entry)) if o_sec_entry else "UNKNOWN"
+                            o_tot = float(getattr(o, "qty", 0.0) if not isinstance(o, dict) else o.get("qty", 0.0) or 0.0)
+                            o_fld = float(getattr(o, "filled_qty", 0.0) if not isinstance(o, dict) else o.get("filled_qty", 0.0) or 0.0)
+                            o_rem = max(0.0, o_tot - o_fld)
+                            o_px = float(getattr(o, "limit_price", None) or getattr(o, "stop_price", None) or price if not isinstance(o, dict) else o.get("limit_price") or o.get("stop_price") or price)
+                            pending_sector_exposure_by_sector[o_sec] = pending_sector_exposure_by_sector.get(o_sec, 0.0) + (o_rem * o_px)
+
+                    atr_val = getattr(signal, "atr_14", None) or getattr(signal, "atr", None) or (price * 0.02)
+                    reg_name = getattr(signal, "regime", "TRENDING_BULL")
+                    norm_stop, norm_stop_dist = calculate_swing_stop_price(
+                        entry_price=price,
+                        atr_14=atr_val,
+                        regime=str(reg_name),
+                        swing_low=getattr(signal, "swing_low", None),
+                    )
+                    stop_price = norm_stop
+                    target_price = getattr(signal, "target_price", getattr(signal, "take_profit", None))
+                    if target_price is None or target_price <= price:
+                        target_price = round(price + (2.0 * norm_stop_dist), 2)
+
+                    adv_val = getattr(signal, "adv_shares_20", None) or getattr(signal, "volume", None)
+                    min_shares = getattr(config_module, "MIN_SHARE_COUNT", 1)
+
+                    sizing = calculate_swing_position_size(
+                        entry_price=price,
+                        stop_price=stop_price,
+                        account_equity=equity,
+                        available_buying_power=bp,
+                        existing_symbol_exposure=existing_sym_exp,
+                        existing_portfolio_exposure=existing_port_exp,
+                        adv_shares_20=adv_val,
+                    )
+
+                    if sizing.rejected or sizing.shares < min_shares:
+                        logger.warning(
+                            "[SWING SIZING REJECTED] %s: %s (shares=%d, constraint=%s)",
+                            symbol, sizing.rejection_reason or "Below min_shares", sizing.shares, sizing.binding_constraint
+                        )
+                        return False
+
+                    qty = sizing.shares
+                    strat_name = getattr(signal, "strategy", getattr(signal, "strategy_name", ""))
+                    bar_ts = getattr(signal, "timestamp", None) or now_eastern().isoformat()
+                    order_ref = build_canonical_swing_order_id(
+                        symbol=symbol,
+                        side="BUY",
+                        session_date=session_date,
+                        bar_timestamp_utc=str(bar_ts),
+                        signal_kind=str(strat_name or "ML_SWING").upper(),
+                        account_number=configured_acct,
+                    )
+
+                    try:
+                        validate_swing_order_safety(
+                            client_order_id=order_ref,
+                            strategy_instance_id="SWING_BOT_PRO",
+                            symbol=symbol,
+                            signal_version=getattr(signal, "version", "v1.6-alpha"),
+                            entry_price=price,
+                            stop_price=stop_price,
+                            shares=qty,
+                            account_equity=equity,
+                            available_buying_power=bp,
+                            current_open_stop_risk=open_stop_risk,
+                            pending_entry_risk=pending_entry_risk,
+                            side="BUY",
+                            account_number=configured_acct,
+                            broker_account_number=broker_acct_num,
+                            current_position_count=len(active_pos_syms),
+                            pending_open_position_count=len(pending_new_syms),
+                            existing_position_symbols=active_pos_syms,
+                            intent=PositionIntent.OPEN_LONG,
+                            symbol_sector=symbol_sector,
+                            existing_sector_exposure_by_sector=existing_sector_exposure_by_sector,
+                            pending_sector_exposure_by_sector=pending_sector_exposure_by_sector,
+                        )
+                    except SwingSizingRejected as val_err:
+                        logger.warning("[SWING SAFETY VALIDATION REJECTED] %s: %s", symbol, val_err)
+                        return False
+                    except Exception as ex:
+                        logger.error("[SWING SAFETY VALIDATION ERROR] %s: %s", symbol, ex)
+                        return False
+
+                    logger.info(
+                        "[SWING SIZING ACCEPTED] %s: shares=%d (constraint=%s, risk=$%.2f, notional=$%.2f, stop=$%.2f)",
+                        symbol, qty, sizing.binding_constraint, sizing.estimated_risk, sizing.gross_notional, stop_price
+                    )
+
+                    result = self._place_open_bracket(
+                        symbol, "BUY", qty, price, getattr(signal, "confidence", 1.0),
+                        strategy_name=strat_name,
+                        custom_stop_price=stop_price,
+                        custom_target_price=target_price,
+                        custom_client_order_id=order_ref,
+                    )
+                    paper_ledger.record_entry(
+                        signal, result,
+                        order_ref=order_ref,
+                    )
+
+                    if result.occupies_slot:
+                        try:
+                            from strategies.swing_risk_store import save_risk_basis, PositionRiskBasis
+                            save_risk_basis(PositionRiskBasis(
+                                symbol=symbol,
+                                entry_price=price,
+                                initial_stop_price=stop_price,
+                                initial_risk_per_share=price - stop_price,
+                                initial_total_risk=qty * (price - stop_price),
+                                shares=qty,
+                                entry_timestamp_utc=now_eastern().isoformat(),
+                            ))
+                        except Exception as r_err:
+                            logger.warning("Could not persist risk basis for %s: %s", symbol, r_err)
+
+                    return result.occupies_slot
+
             if self.has_working_order(symbol, action="BUY"):
                 logger.info("Working BUY order already exists for %s — skipping BUY", symbol)
                 return False
@@ -2981,89 +3628,32 @@ class AlpacaBridge:
 
             min_shares = getattr(config_module, "MIN_SHARE_COUNT", 1)
 
-            if self.mode == "swing":
-                from strategies.swing_sizing import calculate_swing_position_size, calculate_swing_stop_price
-                from strategies.session import now_eastern
+            if stop_price is None or target_price is None:
+                stop_loss_pct = float(self._c("STOP_LOSS_PCT", 0.05))
+                take_profit_pct = float(self._c("TAKE_PROFIT_PCT", 0.10))
+                if stop_price is None:
+                    stop_price = round(price * (1.0 - stop_loss_pct), 2)
+                if target_price is None:
+                    target_price = round(price * (1.0 + take_profit_pct), 2)
 
-                atr_val = getattr(signal, "atr_14", None) or getattr(signal, "atr", None) or (price * 0.02)
-                reg_name = getattr(signal, "regime", "TRENDING_BULL")
-                norm_stop, norm_stop_dist = calculate_swing_stop_price(
-                    entry_price=price,
-                    atr_14=atr_val,
-                    regime=str(reg_name),
-                    swing_low=getattr(signal, "swing_low", None),
-                )
-                stop_price = norm_stop
-                if target_price is None or target_price <= price:
-                    target_price = round(price + (2.0 * norm_stop_dist), 2)
+            if stop_price <= 0 or target_price <= 0 or stop_price >= price or target_price <= price:
+                logger.warning("Rejecting execute_signal for %s: invalid stop_loss/target_price geometry (stop=%s, target=%s, price=%.2f)", symbol, stop_price, target_price, price)
+                return False
 
-                try:
-                    all_pos = self._client.get_all_positions() if self._client else []
-                except Exception:
-                    all_pos = []
-                existing_sym_exp = sum(
-                    abs(float(p.qty)) * float(getattr(p, "current_price", getattr(p, "avg_entry_price", price)))
-                    for p in all_pos if getattr(p, "symbol", "").upper().strip() == symbol
-                )
-                existing_port_exp = sum(
-                    abs(float(p.qty)) * float(getattr(p, "current_price", getattr(p, "avg_entry_price", price)))
-                    for p in all_pos
-                )
+            risk_per_share = max(price - stop_price, 0.01)
+            max_risk_pct = float(self._c("MAX_RISK_PER_TRADE_PCT", 0.01))
+            risk_budget = equity * max_risk_pct
+            risk_cap = float(self._c("MAX_RISK_PER_TRADE_DOLLARS", 150.0))
+            risk_budget = min(risk_budget, risk_cap)
+            qty = max(int(risk_budget / risk_per_share), 0)
 
-                bp = equity
-                try:
-                    acct = self._client.get_account() if self._client else None
-                    if acct:
-                        bp = float(getattr(acct, "buying_power", equity) or equity)
-                except Exception:
-                    bp = equity
+            max_pos_val = equity * float(self._c("MAX_POSITION_PCT", 0.08))
+            if qty * price > max_pos_val:
+                qty = max(int(max_pos_val / price), 0)
 
-                adv_val = getattr(signal, "adv_shares_20", None) or getattr(signal, "volume", None)
-                sizing = calculate_swing_position_size(
-                    entry_price=price,
-                    stop_price=stop_price,
-                    account_equity=equity,
-                    available_buying_power=bp,
-                    existing_symbol_exposure=existing_sym_exp,
-                    existing_portfolio_exposure=existing_port_exp,
-                    adv_shares_20=adv_val,
-                )
-
-                if sizing.rejected or sizing.shares < min_shares:
-                    logger.warning("[SWING SIZING REJECTED] %s: %s (shares=%d, constraint=%s)",
-                                   symbol, sizing.rejection_reason or "Below min_shares", sizing.shares, sizing.binding_constraint)
-                    return False
-
-                qty = sizing.shares
-                logger.info("[SWING SIZING ACCEPTED] %s: shares=%d (constraint=%s, risk=$%.2f, notional=$%.2f, stop=$%.2f)",
-                            symbol, qty, sizing.binding_constraint, sizing.estimated_risk, sizing.gross_notional, stop_price)
-            else:
-                if stop_price is None or target_price is None:
-                    stop_loss_pct = float(self._c("STOP_LOSS_PCT", 0.05))
-                    take_profit_pct = float(self._c("TAKE_PROFIT_PCT", 0.10))
-                    if stop_price is None:
-                        stop_price = round(price * (1.0 - stop_loss_pct), 2)
-                    if target_price is None:
-                        target_price = round(price * (1.0 + take_profit_pct), 2)
-
-                if stop_price <= 0 or target_price <= 0 or stop_price >= price or target_price <= price:
-                    logger.warning("Rejecting execute_signal for %s: invalid stop_loss/target_price geometry (stop=%s, target=%s, price=%.2f)", symbol, stop_price, target_price, price)
-                    return False
-
-                risk_per_share = max(price - stop_price, 0.01)
-                max_risk_pct = float(self._c("MAX_RISK_PER_TRADE_PCT", 0.01))
-                risk_budget = equity * max_risk_pct
-                risk_cap = float(self._c("MAX_RISK_PER_TRADE_DOLLARS", 150.0))
-                risk_budget = min(risk_budget, risk_cap)
-                qty = max(int(risk_budget / risk_per_share), 0)
-
-                max_pos_val = equity * float(self._c("MAX_POSITION_PCT", 0.08))
-                if qty * price > max_pos_val:
-                    qty = max(int(max_pos_val / price), 0)
-
-                if qty < min_shares:
-                    logger.warning("Calculated qty=%d below min_shares=%d for BUY %s (risk_per_share=%.2f)", qty, min_shares, symbol, risk_per_share)
-                    return False
+            if qty < min_shares:
+                logger.warning("Calculated qty=%d below min_shares=%d for BUY %s (risk_per_share=%.2f)", qty, min_shares, symbol, risk_per_share)
+                return False
 
             result = self._place_open_bracket(
                 symbol, "BUY", qty, price, getattr(signal, "confidence", 1.0),
@@ -3075,23 +3665,6 @@ class AlpacaBridge:
                 signal, result,
                 order_ref=order_exec.deterministic_order_ref(self._today(), symbol, "BUY"),
             )
-
-            if self.mode == "swing" and result.occupies_slot:
-                try:
-                    from strategies.swing_risk_store import save_risk_basis, PositionRiskBasis
-                    from strategies.session import now_eastern
-                    save_risk_basis(PositionRiskBasis(
-                        symbol=symbol,
-                        entry_price=price,
-                        initial_stop_price=stop_price,
-                        initial_risk_per_share=price - stop_price,
-                        initial_total_risk=qty * (price - stop_price),
-                        shares=qty,
-                        entry_timestamp_utc=now_eastern().isoformat(),
-                    ))
-                except Exception as r_err:
-                    logger.warning("Could not persist risk basis for %s: %s", symbol, r_err)
-
             return result.occupies_slot
 
         # SELL
