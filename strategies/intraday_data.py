@@ -9,7 +9,7 @@ import asyncio
 import time
 import pickle
 from datetime import date, datetime, timedelta
-from typing import Optional
+from typing import Optional, Dict, List, Tuple, Any
 from dataclasses import dataclass
 
 import pandas as pd
@@ -40,21 +40,57 @@ def _ensure_asyncio_event_loop() -> None:
 _alpaca_client = None
 _client_lock = threading.Lock()
 
+
+def _load_env_if_needed() -> None:
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            k, v = k.strip(), v.strip().strip('"').strip("'")
+                            os.environ.setdefault(k, v)
+            except Exception as e:
+                logger.warning("Failed to auto-parse .env in intraday_data: %s", e)
+
+
+def _get_alpaca_credentials() -> Tuple[str, str]:
+    _load_env_if_needed()
+    mode = os.environ.get("TRADING_MODE", "daytrade").lower()
+    if mode == "swing":
+        key = (
+            os.environ.get("SWING_APCA_API_KEY_ID", "")
+            or os.environ.get("APCA_API_KEY_ID", "")
+            or os.environ.get("DAYTRADE_APCA_API_KEY_ID", "")
+        )
+        secret = (
+            os.environ.get("SWING_APCA_API_SECRET_KEY", "")
+            or os.environ.get("APCA_API_SECRET_KEY", "")
+            or os.environ.get("DAYTRADE_APCA_API_SECRET_KEY", "")
+        )
+    else:
+        key = (
+            os.environ.get("DAYTRADE_APCA_API_KEY_ID", "")
+            or os.environ.get("SWING_APCA_API_KEY_ID", "")
+            or os.environ.get("APCA_API_KEY_ID", "")
+        )
+        secret = (
+            os.environ.get("DAYTRADE_APCA_API_SECRET_KEY", "")
+            or os.environ.get("SWING_APCA_API_SECRET_KEY", "")
+            or os.environ.get("APCA_API_SECRET_KEY", "")
+        )
+    return key, secret
+
+
 def _get_alpaca_client():
     global _alpaca_client
     if _alpaca_client is None:
         with _client_lock:
             if _alpaca_client is None:
-                api_key = (
-                    os.environ.get("APCA_API_KEY_ID", "")
-                    or os.environ.get("DAYTRADE_APCA_API_KEY_ID", "")
-                    or os.environ.get("SWING_APCA_API_KEY_ID", "")
-                )
-                secret_key = (
-                    os.environ.get("APCA_API_SECRET_KEY", "")
-                    or os.environ.get("DAYTRADE_APCA_API_SECRET_KEY", "")
-                    or os.environ.get("SWING_APCA_API_SECRET_KEY", "")
-                )
+                api_key, secret_key = _get_alpaca_credentials()
                 if api_key and secret_key:
                     from alpaca.data.historical import StockHistoricalDataClient
                     _alpaca_client = StockHistoricalDataClient(api_key, secret_key)
@@ -620,8 +656,7 @@ def fetch_intraday_alpaca(
     prepost: bool = False,
     purpose: str = "ENTRY_SIGNAL",
 ) -> pd.DataFrame:
-    api_key = os.environ.get("APCA_API_KEY_ID", "")
-    secret_key = os.environ.get("APCA_API_SECRET_KEY", "")
+    api_key, secret_key = _get_alpaca_credentials()
     if not api_key or not secret_key:
         return pd.DataFrame()
 
@@ -745,8 +780,7 @@ def fetch_batch_intraday_alpaca(
     if not symbols:
         return {}
 
-    api_key = os.environ.get("APCA_API_KEY_ID", "")
-    secret_key = os.environ.get("APCA_API_SECRET_KEY", "")
+    api_key, secret_key = _get_alpaca_credentials()
     if not api_key or not secret_key:
         return {}
 
@@ -1192,8 +1226,7 @@ def fetch_intraday_yfinance(
 
 
 def fetch_daily_alpaca(symbol: str, lookback_days: int = None) -> pd.DataFrame:
-    api_key = os.environ.get("APCA_API_KEY_ID", "")
-    secret_key = os.environ.get("APCA_API_SECRET_KEY", "")
+    api_key, secret_key = _get_alpaca_credentials()
     if not api_key or not secret_key:
         return pd.DataFrame()
 
