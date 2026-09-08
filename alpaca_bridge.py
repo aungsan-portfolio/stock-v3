@@ -1663,6 +1663,52 @@ class AlpacaBridge:
             logger.error("fetch_historical_data failed for %s: %s", symbol, exc)
             return []
 
+    def fetch_batch_historical_data(self, symbols: List[str], durationStr: str = "1 D", barSizeSetting: str = "5 mins", useRTH: bool = True, whatToShow: str = "TRADES") -> Dict[str, List[_Bar]]:
+        self._require_connection()
+        if not symbols:
+            return {}
+        try:
+            tf_map = {
+                "1 day": TimeFrame(1, TimeFrameUnit.Day),
+                "1 hour": TimeFrame(1, TimeFrameUnit.Hour),
+                "5 mins": TimeFrame(5, TimeFrameUnit.Minute),
+                "1 min": TimeFrame(1, TimeFrameUnit.Minute)
+            }
+            tf = tf_map.get(barSizeSetting.lower(), TimeFrame(5, TimeFrameUnit.Minute))
+            if isinstance(durationStr, int):
+                durationStr = f"{durationStr} D"
+            parts = str(durationStr).split()
+            n = int(parts[0]) if parts and parts[0].isdigit() else 1
+            unit = parts[1].upper() if len(parts) > 1 else "D"
+            days = n * {"D": 1, "W": 7, "M": 30, "Y": 365}.get(unit[0], 1)
+
+            end = _dt.datetime.now(_dt.timezone.utc)
+            start = end - _dt.timedelta(days=days)
+
+            clean_symbols = [str(s).upper().strip() for s in symbols if str(s).strip()]
+            if not clean_symbols:
+                return {}
+
+            from alpaca.data.enums import Adjustment
+            feed = str(getattr(config_module, "ALPACA_DATA_FEED", "iex")).lower()
+            bars = self._data_client.get_stock_bars(StockBarsRequest(
+                symbol_or_symbols=clean_symbols,
+                timeframe=tf,
+                start=start,
+                end=end,
+                feed=feed,
+                adjustment=Adjustment.ALL,
+            ))
+            res = {}
+            for s in clean_symbols:
+                raw_bars = bars.data.get(s, [])
+                if raw_bars:
+                    res[s] = [_Bar(b) for b in raw_bars]
+            return res
+        except Exception as exc:
+            logger.error("fetch_batch_historical_data failed: %s", exc)
+            return {}
+
     # ── Sizing / Limit helpers ───────────────────────────────────
     def _calc_quantity(self, price: float, cash: float) -> int:
         if price <= 0:

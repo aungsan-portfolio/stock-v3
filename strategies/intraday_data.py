@@ -6,7 +6,7 @@ Caching is intentionally short-lived (30s default) for live use.
 """
 import logging
 import asyncio
-import time as _time
+import time
 import pickle
 from datetime import date, datetime, timedelta
 from typing import Optional
@@ -734,6 +734,152 @@ def fetch_intraday_alpaca(
         return pd.DataFrame()
 
 
+def fetch_batch_intraday_alpaca(
+    symbols: List[str],
+    interval: str = None,
+    lookback_days: int = None,
+    prepost: bool = False,
+    purpose: str = "ENTRY_SIGNAL",
+) -> Dict[str, pd.DataFrame]:
+    """Fetch 5m bars for multiple symbols in a single vectorized Alpaca REST request."""
+    if not symbols:
+        return {}
+
+    api_key = os.environ.get("APCA_API_KEY_ID", "")
+    secret_key = os.environ.get("APCA_API_SECRET_KEY", "")
+    if not api_key or not secret_key:
+        return {}
+
+    interval = interval or config.INTRADAY_INTERVAL
+    lookback_days = lookback_days or config.INTRADAY_LOOKBACK_DAYS
+
+    clean_symbols = [str(s).upper().strip() for s in symbols if str(s).strip()]
+    if not clean_symbols:
+        return {}
+
+    # Check cache first for any freshly cached symbols
+    results: Dict[str, pd.DataFrame] = {}
+    pending_symbols: List[str] = []
+    validate_staleness = (lookback_days is not None and lookback_days <= 1)
+
+    for sym in clean_symbols:
+        key = _cache_key(sym, interval, lookback_days, prepost, source="alpaca_api")
+        cached_df = _read_cache(key)
+        if cached_df is not None:
+            validated_cache = _validate_intraday_data(
+                cached_df.copy(),
+                symbol=sym,
+                interval=interval,
+                validate_staleness=validate_staleness,
+                purpose=purpose,
+            )
+            if not validated_cache.empty:
+                results[sym] = validated_cache
+                continue
+        pending_symbols.append(sym)
+
+    if not pending_symbols:
+        return results
+
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+        from alpaca.data.enums import Adjustment
+        from datetime import timezone
+
+        client = _get_alpaca_client()
+        if client is None:
+            return results
+
+        start = datetime.now(timezone.utc) - timedelta(days=lookback_days or 1)
+        tf = TimeFrame.Minute
+        if interval == "5m":
+            tf = TimeFrame(5, TimeFrameUnit.Minute)
+        elif interval == "15m":
+            tf = TimeFrame(15, TimeFrameUnit.Minute)
+        elif interval == "1h":
+            tf = TimeFrame.Hour
+
+        primary_feed = str(getattr(config, "ALPACA_DATA_FEED", "iex")).lower()
+        backup_feed = "sip" if primary_feed == "iex" else "iex"
+
+        bars_dict = None
+        try:
+            req = StockBarsRequest(
+                symbol_or_symbols=pending_symbols,
+                timeframe=tf,
+                start=start,
+                feed=primary_feed,
+                adjustment=Adjustment.ALL,
+            )
+            bars_dict = client.get_stock_bars(req)
+        except Exception as primary_err:
+            logger.debug("[BATCH FETCH] Alpaca %s feed error for %s (%s). Trying %s feed.", primary_feed.upper(), pending_symbols, primary_err, backup_feed.upper())
+            try:
+                req = StockBarsRequest(
+                    symbol_or_symbols=pending_symbols,
+                    timeframe=tf,
+                    start=start,
+                    feed=backup_feed,
+                    adjustment=Adjustment.ALL,
+                )
+                bars_dict = client.get_stock_bars(req)
+            except Exception as backup_err:
+                logger.warning("[BATCH FETCH] Alpaca data feed error for batch: %s", backup_err)
+                return results
+
+        if not hasattr(bars_dict, "df") or bars_dict.df.empty:
+            return results
+
+        raw_df = bars_dict.df
+        is_multi = isinstance(raw_df.index, pd.MultiIndex)
+        available_symbols = set()
+        if is_multi:
+            if "symbol" in raw_df.index.names:
+                available_symbols = set(raw_df.index.get_level_values("symbol").unique())
+            else:
+                available_symbols = set(raw_df.index.levels[0].unique())
+
+        for sym in pending_symbols:
+            key = _cache_key(sym, interval, lookback_days, prepost, source="alpaca_api")
+            try:
+                if is_multi:
+                    if sym not in available_symbols:
+                        continue
+                    if "symbol" in raw_df.index.names:
+                        sym_df = raw_df.xs(sym, level="symbol").copy()
+                    else:
+                        sym_df = raw_df.xs(sym, level=0).copy()
+                else:
+                    sym_df = raw_df.copy()
+
+                if sym_df.empty:
+                    continue
+
+                sym_df = sym_df.rename(columns={
+                    "open": "open",
+                    "high": "high",
+                    "low": "low",
+                    "close": "close",
+                    "volume": "volume"
+                })
+                sym_df.index.name = "datetime"
+                validated_df = _validate_intraday_data(
+                    sym_df, sym, interval, validate_staleness=validate_staleness, purpose=purpose
+                )
+                if not validated_df.empty:
+                    _write_cache(key, validated_df.copy())
+                    results[sym] = validated_df
+            except Exception as parse_err:
+                logger.debug("[BATCH FETCH] Error parsing %s from Alpaca batch: %s", sym, parse_err)
+
+        return results
+    except Exception as e:
+        logger.warning("[BATCH FETCH] Alpaca batch fetch failed: %s", e)
+        return results
+
+
 @profile_latency(sample_rate=1.0)
 def fetch_intraday(
     symbol: str,
@@ -844,6 +990,92 @@ def fetch_intraday(
         if not df.empty:
             _write_cache(fallback_key, df.copy())
         return df
+
+
+def fetch_intraday_batch(
+    symbols: List[str],
+    interval: str = None,
+    lookback_days: int = None,
+    prepost: bool = False,
+    bridge = None,
+    purpose: str = "ENTRY_SIGNAL",
+) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+    """Fetch 5m bars for multiple symbols concurrently in a single batch.
+
+    Returns:
+        (symbol_data_dict, telemetry_metadata)
+    """
+    t_start = time.perf_counter()
+    interval = interval or config.INTRADAY_INTERVAL
+    lookback_days = lookback_days or config.INTRADAY_LOOKBACK_DAYS
+
+    # Exclude quarantined symbols
+    valid_symbols = [s for s in symbols if not is_quarantined(s)]
+    total_requested = len(symbols)
+    results: Dict[str, pd.DataFrame] = {}
+
+    # 1. If bridge is connected and supports batch historical data, use broker-native batch fetch
+    if bridge is not None and getattr(bridge, "is_connected", False) and hasattr(bridge, "fetch_batch_historical_data"):
+        try:
+            bar_size = _interval_to_alpaca(interval)
+            raw_batches = bridge.fetch_batch_historical_data(
+                valid_symbols,
+                durationStr=f"{lookback_days} D",
+                barSizeSetting=bar_size,
+                useRTH=not prepost
+            )
+            for sym, bars in raw_batches.items():
+                if bars:
+                    df = _bars_to_frame(bars)
+                    df = df.rename(columns={"date": "datetime"})
+                    df.set_index("datetime", inplace=True)
+                    df = _validate_intraday_data(df, sym, interval, purpose=purpose)
+                    if not df.empty:
+                        key = _cache_key(sym, interval, lookback_days, prepost, source="alpaca")
+                        _write_cache(key, df.copy())
+                        results[sym] = df
+        except Exception as b_exc:
+            logger.warning("[BATCH FETCH] Bridge batch historical fetch error: %s. Falling back to REST client.", b_exc)
+
+    # 2. Check for missing symbols and fetch via direct Alpaca REST client batch
+    missing_from_bridge = [s for s in valid_symbols if s not in results or results[s].empty]
+    if missing_from_bridge:
+        try:
+            alpaca_batch = fetch_batch_intraday_alpaca(
+                missing_from_bridge,
+                interval=interval,
+                lookback_days=lookback_days,
+                prepost=prepost,
+                purpose=purpose,
+            )
+            results.update(alpaca_batch)
+        except Exception as a_exc:
+            logger.warning("[BATCH FETCH] Direct Alpaca batch fetch error: %s", a_exc)
+
+    # 3. Check for any remaining missing symbols (e.g. non-Alpaca or offline fallback)
+    still_missing = [s for s in valid_symbols if s not in results or results[s].empty]
+    if still_missing and (bridge is None or not getattr(bridge, "is_connected", False)):
+        for msym in still_missing:
+            try:
+                ydf = fetch_intraday_yfinance(msym, interval, lookback_days, prepost, purpose=purpose)
+                if not ydf.empty:
+                    results[msym] = ydf
+            except Exception as y_exc:
+                logger.debug("[BATCH FETCH] yfinance fallback failed for %s: %s", msym, y_exc)
+
+    t_end = time.perf_counter()
+    duration_ms = (t_end - t_start) * 1000.0
+    received_count = len(results)
+    coverage = (received_count / total_requested) if total_requested > 0 else 0.0
+
+    telemetry = {
+        "requested": total_requested,
+        "received": received_count,
+        "coverage": round(coverage, 4),
+        "duration_ms": round(duration_ms, 2),
+    }
+
+    return results, telemetry
 
 
 def fetch_intraday_yfinance(

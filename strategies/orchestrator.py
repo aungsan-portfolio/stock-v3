@@ -459,36 +459,79 @@ def evaluate_symbols_parallel(symbols: List[str], bridge: object = None, market_
     if not symbols:
         return []
 
-    from strategies.intraday_data import fetch_intraday
+    from strategies.intraday_data import fetch_intraday, fetch_intraday_batch
     
+    batch_enabled = getattr(config, "DAYTRADE_BATCH_FETCH_ENABLED", False)
     parallel_enabled = getattr(config, "DAYTRADE_PARALLEL_EVALUATION_ENABLED", True)
     min_batch = getattr(config, "DAYTRADE_PARALLEL_EVALUATION_MIN_SYMBOLS", 4)
     max_workers = getattr(config, "DAYTRADE_PARALLEL_EVALUATION_MAX_WORKERS", 3)
+    min_coverage = getattr(config, "DAYTRADE_BATCH_FETCH_MIN_COVERAGE", 0.95)
     
     symbol_data = {}
-    if parallel_enabled and len(symbols) >= min_batch:
-        fetched_data = {}
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {
-                pool.submit(fetch_intraday, sym, bridge=bridge): sym for sym in symbols
-            }
-            for fut in as_completed(futures):
-                sym = futures[fut]
+
+    # 1. Primary Path: Multi-Symbol Batch Fetch (if enabled via feature flag)
+    if batch_enabled and symbols:
+        try:
+            batch_results, telemetry = fetch_intraday_batch(symbols, interval="5m", bridge=bridge, purpose="ENTRY_SIGNAL")
+            logger.info(
+                "[BATCH FETCH] symbols=%d received=%d coverage=%.1f%% duration=%.1fms",
+                telemetry["requested"],
+                telemetry["received"],
+                telemetry["coverage"] * 100.0,
+                telemetry["duration_ms"]
+            )
+            symbol_data = batch_results
+
+            # Partial Symbol Recovery: If some symbols are missing, fetch only missing ones sequentially
+            missing_symbols = [s for s in symbols if s not in symbol_data or symbol_data[s].empty]
+            if missing_symbols:
+                logger.warning(
+                    "[PARTIAL RECOVERY] Batch returned %d/%d (coverage=%.1f%%). Recovering %d missing symbols: %s",
+                    len(symbol_data),
+                    len(symbols),
+                    telemetry["coverage"] * 100.0,
+                    len(missing_symbols),
+                    missing_symbols
+                )
+                for msym in missing_symbols:
+                    try:
+                        mdf = fetch_intraday(msym, interval="5m", bridge=bridge, purpose="ENTRY_SIGNAL")
+                        if mdf is not None and not mdf.empty:
+                            symbol_data[msym] = mdf
+                    except Exception as m_exc:
+                        logger.warning("Targeted sequential recovery failed for %s: %s", msym, m_exc)
+        except Exception as batch_exc:
+            logger.warning(
+                "[CIRCUIT BREAKER] Batch fetch raised exception: %s. Degrading gracefully to full sequential fetch.",
+                batch_exc
+            )
+            symbol_data = {}
+
+    # 2. Fail-Safe Fallback: Proven ThreadPoolExecutor / Sequential Path
+    if not symbol_data:
+        if parallel_enabled and len(symbols) >= min_batch:
+            fetched_data = {}
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(fetch_intraday, sym, bridge=bridge): sym for sym in symbols
+                }
+                for fut in as_completed(futures):
+                    sym = futures[fut]
+                    try:
+                        df = fut.result()
+                        if df is not None and not df.empty:
+                            fetched_data[sym] = df
+                    except Exception:
+                        logger.exception("Data fetch failed for %s", sym)
+            symbol_data = {sym: fetched_data[sym] for sym in symbols if sym in fetched_data}
+        else:
+            for sym in symbols:
                 try:
-                    df = fut.result()
+                    df = fetch_intraday(sym, bridge=bridge)
                     if df is not None and not df.empty:
-                        fetched_data[sym] = df
-                except Exception:
+                        symbol_data[sym] = df
+                except Exception as e:
                     logger.exception("Data fetch failed for %s", sym)
-        symbol_data = {sym: fetched_data[sym] for sym in symbols if sym in fetched_data}
-    else:
-        for sym in symbols:
-            try:
-                df = fetch_intraday(sym, bridge=bridge)
-                if df is not None and not df.empty:
-                    symbol_data[sym] = df
-            except Exception as e:
-                logger.exception("Data fetch failed for %s", sym)
 
     if not symbol_data:
         return []
