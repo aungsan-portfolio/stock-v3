@@ -329,10 +329,10 @@ INTRADAY_DATA_SOURCE_TIMEZONE    = "US/Eastern" # Default fallback timezone for 
 TRAILING_STOP_RECONCILE_TOLERANCE = None  # None defaults dynamically to tick_size / 2.0
 
 # ── Sprint #1: Multi-Symbol Batch Fetch Settings ──
-DAYTRADE_BATCH_FETCH_ENABLED        = False  # Default False (Safety Feature Flag)
-DAYTRADE_BATCH_FETCH_MAX_CHUNK      = 25     # Maximum symbols per single Alpaca request
-DAYTRADE_BATCH_FETCH_TIMEOUT_S      = 6.0    # Timeout before triggering fallback
-DAYTRADE_BATCH_FETCH_MIN_COVERAGE   = 0.95   # Minimum acceptable batch coverage ratio (95%)
+DAYTRADE_BATCH_FETCH_ENABLED        = os.environ.get("DAYTRADE_BATCH_FETCH_ENABLED", "true").lower() in ("true", "1")
+DAYTRADE_BATCH_FETCH_MAX_CHUNK      = int(os.environ.get("DAYTRADE_BATCH_FETCH_MAX_CHUNK", "25"))
+DAYTRADE_BATCH_FETCH_TIMEOUT_S      = float(os.environ.get("DAYTRADE_BATCH_FETCH_TIMEOUT_S", "6.0"))
+DAYTRADE_BATCH_FETCH_MIN_COVERAGE   = float(os.environ.get("DAYTRADE_BATCH_FETCH_MIN_COVERAGE", "0.95"))
 
 
 DATA_HEALTH_SETTINGS = {
