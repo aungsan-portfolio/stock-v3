@@ -299,10 +299,14 @@ class _Bar:
 class MockPosition:
     def __init__(self, symbol: str, qty: float, avg_cost: float, market_value: float, unrealized_pnl: float):
         self.contract = _Contract(symbol)
+        self.symbol = str(symbol).upper().strip()
         self.position = qty
         self.avgCost = avg_cost
         self.marketValue = market_value
         self.unrealizedPNL = unrealized_pnl
+
+    def __str__(self) -> str:
+        return self.symbol
 
 
 class MockOrder:
@@ -3415,7 +3419,7 @@ class AlpacaBridge:
                     raw_open_orders = []
                     if self._client:
                         try:
-                            raw_orders = self._client.get_orders(status=QueryOrderStatus.OPEN)
+                            raw_orders = self._get_active_orders()
                             if isinstance(raw_orders, list):
                                 raw_open_orders = raw_orders
                         except Exception as e:
@@ -3826,9 +3830,12 @@ class AlpacaBridge:
 
         open_positions = self.get_open_positions()
         if isinstance(open_positions, dict):
-            open_symbols = {str(s).upper() for s in open_positions.keys()}
+            open_symbols = {str(s).upper().strip() for s in open_positions.keys()}
         else:
-            open_symbols = {str(s).upper() for s in open_positions}
+            open_symbols = set()
+            for s in open_positions:
+                sym = getattr(s, "symbol", None) or getattr(getattr(s, "contract", None), "symbol", None) or str(s)
+                open_symbols.add(str(sym).upper().strip())
         working_symbols = self.working_order_symbols()
         occupied_symbols = open_symbols | working_symbols
         planned_new_symbols: set = set()

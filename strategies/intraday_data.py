@@ -555,7 +555,7 @@ def _validate_intraday_data(
                 if purpose == "POSITION_MONITORING":
                     grace_seconds = float(getattr(config, "POSITION_ATR_MAX_AGE_SECONDS", 360.0))
                 else:
-                    grace_seconds = float(getattr(config, "ENTRY_BAR_CLOSE_GRACE_SECONDS", getattr(config, "BAR_CLOSE_GRACE_SECONDS", 45.0)))
+                    grace_seconds = float(getattr(config, "ENTRY_BAR_CLOSE_GRACE_SECONDS", getattr(config, "BAR_CLOSE_GRACE_SECONDS", 60.0)))
 
                 try:
                     completed_bar = select_last_completed_bar(

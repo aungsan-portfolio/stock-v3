@@ -321,8 +321,8 @@ MARKET_HOURS_GATE_ENABLED        = True
 
 # ── P1.5.2 / P1.5.2.1 Bar Staleness & Reconciliation Settings ───
 INTRADAY_BAR_SECONDS             = 300.0  # 5-minute default bar interval
-ENTRY_BAR_CLOSE_GRACE_SECONDS    = 45.0   # 45s grace period post completed bar close for new entry signals
-BAR_CLOSE_GRACE_SECONDS          = 45.0   # Backward-compatible alias for entry grace
+ENTRY_BAR_CLOSE_GRACE_SECONDS    = 60.0   # 60s pilot grace period post completed bar close for new entry signals (calibrated 2026-09-08: REST median delay ~58s)
+BAR_CLOSE_GRACE_SECONDS          = 60.0   # Backward-compatible alias for entry grace
 POSITION_ATR_MAX_AGE_SECONDS     = 360.0  # 360s max age for active-position ATR updates during mid-bar polling
 BAR_FUTURE_TOLERANCE_SECONDS     = 5.0    # 5s clock skew tolerance for completed bars
 INTRADAY_DATA_SOURCE_TIMEZONE    = "US/Eastern" # Default fallback timezone for naive bar feeds
