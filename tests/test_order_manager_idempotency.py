@@ -30,8 +30,10 @@ from strategies.order_idempotency import idempotency_manager
 
 
 @pytest.fixture(autouse=True)
-def clean_om_state(monkeypatch):
+def clean_om_state(monkeypatch, tmp_path):
     """Ensure clean global state before and after each test."""
+    test_journal = tmp_path / "test_trade_journal.jsonl"
+    monkeypatch.setattr(config, "DAYTRADE_TRADE_JOURNAL_FILE", test_journal)
     monkeypatch.setattr(config, "REQUIRE_REALTIME_DATA_FOR_ORDERS", False)
     monkeypatch.setattr(config, "SPY_TREND_GUARD_ENABLED", False)
     monkeypatch.setattr(config, "VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED", False)
@@ -261,7 +263,7 @@ def test_final_quote_adjusted_invalid_geometry_is_vetoed(monkeypatch):
 
     bridge.place_bracket_order = mock_place
 
-    sig = _make_signal(symbol="TEST", entry=10.00, stop=9.85, target=10.30, atr=0.20)
+    sig = _make_signal(symbol="TEST", entry=10.00, stop=9.85, target=10.30, atr=0.10)
     monkeypatch.setattr(config, "REQUIRE_REALTIME_DATA_FOR_ORDERS", True)
     # Quote changes entry price to 0.04 -> stop_price = 0.04 - 0.15 = -0.11 <= 0 -> invalid
     mock_quote = MagicMock(valid=True, quote=MagicMock(last=0.04))

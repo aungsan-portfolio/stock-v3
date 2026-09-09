@@ -16,7 +16,9 @@ def register_order_expected_price(
     side: str,
     order_type: str = "ENTRY",
     submit_ts: Optional[float] = None,
-    symbol: Optional[str] = None
+    symbol: Optional[str] = None,
+    strategy: Optional[str] = None,
+    signal_id: Optional[str] = None,
 ) -> None:
     if not order_id:
         return
@@ -28,6 +30,8 @@ def register_order_expected_price(
             "order_type": str(order_type).upper(),
             "submit_ts": float(submit_ts if submit_ts is not None else time.time()),
             "symbol": str(symbol).upper() if symbol else "",
+            "strategy": str(strategy) if strategy else "UNKNOWN",
+            "signal_id": str(signal_id) if signal_id else None,
         }
 
 def get_registered_order(order_id: str) -> Optional[Dict[str, Any]]:

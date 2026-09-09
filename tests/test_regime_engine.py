@@ -104,7 +104,7 @@ class TestRegimeEngine(unittest.TestCase):
         self.assertEqual(res.mode, MODE_CAUTION)
         self.assertTrue(res.requires_opening_buffer)
         self.assertEqual(res.position_scale, 0.5)
-        self.assertEqual(res.confidence_boost, 0.15)
+        self.assertEqual(res.confidence_boost, getattr(config, "CAUTION_CONFIDENCE_BOOST", 0.0))
 
     def test_opening_buffer_timezone_safe(self):
         """Test is_past_opening_buffer helper at various Eastern times."""

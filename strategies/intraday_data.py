@@ -136,7 +136,7 @@ def _read_cache(key: str, ttl: int = None) -> Optional[pd.DataFrame]:
         try:
             mtime = os.path.getmtime(cache_file)
             limit = ttl if ttl is not None else getattr(config, "INTRADAY_CACHE_TTL_SECONDS", 30)
-            if (_time.time() - mtime) > limit:
+            if (time.time() - mtime) > limit:
                 return None
             df = pd.read_json(cache_file, orient="split")
             return df

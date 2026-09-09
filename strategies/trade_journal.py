@@ -82,6 +82,7 @@ def log_fill(
     strategy: Optional[str] = None,
     price_tier: Optional[str] = None,
     signal_id: Optional[str] = None,
+    account_id: Optional[str] = None,
     **kwargs,
 ):
     """Log an actual execution fill event with latency and slippage."""
@@ -89,15 +90,31 @@ def log_fill(
     if not price_tier and fill_price > 0:
         price_tier = "5-10" if (5.0 <= fill_price < 10.0) else (">10" if fill_price >= 10.0 else "<5")
 
+    # Primary key precedence: execution_id is primary; order_id alone is NEVER fill identity
+    if execution_id and str(execution_id).strip():
+        primary_fill_id = str(execution_id).strip()
+        is_synthetic = False
+        requires_reconciliation = False
+    else:
+        # Degraded synthetic key includes (account_id, order_id, side, qty, px, timestamp)
+        synth_acc = account_id or "ACC"
+        synth_oid = broker_order_id or order_id or "UNKNOWN_ORDER"
+        primary_fill_id = f"SYNTH:{synth_acc}:{synth_oid}:{side}:{qty}:{fill_price:.4f}:{timestamp or now_utc_str}"
+        is_synthetic = True
+        requires_reconciliation = True
+
     record = {
         "timestamp": timestamp or now_utc_str,
         "journal_write_timestamp_utc": now_utc_str,
         "type": "FILL",
         "event_type": "FILL",
+        "fill_id": primary_fill_id,
+        "execution_id": str(execution_id).strip() if execution_id else None,
+        "is_synthetic_key": is_synthetic,
+        "requires_reconciliation": requires_reconciliation,
         "order_id": order_id or broker_order_id,
         "client_order_id": client_order_id,
         "broker_order_id": broker_order_id or str(order_id or ""),
-        "execution_id": execution_id,
         "signal_id": signal_id,
         "symbol": symbol,
         "side": side,
@@ -110,6 +127,7 @@ def log_fill(
         "price_tier": price_tier,
         "broker_position_before": broker_position_before,
         "broker_position_after": broker_position_after,
+        **kwargs,
     }
     path = journal_file or config.DAYTRADE_TRADE_JOURNAL_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -400,11 +418,16 @@ def backfill_closed_trades(journal_file: Optional[Path] = None) -> int:
     if not records:
         return 0
 
-    entries_by_signal = {
-        str(record["signal_id"]): record
-        for record in records
-        if record.get("event_type") == "ORDER_SUBMITTED" and record.get("signal_id")
-    }
+    entries_by_signal = {}
+    for record in records:
+        if record.get("event_type") in ("ORDER_SUBMITTED", "TRADE"):
+            sig = record.get("signal_id")
+            if sig:
+                entries_by_signal[str(sig)] = record
+            oid = record.get("order_id")
+            if oid:
+                entries_by_signal[str(oid)] = record
+
     fills_by_symbol = defaultdict(list)
     seen_executions = set()
     existing_closed_signals = set()
@@ -415,6 +438,8 @@ def backfill_closed_trades(journal_file: Optional[Path] = None) -> int:
                 signal_id = record.get("signal_id")
                 if signal_id:
                     existing_closed_signals.add(str(signal_id))
+                syn_key = f"{record.get('symbol')}_{record.get('opened_at') or record.get('timestamp')}"
+                existing_closed_signals.add(syn_key)
                 continue
 
             if record.get("event_type") != "FILL" and record.get("type") != "FILL":
@@ -495,9 +520,11 @@ def backfill_closed_trades(journal_file: Optional[Path] = None) -> int:
                     realized_pnl += closed_quantity * (average_price - fill_price)
 
                 if new_position == 0.0 or previous_position * new_position < 0.0:
-                    signal_key = str(current_signal_id) if current_signal_id else None
-                    if signal_key and signal_key not in existing_closed_signals:
+                    signal_key = str(current_signal_id) if current_signal_id else f"{symbol}_{(opened_at or timestamp).isoformat()}"
+                    if signal_key not in existing_closed_signals:
                         entry = entries_by_signal.get(signal_key, {})
+                        if not entry and current_signal_id:
+                            entry = entries_by_signal.get(str(current_signal_id), {})
                         stop_price = float(entry.get("stop_price", 0) or 0)
                         target_price = float(entry.get("target_price", 0) or 0)
                         risk_per_share = abs(average_price - stop_price)

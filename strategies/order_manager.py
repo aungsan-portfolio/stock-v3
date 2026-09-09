@@ -275,48 +275,189 @@ def _compute_noise_floor(signal: TradeSignal, df: Optional[object] = None) -> fl
 
 
 
-def _pre_submission_veto(signal: TradeSignal, df: Optional[object] = None, market_texture: Optional[str] = None) -> tuple:
+def compute_effective_noise_floor(
+    signal: TradeSignal,
+    df: Optional[object] = None,
+    quote: Optional[dict] = None,
+) -> float:
+    """Compute authoritative effective noise floor:
+    max(atr_noise_floor, spread_noise_floor, tick_size_floor, configured_min)
     """
-    ATR-based pre-submission veto.
-    Hard Veto:  stop_distance < noise_floor * hard_veto_ratio -> block entry
-    Soft Warn:  stop_distance < noise_floor                   -> warn, allow entry
-    Returns: (should_skip: bool, reason: str)
+    atr_noise_floor = _compute_noise_floor(signal, df)
+
+    # Tick size floor (SEC Rule 612)
+    tick_size_floor = 0.01 if signal.entry_price >= 1.0 else 0.0001
+
+    # Configured minimum
+    configured_min = float(getattr(config, "NOISE_FLOOR_ABS_MIN", 0.08))
+
+    # Spread noise floor
+    spread_noise_floor = 0.0
+    if quote:
+        try:
+            bid = float(quote.get("bid", 0.0) or quote.get("bid_price", 0.0) or 0.0)
+            ask = float(quote.get("ask", 0.0) or quote.get("ask_price", 0.0) or 0.0)
+            if ask > bid > 0:
+                spread_noise_floor = ask - bid
+        except Exception:
+            pass
+
+    return max(atr_noise_floor, spread_noise_floor, tick_size_floor, configured_min)
+
+
+def validate_quote_health(
+    quote: Optional[dict],
+    now_ts: Optional[float] = None,
+    max_age_seconds: float = 5.0,
+    max_spread_pct: float = 0.015,
+    atr: Optional[float] = None,
+) -> Tuple[bool, str, dict]:
+    """Validates real-time bid/ask quote health and returns normalized spread metrics."""
+    if not quote:
+        return False, "QUOTE_MISSING", {}
+
+    try:
+        bid = float(quote.get("bid", 0.0) or quote.get("bid_price", 0.0) or 0.0)
+        ask = float(quote.get("ask", 0.0) or quote.get("ask_price", 0.0) or 0.0)
+    except (ValueError, TypeError):
+        return False, "NON_NUMERIC_QUOTE", {}
+
+    if bid <= 0 or ask <= 0:
+        return False, f"NON_POSITIVE_QUOTE (bid={bid}, ask={ask})", {}
+
+    if ask < bid:
+        return False, f"CROSSED_QUOTE (bid={bid} > ask={ask})", {}
+
+    mid = (bid + ask) / 2.0
+    spread_dollars = ask - bid
+    spread_bps = (spread_dollars / mid) * 10000.0 if mid > 0 else 0.0
+    spread_as_atr_fraction = (spread_dollars / atr) if (atr and atr > 0) else 0.0
+
+    metrics = {
+        "bid": bid,
+        "ask": ask,
+        "mid": mid,
+        "spread_dollars": spread_dollars,
+        "spread_bps": spread_bps,
+        "spread_as_atr_fraction": spread_as_atr_fraction,
+    }
+
+    spread_pct = spread_dollars / mid if mid > 0 else 1.0
+    if spread_pct > max_spread_pct:
+        return False, f"EXCESSIVE_SPREAD: {spread_pct*100:.2f}% > {max_spread_pct*100:.2f}%", metrics
+
+    now = time.time() if now_ts is None else float(now_ts)
+    raw_ts = quote.get("timestamp") or quote.get("quote_timestamp") or quote.get("ts")
+    if raw_ts is not None:
+        try:
+            if isinstance(raw_ts, (int, float)):
+                if raw_ts > 1e16:
+                    q_ts = raw_ts / 1e9
+                elif raw_ts > 1e11:
+                    q_ts = raw_ts / 1e3
+                else:
+                    q_ts = float(raw_ts)
+            else:
+                import pandas as pd
+                q_ts = pd.Timestamp(raw_ts).timestamp()
+            age = max(0.0, now - q_ts)
+            metrics["age_seconds"] = age
+            if age > max_age_seconds:
+                return False, f"STALE_QUOTE: age {age:.2f}s > {max_age_seconds:.1f}s", metrics
+        except Exception:
+            pass
+
+    return True, "", metrics
+
+
+def _pre_submission_veto(
+    signal: TradeSignal,
+    df: Optional[object] = None,
+    market_texture: Optional[str] = None,
+    quote: Optional[dict] = None,
+) -> tuple:
+    """Option A (Fail-Closed Default):
+    stop_distance < effective_noise_floor => REJECTED_NOISE_FLOOR_BREACH
     """
     stop_distance = abs(signal.entry_price - signal.stop_price)
-    noise_floor   = _compute_noise_floor(signal, df)
+    effective_noise_floor = compute_effective_noise_floor(signal, df, quote=quote)
 
-    # Dynamically select hard veto ratio based on active market texture
-    hard_veto_ratio = getattr(config, "NOISE_FLOOR_HARD_VETO_RATIO", 0.75)
-    if market_texture and hasattr(config, "MARKET_REGIME_SETTINGS"):
-        tex_cfg = config.MARKET_REGIME_SETTINGS.get(market_texture, {})
-        if "noise_floor_ratio" in tex_cfg:
-            hard_veto_ratio = float(tex_cfg["noise_floor_ratio"])
-
-    hard_veto_line  = noise_floor * hard_veto_ratio
-
-    if stop_distance < (hard_veto_line - 1e-4):
-        reason = (
-            f"Pre-submission Veto: Stop distance ${stop_distance:.4f} critically tight "
-            f"(< {hard_veto_ratio*100:.0f}% of ATR noise floor ${noise_floor:.4f}). "
-            f"Hard veto line: ${hard_veto_line:.4f}"
-        )
-        return True, reason
-
-    if stop_distance < noise_floor:
-        logger.debug(
-            "[SOFT-WARN] %s: Stop $%.4f slightly below noise floor $%.4f "
-            "(%.1f%% of floor) -- allowing entry",
-            signal.symbol,
-            stop_distance,
-            noise_floor,
-            (stop_distance / noise_floor) * 100 if noise_floor > 0 else 100
-        )
+    policy = getattr(config, "NOISE_FLOOR_POLICY", "OPTION_A")
+    if policy == "OPTION_A":
+        if stop_distance < (effective_noise_floor - 1e-6):
+            reason = (
+                f"[Pre-submission Veto] REJECTED_NOISE_FLOOR_BREACH: stop distance ${stop_distance:.4f} < "
+                f"effective noise floor ${effective_noise_floor:.4f}"
+            )
+            return True, reason
+    else:
+        # Legacy/Option B fallback
+        hard_veto_ratio = getattr(config, "NOISE_FLOOR_HARD_VETO_RATIO", 0.75)
+        if market_texture and hasattr(config, "MARKET_REGIME_SETTINGS"):
+            tex_cfg = config.MARKET_REGIME_SETTINGS.get(market_texture, {})
+            if "noise_floor_ratio" in tex_cfg:
+                hard_veto_ratio = float(tex_cfg["noise_floor_ratio"])
+        hard_veto_line = effective_noise_floor * hard_veto_ratio
+        if stop_distance < (hard_veto_line - 1e-4):
+            reason = (
+                f"Pre-submission Veto: Stop distance ${stop_distance:.4f} critically tight "
+                f"(< {hard_veto_ratio*100:.0f}% of ATR noise floor ${effective_noise_floor:.4f}). "
+                f"Hard veto line: ${hard_veto_line:.4f}"
+            )
+            return True, reason
 
     return False, ""
 
 
+def unfavorable_chase(side: str, signal_entry: float, executable_entry: float) -> float:
+    """Compute unfavorable price movement between signal decision and executable price.
+    Favorable price improvements evaluate to 0.0.
+    """
+    s = str(side).upper().strip()
+    if s in ("BUY", "LONG"):
+        return max(float(executable_entry) - float(signal_entry), 0.0)
+    return max(float(signal_entry) - float(executable_entry), 0.0)
 
-def _validate_signal_prices(signal: TradeSignal, market_texture: Optional[str] = None, df_history: Optional[object] = None) -> str:
+
+def validate_geometry(side: str, entry: float, stop: float, target: float) -> Tuple[bool, str, float, float, float]:
+    """Side-neutral price geometry validator.
+    Ensures correct price ordering:
+      - BUY:  stop < entry < target
+      - SELL: target < entry < stop
+    Returns: (is_valid, reason, risk, reward, rr)
+    """
+    side_upper = str(side).upper().strip()
+    e = float(entry)
+    s = float(stop)
+    t = float(target)
+
+    if side_upper in ("BUY", "LONG"):
+        ordering_valid = (s < e < t)
+        risk = e - s
+        reward = t - e
+    elif side_upper in ("SELL", "SHORT"):
+        ordering_valid = (t < e < s)
+        risk = s - e
+        reward = e - t
+    else:
+        return False, f"unsupported_side:{side}", 0.0, 0.0, 0.0
+
+    if not ordering_valid:
+        return False, "invalid_price_ordering", 0.0, 0.0, 0.0
+
+    if risk <= 0.0 or reward <= 0.0:
+        return False, "non_positive_geometry", 0.0, 0.0, 0.0
+
+    rr = reward / risk
+    return True, "", risk, reward, rr
+
+
+def _validate_signal_prices(
+    signal: TradeSignal,
+    market_texture: Optional[str] = None,
+    df_history: Optional[object] = None,
+    quote: Optional[dict] = None,
+) -> str:
     """Return a rejection reason when entry/stop/target geometry is invalid."""
     side = signal.side.upper()
     if signal.entry_price <= 0:
@@ -325,6 +466,13 @@ def _validate_signal_prices(signal: TradeSignal, market_texture: Optional[str] =
         return "Invalid stop/target price"
     if signal.risk_per_share <= 0:
         return "Invalid risk/share"
+
+    # Phase 0: Directional Price Ordering Check
+    geo_ok, geo_err, risk, reward, rr = validate_geometry(
+        signal.side, signal.entry_price, signal.stop_price, signal.target_price
+    )
+    if not geo_ok:
+        return f"Invalid price ordering or geometry: {geo_err}"
 
     derived_risk = abs(signal.entry_price - signal.stop_price)
     if not math.isclose(signal.risk_per_share, derived_risk, rel_tol=1e-6, abs_tol=1e-6):
@@ -352,7 +500,7 @@ def _validate_signal_prices(signal: TradeSignal, market_texture: Optional[str] =
         except Exception:
             pass
 
-    should_skip, veto_reason = _pre_submission_veto(signal, df_history, market_texture)
+    should_skip, veto_reason = _pre_submission_veto(signal, df_history, market_texture, quote=quote)
     if should_skip:
         return veto_reason
 
@@ -686,6 +834,51 @@ def on_broker_fill_event(
         )
         return
 
+    # Post-fill geometry revalidation
+    sub_stop = float(ctx.get("submitted_stop_price") or signal.stop_price)
+    sub_target = float(ctx.get("submitted_target_price") or signal.target_price)
+    is_valid_geo, geo_err, fill_risk, fill_reward, fill_rr = validate_geometry(
+        signal.side,
+        entry=new_average_price,
+        stop=sub_stop,
+        target=sub_target,
+    )
+    if not is_valid_geo:
+        logger.critical(
+            "[POST_FILL_GEOMETRY_BREACH] %s fill price %.4f broke geometry (%s): stop=%.4f target=%.4f",
+            signal.symbol, new_average_price, geo_err, sub_stop, sub_target
+        )
+        ordering_breached = False
+        if signal.side.upper() in ("BUY", "LONG") and new_average_price <= sub_stop:
+            ordering_breached = True
+        elif signal.side.upper() in ("SELL", "SHORT") and new_average_price >= sub_stop:
+            ordering_breached = True
+
+        if ordering_breached:
+            logger.critical(
+                "[POST_FILL_EMERGENCY_FLATTEN] %s fill breached stop price! Emergency flatten required.",
+                signal.symbol
+            )
+            ctx["post_fill_status"] = "POST_FILL_ORDERING_BREACH_FLATTEN"
+            if bridge and hasattr(bridge, "close_position"):
+                try:
+                    bridge.close_position(signal.symbol)
+                except Exception as exc:
+                    logger.error("Failed to close position on post-fill ordering breach: %s", exc)
+            return
+        else:
+            ctx["post_fill_status"] = "POST_FILL_RR_DEGRADED"
+    else:
+        min_rr = getattr(config, "MIN_RR_RATIO", 1.0)
+        if fill_rr < (min_rr - 1e-4):
+            logger.warning(
+                "[POST_FILL_RR_DEGRADED] %s fill RR %.2f < min RR %.2f (fill=%.4f, stop=%.4f, target=%.4f). Stop preserved.",
+                signal.symbol, fill_rr, min_rr, new_average_price, sub_stop, sub_target
+            )
+            ctx["post_fill_status"] = "POST_FILL_RR_DEGRADED"
+        else:
+            ctx["post_fill_status"] = "POST_FILL_GEOMETRY_VALID"
+
     try:
         from strategies.trailing_stop import get_trailing_manager
         manager = get_trailing_manager()
@@ -875,7 +1068,16 @@ def execute_signal(
         logger.info("Skipped %s: %s", signal.symbol, result["reason"])
         return result
 
-    price_reason = _validate_signal_prices(signal, market_texture=market_texture)
+    quote = signal_metadata.get("quote") or getattr(signal, "quote", None)
+    if quote:
+        quote_ok, quote_err, quote_metrics = validate_quote_health(quote, atr=getattr(signal, "atr", None))
+        result["metadata"]["quote_metrics"] = quote_metrics
+        if not quote_ok:
+            result["reason"] = f"Quote health veto: {quote_err}"
+            logger.warning("[QUOTE HEALTH VETO] Blocked %s: %s", signal.symbol, result["reason"])
+            return result
+
+    price_reason = _validate_signal_prices(signal, market_texture=market_texture, quote=quote)
     if price_reason:
         result["reason"] = price_reason
         record_hard_veto_skip(signal.symbol, price_reason, getattr(signal, "bar_timestamp", "") or "")
@@ -883,11 +1085,24 @@ def execute_signal(
         return result
 
     executable_signal = _executable_signal(signal, entry_limit_price)
-    executable_price_reason = _validate_signal_prices(executable_signal, market_texture=market_texture)
+    executable_price_reason = _validate_signal_prices(executable_signal, market_texture=market_texture, quote=quote)
     if executable_price_reason:
         result["reason"] = f"Invalid executable limit: {executable_price_reason}"
         record_hard_veto_skip(signal.symbol, executable_price_reason, getattr(signal, "bar_timestamp", "") or "")
         logger.info("Skipped %s: %s", signal.symbol, result["reason"])
+        return result
+
+    # Direction-Aware Maximum Chase Guard
+    chase = unfavorable_chase(signal.side, signal.entry_price, executable_signal.entry_price)
+    max_allowed_chase = float(getattr(config, "MAX_ALLOWED_CHASE", 0.15))
+    strat_cfg = getattr(config, "STRATEGY_SETTINGS", {}).get(signal.strategy, {})
+    if isinstance(strat_cfg, dict) and "max_chase" in strat_cfg:
+        max_allowed_chase = float(strat_cfg["max_chase"])
+
+    if chase > (max_allowed_chase + 1e-6):
+        chase_reason = f"REJECTED_MAX_CHASE_EXCEEDED: unfavorable chase ${chase:.4f} > max allowed chase ${max_allowed_chase:.4f}"
+        result["reason"] = chase_reason
+        logger.info("[CHASE GUARD] Blocked %s: %s", signal.symbol, chase_reason)
         return result
 
 
@@ -1338,35 +1553,108 @@ def execute_signal(
             logger.warning("[EXECUTION QUOTE VETO] %s: %s", signal.symbol, quote_res.reason)
             return result
 
-        if quote_res.quote and quote_res.quote.last > 0:
-            offset_stop = executable_signal.entry_price - signal.stop_price
-            offset_target = signal.target_price - executable_signal.entry_price
-            limit_price = quote_res.quote.last
+        def _get_num(obj, attr):
+            try:
+                val = getattr(obj, attr, 0.0)
+                if isinstance(val, (int, float)):
+                    return float(val)
+                return 0.0
+            except Exception:
+                return 0.0
 
-            tick_size = 0.01 if limit_price >= 1.0 else 0.0001
+        q_ask = _get_num(quote_res.quote, "ask")
+        q_bid = _get_num(quote_res.quote, "bid")
+        q_last = _get_num(quote_res.quote, "last")
+
+        if quote_res.quote and (q_ask > 0 or q_bid > 0 or q_last > 0 or hasattr(quote_res.quote, "executable_price")):
+            exec_price = 0.0
+            if hasattr(quote_res.quote, "executable_price") and callable(quote_res.quote.executable_price):
+                try:
+                    p = quote_res.quote.executable_price(signal.side)
+                    if isinstance(p, (int, float)) and p > 0:
+                        exec_price = float(p)
+                except Exception:
+                    exec_price = 0.0
+            if exec_price <= 0:
+                exec_price = q_last or q_ask or q_bid
+
+            # 1. Direction-aware unfavorable chase guard
+            unf_chase = unfavorable_chase(signal.side, signal.entry_price, exec_price)
+            max_allowed_chase = float(getattr(config, "MAX_ALLOWED_CHASE", 0.15))
+            strat_cfg = getattr(config, "STRATEGY_SETTINGS", {}).get(signal.strategy, {})
+            if isinstance(strat_cfg, dict) and "max_chase" in strat_cfg:
+                max_allowed_chase = float(strat_cfg["max_chase"])
+
+            if unf_chase > max_allowed_chase:
+                idempotency_manager.release(
+                    signal.symbol,
+                    side=signal.side,
+                    reason=f"chase_exceeded:unfavorable_chase={unf_chase:.4f}>max={max_allowed_chase:.4f}",
+                )
+                result["status"] = "VETOED"
+                result["reason"] = f"Execution Quote Gate: Unfavorable chase ${unf_chase:.4f} exceeds safety guard ${max_allowed_chase:.4f}"
+                logger.warning(
+                    "[CHASE GUARD VETO] %s: unfavorable chase $%.4f > allowed $%.4f (signal=%.2f, executable=%.2f)",
+                    signal.symbol, unf_chase, max_allowed_chase, signal.entry_price, exec_price
+                )
+                return result
+
+            # 2. Side-consistent offset calculation
+            tick_size = 0.01 if exec_price >= 1.0 else 0.0001
             precision = 2 if tick_size == 0.01 else 4
+            limit_price = round(exec_price, precision)
 
-            stop_price = round(
-                limit_price - offset_stop,
-                precision,
-            )
-            target_price = round(
-                limit_price + offset_target,
-                precision,
-            )
+            side_upper = signal.side.upper().strip()
+            if side_upper in ("BUY", "LONG"):
+                stop_offset = executable_signal.entry_price - signal.stop_price
+                target_offset = signal.target_price - executable_signal.entry_price
+                stop_price = round(limit_price - stop_offset, precision)
+                target_price = round(limit_price + target_offset, precision)
+            else:
+                stop_offset = signal.stop_price - executable_signal.entry_price
+                target_offset = executable_signal.entry_price - signal.target_price
+                stop_price = round(limit_price + stop_offset, precision)
+                target_price = round(limit_price - target_offset, precision)
+
             logger.info(
-                "[PRE-SUBMIT OFFSET ADJUST] %s: signal entry $%.2f -> live limit $%.4f | stop $%.4f -> $%.4f (offset $%.4f preserved)",
-                signal.symbol, signal.entry_price, limit_price, signal.stop_price, stop_price, offset_stop
+                "[PRE-SUBMIT OFFSET ADJUST] %s: signal entry $%.2f -> live limit $%.4f | stop $%.4f -> $%.4f | target $%.4f -> $%.4f (unfavorable_chase=$%.4f)",
+                signal.symbol, signal.entry_price, limit_price, signal.stop_price, stop_price, signal.target_price, target_price, unf_chase
             )
+
+            # 3. Side-neutral geometry validation
+            geo_ok, geo_err, adj_risk, adj_reward, adj_rr = validate_geometry(
+                signal.side, limit_price, stop_price, target_price
+            )
+            if not geo_ok:
+                released = idempotency_manager.release(
+                    signal.symbol,
+                    side=signal.side,
+                    reason=f"adjusted_geometry_invalid:{geo_err}",
+                )
+                result["status"] = "VETOED" if released else "IDEMPOTENCY_RELEASE_FAILED"
+                result["reason"] = f"Final submitted geometry invalid: Adjusted geometry invalid: {geo_err}"
+                logger.warning("[ADJUSTED GEOMETRY VETO] %s: %s", signal.symbol, geo_err)
+                return result
+
+            # Verify post-adjustment RR does not degrade below minimum
+            min_rr = getattr(config, "MIN_RISK_REWARD_RATIO", 1.5)
+            if adj_rr < (min_rr - 1e-6):
+                released = idempotency_manager.release(
+                    signal.symbol,
+                    side=signal.side,
+                    reason=f"adjusted_rr_insufficient:rr={adj_rr:.2f}<min={min_rr:.2f}",
+                )
+                result["status"] = "VETOED" if released else "IDEMPOTENCY_RELEASE_FAILED"
+                result["reason"] = f"Final submitted geometry invalid: Adjusted risk/reward ratio {adj_rr:.2f} < minimum {min_rr:.2f}"
+                logger.warning("[ADJUSTED RR VETO] %s: %s", signal.symbol, result["reason"])
+                return result
 
             submitted_candidate = replace(
                 executable_signal,
                 entry_price=float(limit_price),
                 stop_price=float(stop_price),
                 target_price=float(target_price),
-                risk_per_share=abs(
-                    float(limit_price) - float(stop_price)
-                ),
+                risk_per_share=adj_risk,
             )
 
             final_geometry_reason = _validate_signal_prices(
@@ -1745,6 +2033,8 @@ def execute_signal(
             order_type="ENTRY",
             submit_ts=now_ts,
             symbol=signal.symbol,
+            strategy=signal.strategy,
+            signal_id=signal.signal_id,
         )
         register_order_expected_price(
             str(stop_id),
@@ -1753,6 +2043,8 @@ def execute_signal(
             order_type="STOP_LOSS",
             submit_ts=now_ts,
             symbol=signal.symbol,
+            strategy=signal.strategy,
+            signal_id=signal.signal_id,
         )
         register_order_expected_price(
             str(tp_id),
@@ -1761,6 +2053,8 @@ def execute_signal(
             order_type="TAKE_PROFIT",
             submit_ts=now_ts,
             symbol=signal.symbol,
+            strategy=signal.strategy,
+            signal_id=signal.signal_id,
         )
     except Exception as reg_err:
         logger.exception("Expected-price registration failed for accepted parent %s: %s", parent_order_id, reg_err)
@@ -1778,6 +2072,7 @@ def execute_signal(
             order_type="BRACKET",
             status="PLACED",
             order_id=parent_order_id,
+            signal_id=signal.signal_id,
             equity=equity,
             confidence=signal.confidence,
         )

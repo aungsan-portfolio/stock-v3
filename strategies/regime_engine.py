@@ -63,6 +63,112 @@ def detect_market_texture(adx: float = 20.0, bb_width: float = 0.02, atr_ratio: 
     return TEXTURE_TRANSITIONING
 
 
+DIAGNOSTIC_VALID = "VALID"
+DIAGNOSTIC_UNUSUAL_BUT_ALLOWED = "UNUSUAL_BUT_ALLOWED"
+DIAGNOSTIC_INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+DIAGNOSTIC_INTERNALLY_INCONSISTENT = "INTERNALLY_INCONSISTENT"
+
+
+def validate_regime_texture_combination(
+    mode: str,
+    texture: str,
+    component_scores: Optional[Dict[str, Any]] = None,
+    data: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str, Dict[str, Any]]:
+    """
+    Diagnostic-only consistency validator evaluating alignment between macro regime mode and micro market texture.
+    Returns (status, message, attribution_dict).
+
+    Adheres strictly to Phase A invariant:
+    Emits telemetry/diagnostic logging ONLY.
+    DO NOT alter mode, sizing, trade halts, or strategy eligibility!
+    """
+    scores = component_scores or {}
+    dt = data or {}
+
+    attribution = {
+        "mode": mode,
+        "texture": texture,
+        "spy_pct": dt.get("spy_pct"),
+        "qqq_pct": dt.get("qqq_pct"),
+        "soxx_pct": dt.get("soxx_pct"),
+        "breadth": dt.get("scanner_candidate_count"),
+        "factor_scores": scores,
+    }
+
+    if mode == MODE_DATA_DEGRADED or not mode:
+        return (
+            DIAGNOSTIC_INSUFFICIENT_DATA,
+            "Mode is DATA_DEGRADED or unspecified; insufficient benchmark data for texture validation",
+            attribution,
+        )
+
+    if not scores and not dt:
+        return (
+            DIAGNOSTIC_INSUFFICIENT_DATA,
+            "Component scores and market data dictionaries are empty",
+            attribution,
+        )
+
+    # 1. Inconsistent: RISK_ON + VOLATILE
+    if mode == MODE_RISK_ON and texture == TEXTURE_VOLATILE:
+        msg = (
+            "Macro scoring evaluated to RISK_ON while micro texture detected VOLATILE "
+            "(ATR ratio or severe 5m drop). Conflicting macro vs micro signals."
+        )
+        return (DIAGNOSTIC_INTERNALLY_INCONSISTENT, msg, attribution)
+
+    # 2. Inconsistent: RISK_OFF with uniformly bullish components
+    spy_pct = dt.get("spy_pct")
+    qqq_pct = dt.get("qqq_pct")
+    if (
+        mode == MODE_RISK_OFF
+        and spy_pct is not None
+        and spy_pct >= 0.50
+        and qqq_pct is not None
+        and qqq_pct >= 0.50
+    ):
+        msg = (
+            f"Mode evaluated to RISK_OFF despite strong positive benchmark indices "
+            f"(SPY={spy_pct:+.2f}%, QQQ={qqq_pct:+.2f}%). Potential factor score conflict."
+        )
+        return (DIAGNOSTIC_INTERNALLY_INCONSISTENT, msg, attribution)
+
+    # 3. Unusual but allowed: RISK_ON + TRANSITIONING / SIDEWAYS
+    if mode == MODE_RISK_ON and texture in (TEXTURE_TRANSITIONING, TEXTURE_SIDEWAYS):
+        msg = (
+            f"Macro backdrop is RISK_ON but micro texture is {texture}. "
+            f"Market exhibiting range consolidation or intraday texture shift."
+        )
+        return (DIAGNOSTIC_UNUSUAL_BUT_ALLOWED, msg, attribution)
+
+    # 4. Unusual but allowed: CAUTION + VOLATILE
+    if mode == MODE_CAUTION and texture == TEXTURE_VOLATILE:
+        msg = (
+            "Macro mode is CAUTION and micro texture is VOLATILE. "
+            "High volatility during cautious macro backdrop."
+        )
+        return (DIAGNOSTIC_UNUSUAL_BUT_ALLOWED, msg, attribution)
+
+    # 5. Unusual but allowed: RISK_OFF + SIDEWAYS / TRANSITIONING
+    if mode == MODE_RISK_OFF and texture in (TEXTURE_SIDEWAYS, TEXTURE_TRANSITIONING):
+        msg = (
+            f"Macro mode is RISK_OFF with muted micro volatility ({texture}). "
+            f"Slow drift or calm market weakness."
+        )
+        return (DIAGNOSTIC_UNUSUAL_BUT_ALLOWED, msg, attribution)
+
+    # 6. Harmonious / Valid combinations:
+    # - RISK_ON + TRENDING
+    # - CAUTION + TRENDING / SIDEWAYS / TRANSITIONING
+    # - RISK_OFF + VOLATILE / TRENDING
+    return (
+        DIAGNOSTIC_VALID,
+        f"Regime mode {mode} and texture {texture} are harmonious and consistent",
+        attribution,
+    )
+
+
 @dataclass
 class MarketRegimeResult:
     mode: str  # "RISK_ON", "CAUTION", "RISK_OFF", "DATA_DEGRADED"
@@ -81,11 +187,13 @@ class MarketRegimeResult:
     max_trades_day: Optional[int] = None
     halt_new_entries: bool = False
     market_texture: str = TEXTURE_TRENDING
+    diagnostic_status: str = DIAGNOSTIC_VALID
+    diagnostic_message: Optional[str] = None
 
     def summary(self) -> str:
         reasons_str = " | ".join(self.reasons) if self.reasons else "Normal Healthy Market"
         return (
-            f"[REGIME] mode={self.mode} texture={self.market_texture} score={self.score:+d} "
+            f"[REGIME] mode={self.mode} texture={self.market_texture} diag={self.diagnostic_status} score={self.score:+d} "
             f"allow_longs={self.allow_new_longs} halt_entries={self.halt_new_entries} "
             f"max_trades={self.max_trades_day} open_buffer_0945={self.requires_opening_buffer} "
             f"sizing={self.position_scale*100:.0f}% boost=+{self.confidence_boost:.2f} reasons=[{reasons_str}]"
@@ -282,12 +390,12 @@ def evaluate_market_regime(
         _last_soxx_pct = soxx_pct
     data["SOXX"] = {"pct": soxx_pct, "source": soxx_source}
     if soxx_pct is not None:
-        if soxx_pct < -3.00:
+        if soxx_pct < -2.00:
             factor_scores["SOXX"] = -2
-            reasons.append(f"SOXX semiconductor ETF down {soxx_pct:.2f}% (< -3.00% severe) [{soxx_source}]")
-        elif soxx_pct < -1.50:
+            reasons.append(f"SOXX semiconductor ETF down {soxx_pct:.2f}% (< -2.00% severe) [{soxx_source}]")
+        elif soxx_pct < -1.00:
             factor_scores["SOXX"] = -1
-            reasons.append(f"SOXX semiconductor ETF weak {soxx_pct:.2f}% (< -1.50%) [{soxx_source}]")
+            reasons.append(f"SOXX semiconductor ETF weak {soxx_pct:.2f}% (< -1.00%) [{soxx_source}]")
         elif soxx_pct > 2.00:
             factor_scores["SOXX"] = 1
             reasons.append(f"SOXX semiconductor ETF strong +{soxx_pct:.2f}% [{soxx_source}]")
@@ -323,7 +431,7 @@ def evaluate_market_regime(
         mode = MODE_CAUTION
         requires_opening_buffer = True  # Must wait until 09:45 ET
         position_scale = 0.5
-        confidence_boost = float(getattr(config, "CAUTION_CONFIDENCE_BOOST", 0.0))
+        confidence_boost = float(getattr(config, "CAUTION_CONFIDENCE_BOOST", 0.15))
 
         # Dynamic max trades per day based on scanner health & Paper/Live mode
         is_paper = getattr(config, "IS_PAPER_TRADING", True) or getattr(config, "PAPER_TRADING", True)
@@ -378,6 +486,29 @@ def evaluate_market_regime(
     # Inverse ETF long-buy eligibility: valid when RISK_OFF / severe CAUTION has halted normal longs
     allow_inverse_etf_longs = bool(inverse_etf_exempt and macro_index_weak and halt_new_entries)
 
+    # Diagnostic-only Regime/Texture Consistency Check (Phase A: Telemetry Only, No Halts/Policy Changes)
+    diag_status, diag_msg, diag_attribution = validate_regime_texture_combination(
+        mode=mode,
+        texture=market_texture,
+        component_scores=factor_scores,
+        data=data,
+    )
+    data["diagnostic_consistency"] = {
+        "status": diag_status,
+        "message": diag_msg,
+        "attribution": diag_attribution,
+    }
+    if diag_status in (DIAGNOSTIC_UNUSUAL_BUT_ALLOWED, DIAGNOSTIC_INTERNALLY_INCONSISTENT):
+        logger.warning(
+            "[REGIME_TEXTURE_DIAGNOSTIC] %s: mode=%s, texture=%s | %s | Attribution: %s",
+            diag_status, mode, market_texture, diag_msg, diag_attribution
+        )
+    else:
+        logger.debug(
+            "[REGIME_TEXTURE_DIAGNOSTIC] %s: mode=%s, texture=%s | Attribution: %s",
+            diag_status, mode, market_texture, diag_attribution
+        )
+
     res = MarketRegimeResult(
         mode=mode,
         score=score,
@@ -394,7 +525,9 @@ def evaluate_market_regime(
         scanner_candidate_count=scanner_candidate_count,
         max_trades_day=max_trades_day,
         halt_new_entries=halt_new_entries,
-        market_texture=market_texture
+        market_texture=market_texture,
+        diagnostic_status=diag_status,
+        diagnostic_message=diag_msg,
     )
 
     logger.info("Market Regime Evaluation: %s", res.summary())

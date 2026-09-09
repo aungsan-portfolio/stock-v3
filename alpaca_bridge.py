@@ -2903,7 +2903,15 @@ class AlpacaBridge:
             order = self._client.get_order_by_id(order_id)
             status = order.status.value if hasattr(order.status, "value") else str(order.status)
             qty = float(order.qty) if getattr(order, "qty", None) is not None else 0.0
-            return {"id": str(order.id), "status": status, "qty": qty}
+            filled_qty = float(getattr(order, "filled_qty", 0.0) or 0.0)
+            replaced_by = getattr(order, "replaced_by", None)
+            return {
+                "id": str(order.id),
+                "status": status,
+                "qty": qty,
+                "filled_qty": filled_qty,
+                "replaced_by": str(replaced_by) if replaced_by else None,
+            }
         except Exception as exc:
             logger.error("get_order_snapshot failed for %s: %s", order_id, exc)
             return None
@@ -3069,7 +3077,13 @@ class AlpacaBridge:
 
             today_date = now_eastern().date()
             existing_records = read_journal()
-            existing_order_ids = {str(r.get("execution_id") or r.get("order_id") or "") for r in existing_records}
+            existing_fill_ids = set()
+            for r in existing_records:
+                if r.get("event_type") == "FILL" or r.get("type") == "FILL":
+                    for key in ("execution_id", "order_id", "broker_order_id"):
+                        val = r.get(key)
+                        if val:
+                            existing_fill_ids.add(str(val))
 
             req = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=500)
             orders = self._client.get_orders(req)
@@ -3088,7 +3102,7 @@ class AlpacaBridge:
                     continue
 
                 order_id_str = str(o.id)
-                if order_id_str in existing_order_ids:
+                if order_id_str in existing_fill_ids:
                     continue
 
                 client_ref = getattr(o, "client_order_id", "") or ""
@@ -3103,9 +3117,14 @@ class AlpacaBridge:
                 reg = get_registered_order(order_id_str)
                 
                 order_type = "ENTRY"
+                signal_id = None
                 if reg:
                     expected_price = reg["expected_price"]
                     order_type = reg.get("order_type", "ENTRY")
+                    if reg.get("strategy") and reg["strategy"] != "UNKNOWN":
+                        strat = reg["strategy"]
+                    if reg.get("signal_id"):
+                        signal_id = reg["signal_id"]
                 else:
                     if getattr(o, "stop_price", None) and float(o.stop_price) > 0:
                         expected_price = float(o.stop_price)
@@ -3144,7 +3163,10 @@ class AlpacaBridge:
                     slippage=slippage,
                     fill_latency_ms=fill_latency_ms,
                     order_id=order_id_str,
-                    execution_id=order_id_str,
+                    broker_order_id=order_id_str,
+                    execution_id=None,
+                    account_id=str(getattr(self, "account_id", "") or "ALPACA"),
+                    signal_id=signal_id,
                     timestamp=filled_utc.isoformat(),
                     strategy=strat,
                     price_tier=tier,
@@ -3185,7 +3207,7 @@ class AlpacaBridge:
                             register_symbol_loss(o.symbol, filled_utc)
                     except Exception as loss_chk_exc:
                         logger.debug("Error checking trade exit loss status for %s: %s", o.symbol, loss_chk_exc)
-                existing_order_ids.add(order_id_str)
+                existing_fill_ids.add(order_id_str)
                 synced_count += 1
             return synced_count
         except Exception as exc:

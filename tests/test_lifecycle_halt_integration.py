@@ -20,13 +20,24 @@ from strategies.entry_lifecycle import EntryOrderLifecycle
 from strategies.regime_engine import MarketRegimeResult, MODE_RISK_ON, MODE_DATA_DEGRADED, RegimeStateTracker
 
 
+import pathlib
+import tempfile
+import shutil
+import config
+
+
 class TestLifecycleHaltIntegration(unittest.TestCase):
 
     def setUp(self):
         halt_manager.reset_all()
+        self._tmp_dir = tempfile.mkdtemp()
+        self._orig_journal = config.DAYTRADE_TRADE_JOURNAL_FILE
+        config.DAYTRADE_TRADE_JOURNAL_FILE = pathlib.Path(self._tmp_dir) / "test_journal.jsonl"
 
     def tearDown(self):
         halt_manager.reset_all()
+        config.DAYTRADE_TRADE_JOURNAL_FILE = self._orig_journal
+        shutil.rmtree(self._tmp_dir, ignore_errors=True)
 
     def test_entry_halt_manager_basic_transient_lifecycle(self):
         """Verify transient halts can be added and cleared normally."""

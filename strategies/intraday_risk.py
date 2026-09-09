@@ -108,6 +108,13 @@ def get_recent_symbol_loss_time(symbol: str, journal_file=None) -> Optional[date
     return mem_time or journal_time
 
 
+def reset_risk_state() -> None:
+    """Reset in-memory risk tracking state (loss timestamps, bypass cooldowns)."""
+    global _RECENT_SYMBOL_LOSS_TIMESTAMPS, _bypass_cooldowns
+    _RECENT_SYMBOL_LOSS_TIMESTAMPS.clear()
+    _bypass_cooldowns.clear()
+
+
 def get_symbol_consecutive_losses(symbol: str, journal_file=None) -> int:
     symbol_trades = [trade for trade in get_today_closed_trades(journal_file) if trade.get("symbol") == symbol]
     if not symbol_trades:
@@ -273,6 +280,7 @@ def pre_trade_check(
     open_symbols: Optional[list] = None,
     max_trades: Optional[int] = None,
     side: str = "BUY",
+    check_reentry_cooldown: bool = True,
 ) -> str:
     """Run all risk checks before placing a trade."""
     if current_pnl is None:
@@ -329,16 +337,17 @@ def pre_trade_check(
             logger.info("Re-entry blocked for %s: consecutive loss limit reached (%d/%d)", symbol, symbol_losses, max_symbol_losses)
             return f"Symbol consecutive loss limit reached for {symbol} ({symbol_losses}/{max_symbol_losses})"
 
-        last_loss_time = get_recent_symbol_loss_time(symbol)
-        if last_loss_time is not None:
-            cooldown_minutes = getattr(config, "REENTRY_COOLDOWN_MINUTES", 5)
-            elapsed_minutes = (datetime.now(timezone.utc) - last_loss_time).total_seconds() / 60.0
-            if elapsed_minutes < cooldown_minutes:
-                remaining_minutes = cooldown_minutes - elapsed_minutes
-                return (
-                    f"Re-entry cooldown active for {symbol} "
-                    f"({remaining_minutes:.1f} min left of {cooldown_minutes} min)"
-                )
+        if check_reentry_cooldown:
+            last_loss_time = get_recent_symbol_loss_time(symbol)
+            if last_loss_time is not None:
+                cooldown_minutes = getattr(config, "REENTRY_COOLDOWN_MINUTES", 5)
+                elapsed_minutes = (datetime.now(timezone.utc) - last_loss_time).total_seconds() / 60.0
+                if elapsed_minutes < cooldown_minutes:
+                    remaining_minutes = cooldown_minutes - elapsed_minutes
+                    return (
+                        f"Re-entry cooldown active for {symbol} "
+                        f"({remaining_minutes:.1f} min left of {cooldown_minutes} min)"
+                    )
 
     if not check_trade_risk(risk_dollars, equity, max_risk_pct):
         max_risk = equity * (max_risk_pct / 100.0)

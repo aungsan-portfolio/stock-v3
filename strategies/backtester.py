@@ -317,7 +317,7 @@ def run_backtest(symbol: str, strategy_name: str, lookback_days: int = 5, overri
                 try:
                     from strategies.intraday_risk import pre_trade_check
                     risk_dollars = shares * abs(signal.entry_price - signal.stop_price)
-                    allowed, veto_reason = pre_trade_check(
+                    risk_veto = pre_trade_check(
                         equity=current_equity,
                         current_pnl=current_equity - start_equity,
                         trades_today=len([tr for tr in trades if tr['exit_time'].date() == current_date]),
@@ -328,9 +328,10 @@ def run_backtest(symbol: str, strategy_name: str, lookback_days: int = 5, overri
                         side=signal.side,
                         open_symbols=[symbol] if active_trade else [],
                         max_trades=getattr(config, "MAX_TRADES_PER_DAY", 15),
+                        check_reentry_cooldown=False,
                     )
-                    if not allowed:
-                        logger.debug(f"[BACKTEST RISK VETO] {symbol} {signal.side}: {veto_reason}")
+                    if risk_veto:
+                        logger.debug(f"[BACKTEST RISK VETO] {symbol} {signal.side}: {risk_veto}")
                         continue
                 except Exception as risk_err:
                     logger.warning("[BACKTEST RISK GATE ERROR] %s: %s", symbol, risk_err)

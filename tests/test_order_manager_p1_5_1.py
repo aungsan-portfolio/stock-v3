@@ -37,9 +37,11 @@ from strategies.base import TradeSignal
 
 
 @pytest.fixture(autouse=True)
-def reset_order_manager_globals(monkeypatch):
+def reset_order_manager_globals(monkeypatch, tmp_path):
     """Ensure clean global state before and after each test."""
     import config
+    test_journal = tmp_path / "test_trade_journal.jsonl"
+    monkeypatch.setattr(config, "DAYTRADE_TRADE_JOURNAL_FILE", test_journal)
     monkeypatch.setattr(config, "REQUIRE_REALTIME_DATA_FOR_ORDERS", False)
     monkeypatch.setattr(config, "SPY_TREND_GUARD_ENABLED", False)
     with om._pending_order_contexts_lock:

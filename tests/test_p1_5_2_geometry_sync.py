@@ -743,13 +743,13 @@ def test_post_close_bar_exceeding_grace_rejected_as_stale():
     bar_start = pd.Timestamp("2026-09-02 14:40:00", tz="UTC")
     df = _make_sample_bar_df(bar_start)
 
-    # Evaluated at 14:45:50 (50s post-close, exceeding 45s grace)
-    eval_time = pd.Timestamp("2026-09-02 14:45:50", tz="UTC")
+    # Evaluated at 14:46:15 (75s post-close, exceeding 60s grace)
+    eval_time = pd.Timestamp("2026-09-02 14:46:15", tz="UTC")
 
     with patch("strategies.session.is_market_open", return_value=True), \
          patch("pandas.Timestamp.now", return_value=eval_time):
         res = _validate_intraday_data(df, symbol="MU", interval="5m", validate_staleness=True)
-        assert res.empty, "50s post-close bar exceeding 45s grace must be rejected as stale!"
+        assert res.empty, "Bar exceeding grace must be rejected as stale!"
 
 
 def test_future_dated_completed_bar_fails_closed():
