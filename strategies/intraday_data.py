@@ -37,6 +37,29 @@ def _ensure_asyncio_event_loop() -> None:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
 
+@dataclass(frozen=True)
+class ValidatedBarBatch:
+    symbol: str
+    dataframe: pd.DataFrame
+    latest_completed_bar_end: Optional[datetime]
+    fetched_at: datetime
+    bar_age_seconds: float
+    fetch_generation_id: str
+    source: str
+    validation_status: str
+
+
+def should_validate_staleness(purpose: Optional[str], lookback_days: Optional[int]) -> bool:
+    """
+    Determines whether staleness validation must be enforced.
+    Strict Invariant: Real-time decision contexts (ENTRY_SIGNAL, REALTIME, EXECUTION)
+    MUST validate freshness unconditionally, even if historical lookback_days > 1.
+    """
+    if str(purpose or "").upper() in ("ENTRY_SIGNAL", "REALTIME", "EXECUTION"):
+        return True
+    return bool(lookback_days is not None and lookback_days <= 1)
+
+
 _alpaca_client = None
 _client_lock = threading.Lock()
 
@@ -578,8 +601,9 @@ def _validate_intraday_data(
                 logger.warning("Data validation failed for %s: Invalid ATR %.4f detected.", symbol, last_atr)
                 return _quarantine("invalid_atr")
 
-        # 3. Stale Quote Guard (Only for live real-time feeds when validate_staleness is True)
-        if validate_staleness:
+        # 3. Stale Quote Guard (Enforced for live feeds or ENTRY_SIGNAL)
+        effective_staleness = bool(validate_staleness or should_validate_staleness(purpose, None))
+        if effective_staleness:
             from strategies.session import is_market_open
             if is_market_open():
                 interval_seconds = _parse_interval_seconds(interval)
@@ -670,10 +694,7 @@ def fetch_intraday_alpaca(
             cached_df.copy(),
             symbol=symbol,
             interval=interval,
-            validate_staleness=(
-                lookback_days is not None
-                and lookback_days <= 1
-            ),
+            validate_staleness=should_validate_staleness(purpose, lookback_days),
             purpose=purpose,
         )
         if not validated_cache.empty:
@@ -759,7 +780,7 @@ def fetch_intraday_alpaca(
             "volume": "volume"
         })
         df.index.name = "datetime"
-        validate_staleness = (lookback_days is not None and lookback_days <= 1)
+        validate_staleness = should_validate_staleness(purpose, lookback_days)
         df = _validate_intraday_data(df, symbol, interval, validate_staleness=validate_staleness, purpose=purpose)
         if not df.empty:
             _write_cache(key, df.copy())
@@ -794,7 +815,7 @@ def fetch_batch_intraday_alpaca(
     # Check cache first for any freshly cached symbols
     results: Dict[str, pd.DataFrame] = {}
     pending_symbols: List[str] = []
-    validate_staleness = (lookback_days is not None and lookback_days <= 1)
+    validate_staleness = should_validate_staleness(purpose, lookback_days)
 
     for sym in clean_symbols:
         key = _cache_key(sym, interval, lookback_days, prepost, source="alpaca_api")
@@ -838,7 +859,38 @@ def fetch_batch_intraday_alpaca(
         primary_feed = str(getattr(config, "ALPACA_DATA_FEED", "iex")).lower()
         backup_feed = "sip" if primary_feed == "iex" else "iex"
 
-        bars_dict = None
+        def _extract_symbol_df(raw_df: pd.DataFrame, sym: str) -> pd.DataFrame:
+            if raw_df is None or raw_df.empty:
+                return pd.DataFrame()
+            is_multi = isinstance(raw_df.index, pd.MultiIndex)
+            if is_multi:
+                names = raw_df.index.names
+                if "symbol" in names:
+                    if sym not in raw_df.index.get_level_values("symbol").unique():
+                        return pd.DataFrame()
+                    sym_df = raw_df.xs(sym, level="symbol").copy()
+                else:
+                    if sym not in raw_df.index.levels[0].unique():
+                        return pd.DataFrame()
+                    sym_df = raw_df.xs(sym, level=0).copy()
+            else:
+                sym_df = raw_df.copy()
+
+            if sym_df.empty:
+                return pd.DataFrame()
+
+            sym_df = sym_df.rename(columns={
+                "open": "open",
+                "high": "high",
+                "low": "low",
+                "close": "close",
+                "volume": "volume"
+            })
+            sym_df.index.name = "datetime"
+            return sym_df
+
+        # 1. Fetch Primary Feed
+        primary_bars = None
         try:
             req = StockBarsRequest(
                 symbol_or_symbols=pending_symbols,
@@ -847,67 +899,72 @@ def fetch_batch_intraday_alpaca(
                 feed=primary_feed,
                 adjustment=Adjustment.ALL,
             )
-            bars_dict = client.get_stock_bars(req)
+            primary_bars = client.get_stock_bars(req)
         except Exception as primary_err:
-            logger.debug("[BATCH FETCH] Alpaca %s feed error for %s (%s). Trying %s feed.", primary_feed.upper(), pending_symbols, primary_err, backup_feed.upper())
+            logger.debug("[BATCH FETCH] Alpaca %s feed error for %s (%s).", primary_feed.upper(), pending_symbols, primary_err)
+
+        primary_raw_df = getattr(primary_bars, "df", None) if primary_bars is not None else None
+        stale_or_missing_symbols: List[str] = []
+
+        for sym in pending_symbols:
+            key = _cache_key(sym, interval, lookback_days, prepost, source="alpaca_api")
+            sym_df = _extract_symbol_df(primary_raw_df, sym) if primary_raw_df is not None else pd.DataFrame()
+            if sym_df.empty:
+                stale_or_missing_symbols.append(sym)
+                continue
+
+            validated_df = _validate_intraday_data(
+                sym_df, sym, interval, validate_staleness=validate_staleness, purpose=purpose
+            )
+            if not validated_df.empty:
+                _write_cache(key, validated_df.copy())
+                results[sym] = validated_df
+            else:
+                stale_or_missing_symbols.append(sym)
+
+        # 2. Independent Fallback Pipeline for Stale or Missing Symbols
+        if stale_or_missing_symbols:
+            logger.info(
+                "[BATCH FETCH FALLBACK] Attempting %s feed for %d symbols: %s",
+                backup_feed.upper(), len(stale_or_missing_symbols), stale_or_missing_symbols,
+            )
             try:
-                req = StockBarsRequest(
-                    symbol_or_symbols=pending_symbols,
+                backup_req = StockBarsRequest(
+                    symbol_or_symbols=stale_or_missing_symbols,
                     timeframe=tf,
                     start=start,
                     feed=backup_feed,
                     adjustment=Adjustment.ALL,
                 )
-                bars_dict = client.get_stock_bars(req)
-            except Exception as backup_err:
-                logger.warning("[BATCH FETCH] Alpaca data feed error for batch: %s", backup_err)
-                return results
+                backup_bars = client.get_stock_bars(backup_req)
+                backup_raw_df = getattr(backup_bars, "df", None) if backup_bars is not None else None
 
-        if not hasattr(bars_dict, "df") or bars_dict.df.empty:
-            return results
-
-        raw_df = bars_dict.df
-        is_multi = isinstance(raw_df.index, pd.MultiIndex)
-        available_symbols = set()
-        if is_multi:
-            if "symbol" in raw_df.index.names:
-                available_symbols = set(raw_df.index.get_level_values("symbol").unique())
-            else:
-                available_symbols = set(raw_df.index.levels[0].unique())
-
-        for sym in pending_symbols:
-            key = _cache_key(sym, interval, lookback_days, prepost, source="alpaca_api")
-            try:
-                if is_multi:
-                    if sym not in available_symbols:
+                for sym in stale_or_missing_symbols:
+                    key = _cache_key(sym, interval, lookback_days, prepost, source="alpaca_api")
+                    fb_df = _extract_symbol_df(backup_raw_df, sym) if backup_raw_df is not None else pd.DataFrame()
+                    if fb_df.empty:
+                        logger.warning("[BATCH FETCH REJECTED] %s: No data from fallback %s feed.", sym, backup_feed.upper())
                         continue
-                    if "symbol" in raw_df.index.names:
-                        sym_df = raw_df.xs(sym, level="symbol").copy()
+
+                    # Fallback generation is validated independently with its own freshness check
+                    fb_validated_df = _validate_intraday_data(
+                        fb_df, sym, interval, validate_staleness=validate_staleness, purpose=purpose
+                    )
+                    if not fb_validated_df.empty:
+                        logger.info("[BATCH FETCH FALLBACK ACCEPTED] %s: Accepted fresh bars from %s feed.", sym, backup_feed.upper())
+                        _write_cache(key, fb_validated_df.copy())
+                        results[sym] = fb_validated_df
                     else:
-                        sym_df = raw_df.xs(sym, level=0).copy()
-                else:
-                    sym_df = raw_df.copy()
+                        logger.warning(
+                            "[BATCH FETCH REJECTED] %s: Fallback %s bars also stale/invalid. Strictly excluded.",
+                            sym, backup_feed.upper(),
+                        )
+            except Exception as backup_err:
+                logger.warning("[BATCH FETCH] Alpaca fallback %s feed failed: %s", backup_feed.upper(), backup_err)
 
-                if sym_df.empty:
-                    continue
-
-                sym_df = sym_df.rename(columns={
-                    "open": "open",
-                    "high": "high",
-                    "low": "low",
-                    "close": "close",
-                    "volume": "volume"
-                })
-                sym_df.index.name = "datetime"
-                validated_df = _validate_intraday_data(
-                    sym_df, sym, interval, validate_staleness=validate_staleness, purpose=purpose
-                )
-                if not validated_df.empty:
-                    _write_cache(key, validated_df.copy())
-                    results[sym] = validated_df
-            except Exception as parse_err:
-                logger.debug("[BATCH FETCH] Error parsing %s from Alpaca batch: %s", sym, parse_err)
-
+        return results
+    except Exception as e:
+        logger.warning("[BATCH FETCH] Alpaca batch fetch failed: %s", e)
         return results
     except Exception as e:
         logger.warning("[BATCH FETCH] Alpaca batch fetch failed: %s", e)
@@ -944,10 +1001,7 @@ def fetch_intraday(
             cached_df.copy(),
             symbol=symbol,
             interval=interval,
-            validate_staleness=(
-                lookback_days is not None
-                and lookback_days <= 1
-            ),
+            validate_staleness=should_validate_staleness(purpose, lookback_days),
             purpose=purpose,
         )
         if not validated_cache.empty:
@@ -976,10 +1030,7 @@ def fetch_intraday(
             fallback_df.copy(),
             symbol=symbol,
             interval=interval,
-            validate_staleness=(
-                lookback_days is not None
-                and lookback_days <= 1
-            ),
+            validate_staleness=should_validate_staleness(purpose, lookback_days),
             purpose=purpose,
         )
         if not validated_fallback.empty:
@@ -1133,10 +1184,7 @@ def fetch_intraday_yfinance(
             cached_df.copy(),
             symbol=symbol,
             interval=interval,
-            validate_staleness=(
-                lookback_days is not None
-                and lookback_days <= 1
-            ),
+            validate_staleness=should_validate_staleness(purpose, lookback_days),
             purpose=purpose,
         )
         if not validated_cache.empty:
@@ -1214,7 +1262,7 @@ def fetch_intraday_yfinance(
             return pd.DataFrame()
 
     df = df.dropna(subset=["close"])
-    validate_staleness = (lookback_days is not None and lookback_days <= 1)
+    validate_staleness = should_validate_staleness(purpose, lookback_days)
     df = _validate_intraday_data(df, symbol, interval, validate_staleness=validate_staleness, purpose=purpose)
     if not df.empty:
         _write_cache(key, df.copy())

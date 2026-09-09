@@ -422,28 +422,51 @@ class DynamicTrailingStopManager:
         is_short = (side.upper() == "SELL")
         decimals = 4 if fill_price < 1.0 else 2
         stop_distance = (initial_stop - fill_price) if is_short else (fill_price - initial_stop)
-        # Fix A: Minimum required broker tick/distance buffer (0.05 min or 5 bps price scale)
+        # Minimum required broker tick/distance buffer (0.05 min or 5 bps price scale)
         min_required_distance = max(0.05, fill_price * 0.0005)
-        min_rebuild_distance  = round(min_required_distance * 1.15, decimals)
-        
-        if is_short:
-            is_valid = (initial_stop > fill_price) and (stop_distance >= min_required_distance)
-            if target_price and target_price > 0:
-                is_valid = is_valid and (fill_price > target_price)
-        else:
-            is_valid = (initial_stop < fill_price) and (stop_distance >= min_required_distance)
-            if target_price and target_price > 0:
-                is_valid = is_valid and (fill_price < target_price)
+        min_rebuild_distance = round(min_required_distance * 1.15, decimals)
 
-        action = "ACCEPTED" if is_valid else "REBUILD_CHILD_LEGS"
+        # 1. Component Validations
+        ordering_valid = (
+            (initial_stop > fill_price and (not target_price or fill_price > target_price))
+            if is_short
+            else (initial_stop < fill_price and (not target_price or fill_price < target_price))
+        )
+        noise_floor_valid = stop_distance >= min_required_distance
+        
+        min_rr = getattr(config, "MIN_RISK_REWARD_RATIO", getattr(config, "MIN_RR_RATIO", 1.5))
+        risk = stop_distance
+        reward = (fill_price - target_price) if is_short else ((target_price - fill_price) if target_price and target_price > 0 else 0.0)
+        actual_rr = (reward / risk) if risk > 0 and reward > 0 else 0.0
+        rr_valid = (round(actual_rr, 4) >= round(min_rr - 1e-4, 4)) if (target_price and target_price > 0) else True
+
+        composite_valid = bool(ordering_valid and noise_floor_valid and rr_valid)
+
+        if not ordering_valid or not noise_floor_valid:
+            action = "REBUILD_CHILD_LEGS"
+        elif not rr_valid:
+            action = "POST_FILL_RR_DEGRADED"
+        else:
+            action = "ACCEPTED"
 
         logger.info(
-            f"[POST-FILL GEOMETRY] symbol={symbol} side={side.upper()} signal_price={signal_price:.{decimals}f} actual_avg_fill={fill_price:.4f} "
-            f"stop_price={initial_stop:.{decimals}f} target_price={target_price or 0.0:.{decimals}f} stop_distance={stop_distance:.4f} "
-            f"valid={is_valid} action={action}"
+            f"[POST-FILL GEOMETRY] symbol={symbol} side={side.upper()} signal_price={signal_price:.{decimals}f} "
+            f"actual_avg_fill={fill_price:.4f} stop_price={initial_stop:.{decimals}f} target_price={target_price or 0.0:.{decimals}f} "
+            f"stop_distance={stop_distance:.4f} ordering_valid={ordering_valid} noise_floor_valid={noise_floor_valid} "
+            f"actual_rr={actual_rr:.2f} min_rr={min_rr:.2f} rr_valid={rr_valid} composite_valid={composite_valid} action={action}"
         )
 
-        if not is_valid:
+        if action == "POST_FILL_RR_DEGRADED":
+            logger.warning(
+                f"[POST-FILL GEOMETRY DEGRADED] {symbol} ({side.upper()}): Post-fill actual R:R ({actual_rr:.2f}) "
+                f"fell below required minimum ({min_rr:.2f}). Preserving valid protective stop at ${initial_stop:.{decimals}f}."
+            )
+            return initial_stop
+
+        if action == "ACCEPTED":
+            return initial_stop
+
+        if not composite_valid:
             # Fix B: min_rebuild_distance (with 15% buffer) for safe offset
             stop_offset = max(fill_price * 0.005, min_rebuild_distance)
 

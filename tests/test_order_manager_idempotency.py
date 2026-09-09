@@ -247,8 +247,8 @@ def test_sub_dollar_quote_adjustment_preserves_0001_precision(monkeypatch):
 
     assert res["status"] == "PLACED"
     assert submitted_kwargs["entry_price"] == 0.8525
-    assert submitted_kwargs["stop_price"] == 0.7325
-    assert submitted_kwargs["target_price"] == 1.0325
+    assert submitted_kwargs["stop_price"] == 0.7525
+    assert submitted_kwargs["target_price"] == 1.0525
 
 
 def test_final_quote_adjusted_invalid_geometry_is_vetoed(monkeypatch):

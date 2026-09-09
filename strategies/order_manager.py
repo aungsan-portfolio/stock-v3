@@ -1606,15 +1606,15 @@ def execute_signal(
 
             side_upper = signal.side.upper().strip()
             if side_upper in ("BUY", "LONG"):
-                stop_offset = executable_signal.entry_price - signal.stop_price
-                target_offset = signal.target_price - executable_signal.entry_price
-                stop_price = round(limit_price - stop_offset, precision)
-                target_price = round(limit_price + target_offset, precision)
+                stop_distance = signal.entry_price - signal.stop_price
+                target_distance = signal.target_price - signal.entry_price
+                stop_price = round(limit_price - stop_distance, precision)
+                target_price = round(limit_price + target_distance, precision)
             else:
-                stop_offset = signal.stop_price - executable_signal.entry_price
-                target_offset = executable_signal.entry_price - signal.target_price
-                stop_price = round(limit_price + stop_offset, precision)
-                target_price = round(limit_price - target_offset, precision)
+                stop_distance = signal.stop_price - signal.entry_price
+                target_distance = signal.entry_price - signal.target_price
+                stop_price = round(limit_price + stop_distance, precision)
+                target_price = round(limit_price - target_distance, precision)
 
             logger.info(
                 "[PRE-SUBMIT OFFSET ADJUST] %s: signal entry $%.2f -> live limit $%.4f | stop $%.4f -> $%.4f | target $%.4f -> $%.4f (unfavorable_chase=$%.4f)",

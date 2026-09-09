@@ -69,6 +69,35 @@ DIAGNOSTIC_INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
 DIAGNOSTIC_INTERNALLY_INCONSISTENT = "INTERNALLY_INCONSISTENT"
 
 
+def extract_benchmark_pct(data: Optional[Dict[str, Any]], symbol: str) -> Optional[float]:
+    """
+    Extracts benchmark percentage return safely from flat or nested dictionary structures.
+    Supports:
+      - data['spy_pct']
+      - data['SPY']['pct']
+      - data['SPY'] (scalar float or int)
+    """
+    if not data or not isinstance(data, dict):
+        return None
+    flat_key = f"{symbol.lower()}_pct"
+    if flat_key in data and data[flat_key] is not None:
+        try:
+            return float(data[flat_key])
+        except (TypeError, ValueError):
+            pass
+    node = data.get(symbol.upper()) or data.get(symbol.lower())
+    if isinstance(node, dict):
+        val = node.get("pct")
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                pass
+    elif isinstance(node, (int, float)):
+        return float(node)
+    return None
+
+
 def validate_regime_texture_combination(
     mode: str,
     texture: str,
@@ -86,13 +115,17 @@ def validate_regime_texture_combination(
     scores = component_scores or {}
     dt = data or {}
 
+    spy_pct = extract_benchmark_pct(dt, "SPY")
+    qqq_pct = extract_benchmark_pct(dt, "QQQ")
+    soxx_pct = extract_benchmark_pct(dt, "SOXX")
+
     attribution = {
         "mode": mode,
         "texture": texture,
-        "spy_pct": dt.get("spy_pct"),
-        "qqq_pct": dt.get("qqq_pct"),
-        "soxx_pct": dt.get("soxx_pct"),
-        "breadth": dt.get("scanner_candidate_count"),
+        "spy_pct": spy_pct,
+        "qqq_pct": qqq_pct,
+        "soxx_pct": soxx_pct,
+        "breadth": dt.get("market_breadth", dt.get("scanner_candidate_count")),
         "factor_scores": scores,
     }
 
@@ -100,6 +133,14 @@ def validate_regime_texture_combination(
         return (
             DIAGNOSTIC_INSUFFICIENT_DATA,
             "Mode is DATA_DEGRADED or unspecified; insufficient benchmark data for texture validation",
+            attribution,
+        )
+
+    # Fail-closed benchmark absence check
+    if spy_pct is None and qqq_pct is None:
+        return (
+            DIAGNOSTIC_INSUFFICIENT_DATA,
+            "Required benchmark inputs unavailable",
             attribution,
         )
 
@@ -119,8 +160,6 @@ def validate_regime_texture_combination(
         return (DIAGNOSTIC_INTERNALLY_INCONSISTENT, msg, attribution)
 
     # 2. Inconsistent: RISK_OFF with uniformly bullish components
-    spy_pct = dt.get("spy_pct")
-    qqq_pct = dt.get("qqq_pct")
     if (
         mode == MODE_RISK_OFF
         and spy_pct is not None
@@ -191,7 +230,12 @@ class MarketRegimeResult:
     diagnostic_message: Optional[str] = None
 
     def summary(self) -> str:
-        reasons_str = " | ".join(self.reasons) if self.reasons else "Normal Healthy Market"
+        if self.reasons:
+            reasons_str = " | ".join(self.reasons)
+        elif self.diagnostic_status == DIAGNOSTIC_INSUFFICIENT_DATA:
+            reasons_str = "Insufficient Benchmark Data (Fallback Mode)"
+        else:
+            reasons_str = "Normal Healthy Market"
         return (
             f"[REGIME] mode={self.mode} texture={self.market_texture} diag={self.diagnostic_status} score={self.score:+d} "
             f"allow_longs={self.allow_new_longs} halt_entries={self.halt_new_entries} "
