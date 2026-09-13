@@ -277,19 +277,19 @@ ALPACA_TOTAL_RETRIES                      = int(os.environ.get("ALPACA_TOTAL_RET
 ALPACA_RETRY_BACKOFF_FACTOR               = float(os.environ.get("ALPACA_RETRY_BACKOFF_FACTOR", 0.5))
 ALPACA_CONNECT_MAX_ATTEMPTS               = int(os.environ.get("ALPACA_CONNECT_MAX_ATTEMPTS", 3))
 
-# Swing Trading daily loss & protection configuration
+# Swing Trading daily loss & protection configuration (Option C: Hard Dollar Cap mandatory)
 SWING_MAX_DAILY_LOSS_PCT = float(os.environ.get("SWING_MAX_DAILY_LOSS_PCT", "0.01"))
-SWING_MAX_DAILY_LOSS_DOLLAR_CAP = float(os.environ.get("SWING_MAX_DAILY_LOSS_DOLLAR_CAP", "0.0"))
+SWING_MAX_DAILY_LOSS_DOLLAR_CAP = float(os.environ.get("SWING_MAX_DAILY_LOSS_DOLLAR_CAP", "300.00"))
 SWING_PROTECTED_SYMBOLS = {
     s.strip().upper()
-    for s in os.environ.get("SWING_PROTECTED_SYMBOLS", "SPY").split(",")
+    for s in os.environ.get("SWING_PROTECTED_SYMBOLS", "SPY,QQQ").split(",")
     if s.strip()
 }
 
 if not 0 < SWING_MAX_DAILY_LOSS_PCT <= 0.10:
     raise ValueError("SWING_MAX_DAILY_LOSS_PCT must be between 0 and 0.10")
-if SWING_MAX_DAILY_LOSS_DOLLAR_CAP < 0:
-    raise ValueError("SWING_MAX_DAILY_LOSS_DOLLAR_CAP cannot be negative")
+if SWING_MAX_DAILY_LOSS_DOLLAR_CAP <= 0:
+    raise ValueError("SWING_MAX_DAILY_LOSS_DOLLAR_CAP must be greater than 0")
 
 MAX_DAILY_LOSS_SWING   = float(os.environ.get("MAX_DAILY_LOSS_SWING", "150.0"))
 MAX_DAILY_LOSS_DAYTRADE = 300.0  # Expanded limit for tonight per trader instruction ($300.00)
@@ -463,7 +463,7 @@ LOG_BACKUP_COUNT    = 5
 INCIDENT_DIR            = LOG_DIR / "incidents"
 FLIGHT_RECORDER_CAPACITY = 500
 LATCH_HEARTBEAT_SECONDS = 300
-BROKER_EVENTS_PATH      = LOG_DIR / "broker_events.jsonl"
+BROKER_EVENTS_PATH      = Path(os.environ.get("BROKER_EVENTS_PATH", str(LOG_DIR / "broker_events.jsonl")))
 
 
 # ── Coach ────────────────────────────────────────
@@ -865,12 +865,9 @@ FORWARD_TEST_REPORT_MD   = REPORTS_DIR / "forward_test_report.md"
 FORWARD_TEST_SESSION     = None
 
 # ── Swing Trading Hard Risk Ceilings & Sector Policies ──────────────
-SWING_MAX_DAILY_LOSS_DOLLAR_CAP: float = 300.00
-SWING_MAX_DAILY_LOSS_PCT: float        = 0.01
 SWING_ACCOUNT_ID: str                  = "PA3R71I7JFDZ"
 SECTOR_EXPOSURE_CAP_PCT: float         = 0.25
 MAX_CLUSTER_RISK_PCT: float            = 0.0125
-SWING_PROTECTED_SYMBOLS: set           = {"SPY", "QQQ"}
 
 # Authoritative sector attribution with source and versioning
 SECTOR_MAPPINGS: dict = {

@@ -330,11 +330,13 @@ def run_backtest(symbol: str, strategy_name: str, lookback_days: int = 5, overri
                         max_trades=getattr(config, "MAX_TRADES_PER_DAY", 15),
                         check_reentry_cooldown=False,
                     )
-                    if risk_veto:
-                        logger.debug(f"[BACKTEST RISK VETO] {symbol} {signal.side}: {risk_veto}")
-                        continue
                 except Exception as risk_err:
-                    logger.warning("[BACKTEST RISK GATE ERROR] %s: %s", symbol, risk_err)
+                    logger.exception("[BACKTEST RISK CHECK FAILED] %s: %s", symbol, risk_err)
+                    risk_veto = f"RISK_CHECK_ERROR:{type(risk_err).__name__}"
+
+                if risk_veto:
+                    logger.debug(f"[BACKTEST RISK VETO] {symbol} {signal.side}: {risk_veto}")
+                    continue
                     
                 # Store in queue for causal t+1 open fill
                 pending_signal = {
@@ -432,7 +434,8 @@ def run_backtest(symbol: str, strategy_name: str, lookback_days: int = 5, overri
         "ending_equity": current_equity,
         "profit_factor": profit_factor,
         "avg_win": avg_win,
-        "avg_loss": avg_loss
+        "avg_loss": avg_loss,
+        "trades": trades,
     }
 
 
@@ -765,7 +768,7 @@ def run_portfolio_backtest(
                         try:
                             from strategies.intraday_risk import pre_trade_check
                             risk_dollars = shares * abs(best_signal.entry_price - best_signal.stop_price)
-                            allowed, veto_reason = pre_trade_check(
+                            veto_reason = pre_trade_check(
                                 equity=current_equity,
                                 current_pnl=current_equity - start_equity,
                                 trades_today=len([tr for tr in trades if tr['exit_time'].date() == current_date]),
@@ -777,11 +780,13 @@ def run_portfolio_backtest(
                                 open_symbols=list(active_positions.keys()),
                                 max_trades=getattr(config, "MAX_TRADES_PER_DAY", 15),
                             )
-                            if not allowed:
-                                logger.debug(f"[PORTFOLIO BACKTEST RISK VETO] {sym} {best_signal.side}: {veto_reason}")
-                                continue
                         except Exception as risk_err:
-                            logger.warning("[PORTFOLIO BACKTEST RISK GATE ERROR] %s: %s", sym, risk_err)
+                            logger.exception("[PORTFOLIO BACKTEST RISK CHECK FAILED] %s: %s", sym, risk_err)
+                            veto_reason = f"RISK_CHECK_ERROR:{type(risk_err).__name__}"
+
+                        if veto_reason:
+                            logger.debug(f"[PORTFOLIO BACKTEST RISK VETO] {sym} {best_signal.side}: {veto_reason}")
+                            continue
 
                         # Queue for causal t+1 open fill
                         pending_signals[sym] = {

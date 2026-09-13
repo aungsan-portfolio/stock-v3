@@ -40,3 +40,85 @@ class TestConfigValidation:
     def test_valid_default_config_passes(self):
         # Must execute cleanly with default settings
         validate_alpaca_runtime_config()
+
+    def test_swing_risk_defaults_in_subprocess(self):
+        import subprocess
+        import sys
+        code = (
+            "import config\n"
+            "assert config.SWING_MAX_DAILY_LOSS_PCT == 0.01\n"
+            "assert config.SWING_MAX_DAILY_LOSS_DOLLAR_CAP == 300.00\n"
+            "assert config.SWING_PROTECTED_SYMBOLS == {'SPY', 'QQQ'}\n"
+        )
+        res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        assert res.returncode == 0, f"Subprocess failed: {res.stderr}"
+
+    def test_swing_risk_env_overrides_in_subprocess(self):
+        import os
+        import subprocess
+        import sys
+        env = os.environ.copy()
+        env["SWING_MAX_DAILY_LOSS_PCT"] = "0.03"
+        env["SWING_MAX_DAILY_LOSS_DOLLAR_CAP"] = "500.00"
+        env["SWING_PROTECTED_SYMBOLS"] = "AAPL, MSFT ,GOOG "
+        code = (
+            "import config\n"
+            "assert abs(config.SWING_MAX_DAILY_LOSS_PCT - 0.03) < 1e-6\n"
+            "assert abs(config.SWING_MAX_DAILY_LOSS_DOLLAR_CAP - 500.00) < 1e-6\n"
+            "assert config.SWING_PROTECTED_SYMBOLS == {'AAPL', 'MSFT', 'GOOG'}\n"
+        )
+        res = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+        assert res.returncode == 0, f"Subprocess failed: {res.stderr}"
+
+    def test_swing_risk_dollar_cap_zero_rejected_option_c(self):
+        import os
+        import subprocess
+        import sys
+        env = os.environ.copy()
+        env["SWING_MAX_DAILY_LOSS_DOLLAR_CAP"] = "0.0"
+        code = "import config"
+        res = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+        assert res.returncode != 0
+        assert "SWING_MAX_DAILY_LOSS_DOLLAR_CAP must be greater than 0" in res.stderr
+
+    @pytest.mark.parametrize(
+        "env_var,val,err_match",
+        [
+            ("SWING_MAX_DAILY_LOSS_PCT", "0.15", "SWING_MAX_DAILY_LOSS_PCT must be between 0 and 0.10"),
+            ("SWING_MAX_DAILY_LOSS_PCT", "-0.01", "SWING_MAX_DAILY_LOSS_PCT must be between 0 and 0.10"),
+            ("SWING_MAX_DAILY_LOSS_DOLLAR_CAP", "-1.0", "SWING_MAX_DAILY_LOSS_DOLLAR_CAP must be greater than 0"),
+            ("SWING_MAX_DAILY_LOSS_DOLLAR_CAP", "0.0", "SWING_MAX_DAILY_LOSS_DOLLAR_CAP must be greater than 0"),
+            ("SWING_MAX_DAILY_LOSS_DOLLAR_CAP", "-50.0", "SWING_MAX_DAILY_LOSS_DOLLAR_CAP must be greater than 0"),
+        ],
+    )
+    def test_swing_risk_validation_errors_in_subprocess(self, env_var, val, err_match):
+        import os
+        import subprocess
+        import sys
+        env = os.environ.copy()
+        env[env_var] = val
+        code = "import config"
+        res = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+        assert res.returncode != 0
+        assert err_match in res.stderr
+
+    def test_single_definition_of_swing_risk_configs(self):
+        import ast
+        from pathlib import Path
+        config_path = Path(__file__).resolve().parent.parent / "config.py"
+        tree = ast.parse(config_path.read_text(encoding="utf-8"))
+
+        target_names = {
+            "SWING_MAX_DAILY_LOSS_PCT",
+            "SWING_MAX_DAILY_LOSS_DOLLAR_CAP",
+            "SWING_PROTECTED_SYMBOLS",
+        }
+        counts = {name: 0 for name in target_names}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id in counts:
+                        counts[target.id] += 1
+
+        for name, count in counts.items():
+            assert count == 1, f"Expected {name} to be assigned exactly once, found {count} assignments."

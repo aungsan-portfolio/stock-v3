@@ -15,6 +15,7 @@ import time
 from collections import deque
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Set, Tuple
+from pathlib import Path
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.stream import TradingStream
@@ -43,6 +44,7 @@ from predictor import Signal
 from position_rotator import PositionRotator, OpenPosition, IncomingSignal
 
 logger = logging.getLogger(__name__)
+_broker_event_write_lock = threading.Lock()
 
 
 class AccountModeViolation(RuntimeError):
@@ -1313,22 +1315,23 @@ class AlpacaBridge:
 
             # Record always-on trade update stream to broker_events.jsonl
             try:
-                broker_ev_path = getattr(config, "BROKER_EVENTS_PATH", None) or Path("logs/broker_events.jsonl")
-                broker_ev_path = Path(broker_ev_path)
+                configured_path = getattr(config_module, "BROKER_EVENTS_PATH", None)
+                broker_ev_path = Path(configured_path or "logs/broker_events.jsonl")
                 broker_ev_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(broker_ev_path, "a", encoding="utf-8") as f_ev:
-                    f_ev.write(json.dumps({
-                        "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-                        "event": event_name,
-                        "status": status,
-                        "order_id": parent_order_id,
-                        "symbol": str(getattr(order, "symbol", "") if order else ""),
-                        "filled_qty": cumulative_filled_qty,
-                        "price": average_fill_price,
-                        "execution_id": execution_id,
-                    }) + "\n")
+                with _broker_event_write_lock:
+                    with open(broker_ev_path, "a", encoding="utf-8") as f_ev:
+                        f_ev.write(json.dumps({
+                            "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                            "event": event_name,
+                            "status": status,
+                            "order_id": parent_order_id,
+                            "symbol": str(getattr(order, "symbol", "") if order else ""),
+                            "filled_qty": cumulative_filled_qty,
+                            "price": average_fill_price,
+                            "execution_id": execution_id,
+                        }) + "\n")
             except Exception:
-                pass
+                logger.exception("Failed to persist broker trade-update event")
 
             if not self._remember_trade_update(event_key):
                 logger.debug("Ignoring duplicate Alpaca trade update %s", event_key)

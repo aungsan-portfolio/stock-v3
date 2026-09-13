@@ -285,10 +285,14 @@ def test_near_miss_logging_triggered(caplog):
 
     now_utc = datetime(2026, 9, 11, 18, 0, 10, tzinfo=timezone.utc)
 
+    from zoneinfo import ZoneInfo
+    now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
+
     with patch("strategies.orchestrator.datetime") as mock_dt, \
          patch("strategies.orchestrator.evaluate_symbols_parallel", return_value=[sig]), \
          patch("strategies.session.is_market_open", return_value=True), \
          patch("strategies.session.is_past_opening_buffer", return_value=True), \
+         patch("strategies.session.now_eastern", return_value=now_et), \
          patch("strategies.orchestrator._min_confidence_for", return_value=0.60):
         mock_dt.now.return_value = now_utc
         mock_dt.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)

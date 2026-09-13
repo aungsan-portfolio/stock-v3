@@ -1,5 +1,5 @@
 """
-stock_prompts.py — Wall-Street-style research prompt pack runner.
+stock_prompts.py - Wall-Street-style research prompt pack runner.
 
 Reads templates in `prompts/*.md`, fills `{{placeholders}}` with live numbers
 sourced from this repo (data_manager / market_universe / hot_scanner /
@@ -9,7 +9,7 @@ config.WATCHLIST), and writes a finished Markdown brief to
 Design rules:
 - This module never places orders. It only produces research briefs.
 - All network / data calls are best-effort. On any failure, the slot is
-  left as `TBD` and execution continues — bad data must never break
+  left as `TBD` and execution continues - bad data must never break
   the run.
 - Imports are wrapped in try/except so this module can also run in a
   lean environment (e.g. just the templates and placeholder fills).
@@ -281,7 +281,7 @@ def ticker_context(symbol: str) -> Dict[str, str]:
             hi = raw_close.tail(252).max()
             lo = raw_close.tail(252).min()
             ctx["fifty_two_week_range"] = (
-                f"{_safe_float(lo, 2)} – {_safe_float(hi, 2)}"
+                f"{_safe_float(lo, 2)} - {_safe_float(hi, 2)}"
             )
         except Exception:
             pass
@@ -446,7 +446,7 @@ def write_render(template: Template, vars_in: Dict[str, str],
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="prompts",
-        description="Stock Engine Pro v3 — research prompt pack",
+        description="Stock Engine Pro v3 - research prompt pack",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 

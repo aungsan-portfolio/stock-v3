@@ -112,8 +112,8 @@ def test_backtest_trade_timestamps(monkeypatch):
     assert t["decision_time"] < t["fill_time"]
 
 
-def test_backtest_unified_risk_gate(monkeypatch):
-    """H-07: Unified pre_trade_check vetoes candidate entries in backtest."""
+def test_backtest_unified_risk_gate_vetoed(monkeypatch):
+    """H-07: Unified pre_trade_check returning reason string vetoes candidate entries in backtest."""
     dates = pd.date_range("2026-08-14 09:30", periods=35, freq="5min")
     opens = [100.0] * 35
     df = pd.DataFrame(
@@ -150,12 +150,179 @@ def test_backtest_unified_risk_gate(monkeypatch):
     monkeypatch.setattr("strategies.backtester.fetch_intraday_yfinance", lambda sym, lookback_days=5: df)
     monkeypatch.setattr("strategies.backtester.MomentumScalpStrategy", MockStrategy)
 
-    # Force pre_trade_check to veto entry
+    # Force pre_trade_check to veto entry by returning non-empty error string
     import strategies.intraday_risk as risk
-    monkeypatch.setattr(risk, "pre_trade_check", lambda **kwargs: (False, "Simulated Risk Veto"))
+    monkeypatch.setattr(risk, "pre_trade_check", lambda **kwargs: "Simulated Risk Veto")
 
     result = run_backtest("TSLA", strategy_name="MOMENTUM_SCALP", lookback_days=5, override_min_confidence=0.60)
     trades = result.get("trades", [])
-
-    # Trade must be vetoed and zero trades returned
     assert len(trades) == 0
+
+
+def test_backtest_unified_risk_gate_allowed(monkeypatch):
+    """Unified pre_trade_check returning empty string allows trade to proceed in backtest."""
+    dates = pd.date_range("2026-08-14 09:30", periods=35, freq="5min")
+    opens = [100.0] * 35
+    df = pd.DataFrame(
+        {
+            "open": opens,
+            "high": [101.0] * 35,
+            "low": [99.0] * 35,
+            "close": opens,
+            "volume": [10000] * 35,
+            "vwap": [100.0] * 35,
+        },
+        index=dates,
+    )
+
+    class MockStrategy:
+        name = "MOMENTUM_SCALP"
+
+        def evaluate(self, symbol, current_df):
+            if len(current_df) == 30:
+                return TradeSignal(
+                    symbol=symbol,
+                    strategy=StrategyName.MOMENTUM_SCALP,
+                    side="BUY",
+                    confidence=0.85,
+                    entry_price=100.0,
+                    stop_price=99.0,
+                    target_price=102.0,
+                    atr=0.5,
+                    risk_per_share=1.0,
+                    reason="Signal approved",
+                )
+            return None
+
+    monkeypatch.setattr("strategies.backtester.fetch_intraday_yfinance", lambda sym, lookback_days=5: df)
+    monkeypatch.setattr("strategies.backtester.MomentumScalpStrategy", MockStrategy)
+
+    # Return empty string meaning risk gate passes
+    import strategies.intraday_risk as risk
+    monkeypatch.setattr(risk, "pre_trade_check", lambda **kwargs: "")
+
+    result = run_backtest("TSLA", strategy_name="MOMENTUM_SCALP", lookback_days=5, override_min_confidence=0.60)
+    trades = result.get("trades", [])
+    assert len(trades) >= 1
+
+
+def test_backtest_unified_risk_gate_exception_fail_closed(monkeypatch):
+    """Unified pre_trade_check exception fails closed (vetoes entry) in single backtest."""
+    dates = pd.date_range("2026-08-14 09:30", periods=35, freq="5min")
+    opens = [100.0] * 35
+    df = pd.DataFrame(
+        {
+            "open": opens,
+            "high": [101.0] * 35,
+            "low": [99.0] * 35,
+            "close": opens,
+            "volume": [10000] * 35,
+            "vwap": [100.0] * 35,
+        },
+        index=dates,
+    )
+
+    class MockStrategy:
+        name = "MOMENTUM_SCALP"
+
+        def evaluate(self, symbol, current_df):
+            if len(current_df) == 30:
+                return TradeSignal(
+                    symbol=symbol,
+                    strategy=StrategyName.MOMENTUM_SCALP,
+                    side="BUY",
+                    confidence=0.85,
+                    entry_price=100.0,
+                    stop_price=99.0,
+                    target_price=102.0,
+                    atr=0.5,
+                    risk_per_share=1.0,
+                    reason="Signal will fail-closed",
+                )
+            return None
+
+    monkeypatch.setattr("strategies.backtester.fetch_intraday_yfinance", lambda sym, lookback_days=5: df)
+    monkeypatch.setattr("strategies.backtester.MomentumScalpStrategy", MockStrategy)
+
+    import strategies.intraday_risk as risk
+    def raise_err(**kwargs):
+        raise RuntimeError("Simulated Risk Check Outage")
+    monkeypatch.setattr(risk, "pre_trade_check", raise_err)
+
+    result = run_backtest("TSLA", strategy_name="MOMENTUM_SCALP", lookback_days=5, override_min_confidence=0.60)
+    trades = result.get("trades", [])
+    assert len(trades) == 0
+
+
+def test_portfolio_backtest_risk_gate_contract(monkeypatch):
+    """Verify run_portfolio_backtest correctly vetoes on non-empty string, allows on empty, and fails closed on exception."""
+    from strategies.backtester import run_portfolio_backtest
+
+    dates = pd.date_range("2026-08-14 09:30", periods=35, freq="5min")
+    opens = [100.0] * 35
+    df = pd.DataFrame(
+        {
+            "open": opens,
+            "high": [101.0] * 35,
+            "low": [99.0] * 35,
+            "close": opens,
+            "volume": [10000] * 35,
+            "vwap": [100.0] * 35,
+            "atr": [0.5] * 35,
+        },
+        index=dates,
+    )
+
+    class MockStrategy:
+        name = "MOMENTUM_SCALP"
+
+        def evaluate(self, symbol, current_df):
+            if len(current_df) == 30:
+                return TradeSignal(
+                    symbol=symbol,
+                    strategy=StrategyName.MOMENTUM_SCALP,
+                    side="BUY",
+                    confidence=0.85,
+                    entry_price=100.0,
+                    stop_price=99.0,
+                    target_price=102.0,
+                    atr=0.5,
+                    risk_per_share=1.0,
+                    reason="Portfolio candidate",
+                )
+            return None
+
+    monkeypatch.setattr("strategies.backtester.MomentumScalpStrategy", MockStrategy)
+    import strategies.intraday_risk as risk
+
+    # 1. Allowed case ("")
+    monkeypatch.setattr(risk, "pre_trade_check", lambda **kwargs: "")
+    res_allowed = run_portfolio_backtest(
+        symbols=["AAPL"],
+        strategy_name="MOMENTUM_SCALP",
+        data_dict={"AAPL": df.copy()},
+        live_parity=True,
+    )
+    assert res_allowed["total_trades"] >= 1
+
+    # 2. Vetoed case (non-empty string)
+    monkeypatch.setattr(risk, "pre_trade_check", lambda **kwargs: "Daily loss cap reached")
+    res_vetoed = run_portfolio_backtest(
+        symbols=["AAPL"],
+        strategy_name="MOMENTUM_SCALP",
+        data_dict={"AAPL": df.copy()},
+        live_parity=True,
+    )
+    assert res_vetoed["total_trades"] == 0
+
+    # 3. Exception fail-closed case
+    def raise_exc(**kwargs):
+        raise RuntimeError("Corrupt state")
+    monkeypatch.setattr(risk, "pre_trade_check", raise_exc)
+    res_fail_closed = run_portfolio_backtest(
+        symbols=["AAPL"],
+        strategy_name="MOMENTUM_SCALP",
+        data_dict={"AAPL": df.copy()},
+        live_parity=True,
+    )
+    assert res_fail_closed["total_trades"] == 0

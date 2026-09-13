@@ -145,12 +145,16 @@ def test_raw_precision_confidence_gating():
         missing_symbols=(),
     )
 
+    from zoneinfo import ZoneInfo
+    now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
+
     with patch("strategies.orchestrator.datetime") as mock_dt, \
          patch("strategies.orchestrator.evaluate_symbols_parallel", return_value=eval_result), \
          patch("strategies.orchestrator._min_confidence_for", return_value=0.6000000), \
          patch("strategies.orchestrator.execute_signal") as mock_exec, \
          patch("strategies.session.is_market_open", return_value=True), \
-         patch("strategies.session.is_past_opening_buffer", return_value=True):
+         patch("strategies.session.is_past_opening_buffer", return_value=True), \
+         patch("strategies.session.now_eastern", return_value=now_et):
 
         mock_dt.now.return_value = now_utc
         mock_dt.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
