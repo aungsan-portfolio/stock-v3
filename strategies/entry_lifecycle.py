@@ -86,6 +86,7 @@ class FillUpdate:
     entry: PendingEntry
     fill_delta: float
     is_complete: bool
+    incremental_price: float = 0.0
 
 
 class EntryOrderLifecycle:
@@ -201,12 +202,25 @@ class EntryOrderLifecycle:
             if fill_delta <= 0:
                 return None
 
+            prev_qty = entry.cumulative_filled_qty
+            prev_avg_px = entry.average_fill_price
+            curr_avg_px = float(average_fill_price)
+
+            if prev_qty > 0 and curr_avg_px > 0:
+                prev_notional = prev_qty * prev_avg_px
+                curr_notional = reported_qty * curr_avg_px
+                delta_notional = curr_notional - prev_notional
+                incremental_price = delta_notional / fill_delta if fill_delta > 0 else curr_avg_px
+            else:
+                incremental_price = curr_avg_px
+
             entry.cumulative_filled_qty = reported_qty
             entry.average_fill_price = float(average_fill_price)
             return FillUpdate(
                 entry=entry,
                 fill_delta=fill_delta,
                 is_complete=reported_qty >= entry.requested_qty,
+                incremental_price=incremental_price,
             )
 
     @staticmethod
@@ -678,21 +692,26 @@ class EntryOrderLifecycle:
 
         # Log confirmed entry fill to trade journal
         try:
-            from strategies.trade_journal import log_fill
-            log_fill(
-                symbol=entry.symbol,
-                side=entry.signal.side,
-                qty=int(cumulative_filled_qty),
-                fill_price=average_fill_price,
-                expected_price=entry.submitted_entry_price or entry.signal.entry_price,
-                slippage=(average_fill_price - (entry.submitted_entry_price or entry.signal.entry_price)) / (entry.submitted_entry_price or entry.signal.entry_price) if (entry.submitted_entry_price or entry.signal.entry_price) else 0.0,
-                fill_latency_ms=max(0.0, (time.time() - entry.submitted_at) * 1000.0) if entry.submitted_at else None,
-                order_id=str(entry.parent_order_id),
-                broker_order_id=str(entry.parent_order_id),
-                execution_id=str(execution_id) if execution_id else str(entry.parent_order_id),
-                signal_id=getattr(entry.signal, "signal_id", None),
-                strategy=getattr(entry.signal, "strategy", "UNKNOWN"),
-            )
+            from strategies.trade_journal import log_fill, get_journal_lock
+            delta_qty = int(update.fill_delta) if (update.fill_delta % 1 == 0) else float(update.fill_delta)
+            fill_px = update.incremental_price if update.incremental_price > 0 else average_fill_price
+            exp_px = entry.submitted_entry_price or entry.signal.entry_price
+            with get_journal_lock():
+                log_fill(
+                    symbol=entry.symbol,
+                    side=entry.signal.side,
+                    qty=delta_qty,
+                    fill_price=fill_px,
+                    expected_price=exp_px,
+                    slippage=(fill_px - exp_px) / exp_px if exp_px else 0.0,
+                    fill_latency_ms=max(0.0, (time.time() - entry.submitted_at) * 1000.0) if entry.submitted_at else None,
+                    order_id=str(entry.parent_order_id),
+                    broker_order_id=str(entry.parent_order_id),
+                    execution_id=str(execution_id) if execution_id else str(entry.parent_order_id),
+                    signal_id=getattr(entry.signal, "signal_id", None),
+                    strategy=getattr(entry.signal, "strategy", "UNKNOWN"),
+                    account_id=getattr(bridge, "account_id", None) or "ALPACA",
+                )
         except Exception as j_err:
             logger.debug("[ENTRY LIFECYCLE] Non-fatal journal fill log error: %s", j_err)
 

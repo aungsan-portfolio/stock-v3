@@ -61,6 +61,15 @@ def _get_git_commit() -> str:
         return "production-release-v3"
 
 
+from enum import Enum
+
+
+class PreflightDecision(str, Enum):
+    GO = "GO"
+    GO_WITH_ENTRY_HOLD = "GO_WITH_ENTRY_HOLD"
+    NO_GO = "NO_GO"
+
+
 @dataclass
 class GateResult:
     name: str
@@ -68,6 +77,7 @@ class GateResult:
     passed: bool
     message: str
     details: Dict[str, Any]
+    status: str = "PASS"  # "PASS", "FAIL", "WARN", "NOT_VERIFIED", "ENTRY_HOLD"
 
 
 @dataclass
@@ -75,7 +85,9 @@ class PreflightReport:
     run_id: str
     stage: str
     timestamp: str
-    status: str  # "GO", "GO_WITH_WARNINGS", "NO-GO"
+    decision: PreflightDecision
+    entry_allowed: bool
+    status: str  # Backward-compatible mirror of decision.value
     summary: str
     git_commit: str
     config_hash: str
@@ -84,27 +96,35 @@ class PreflightReport:
     gates: List[Dict[str, Any]]
     critical_pass: int
     critical_fail: int
-    warning_pass: int
-    warning_fail: int
+    critical_not_verified: int
+    warning_count: int
+    warnings: List[str]
+    warning_pass: int = 0
+    warning_fail: int = 0
+    hold_reason: Optional[str] = None
+    wall_clock_utc: str = ""
+    wall_clock_local: str = ""
+    timezone_name: str = ""
+    utc_offset: str = ""
 
 
-def check_data_freshness() -> GateResult:
-    """Verifies that daily/intraday price data is available and non-empty."""
+def check_historical_data_freshness() -> GateResult:
+    """Verifies that daily/historical price data is available and non-empty."""
     try:
         from data_manager import fetch_ohlcv
         df = fetch_ohlcv("SPY")
         if df is None or len(df) < 50:
             return GateResult(
-                name="Data Freshness",
+                name="Historical Data Freshness",
                 category="CRITICAL",
                 passed=False,
                 message="SPY historical price data is missing or insufficient (<50 rows)",
                 details={"rows": 0 if df is None else len(df)},
             )
-        
+
         last_date = df.index[-1].strftime("%Y-%m-%d") if hasattr(df.index[-1], "strftime") else str(df.index[-1])
         return GateResult(
-            name="Data Freshness",
+            name="Historical Data Freshness",
             category="CRITICAL",
             passed=True,
             message=f"SPY price data verified ({len(df)} rows, latest: {last_date})",
@@ -112,7 +132,7 @@ def check_data_freshness() -> GateResult:
         )
     except Exception as exc:
         return GateResult(
-            name="Data Freshness",
+            name="Historical Data Freshness",
             category="CRITICAL",
             passed=False,
             message=f"Data fetch exception: {exc}",
@@ -120,8 +140,109 @@ def check_data_freshness() -> GateResult:
         )
 
 
+check_data_freshness = check_historical_data_freshness
+
+
+def check_intraday_data_readiness(
+    bridge: Any = None,
+    anchor_symbols: Tuple[str, ...] = ("SPY", "QQQ"),
+    grace_seconds: float = 60.0,
+) -> GateResult:
+    """Verifies live 5m bar timeliness and freshness during regular market hours."""
+    from strategies.session import is_market_open, now_eastern, EASTERN_TZ
+    from datetime import datetime
+    import pandas as pd
+
+    if not is_market_open():
+        return GateResult(
+            name="Intraday Data Readiness",
+            category="WARNING",
+            passed=True,
+            status="PASS",
+            message="Market closed or pre-market — live intraday 5m cadence deferred to market open",
+            details={"market_open": False, "status": "DEFERRED_TO_OPEN"},
+        )
+
+    # 09:30–09:35 ET warmup window — first bar is forming, no completed bar expected yet
+    now_et = now_eastern()
+    market_open_dt = datetime.combine(now_et.date(), config.MARKET_OPEN, tzinfo=EASTERN_TZ)
+    seconds_since_open = (now_et - market_open_dt).total_seconds()
+    WARMUP_SECONDS = 300.0  # 5 minutes
+    if 0 <= seconds_since_open < WARMUP_SECONDS:
+        return GateResult(
+            name="Intraday Data Readiness",
+            category="CRITICAL",
+            passed=True,
+            status="PASS",
+            message=f"Market open warmup period ({seconds_since_open:.0f}s elapsed) — first 5m bar forming",
+            details={"warmup": True, "seconds_since_open": seconds_since_open},
+        )
+
+    from strategies.intraday_data import fetch_intraday, select_last_completed_bar
+
+    stale_symbols = []
+    hold_symbols = []
+    symbol_ages = {}
+    interval_seconds = 300.0
+    max_recoverable_delay = interval_seconds + grace_seconds  # 360.0s
+
+    for sym in anchor_symbols:
+        try:
+            df = fetch_intraday(sym, interval="5m", bridge=bridge)
+            if df is None or df.empty:
+                stale_symbols.append(f"{sym}:NO_DATA")
+                continue
+
+            now_utc = pd.Timestamp.now(tz="UTC")
+            future_tol = float(getattr(config, "BAR_FUTURE_TOLERANCE_SECONDS", 5.0))
+            completed_bar = select_last_completed_bar(
+                df=df,
+                interval_seconds=int(interval_seconds),
+                now_utc=now_utc,
+                close_tolerance_seconds=future_tol,
+            )
+            age = float(completed_bar.post_close_delay_seconds)
+            symbol_ages[sym] = round(age, 1)
+
+            if age > max_recoverable_delay:
+                stale_symbols.append(f"{sym}:{age:.0f}s > {max_recoverable_delay:.0f}s")
+            elif age > grace_seconds:
+                hold_symbols.append(f"{sym}:{age:.0f}s")
+        except Exception as exc:
+            stale_symbols.append(f"{sym}:{exc}")
+
+    if stale_symbols:
+        return GateResult(
+            name="Intraday Data Readiness",
+            category="CRITICAL",
+            passed=False,
+            status="FAIL",
+            message=f"Stale anchor bars (>1 interval behind or missing): {', '.join(stale_symbols)}",
+            details={"stale_symbols": stale_symbols, "ages": symbol_ages, "grace": grace_seconds},
+        )
+
+    if hold_symbols:
+        return GateResult(
+            name="Intraday Data Readiness",
+            category="CRITICAL",
+            passed=True,
+            status="ENTRY_HOLD",
+            message=f"Mid-bar startup: Anchor bars valid within current forming interval ({', '.join(hold_symbols)} > {grace_seconds:.0f}s); entries held until next bar close",
+            details={"entry_hold": True, "hold_symbols": hold_symbols, "ages": symbol_ages, "grace": grace_seconds},
+        )
+
+    return GateResult(
+        name="Intraday Data Readiness",
+        category="CRITICAL",
+        passed=True,
+        status="PASS",
+        message=f"Anchor bars fresh within {grace_seconds}s ({', '.join(f'{k}={v}s' for k, v in symbol_ages.items())})",
+        details={"ages": symbol_ages, "grace": grace_seconds},
+    )
+
+
 def check_broker_reconciliation(bridge: Any = None) -> GateResult:
-    """Verifies Alpaca paper broker connectivity, active status, and 0 orphan orders."""
+    """Verifies Alpaca paper broker connectivity, active status, 0 orphan orders, and total account flatness."""
     from alpaca_bridge import AlpacaBridge
     owns_bridge = False
     if bridge is None:
@@ -135,6 +256,7 @@ def check_broker_reconciliation(bridge: Any = None) -> GateResult:
                 name="Broker Reconciliation",
                 category="CRITICAL",
                 passed=False,
+                status="FAIL",
                 message="Could not connect to Alpaca Paper Broker API",
                 details={"connected": False},
             )
@@ -142,29 +264,69 @@ def check_broker_reconciliation(bridge: Any = None) -> GateResult:
         recon = bridge.reconcile_startup_state()
         snap = recon.get("snapshot", {})
         clean = bool(snap.get("clean", False))
-        n_longs = int(snap.get("n_long", 0))
+
+        # Total positions audit: check all positions (long and short)
+        positions = []
+        try:
+            if hasattr(bridge, "positions_plain"):
+                positions = bridge.positions_plain() or []
+            elif hasattr(bridge, "get_all_positions"):
+                raw_positions = bridge.get_all_positions() or []
+                positions = [{"symbol": p.symbol, "qty": float(p.qty)} for p in raw_positions]
+        except Exception as p_err:
+            logger.warning("Could not fetch plain positions directly: %s", p_err)
+            positions = snap.get("open_positions", [])
+            if positions and isinstance(positions[0], (tuple, list)):
+                positions = [{"symbol": s, "qty": q} for s, q in positions]
+
+        longs = [p for p in positions if float(p.get("qty", 0.0) or 0.0) > 0]
+        shorts = [p for p in positions if float(p.get("qty", 0.0) or 0.0) < 0]
+        total_open_positions = len(positions)
+        n_longs = len(longs)
+        n_shorts = len(shorts)
+
         n_orders = int(snap.get("n_working_orders", 0))
         orphan_exits = snap.get("orphan_exits", [])
         duplicate_refs = snap.get("duplicate_refs", [])
 
-        passed = clean and len(orphan_exits) == 0 and len(duplicate_refs) == 0
-        msg = (
-            f"Broker reconciled cleanly ({n_longs} longs, {n_orders} working orders, 0 duplicates, 0 orphans)"
-            if passed
-            else f"Broker reconciliation mismatch: clean={clean}, orphans={len(orphan_exits)}, duplicates={len(duplicate_refs)}"
-        )
+        is_flat = (total_open_positions == 0)
+        passed = clean and is_flat and len(orphan_exits) == 0 and len(duplicate_refs) == 0
+
+        details = {
+            "clean": clean,
+            "total_open_positions": total_open_positions,
+            "long_positions": n_longs,
+            "short_positions": n_shorts,
+            "working_orders": n_orders,
+            "duplicates": len(duplicate_refs),
+            "orphans": len(orphan_exits),
+            "is_flat": is_flat,
+            "orphan_exits": orphan_exits,
+            "duplicate_refs": duplicate_refs,
+        }
+
+        if passed:
+            msg = (
+                f"Broker reconciled cleanly | Open positions: {total_open_positions} "
+                f"(longs: {n_longs}, shorts: {n_shorts}) | Working orders: {n_orders} | "
+                f"Duplicates: {len(duplicate_refs)} | Orphans: {len(orphan_exits)}"
+            )
+            status = "PASS"
+        else:
+            msg = (
+                f"Broker reconciliation mismatch: clean={clean}, open_positions={total_open_positions} "
+                f"(longs={n_longs}, shorts={n_shorts}), working_orders={n_orders}, "
+                f"duplicates={len(duplicate_refs)}, orphans={len(orphan_exits)}"
+            )
+            status = "FAIL"
+
         return GateResult(
             name="Broker Reconciliation",
             category="CRITICAL",
             passed=passed,
+            status=status,
             message=msg,
-            details={
-                "clean": clean,
-                "n_longs": n_longs,
-                "n_working_orders": n_orders,
-                "orphan_exits": orphan_exits,
-                "duplicate_refs": duplicate_refs,
-            },
+            details=details,
         )
     except Exception as exc:
         return GateResult(
@@ -348,41 +510,89 @@ def check_event_and_models() -> GateResult:
 
 
 def check_trade_stream_readiness(bridge: Any = None) -> GateResult:
-    """Verifies that Trade Stream State is HEALTHY with single stream thread and clean reconciliation."""
+    """Verifies that Trade Stream State is HEALTHY with single stream thread, valid paper endpoint, and clean reconciliation."""
     if bridge is None:
         return GateResult(
             name="Trade Stream Readiness",
             category="CRITICAL",
-            passed=True,
-            message="Trade stream check bypassed (no bridge provided)",
-            details={},
+            passed=False,
+            status="NOT_VERIFIED",
+            message="No broker bridge was supplied to the pre-flight audit",
+            details={"verified": False, "reason": "no_bridge_supplied"},
         )
     try:
         from alpaca_bridge import StreamState
         state = getattr(bridge, "stream_state", None)
         threads = getattr(bridge, "active_stream_threads_count", 0)
-        generation = getattr(bridge, "stream_generation", 1)
+        generation = getattr(bridge, "stream_generation", 0)
         ready = getattr(bridge, "_trade_stream_ready", False)
+        recovery_req = getattr(bridge, "_trade_stream_recovery_required", False)
+        latched_desync = (state == StreamState.LATCHED_DESYNC)
 
-        passed = state in (StreamState.HEALTHY, StreamState.AUTHENTICATED_UNRECONCILED) and threads <= 1
-        msg = f"Stream state: {getattr(state, 'value', str(state))} (threads={threads}, generation={generation}, ready={ready})"
+        # Verify stream thread is alive
+        stream_thread = getattr(bridge, "_trade_stream_thread", None)
+        thread_alive = stream_thread is not None and stream_thread.is_alive()
+
+        # Verify paper endpoint
+        stream_obj = getattr(bridge, "_trade_stream", None)
+        endpoint_val = "unknown"
+        paper_verified = False
+        if stream_obj is not None:
+            raw_endpoint = getattr(stream_obj, "_endpoint", None)
+            endpoint_val = raw_endpoint.value if hasattr(raw_endpoint, "value") else str(raw_endpoint or "")
+            if hasattr(bridge, "_assert_paper_stream_endpoint"):
+                bridge._assert_paper_stream_endpoint(stream_obj)
+                paper_verified = True
+
+        passed = (
+            state == StreamState.HEALTHY
+            and thread_alive
+            and generation > 0
+            and ready
+            and not recovery_req
+            and not latched_desync
+            and paper_verified
+        )
+
+        details = {
+            "endpoint": endpoint_val,
+            "paper_mode": "verified" if paper_verified else "unverified",
+            "generation": generation,
+            "thread_alive": thread_alive,
+            "subscription": "trade_updates",
+            "reconciliation": "CLEAN" if (not recovery_req and not latched_desync) else "DESYNC",
+            "stream_state": getattr(state, "value", str(state)),
+            "latched_desync": latched_desync,
+        }
+
+        if passed:
+            msg = (
+                f"Stream verified HEALTHY (gen={generation}, thread=alive, "
+                f"reconciliation=CLEAN, endpoint={endpoint_val})"
+            )
+            status = "PASS"
+        else:
+            msg = (
+                f"Stream check failed: state={getattr(state, 'value', str(state))}, "
+                f"thread_alive={thread_alive}, gen={generation}, ready={ready}, "
+                f"recovery_required={recovery_req}, latched_desync={latched_desync}"
+            )
+            status = "FAIL"
+
         return GateResult(
             name="Trade Stream Readiness",
             category="CRITICAL",
             passed=passed,
+            status=status,
             message=msg,
-            details={
-                "stream_state": getattr(state, "value", str(state)),
-                "threads": threads,
-                "generation": generation,
-                "ready": ready,
-            },
+            details=details,
         )
     except Exception as exc:
         return GateResult(
             name="Trade Stream Readiness",
             category="CRITICAL",
             passed=False,
+            status="FAIL",
             message=f"Trade stream readiness error: {exc}",
             details={"error": str(exc)},
         )
@@ -394,9 +604,10 @@ def run_preflight_audit(
     save_report: bool = True,
     report_path: str = "reports/preflight_report.json"
 ) -> PreflightReport:
-    """Runs all 6 pre-flight gates and compiles the Tri-State Go / No-Go decision."""
+    """Runs all 7 pre-flight gates and compiles the Institutional Tri-State Go / No-Go decision."""
     gates: List[GateResult] = [
-        check_data_freshness(),
+        check_historical_data_freshness(),
+        check_intraday_data_readiness(bridge=bridge),
         check_broker_reconciliation(bridge=bridge),
         check_position_protection(bridge=bridge),
         check_portfolio_exposure(bridge=bridge),
@@ -405,30 +616,64 @@ def run_preflight_audit(
     ]
 
     critical_gates = [g for g in gates if g.category == "CRITICAL"]
-    critical_fail = [g for g in critical_gates if not g.passed]
-    
+    critical_fail = [
+        g for g in critical_gates
+        if getattr(g, "status", "PASS" if g.passed else "FAIL") == "FAIL"
+        or (not g.passed and getattr(g, "status", "") not in ("NOT_VERIFIED", "SKIPPED", "ENTRY_HOLD"))
+    ]
+    critical_entry_hold = [
+        g for g in critical_gates
+        if getattr(g, "status", "") in ("ENTRY_HOLD", "NOT_VERIFIED")
+    ]
+    critical_pass = [
+        g for g in critical_gates
+        if getattr(g, "status", "PASS" if g.passed else "FAIL") == "PASS" and g.passed
+    ]
+    critical_not_verified = [
+        g for g in critical_gates
+        if getattr(g, "status", "") in ("NOT_VERIFIED", "SKIPPED")
+    ]
+
     warning_gates = [g for g in gates if g.category == "WARNING"]
+    warning_pass = [g for g in warning_gates if g.passed]
     warning_fail = [g for g in warning_gates if not g.passed]
+    warning_list = [f"{g.name}: {g.message}" for g in warning_fail]
 
+    hold_reason: Optional[str] = None
     if len(critical_fail) > 0:
-        status = "NO-GO"
-        summary = f"Trading Disabled (NO-GO) - {len(critical_fail)} critical gate(s) FAILED."
-    elif len(warning_fail) > 0:
-        status = "GO_WITH_WARNINGS"
-        summary = f"Trading Approved with Vigilance (GO_WITH_WARNINGS) - {len(warning_fail)} warning item(s) flagged."
+        decision = PreflightDecision.NO_GO
+        entry_allowed = False
+        hold_reason = f"{len(critical_fail)} critical gate(s) failed"
+        summary = f"Trading Disabled (NO_GO) - {len(critical_fail)} critical gate(s) FAILED."
+    elif len(critical_entry_hold) > 0:
+        decision = PreflightDecision.GO_WITH_ENTRY_HOLD
+        entry_allowed = False
+        hold_reason = "; ".join(g.message for g in critical_entry_hold)
+        summary = f"Trading Engine Active with Entry Hold (GO_WITH_ENTRY_HOLD) - {hold_reason}"
     else:
-        status = "GO"
-        summary = "Trading Operations Approved (GO) - All critical and warning gates PASSED."
+        decision = PreflightDecision.GO
+        entry_allowed = True
+        summary = "Trading Operations Approved (GO) - All critical gates PASSED."
+        if warning_fail:
+            summary += f" ({len(warning_fail)} warning(s) logged)"
 
-    now_iso = datetime.now(timezone.utc).astimezone().isoformat()
+    now_local = datetime.now().astimezone()
+    now_utc = datetime.now(timezone.utc)
+    utc_offset_str = now_local.strftime("%z")
+    formatted_offset = f"{utc_offset_str[:3]}:{utc_offset_str[3:]}" if len(utc_offset_str) == 5 else utc_offset_str
+    tz_name = now_local.tzname() or "ICT"
+    now_iso = now_local.isoformat()
+
     config_file = str(Path(__file__).parent / "config.py")
     rf_model_file = str(Path(__file__).parent / "models" / "rf_models.joblib")
-    
+
     report = PreflightReport(
         run_id=uuid.uuid4().hex[:12],
         stage=stage,
         timestamp=now_iso,
-        status=status,
+        decision=decision,
+        entry_allowed=entry_allowed,
+        status=decision.value,
         summary=summary,
         git_commit=_get_git_commit(),
         config_hash=_compute_file_hash(config_file),
@@ -439,15 +684,24 @@ def run_preflight_audit(
                 "name": g.name,
                 "category": g.category,
                 "passed": g.passed,
+                "status": getattr(g, "status", "PASS" if g.passed else "FAIL"),
                 "message": g.message,
                 "details": g.details,
             }
             for g in gates
         ],
-        critical_pass=len(critical_gates) - len(critical_fail),
+        critical_pass=len(critical_pass),
         critical_fail=len(critical_fail),
-        warning_pass=len(warning_gates) - len(warning_fail),
+        critical_not_verified=len(critical_not_verified),
+        warning_count=len(warning_fail),
+        warnings=warning_list,
+        warning_pass=len(warning_pass),
         warning_fail=len(warning_fail),
+        hold_reason=hold_reason,
+        wall_clock_utc=now_utc.isoformat(),
+        wall_clock_local=now_local.isoformat(),
+        timezone_name=tz_name,
+        utc_offset=formatted_offset,
     )
 
     if save_report:
@@ -464,30 +718,51 @@ def run_preflight_audit(
 
 def print_preflight_scorecard(report: PreflightReport) -> None:
     """Prints a beautiful institutional-grade terminal scorecard."""
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except Exception:
+        pass
     print("\n" + "=" * 68)
     print("        🚦 AUTOMATED PRE-FLIGHT GO / NO-GO AUDIT GATE 🚦")
     print("=" * 68)
     print(f"  Run ID     : {report.run_id}  |  Stage: {report.stage}")
-    print(f"  Timestamp  : {report.timestamp}")
+    tz_label = f" ({report.timezone_name}, UTC{report.utc_offset})" if report.timezone_name else ""
+    print(f"  Timestamp  : {report.timestamp}{tz_label}")
+    if report.wall_clock_utc:
+        print(f"  UTC Clock  : {report.wall_clock_utc}")
     print(f"  Git Commit : {report.git_commit}  |  Config Hash: {report.config_hash}")
     print(f"  Model Hash : {report.model_hash}  |  Operator   : {report.operator}")
     print("-" * 68)
 
     for g in report.gates:
         cat_badge = f"[{g['category']}]"
-        status_icon = "🟢 [PASS]" if g["passed"] else "🔴 [FAIL]" if g["category"] == "CRITICAL" else "🟡 [WARN]"
-        print(f"  {status_icon:<10} {g['name']:<24} {cat_badge:<11}")
-        print(f"             └─► {g['message']}")
+        gate_status = g.get("status", "PASS" if g["passed"] else "FAIL")
+        if gate_status == "NOT_VERIFIED":
+            status_icon = "⚪ [NOT VERIFIED]"
+        elif gate_status == "ENTRY_HOLD":
+            status_icon = "🟡 [ENTRY HOLD]"
+        elif g["passed"]:
+            status_icon = "🟢 [PASS]"
+        elif g["category"] == "CRITICAL":
+            status_icon = "🔴 [FAIL]"
+        else:
+            status_icon = "🟡 [WARN]"
+        print(f"  {status_icon:<18} {g['name']:<24} {cat_badge:<11}")
+        print(f"                     └─► {g['message']}")
 
     print("-" * 68)
-    print(f"  Critical Gates : {report.critical_pass} PASS / {report.critical_fail} FAIL")
-    print(f"  Warning Gates  : {report.warning_pass} PASS / {report.warning_fail} WARN")
+    if report.critical_not_verified > 0:
+        print(f"  Critical Gates : {report.critical_pass} PASS / {report.critical_fail} FAIL / {report.critical_not_verified} NOT VERIFIED")
+    else:
+        print(f"  Critical Gates : {report.critical_pass} PASS / {report.critical_fail} FAIL")
+    print(f"  Warning Gates  : {report.warning_pass} PASS / {report.warning_fail} WARN (Count: {report.warning_count})")
     print("=" * 68)
 
-    if report.status == "GO":
-        print(f"  🏆 FINAL STATUS: 🟢 GO  (Trading Operations Fully Approved)")
-    elif report.status == "GO_WITH_WARNINGS":
-        print(f"  ⚠️ FINAL STATUS: 🟡 GO_WITH_WARNINGS  (Trading Approved with Alerts)")
+    if report.decision == PreflightDecision.GO:
+        print("  🏆 FINAL DECISION: 🟢 GO  (Trading Operations Fully Approved, Entries Allowed)")
+    elif report.decision == PreflightDecision.GO_WITH_ENTRY_HOLD:
+        print(f"  ⚠️ FINAL DECISION: 🟡 GO_WITH_ENTRY_HOLD  (Trading Engine Active, Entries On Hold: {report.hold_reason})")
     else:
-        print(f"  🚨 FINAL STATUS: 🔴 NO-GO  (Trading Operations Halted)")
+        print(f"  🚨 FINAL DECISION: 🔴 NO_GO  (Trading Operations Halted: {report.hold_reason})")
     print("=" * 68 + "\n")

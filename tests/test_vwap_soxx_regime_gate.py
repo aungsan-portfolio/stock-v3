@@ -48,7 +48,11 @@ class TestVWAPSOXXRegimeGate(unittest.TestCase):
         config.REQUIRE_REALTIME_DATA_FOR_ORDERS = False
         config.SPY_TREND_GUARD_ENABLED = False
 
+        self._count_patch = patch("strategies.order_manager.today_trade_count", return_value=0)
+        self._count_patch.start()
+
     def tearDown(self):
+        self._count_patch.stop()
         config.REQUIRE_REALTIME_DATA_FOR_ORDERS = self.orig_realtime
         config.SPY_TREND_GUARD_ENABLED = self.orig_spy_guard
         om.reset_session_skip_state()

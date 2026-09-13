@@ -769,48 +769,54 @@ def test_future_dated_completed_bar_fails_closed():
 # Test 23: Entry Lifecycle Partial Fill Uses Submitted Geometry
 # ---------------------------------------------------------------------------
 
-def test_entry_lifecycle_partial_fill_uses_submitted_geometry():
+def test_entry_lifecycle_partial_fill_uses_submitted_geometry(tmp_path=None):
     """CRITICAL INTEGRATION INVARIANT:
     Original stop  = $945.31
     Submitted stop = $944.38
     Partial fill report
     -> Trailing state MUST initialize with submitted stop $944.38!
     """
-    mgr = DynamicTrailingStopManager()
-    lifecycle = EntryOrderLifecycle(mgr)
+    import config
+    from pathlib import Path
+    from unittest.mock import patch
+    target_tmp = tmp_path / "temp_journal.jsonl" if tmp_path else Path("scratch/test_journal_tmp.jsonl")
+    target_tmp.parent.mkdir(parents=True, exist_ok=True)
+    with patch.object(config, "DAYTRADE_TRADE_JOURNAL_FILE", target_tmp):
+        mgr = DynamicTrailingStopManager()
+        lifecycle = EntryOrderLifecycle(mgr)
 
-    original_signal = _make_dummy_signal(entry=948.43, stop=945.31, target=956.16)
+        original_signal = _make_dummy_signal(entry=948.43, stop=945.31, target=956.16)
 
-    # Register submission with shifted geometry
-    lifecycle.register_submission(
-        parent_order_id="p-lifecycle-int",
-        signal=original_signal,
-        requested_qty=4.0,
-        stop_order_id="s-lifecycle-int",
-        target_order_id="t-lifecycle-int",
-        submitted_entry_price=947.50,
-        submitted_stop_price=944.38,
-        submitted_target_price=956.16,
-    )
+        # Register submission with shifted geometry
+        lifecycle.register_submission(
+            parent_order_id="p-lifecycle-int",
+            signal=original_signal,
+            requested_qty=4.0,
+            stop_order_id="s-lifecycle-int",
+            target_order_id="t-lifecycle-int",
+            submitted_entry_price=947.50,
+            submitted_stop_price=944.38,
+            submitted_target_price=956.16,
+        )
 
-    mock_bridge = MagicMock()
-    mock_bridge.get_order_snapshot.return_value = {
-        "status": "held",
-        "qty": 4,
-    }
+        mock_bridge = MagicMock()
+        mock_bridge.get_order_snapshot.return_value = {
+            "status": "held",
+            "qty": 4,
+        }
 
-    # First partial fill: 1 share filled
-    success = lifecycle.on_parent_fill(
-        bridge=mock_bridge,
-        parent_order_id="p-lifecycle-int",
-        cumulative_filled_qty=1.0,
-        average_fill_price=947.40,
-        execution_id="exec-lifecycle-1",
-    )
+        # First partial fill: 1 share filled
+        success = lifecycle.on_parent_fill(
+            bridge=mock_bridge,
+            parent_order_id="p-lifecycle-int",
+            cumulative_filled_qty=1.0,
+            average_fill_price=947.40,
+            execution_id="exec-lifecycle-1",
+        )
 
-    assert success is True
-    state = mgr.states.get("MU")
-    assert state is not None
-    assert state.stop_price == 944.38, f"Expected 944.38 but got {state.stop_price}"
-    assert state.desired_stop_price == 944.38
-    assert state.confirmed_broker_stop_price == 944.38
+        assert success is True
+        state = mgr.states.get("MU")
+        assert state is not None
+        assert state.stop_price == 944.38, f"Expected 944.38 but got {state.stop_price}"
+        assert state.desired_stop_price == 944.38
+        assert state.confirmed_broker_stop_price == 944.38

@@ -13,6 +13,14 @@ from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+def get_default_risk_store_path() -> Path:
+    try:
+        import config
+        return Path(getattr(config, "DATA_DIR", "data")) / "swing_position_risk.json"
+    except Exception:
+        return Path("data/swing_position_risk.json")
+
+
 DEFAULT_RISK_STORE_PATH = Path("data/swing_position_risk.json")
 
 
@@ -32,7 +40,7 @@ class PositionRiskBasis:
 
 
 def load_risk_store(path: Optional[Path] = None) -> Dict[str, PositionRiskBasis]:
-    target_path = Path(path or DEFAULT_RISK_STORE_PATH)
+    target_path = Path(path or get_default_risk_store_path())
     if not target_path.exists():
         return {}
     try:
@@ -48,7 +56,7 @@ def load_risk_store(path: Optional[Path] = None) -> Dict[str, PositionRiskBasis]
 
 
 def save_risk_basis(basis: PositionRiskBasis, path: Optional[Path] = None) -> None:
-    target_path = Path(path or DEFAULT_RISK_STORE_PATH)
+    target_path = Path(path or get_default_risk_store_path())
     store = load_risk_store(target_path)
     store[basis.symbol.upper()] = basis
     target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -59,7 +67,7 @@ def save_risk_basis(basis: PositionRiskBasis, path: Optional[Path] = None) -> No
 
 
 def remove_risk_basis(symbol: str, path: Optional[Path] = None) -> None:
-    target_path = Path(path or DEFAULT_RISK_STORE_PATH)
+    target_path = Path(path or get_default_risk_store_path())
     store = load_risk_store(target_path)
     if symbol.upper() in store:
         del store[symbol.upper()]
@@ -115,17 +123,35 @@ def get_unrealized_r(
     store = load_risk_store(path)
     basis = store.get(symbol.upper())
     if basis and basis.initial_risk_per_share > 0.0:
-        return (current_price - basis.entry_price) / basis.initial_risk_per_share
-
-    # Fallback to current stop distance if known
-    if current_stop_price is not None and current_stop_price < avg_entry_price:
+        r_val = (current_price - basis.entry_price) / basis.initial_risk_per_share
+    elif current_stop_price is not None and current_stop_price < avg_entry_price:
+        # Fallback to current stop distance if known
         stop_dist = avg_entry_price - current_stop_price
         if stop_dist > 0.0:
-            return (current_price - avg_entry_price) / stop_dist
+            r_val = (current_price - avg_entry_price) / stop_dist
+        else:
+            proxy_dist = max(0.01, avg_entry_price * 0.02)
+            r_val = (current_price - avg_entry_price) / proxy_dist
+    else:
+        # Fallback to 2% proxy distance if stop unknown (analytics only)
+        proxy_dist = max(0.01, avg_entry_price * 0.02)
+        r_val = (current_price - avg_entry_price) / proxy_dist
 
-    # Fallback to 2% proxy distance if stop unknown (analytics only)
-    proxy_dist = max(0.01, avg_entry_price * 0.02)
-    return (current_price - avg_entry_price) / proxy_dist
+    # Sanity check: Swing positions rarely exceed 10.0R under normal conditions.
+    # An extreme value indicates basis corruption or severe data skew.
+    if abs(r_val) > 10.0:
+        logger.error(
+            "[RISK SANITY ANOMALY] %s computed abnormal unrealized R=%.2f "
+            "(curr=$%.2f, entry=$%.2f). Possible risk basis corruption! "
+            "Falling back to broker 2%% proxy distance for rotation safety.",
+            symbol, r_val, current_price, (basis.entry_price if basis else avg_entry_price)
+        )
+        # Fail-safe defense: Never propagate extreme corrupted R to rotation logic.
+        # Fall back to broker-authoritative 2% proxy distance so position can still be managed.
+        proxy_dist = max(0.01, avg_entry_price * 0.02)
+        r_val = (current_price - avg_entry_price) / proxy_dist
+
+    return r_val
 
 
 def get_unrealized_r_analytics(

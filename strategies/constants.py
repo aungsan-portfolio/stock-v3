@@ -8,3 +8,21 @@ class StrategyName(str, Enum):
     CANDLESTICK = "CANDLESTICK"
     MEAN_REVERSION = "MEAN_REVERSION"
 
+
+class OrderIntent(str, Enum):
+    ENTRY = "ENTRY"
+    EXIT = "EXIT"
+    STOP_PROTECTION = "STOP_PROTECTION"
+    PROFIT_TARGET = "PROFIT_TARGET"
+    EOD_FLATTEN = "EOD_FLATTEN"
+    RECONCILIATION = "RECONCILIATION"
+
+
+EXIT_INTENTS = {
+    OrderIntent.EXIT,
+    OrderIntent.STOP_PROTECTION,
+    OrderIntent.PROFIT_TARGET,
+    OrderIntent.EOD_FLATTEN,
+    OrderIntent.RECONCILIATION,
+}
+

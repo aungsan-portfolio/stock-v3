@@ -45,6 +45,89 @@ from position_rotator import PositionRotator, OpenPosition, IncomingSignal
 logger = logging.getLogger(__name__)
 
 
+class AccountModeViolation(RuntimeError):
+    """Raised when an account-mode safety invariant is violated (e.g. non-paper URL, mismatched account ID)."""
+    pass
+
+
+import urllib.parse
+from datetime import datetime, timezone
+
+ACCOUNT_MODE_VIOLATION_CODE = 6
+
+
+def _validate_paper_url(raw_url: str) -> None:
+    if not raw_url:
+        return
+    raw_str = str(raw_url).strip()
+    parsed = urllib.parse.urlsplit(raw_str)
+    if (parsed.scheme or "").lower() != "https":
+        raise AccountModeViolation(
+            f"ACCOUNT_MODE_VIOLATION: Insecure scheme '{parsed.scheme}' in base URL ({raw_url}). Must be https."
+        )
+    hostname = (parsed.hostname or "").lower()
+    if hostname != "paper-api.alpaca.markets":
+        raise AccountModeViolation(
+            f"ACCOUNT_MODE_VIOLATION: Unauthorized endpoint host '{hostname}'. Expected exactly 'paper-api.alpaca.markets'."
+        )
+    if parsed.port not in (None, 443):
+        raise AccountModeViolation(
+            f"ACCOUNT_MODE_VIOLATION: Non-standard port '{parsed.port}' in base URL ({raw_url})."
+        )
+    if parsed.username or parsed.password:
+        raise AccountModeViolation(
+            "ACCOUNT_MODE_VIOLATION: Embedded credentials detected in base URL."
+        )
+
+
+def record_account_mode_violation_snapshot(
+    expected_account_id: str,
+    observed_account_id: str,
+    endpoint_url: str,
+    failure_reason: str,
+) -> str:
+    """Record fail-closed diagnostic snapshot for Exit Code 6 (ACCOUNT_MODE_VIOLATION)."""
+    os.makedirs("logs", exist_ok=True)
+    ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    snapshot_path = os.path.join("logs", f"account_mode_violation_{ts_str}.json")
+    parsed_host = "unknown"
+    if endpoint_url:
+        try:
+            parsed_host = urllib.parse.urlsplit(str(endpoint_url).strip()).hostname or str(endpoint_url)
+        except Exception:
+            parsed_host = "unparseable"
+
+    data = {
+        "exit_code": 6,
+        "failure_type": "ACCOUNT_MODE_VIOLATION",
+        "expected_account_id": expected_account_id or "PA3UODIC5JTA",
+        "observed_account_id": observed_account_id or "UNVERIFIED",
+        "endpoint_host": parsed_host,
+        "order_submission_attempted": False,
+        "failure_reason": str(failure_reason),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    tmp_path = snapshot_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, snapshot_path)
+    return snapshot_path
+
+
+def log_reconciliation_anomaly(anomaly_data: dict) -> None:
+    """Durably records reconciliation price or quantity anomalies for operator review."""
+    os.makedirs("reports", exist_ok=True)
+    path = os.path.join("reports", "reconciliation_anomalies.jsonl")
+    anomaly_data["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
+    line = json.dumps(anomaly_data, default=str) + "\n"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line)
+        f.flush()
+        os.fsync(f.fileno())
+
+
 import requests
 import urllib3
 
@@ -98,6 +181,29 @@ def configure_session_timeouts(
     )
     session.mount("https://", adapter)
     session.mount("http://", adapter)
+
+
+def normalize_position_qty(pos_val: Any) -> float:
+    """Safely extract and normalize any broker position object, dict, string, Decimal, or None into a signed float.
+    Treats None, empty, or explicit zero as 0.0 (flat).
+    """
+    if pos_val is None:
+        return 0.0
+    if isinstance(pos_val, (int, float)):
+        return float(pos_val)
+    if hasattr(pos_val, "qty"):
+        raw_qty = getattr(pos_val, "qty")
+        return normalize_position_qty(raw_qty)
+    if isinstance(pos_val, dict):
+        raw_qty = pos_val.get("qty", pos_val.get("position", 0.0))
+        return normalize_position_qty(raw_qty)
+    try:
+        s = str(pos_val).strip()
+        if not s:
+            return 0.0
+        return float(s)
+    except (ValueError, TypeError):
+        return 0.0
 
 
 def normalize_enum_value(val: Any) -> str:
@@ -393,7 +499,7 @@ class MockIB:
                 status = status_map.get(raw_status.lower(), "Submitted")
                 lmt_price = float(o.limit_price) if getattr(o, "limit_price", None) is not None else 0.0
                 stp_price = float(o.stop_price) if getattr(o, "stop_price", None) is not None else None
-                
+
                 raw_type = o.type.value if hasattr(o.type, "value") else str(o.type)
                 raw_type_str = str(raw_type).upper().strip()
                 if raw_type_str in ("STOP", "STP"):
@@ -650,6 +756,11 @@ class AlpacaBridge:
         # Stream State Machine and Lifecycle Controls
         self._stream_state = StreamState.DISCONNECTED
         self._stream_state_lock = threading.RLock()
+        # Global lock order invariant:
+        # 1. _reconcile_lock
+        # 2. get_journal_lock()
+        #
+        # Never acquire _reconcile_lock while already holding the journal lock.
         self._reconcile_lock = threading.Lock()
         self._stream_generation = 0
         # Daemon thread owns SDK websocket event loop
@@ -668,6 +779,15 @@ class AlpacaBridge:
         self.entry_gate = EntryGateMock(self)
         self.rotator = PositionRotator()
         self._swing_dispatch_lock = threading.Lock()
+        self._account_id: str = "default"
+
+    @property
+    def account_id(self) -> str:
+        return getattr(self, "_account_id", "") or "default"
+
+    @account_id.setter
+    def account_id(self, value: str):
+        self._account_id = str(value)
 
     @property
     def is_paper(self) -> bool:
@@ -678,6 +798,116 @@ class AlpacaBridge:
     @property
     def account_mode(self) -> str:
         return "PAPER" if self.is_paper else "LIVE"
+
+    def assert_account_mode_safety(self, expected_account_id: Optional[str] = None) -> bool:
+        """
+        Fail-closed Account-Mode Safety Guard enforcing paper trading invariants.
+        Must be called prior to starting trading loops and before any order submission/mutation.
+
+        Guarantees:
+          1. TradingClient is constructed in paper mode (is_paper is True, client._paper is True).
+          2. Client base URL strictly resolves to https://paper-api.alpaca.markets (never live api.alpaca.markets).
+          3. Authenticated broker account number matches expected account ID (default: PA3UODIC5JTA for daytrade).
+          4. Any unreadable, failing, or mismatched account number fails closed.
+
+        Raises AccountModeViolation if any invariant fails.
+        """
+        if not self.is_paper:
+            raise AccountModeViolation(
+                "ACCOUNT_MODE_VIOLATION: TradingClient is not in paper mode (paper=False detected)."
+            )
+
+        client = getattr(self, "_client", None)
+        if client is not None:
+            if not getattr(client, "_paper", True):
+                raise AccountModeViolation(
+                    "ACCOUNT_MODE_VIOLATION: Underlying client._paper is False! Refusing execution."
+                )
+
+            raw_base_url = getattr(client, "_base_url", None)
+            base_url_str = ""
+            if hasattr(raw_base_url, "value"):
+                base_url_str = str(raw_base_url.value).strip().rstrip("/")
+            elif raw_base_url:
+                base_url_str = str(raw_base_url).strip().rstrip("/")
+
+            if base_url_str:
+                _validate_paper_url(base_url_str)
+
+        env_base_url = os.environ.get("APCA_API_BASE_URL", "").strip().rstrip("/")
+        if env_base_url:
+            _validate_paper_url(env_base_url)
+
+        if expected_account_id:
+            target_acct = expected_account_id
+        elif self.mode == "swing":
+            target_acct = os.environ.get("SWING_ACCOUNT_ID", "PA3R71I7JFDZ")
+        else:
+            target_acct = os.environ.get("EXPECTED_PAPER_ACCOUNT_ID") or "PA3UODIC5JTA"
+
+        # If client is present, we must affirmatively verify via get_account()
+        if client is not None:
+            if not hasattr(client, "get_account"):
+                raise AccountModeViolation(
+                    "ACCOUNT_MODE_VIOLATION: Client does not implement get_account()."
+                )
+            try:
+                acct = client.get_account()
+            except Exception as exc:
+                raise AccountModeViolation(
+                    f"ACCOUNT_MODE_VIOLATION: Broker get_account() query failed: {exc}"
+                ) from exc
+
+            if acct is None:
+                raise AccountModeViolation(
+                    "ACCOUNT_MODE_VIOLATION: Broker get_account() returned None."
+                )
+
+            broker_acct_no = str(getattr(acct, "account_number", "") or getattr(acct, "id", "") or "").strip()
+            if not broker_acct_no or broker_acct_no.upper() in ("UNKNOWN", "NONE", "DEFAULT"):
+                raise AccountModeViolation(
+                    f"ACCOUNT_MODE_VIOLATION: Authenticated broker account number unreadable or unknown: '{broker_acct_no}'."
+                )
+
+            if broker_acct_no != target_acct:
+                raise AccountModeViolation(
+                    f"ACCOUNT_MODE_VIOLATION: Authenticated broker account {broker_acct_no} does not match expected {target_acct}."
+                )
+
+            self.account_id = broker_acct_no
+        else:
+            current_acct = str(self.account_id or "").strip()
+            if not current_acct or current_acct in ("default", "UNKNOWN", "NONE"):
+                raise AccountModeViolation(
+                    "ACCOUNT_MODE_VIOLATION: No active broker client and account_id is unverified."
+                )
+            if current_acct != target_acct:
+                raise AccountModeViolation(
+                    f"ACCOUNT_MODE_VIOLATION: Bridge account_id {current_acct} does not match expected {target_acct}."
+                )
+
+        return True
+
+    def _assert_paper_stream_endpoint(self, stream: Any) -> None:
+        """
+        Fail-closed assertion that TradingStream is strictly routed to Alpaca paper stream endpoint.
+        Raises AccountModeViolation if endpoint is missing, invalid, or pointing to live trading.
+        """
+        raw_endpoint = getattr(stream, "_endpoint", None)
+        if raw_endpoint is None:
+            raise AccountModeViolation("TradeStream missing '_endpoint' attribute; cannot verify paper stream safety.")
+
+        endpoint_str = raw_endpoint.value if hasattr(raw_endpoint, "value") else str(raw_endpoint)
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(endpoint_str)
+        except Exception as exc:
+            raise AccountModeViolation(f"Unable to parse trade stream endpoint '{endpoint_str}': {exc}")
+
+        if parsed.scheme != "wss" or parsed.hostname != "paper-api.alpaca.markets":
+            raise AccountModeViolation(
+                f"TradeStream endpoint safety violation! Target must be wss://paper-api.alpaca.markets, got '{endpoint_str}'"
+            )
 
     @property
     def stream_state(self) -> StreamState:
@@ -698,6 +928,37 @@ class AlpacaBridge:
             if self._trade_stream_reconnect_thread is not None and self._trade_stream_reconnect_thread.is_alive():
                 count += 1
         return count
+
+    def _set_stream_state_for_generation(
+        self,
+        generation: int,
+        state: StreamState,
+        reason: str = "",
+    ) -> bool:
+        """
+        Sets stream state only if the supplied generation matches the current active stream generation.
+        Prevents stale/exiting threads from older generations from overriding state.
+        """
+        with self._stream_state_lock:
+            if generation != self._stream_generation:
+                logger.warning(
+                    "[STREAM GENERATION DISCARDED] Ignored state %s for stale generation %d (current=%d): %s",
+                    getattr(state, "value", str(state)),
+                    generation,
+                    self._stream_generation,
+                    reason,
+                )
+                return False
+            old_state = self._stream_state
+            self._stream_state = state
+            logger.info(
+                "[STREAM STATE (GEN %d)] old=%s new=%s reason=%s",
+                generation,
+                old_state.value,
+                state.value,
+                reason,
+            )
+            return True
 
     def _transition_stream_state(self, expected: set, new_state: StreamState, reason: str = "") -> bool:
         with self._stream_state_lock:
@@ -1203,6 +1464,10 @@ class AlpacaBridge:
                     logger.info("[TRADE STREAM] Reconnected and authenticated on attempt %d", attempt)
                     self._run_post_reconnect_reconciliation()
                     return
+                except AccountModeViolation as amv:
+                    logger.critical("🚨 [ACCOUNT_MODE_VIOLATION] Trade stream reconnect aborted: %s", amv)
+                    self._mark_trade_stream_unavailable(f"Account mode violation: {amv}")
+                    raise
                 except Exception as exc:
                     self._mark_trade_stream_unavailable(
                         f"Reconnect attempt {attempt}/{max_attempts} failed: {exc}"
@@ -1221,7 +1486,7 @@ class AlpacaBridge:
                 if self._trade_stream_reconnect_thread is threading.current_thread():
                     self._trade_stream_reconnect_thread = None
 
-    def _run_trade_stream(self, stream: TradingStream) -> None:
+    def _run_trade_stream(self, stream: TradingStream, generation: int = 0) -> None:
         unexpected_exit = False
         failure_reason = "Trade stream stopped unexpectedly"
         try:
@@ -1240,13 +1505,18 @@ class AlpacaBridge:
                     self._trade_stream_thread = None
                     self._trade_stream = None
             if unexpected_exit and self._is_reconnect_allowed():
-                self._transition_stream_state(
-                    expected={StreamState.HEALTHY, StreamState.AUTHENTICATED_UNRECONCILED, StreamState.RECONCILING, StreamState.DEGRADED},
-                    new_state=StreamState.DISCONNECTED,
-                    reason=failure_reason,
-                )
-                self._mark_trade_stream_unavailable(failure_reason)
-                self._schedule_trade_stream_reconnect()
+                with self._stream_state_lock:
+                    is_current_gen = (generation == self._stream_generation or generation == 0)
+                if is_current_gen:
+                    self._transition_stream_state(
+                        expected={StreamState.HEALTHY, StreamState.AUTHENTICATED_UNRECONCILED, StreamState.RECONCILING, StreamState.DEGRADED},
+                        new_state=StreamState.DISCONNECTED,
+                        reason=failure_reason,
+                    )
+                    self._mark_trade_stream_unavailable(failure_reason)
+                    self._schedule_trade_stream_reconnect()
+                else:
+                    logger.warning("[TRADE STREAM] Stale generation %d exit ignored; current is %d", generation, self._stream_generation)
 
     def _start_trade_stream(self, api_key: str, secret_key: str) -> None:
         with self._trade_stream_lock:
@@ -1260,7 +1530,13 @@ class AlpacaBridge:
             self._trade_stream_stopping = False
             self._trade_stream_ready = False
             self._trade_stream_credentials = (api_key, secret_key)
-            stream = TradingStream(api_key, secret_key, paper=True)
+            ws_params = {
+                "ping_interval": int(self._c("ALPACA_WS_PING_INTERVAL_SECONDS", 20)),
+                "ping_timeout": int(self._c("ALPACA_WS_PING_TIMEOUT_SECONDS", 10)),
+                "max_queue": int(self._c("ALPACA_WS_MAX_QUEUE", 1024)),
+            }
+            stream = TradingStream(api_key, secret_key, paper=True, websocket_params=ws_params)
+            self._assert_paper_stream_endpoint(stream)
 
             async def _stream_callback(upd):
                 await self._on_trade_update(upd, generation=current_gen)
@@ -1268,7 +1544,7 @@ class AlpacaBridge:
             stream.subscribe_trade_updates(_stream_callback)
             thread = threading.Thread(
                 target=self._run_trade_stream,
-                args=(stream,),
+                args=(stream, current_gen),
                 name="alpaca-trade-updates",
                 daemon=True,
             )
@@ -1341,6 +1617,14 @@ class AlpacaBridge:
                 except Exception as l_err:
                     logger.warning("Could not trigger latch state machine during desync: %s", l_err)
                 return False
+        except Exception as exc:
+            self._transition_stream_state(
+                expected={StreamState.RECONCILING, StreamState.AUTHENTICATED_UNRECONCILED},
+                new_state=StreamState.DEGRADED,
+                reason=f"Post-reconnect reconciliation crashed: {exc}",
+            )
+            logger.exception("[TRADE STREAM RECONCILIATION FAILED] %s", exc)
+            raise
         finally:
             self._reconcile_lock.release()
 
@@ -1800,7 +2084,7 @@ class AlpacaBridge:
         limit_price = self._limit_price(action, price)
         stop_price = custom_stop_price if custom_stop_price is not None else self._initial_stop_price(action, price, symbol=symbol)
         take_profit_price = custom_target_price if custom_target_price is not None else self._take_profit_price(action, price, symbol=symbol)
-        
+
         strat_tag = str(strategy_name or "UNKNOWN").replace("StrategyName.", "").upper()
         if custom_client_order_id is not None:
             client_order_id = custom_client_order_id
@@ -1847,7 +2131,7 @@ class AlpacaBridge:
                 take_profit=TakeProfitRequest(limit_price=_round_price(take_profit_price)),
                 stop_loss=StopLossRequest(stop_price=_round_price(stop_price)),
             ))
-            
+
             parent_id = str(order.id)
             stop_leg_id = None
             try:
@@ -1872,7 +2156,14 @@ class AlpacaBridge:
             logger.error("submit_order failed: %s", exc)
             return order_exec.OrderResult(outcome=order_exec.REJECTED, status="Rejected", filled=0.0, remaining=float(qty))
 
-    def _await_order_outcome(self, order_id: str, timeout: float = 10.0) -> order_exec.OrderResult:
+    def _await_order_outcome(
+        self,
+        order_id: str,
+        timeout: float = 10.0,
+        timeout_seconds: Optional[float] = None,
+    ) -> order_exec.OrderResult:
+        if timeout_seconds is not None:
+            timeout = float(timeout_seconds)
         start_time = time.time()
         while time.time() - start_time < timeout:
             try:
@@ -2031,6 +2322,7 @@ class AlpacaBridge:
         return result
 
     def _close_position(self, symbol: str, action: str, qty: int, price: float, note: str) -> order_exec.OrderResult:
+        self.assert_account_mode_safety()
         self._require_connection()
         client_order_id = order_exec.deterministic_order_ref(self._today(), symbol, action)
         order_audit.log_event(
@@ -2058,14 +2350,14 @@ class AlpacaBridge:
             if not self._cancel_symbol_working_orders(symbol, timeout_seconds=10.0):
                 logger.error("Aborting close_position for %s: working order cancellation unconfirmed/timed out", symbol)
                 return order_exec.OrderResult(outcome=order_exec.REJECTED, status="CancellationTimeout", filled=0.0, remaining=float(qty))
-            
+
             order = self._client.submit_order(MarketOrderRequest(
                 symbol=symbol, qty=qty,
                 side=OrderSide.BUY if action == "BUY" else OrderSide.SELL,
                 time_in_force=TimeInForce.DAY,
                 client_order_id=client_order_id,
             ))
-            
+
             result = self._await_order_outcome(str(order.id))
             logger.info("Close position %s x%d -> %s filled=%.0f avg=%.2f",
                         symbol, qty, result.outcome, result.filled, result.avg_fill_price)
@@ -2075,9 +2367,10 @@ class AlpacaBridge:
             return order_exec.OrderResult(outcome=order_exec.REJECTED, status="Rejected", filled=0.0, remaining=float(qty))
 
     def _cancel_symbol_working_orders(self, symbol: str, timeout_seconds: float = 10.0) -> bool:
+        self.assert_account_mode_safety()
         sym_upper = symbol.upper().strip()
         active_statuses = {"new", "partially_filled", "submitted", "queued", "held", "accepted", "pending_new", "accepted_for_bidding", "stopped", "suspended", "calculated"}
-        
+
         try:
             al_orders = self._get_active_orders()
             matching_ids = [
@@ -2633,6 +2926,7 @@ class AlpacaBridge:
         return report
 
     def flatten_all(self, confirm: bool = False) -> dict:
+        self.assert_account_mode_safety()
         self._require_connection()
         logger.info("Flattening all positions and orders on Alpaca paper account")
         closed_count = 0
@@ -2829,6 +3123,7 @@ class AlpacaBridge:
         target_price: float,
         client_order_id: Optional[str] = None,
     ) -> dict:
+        self.assert_account_mode_safety()
         self._require_connection()
         self._require_trade_stream()
         self._require_new_entries_allowed()
@@ -2951,6 +3246,7 @@ class AlpacaBridge:
             return None
 
     def place_stop_order(self, symbol: str, side: str, qty: float, stop_price: float) -> dict:
+        self.assert_account_mode_safety()
         self._require_connection()
         min_shares = getattr(config_module, "MIN_SHARE_COUNT", 1)
         qty = max(int(qty), min_shares)
@@ -2968,6 +3264,7 @@ class AlpacaBridge:
         return {"order_id": str(order.id)}
 
     def modify_stop_order(self, order_id: str, new_stop: float, symbol: Optional[str] = None) -> Optional[str]:
+        self.assert_account_mode_safety()
         self._require_connection()
         if getattr(self, "dry_run", False):
             logger.info("[DRY-RUN MUTATION BLOCKED] modify_stop_order %s -> stop=%.2f", order_id, new_stop)
@@ -3052,6 +3349,7 @@ class AlpacaBridge:
             return None
 
     def cancel_order(self, order_id: str) -> bool:
+        self.assert_account_mode_safety()
         self._require_connection()
         if getattr(self, "dry_run", False):
             self.mutation_counters.record("cancel_order", True)
@@ -3072,147 +3370,449 @@ class AlpacaBridge:
             from alpaca.trading.requests import GetOrdersRequest
             from alpaca.trading.enums import QueryOrderStatus
             from strategies.session import now_eastern
-            from strategies.trade_journal import log_fill, read_journal
+            from strategies.trade_journal import (
+                log_fill, read_journal, get_journal_lock,
+                canonical_decimal, load_journal_order_fill_state, OrderFillState,
+            )
+            from decimal import Decimal
             import pytz
 
             today_date = now_eastern().date()
-            existing_records = read_journal()
-            existing_fill_ids = set()
-            for r in existing_records:
-                if r.get("event_type") == "FILL" or r.get("type") == "FILL":
-                    for key in ("execution_id", "order_id", "broker_order_id"):
-                        val = r.get(key)
-                        if val:
-                            existing_fill_ids.add(str(val))
+            acct_id = str(getattr(self, "account_id", "") or "ALPACA")
 
             req = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=500)
             orders = self._client.get_orders(req)
             synced_count = 0
 
-            for o in sorted(orders, key=lambda x: x.filled_at if x.filled_at else _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)):
-                if o.filled_at is None or not o.filled_qty or float(o.filled_qty) <= 0:
-                    continue
-                filled_utc = o.filled_at
-                if filled_utc.tzinfo is None:
-                    filled_utc = filled_utc.replace(tzinfo=_dt.timezone.utc)
-                
-                et_tz = pytz.timezone("US/Eastern")
-                filled_et = filled_utc.astimezone(et_tz)
-                if filled_et.date() != today_date:
-                    continue
-
-                order_id_str = str(o.id)
-                if order_id_str in existing_fill_ids:
-                    continue
-
-                client_ref = getattr(o, "client_order_id", "") or ""
-                parts = client_ref.split("_")
-                strat = parts[1] if len(parts) >= 2 and parts[0] == "dt" else "UNKNOWN"
-
-                side = o.side.value.upper() if hasattr(o.side, "value") else str(o.side).upper()
-                fill_price = float(o.filled_avg_price or 0.0)
-                qty = int(float(o.filled_qty))
-
-                from strategies.order_registry import get_registered_order
-                reg = get_registered_order(order_id_str)
-                
-                order_type = "ENTRY"
-                signal_id = None
-                if reg:
-                    expected_price = reg["expected_price"]
-                    order_type = reg.get("order_type", "ENTRY")
-                    if reg.get("strategy") and reg["strategy"] != "UNKNOWN":
-                        strat = reg["strategy"]
-                    if reg.get("signal_id"):
-                        signal_id = reg["signal_id"]
-                else:
-                    if getattr(o, "stop_price", None) and float(o.stop_price) > 0:
-                        expected_price = float(o.stop_price)
-                        order_type = "STOP_LOSS"
-                    elif getattr(o, "limit_price", None) and float(o.limit_price) > 0:
-                        expected_price = float(o.limit_price)
-                        order_type = "TAKE_PROFIT" if side == "SELL" else "ENTRY"
-                    else:
-                        expected_price = fill_price
-
-                if expected_price > 0:
-                    if side == "BUY":
-                        slippage = (fill_price - expected_price) / expected_price
-                    else:
-                        slippage = (expected_price - fill_price) / expected_price
-                else:
-                    slippage = 0.0
-
-                submitted_at = getattr(o, "submitted_at", None) or getattr(o, "created_at", None)
-                fill_latency_ms = None
-                if submitted_at and getattr(o, "filled_at", None):
-                    try:
-                        duration_sec = (o.filled_at - submitted_at).total_seconds()
-                        if order_type == "ENTRY" or duration_sec <= 10.0:
-                            fill_latency_ms = max(0.0, duration_sec * 1000.0)
-                    except Exception:
-                        fill_latency_ms = None
-
-                tier = "5-10" if (5.0 <= fill_price < 10.0) else (">10" if fill_price >= 10.0 else "<5")
-                log_fill(
-                    symbol=o.symbol,
-                    side=side,
-                    qty=qty,
-                    fill_price=fill_price,
-                    expected_price=expected_price,
-                    slippage=slippage,
-                    fill_latency_ms=fill_latency_ms,
-                    order_id=order_id_str,
-                    broker_order_id=order_id_str,
-                    execution_id=None,
-                    account_id=str(getattr(self, "account_id", "") or "ALPACA"),
-                    signal_id=signal_id,
-                    timestamp=filled_utc.isoformat(),
-                    strategy=strat,
-                    price_tier=tier,
+            with get_journal_lock():
+                existing_records = read_journal()
+                states = load_journal_order_fill_state(
+                    existing_records, account_id=acct_id, trading_date=today_date
                 )
-                if side == "SELL":
-                    try:
-                        from strategies.intraday_risk import register_symbol_loss
-                        from strategies.trailing_stop import get_trailing_manager
-                        from strategies.trade_journal import get_today_closed_trades
 
-                        is_loss = False  # Fail-safe default: do not penalize without proven negative PnL
-                        mgr = get_trailing_manager()
-                        state = mgr.states.get(o.symbol)
+                for o in sorted(orders, key=lambda x: x.filled_at if x.filled_at else _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)):
+                    if o.filled_at is None or not o.filled_qty or float(o.filled_qty) <= 0:
+                        continue
+                    filled_utc = o.filled_at
+                    if filled_utc.tzinfo is None:
+                        filled_utc = filled_utc.replace(tzinfo=_dt.timezone.utc)
 
-                        if state and state.entry_price > 0:
-                            is_loss = (fill_price < state.entry_price)
+                    et_tz = pytz.timezone("US/Eastern")
+                    filled_et = filled_utc.astimezone(et_tz)
+                    if filled_et.date() != today_date:
+                        continue
+
+                    order_id_str = str(o.id)
+                    symbol = str(o.symbol).upper()
+                    side = o.side.value.upper() if hasattr(o.side, "value") else str(o.side).upper()
+
+                    key = (acct_id, str(today_date), order_id_str, symbol, side)
+                    fill_state = states.get(key)
+                    if fill_state is None:
+                        fill_state = OrderFillState(broker_order_id=order_id_str)
+                        states[key] = fill_state
+
+                    broker_cum_qty = Decimal(canonical_decimal(o.filled_qty))
+                    already_logged_qty = fill_state.logged_qty
+                    delta_qty = broker_cum_qty - already_logged_qty
+                    broker_avg_price = Decimal(str(getattr(o, "filled_avg_price", None) or 0.0))
+
+                    if delta_qty == Decimal("0"):
+                        # Invariant satisfied: Idempotent no-op
+                        continue
+                    elif delta_qty < Decimal("0"):
+                        reason = f"Broker cumulative qty {broker_cum_qty} < local logged qty {already_logged_qty}"
+                        logger.error(
+                            "[RECONCILIATION ANOMALY] Order %s %s",
+                            order_id_str, reason
+                        )
+                        log_reconciliation_anomaly({
+                            "anomaly_type": "NEGATIVE_DELTA_QUANTITY",
+                            "symbol": symbol,
+                            "broker_order_id": order_id_str,
+                            "previous_cumulative_quantity": str(already_logged_qty),
+                            "new_cumulative_quantity": str(broker_cum_qty),
+                            "previous_cumulative_average": "N/A",
+                            "new_cumulative_average": str(broker_avg_price),
+                            "derived_incremental_price": "N/A",
+                            "rejection_reason": reason,
+                            "required_operator_action": "Audit broker fill history and order lifecycle for reversal.",
+                        })
+                        continue
+
+                    # delta_qty > 0: Deriving incremental fill price and notional
+                    cum_notional = broker_cum_qty * broker_avg_price
+                    prev_notional = fill_state.logged_notional
+                    delta_notional = cum_notional - prev_notional
+
+                    if delta_notional > Decimal("0") and delta_qty > Decimal("0"):
+                        incremental_price = delta_notional / delta_qty
+                    else:
+                        incremental_price = broker_avg_price
+
+                    if incremental_price <= Decimal("0"):
+                        reason = f"Derived incremental price {incremental_price} <= 0"
+                        logger.error(
+                            "[RECONCILIATION REJECTED] Order %s %s. Skipping unverified fill.",
+                            order_id_str, reason
+                        )
+                        log_reconciliation_anomaly({
+                            "anomaly_type": "NON_POSITIVE_DERIVED_PRICE",
+                            "symbol": symbol,
+                            "broker_order_id": order_id_str,
+                            "previous_cumulative_quantity": str(already_logged_qty),
+                            "new_cumulative_quantity": str(broker_cum_qty),
+                            "previous_cumulative_average": str(fill_state.logged_notional / already_logged_qty) if already_logged_qty > 0 else "0.0",
+                            "new_cumulative_average": str(broker_avg_price),
+                            "derived_incremental_price": str(incremental_price),
+                            "rejection_reason": reason,
+                            "required_operator_action": "Inspect Alpaca Web UI for non-positive fill pricing.",
+                        })
+                        continue
+
+                    # Plausibility threshold: price must not deviate by > 20% from cumulative average price
+                    if broker_avg_price > Decimal("0"):
+                        lower_plausible = broker_avg_price * Decimal("0.80")
+                        upper_plausible = broker_avg_price * Decimal("1.20")
+                        if not (lower_plausible <= incremental_price <= upper_plausible):
+                            reason = (
+                                f"Derived incremental price {incremental_price} deviates > 20% "
+                                f"from cumulative average {broker_avg_price} [bounds: {lower_plausible}, {upper_plausible}]"
+                            )
+                            logger.error(
+                                "[RECONCILIATION REJECTED] Order %s %s. Skipping.",
+                                order_id_str, reason
+                            )
+                            log_reconciliation_anomaly({
+                                "anomaly_type": "IMPLAUSIBLE_INCREMENTAL_PRICE",
+                                "symbol": symbol,
+                                "broker_order_id": order_id_str,
+                                "previous_cumulative_quantity": str(already_logged_qty),
+                                "new_cumulative_quantity": str(broker_cum_qty),
+                                "previous_cumulative_average": str(fill_state.logged_notional / already_logged_qty) if already_logged_qty > 0 else "0.0",
+                                "new_cumulative_average": str(broker_avg_price),
+                                "derived_incremental_price": str(incremental_price),
+                                "rejection_reason": reason,
+                                "required_operator_action": "Inspect Alpaca Web UI and broker fills for order pricing discrepancy.",
+                            })
+                            continue
+
+                    synth_exec_id = (
+                        f"SYNTH:ALPACA:{order_id_str}:"
+                        f"{canonical_decimal(already_logged_qty)}-{canonical_decimal(broker_cum_qty)}"
+                    )
+                    if synth_exec_id in fill_state.execution_ids:
+                        continue
+
+                    client_ref = getattr(o, "client_order_id", "") or ""
+                    parts = client_ref.split("_")
+                    strat = parts[1] if len(parts) >= 2 and parts[0] == "dt" else "UNKNOWN"
+
+                    from strategies.order_registry import get_registered_order
+                    reg = get_registered_order(order_id_str)
+
+                    order_type = "ENTRY"
+                    signal_id = None
+                    if reg:
+                        expected_price = reg["expected_price"]
+                        order_type = reg.get("order_type", "ENTRY")
+                        if reg.get("strategy") and reg["strategy"] != "UNKNOWN":
+                            strat = reg["strategy"]
+                        if reg.get("signal_id"):
+                            signal_id = reg["signal_id"]
+                    else:
+                        if getattr(o, "stop_price", None) and float(o.stop_price) > 0:
+                            expected_price = float(o.stop_price)
+                            order_type = "STOP_LOSS"
+                        elif getattr(o, "limit_price", None) and float(o.limit_price) > 0:
+                            expected_price = float(o.limit_price)
+                            order_type = "TAKE_PROFIT" if side == "SELL" else "ENTRY"
                         else:
-                            closed_trades = [t for t in get_today_closed_trades() if t.get("symbol") == o.symbol]
-                            if closed_trades and closed_trades[-1].get("realized_pnl") is not None:
-                                is_loss = (float(closed_trades[-1].get("realized_pnl", 0.0) or 0.0) < 0)
-                            else:
-                                # Fallback to authoritative broker BUY orders for this symbol today
-                                buy_orders = [
-                                    b for b in orders
-                                    if getattr(b, "symbol", "") == o.symbol
-                                    and str(getattr(b, "side", "")).upper() in ("BUY", "ORDERSIDE.BUY")
-                                    and getattr(b, "filled_avg_price", None) is not None
-                                ]
-                                if buy_orders:
-                                    try:
-                                        avg_buy_price = float(buy_orders[-1].filled_avg_price)
-                                        if avg_buy_price > 0:
-                                            is_loss = (fill_price < avg_buy_price)
-                                    except Exception:
-                                        is_loss = False
+                            expected_price = float(incremental_price)
 
-                        if is_loss:
-                            register_symbol_loss(o.symbol, filled_utc)
-                    except Exception as loss_chk_exc:
-                        logger.debug("Error checking trade exit loss status for %s: %s", o.symbol, loss_chk_exc)
-                existing_fill_ids.add(order_id_str)
-                synced_count += 1
+                    fill_price_float = float(incremental_price)
+                    if expected_price > 0:
+                        if side == "BUY":
+                            slippage = (fill_price_float - expected_price) / expected_price
+                        else:
+                            slippage = (expected_price - fill_price_float) / expected_price
+                    else:
+                        slippage = 0.0
+
+                    submitted_at = getattr(o, "submitted_at", None) or getattr(o, "created_at", None)
+                    fill_latency_ms = None
+                    if submitted_at and getattr(o, "filled_at", None):
+                        try:
+                            duration_sec = (o.filled_at - submitted_at).total_seconds()
+                            if order_type == "ENTRY" or duration_sec <= 10.0:
+                                fill_latency_ms = max(0.0, duration_sec * 1000.0)
+                        except Exception:
+                            fill_latency_ms = None
+
+                    tier = "5-10" if (5.0 <= fill_price_float < 10.0) else (">10" if fill_price_float >= 10.0 else "<5")
+
+                    qty_to_log = int(delta_qty) if (delta_qty % 1 == 0) else float(delta_qty)
+                    prev_avg_px_str = canonical_decimal(prev_notional / already_logged_qty) if already_logged_qty > 0 else "0"
+
+                    upd = getattr(o, "updated_at", None)
+                    if isinstance(upd, _dt.datetime):
+                        upd_str = upd.isoformat()
+                    elif isinstance(upd, str) and upd:
+                        upd_str = upd
+                    else:
+                        upd_str = filled_utc.isoformat()
+
+                    log_fill(
+                        symbol=o.symbol,
+                        side=side,
+                        qty=qty_to_log,
+                        fill_price=fill_price_float,
+                        expected_price=expected_price,
+                        slippage=slippage,
+                        fill_latency_ms=fill_latency_ms,
+                        order_id=order_id_str,
+                        broker_order_id=order_id_str,
+                        execution_id=synth_exec_id,
+                        account_id=acct_id,
+                        signal_id=signal_id,
+                        timestamp=filled_utc.isoformat(),
+                        strategy=strat,
+                        price_tier=tier,
+                        incremental_qty=canonical_decimal(delta_qty),
+                        previously_logged_qty=canonical_decimal(already_logged_qty),
+                        broker_cumulative_filled_qty=canonical_decimal(broker_cum_qty),
+                        broker_filled_avg_price=canonical_decimal(broker_avg_price),
+                        previous_cumulative_avg_price=prev_avg_px_str,
+                        price_semantics="DERIVED_FROM_CUMULATIVE_AVERAGE",
+                        source="ALPACA_ORDER_RECONCILIATION",
+                        synthetic=True,
+                        reconciliation_reason="CUMULATIVE_FILLED_QTY_ADVANCED",
+                        broker_state_observed_at_utc=now_eastern().astimezone(pytz.utc).isoformat(),
+                        broker_order_updated_at=upd_str,
+                    )
+
+                    if side == "SELL":
+                        try:
+                            from strategies.intraday_risk import register_symbol_loss
+                            from strategies.trailing_stop import get_trailing_manager
+                            from strategies.trade_journal import get_today_closed_trades
+
+                            is_loss = False
+                            mgr = get_trailing_manager()
+                            state_obj = mgr.states.get(o.symbol)
+
+                            if state_obj and state_obj.entry_price > 0:
+                                is_loss = (fill_price_float < state_obj.entry_price)
+                            else:
+                                closed_trades = [t for t in get_today_closed_trades() if t.get("symbol") == o.symbol]
+                                if closed_trades and closed_trades[-1].get("realized_pnl") is not None:
+                                    is_loss = (float(closed_trades[-1].get("realized_pnl", 0.0) or 0.0) < 0)
+                                else:
+                                    buy_orders = [
+                                        b for b in orders
+                                        if getattr(b, "symbol", "") == o.symbol
+                                        and str(getattr(b, "side", "")).upper() in ("BUY", "ORDERSIDE.BUY")
+                                        and getattr(b, "filled_avg_price", None) is not None
+                                    ]
+                                    if buy_orders:
+                                        try:
+                                            avg_buy_price = float(buy_orders[-1].filled_avg_price)
+                                            if avg_buy_price > 0:
+                                                is_loss = (fill_price_float < avg_buy_price)
+                                        except Exception:
+                                            is_loss = False
+
+                            if is_loss:
+                                register_symbol_loss(o.symbol, filled_utc)
+                        except Exception as loss_chk_exc:
+                            logger.debug("Error checking trade exit loss status for %s: %s", o.symbol, loss_chk_exc)
+
+                    # Advance local in-memory cumulative state
+                    fill_state.add_fill(delta_qty, incremental_price, synth_exec_id)
+                    synced_count += 1
+
             return synced_count
         except Exception as exc:
             logger.warning("sync_today_trades_to_journal failed: %s", exc)
             return 0
+
+    def verify_shutdown_positions(self, timeout_seconds: float = 5.0, reason: str = "SHUTDOWN") -> dict:
+        """
+        Phase 4: Graceful shutdown broker position & working order assertion with atomic snapshot persistence.
+        Does NOT perform automated liquidation/flattening.
+        Evaluates discrete position and working-order statuses and writes atomic snapshot to logs/.
+        """
+        import os
+        import json
+        from pathlib import Path
+        from datetime import datetime, timezone
+        from concurrent.futures import ThreadPoolExecutor
+
+        now_utc = datetime.now(timezone.utc)
+        now_ts = int(now_utc.timestamp())
+        now_utc_str = now_utc.isoformat()
+        acct_id = str(getattr(self, "account_id", "") or "ALPACA")
+
+        positions_raw = []
+        working_orders_raw = []
+        position_query_status = "SUCCESS"
+        order_query_status = "SUCCESS"
+
+        if not self._connected or not self._client:
+            position_query_status = "FAILED"
+            order_query_status = "FAILED"
+        else:
+            # Enforce standardized transport-level connect & read timeouts (P1 reuse)
+            try:
+                c_to = float(getattr(config_module, "ALPACA_DATA_CONNECT_TIMEOUT", 1.0))
+                r_to = float(getattr(config_module, "ALPACA_DATA_READ_TIMEOUT", 2.5))
+                client_sess = getattr(self._client, "_session", None)
+                if client_sess:
+                    configure_session_timeouts(
+                        client_sess,
+                        connect_timeout=c_to,
+                        read_timeout=r_to,
+                        total_retries=1,
+                        backoff_factor=0.1,
+                    )
+            except Exception as sess_cfg_err:
+                logger.debug("Session timeout standardization non-fatal: %s", sess_cfg_err)
+
+            # Query positions with bounded timeout
+            try:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    fut = executor.submit(lambda: self._client.get_all_positions())
+                    pos_objs = fut.result(timeout=timeout_seconds)
+                for p in (pos_objs or []):
+                    qty_f = float(getattr(p, "qty", 0.0) or 0.0)
+                    if qty_f != 0:
+                        positions_raw.append({
+                            "symbol": getattr(p, "symbol", ""),
+                            "qty": qty_f,
+                            "side": getattr(p, "side", ""),
+                            "market_value": float(getattr(p, "market_value", 0.0) or 0.0),
+                            "avg_entry_price": float(getattr(p, "avg_entry_price", 0.0) or 0.0),
+                        })
+            except Exception as pos_exc:
+                logger.error("[SHUTDOWN ASSERTION] Broker position query failed: %s", pos_exc)
+                position_query_status = "FAILED"
+
+            # Query open orders with bounded timeout
+            try:
+                from alpaca.trading.requests import GetOrdersRequest
+                from alpaca.trading.enums import QueryOrderStatus
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    req = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=200)
+                    fut = executor.submit(lambda: self._client.get_orders(req))
+                    ord_objs = fut.result(timeout=timeout_seconds)
+                WORKING_STATUSES = {
+                    "new", "accepted", "pending_new", "partially_filled",
+                    "held", "pending_replace", "accepted_for_bidding", "calculated"
+                }
+                TERMINAL_STATUSES = {
+                    "filled", "canceled", "cancelled", "expired", "rejected", "replaced", "done_for_day"
+                }
+                for o in (ord_objs or []):
+                    st_raw = getattr(o, "status", "")
+                    st = (st_raw.value if hasattr(st_raw, "value") else str(st_raw)).lower().strip()
+                    if st in TERMINAL_STATUSES:
+                        continue
+                    if st in WORKING_STATUSES or (st and st not in TERMINAL_STATUSES):
+                        working_orders_raw.append({
+                            "order_id": str(getattr(o, "id", "")),
+                            "symbol": getattr(o, "symbol", ""),
+                            "side": str(getattr(o, "side", "")),
+                            "qty": float(getattr(o, "qty", 0.0) or 0.0),
+                            "type": str(getattr(o, "type", "")),
+                            "status": st,
+                        })
+            except Exception as ord_exc:
+                logger.error("[SHUTDOWN ASSERTION] Broker open order query failed: %s", ord_exc)
+                order_query_status = "FAILED"
+
+        # Evaluate discrete statuses
+        if position_query_status == "FAILED":
+            position_status = "POSITION_VERIFICATION_FAILED"
+        elif len(positions_raw) > 0:
+            position_status = "VERIFIED_NON_FLAT"
+        else:
+            position_status = "VERIFIED_FLAT"
+
+        if order_query_status == "FAILED":
+            order_status = "ORDER_VERIFICATION_FAILED"
+        elif len(working_orders_raw) > 0:
+            order_status = "WORKING_ORDERS_PRESENT"
+        else:
+            order_status = "NO_WORKING_ORDERS"
+
+        # Determine overall status and exit code
+        failures = []
+        if position_status == "POSITION_VERIFICATION_FAILED":
+            failures.append("POSITION_VERIFICATION_FAILED")
+        elif position_status == "VERIFIED_NON_FLAT":
+            failures.append("VERIFIED_NON_FLAT")
+
+        if order_status == "ORDER_VERIFICATION_FAILED":
+            failures.append("ORDER_VERIFICATION_FAILED")
+        elif order_status == "WORKING_ORDERS_PRESENT":
+            failures.append("WORKING_ORDERS_PRESENT")
+
+        if "VERIFIED_NON_FLAT" in failures:
+            exit_code = 2
+            overall_status = "VERIFIED_NON_FLAT"
+        elif "POSITION_VERIFICATION_FAILED" in failures:
+            exit_code = 3
+            overall_status = "POSITION_VERIFICATION_FAILED"
+        elif "WORKING_ORDERS_PRESENT" in failures:
+            exit_code = 4
+            overall_status = "VERIFIED_FLAT_BUT_UNCLEAN" if position_status == "VERIFIED_FLAT" else "VERIFIED_NON_FLAT"
+        elif "ORDER_VERIFICATION_FAILED" in failures:
+            exit_code = 4
+            overall_status = "ORDER_VERIFICATION_FAILED"
+        else:
+            exit_code = 0
+            overall_status = "VERIFIED_FLAT_CLEAN"
+
+        snapshot = {
+            "snapshot_id": f"SNAPSHOT_{now_ts}",
+            "created_at_utc": now_utc_str,
+            "account_id": acct_id,
+            "environment": "paper",
+            "shutdown_reason": reason,
+            "position_query_status": position_query_status,
+            "order_query_status": order_query_status,
+            "position_status": position_status,
+            "order_status": order_status,
+            "overall_status": overall_status,
+            "positions": positions_raw,
+            "working_orders": working_orders_raw,
+            "exit_code": exit_code,
+            "failures": failures,
+        }
+
+        # Atomic persistence
+        logs_dir = Path("logs")
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        final_path = logs_dir / f"shutdown_position_snapshot_{now_ts}.json"
+        tmp_path = final_path.with_suffix(".json.tmp")
+        try:
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                json.dump(snapshot, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, final_path)
+            snapshot["persisted_to"] = str(final_path)
+        except Exception as write_err:
+            logger.error("[SHUTDOWN ASSERTION] Atomic snapshot write failed: %s", write_err)
+            failures.append("SNAPSHOT_PERSISTENCE_FAILED")
+            if exit_code == 0:
+                exit_code = 5
+                overall_status = "SNAPSHOT_PERSISTENCE_FAILED"
+            snapshot["exit_code"] = exit_code
+            snapshot["overall_status"] = overall_status
+            snapshot["failures"] = failures
+
+        return snapshot
 
     def open_position_count(self) -> int:
         self._require_connection()
@@ -3243,6 +3843,7 @@ class AlpacaBridge:
             return False
 
     def _cancel_all_orders_for_symbol(self, symbol: str) -> None:
+        self.assert_account_mode_safety()
         if getattr(self, "dry_run", False):
             logger.info("[DRY-RUN MUTATION BLOCKED] _cancel_all_orders_for_symbol %s", symbol)
             return
@@ -3262,25 +3863,86 @@ class AlpacaBridge:
             logger.debug("Error cancelling orders for %s: %s", symbol, err)
 
     def close_position(self, symbol: str) -> bool:
+        self.assert_account_mode_safety()
         self._require_connection()
         if getattr(self, "dry_run", False):
             self.mutation_counters.record("close_position", True)
             logger.info("[DRY-RUN MUTATION BLOCKED] close_position %s", symbol)
             return True
         try:
-            self._cancel_all_orders_for_symbol(symbol)
-            close_order = self._client.close_position(symbol.upper().strip())
+            sym_upper = symbol.upper().strip()
+            # 1. Pre-Exit Validation: Check if position is already flat
+            raw_pos = self.get_position(sym_upper)
+            pos_qty = normalize_position_qty(raw_pos)
+            if abs(pos_qty) < 1e-6:
+                logger.info("[CLOSE POSITION] %s is already flat (qty=0)", sym_upper)
+                return True
+
+            # 2. Cancel existing working orders for this symbol first
+            self._cancel_all_orders_for_symbol(sym_upper)
+
+            # 3. Submit broker close order
+            close_order = self._client.close_position(sym_upper)
             order_id = getattr(close_order, "id", None)
             if order_id and hasattr(self, "_await_order_outcome"):
-                res = self._await_order_outcome(str(order_id), timeout_seconds=15.0)
-                is_filled = res.has_fill or (res.outcome == order_exec.FILLED)
-                logger.info("Closed position for %s: outcome=%s, filled=%.0f", symbol, res.outcome, res.filled)
-                return is_filled
+                try:
+                    res = self._await_order_outcome(str(order_id), timeout=15.0)
+                    logger.info("Close order for %s: outcome=%s, filled=%.0f, remaining=%.0f", sym_upper, res.outcome, res.filled, getattr(res, "remaining", 0.0))
+                except Exception as await_err:
+                    logger.warning("[CLOSE POSITION] Error polling outcome for order %s (%s): %s", order_id, sym_upper, await_err)
+
+            # 4. Authoritative broker position re-query check
             time.sleep(0.5)
-            pos = self.get_position(symbol)
-            return pos == 0
+            pos_after = normalize_position_qty(self.get_position(sym_upper))
+            if abs(pos_after) < 1e-6:
+                logger.info("[CLOSE POSITION] Verified %s is now flat after close submission", sym_upper)
+                return True
+
+            # 5. Controlled Retry Guard:
+            # Check if original close order is still working or other working orders exist
+            active_orders = [
+                o for o in self._get_active_orders()
+                if getattr(o, "symbol", "").upper().strip() == sym_upper
+            ]
+            if active_orders:
+                logger.warning(
+                    "[CLOSE POSITION RETRY BLOCKED] %s has %d working orders. Cancelling before retry evaluation.",
+                    sym_upper, len(active_orders),
+                )
+                self._cancel_all_orders_for_symbol(sym_upper)
+                time.sleep(0.5)
+
+            # Re-verify remaining position from broker truth
+            rem_pos = normalize_position_qty(self.get_position(sym_upper))
+            if abs(rem_pos) < 1e-6:
+                logger.info("[CLOSE POSITION] Verified %s became flat after clearing working orders", sym_upper)
+                return True
+
+            # Anti-reversal guard: Do not retry if position flipped direction (long->short or short->long)
+            if (pos_qty > 0 and rem_pos < 0) or (pos_qty < 0 and rem_pos > 0):
+                logger.critical(
+                    "[CLOSE POSITION REVERSAL DETECTED] %s initial=%.2f, current=%.2f. Refusing retry to prevent reversal escalation.",
+                    sym_upper, pos_qty, rem_pos,
+                )
+                return False
+
+            # Controlled single retry derived from broker-verified remaining position
+            logger.warning("[CLOSE POSITION RETRY] %s still holds %.2f shares. Submitting controlled retry...", sym_upper, rem_pos)
+            retry_order = self._client.close_position(sym_upper)
+            retry_id = getattr(retry_order, "id", None)
+            if retry_id and hasattr(self, "_await_order_outcome"):
+                try:
+                    res = self._await_order_outcome(str(retry_id), timeout=15.0)
+                    if res.has_fill or (res.outcome == order_exec.FILLED):
+                        return True
+                except Exception as retry_await_err:
+                    logger.warning("[CLOSE POSITION RETRY] Error polling retry order %s: %s", retry_id, retry_await_err)
+
+            time.sleep(1.0)
+            final_pos = normalize_position_qty(self.get_position(sym_upper))
+            return abs(final_pos) < 1e-6
         except Exception as exc:
-            logger.error("Failed to close position for %s: %s", symbol, exc)
+            logger.exception("Failed to close position for %s: %s", symbol, exc)
             return False
 
     def market_price(self, symbol: str) -> Optional[float]:
@@ -3300,6 +3962,7 @@ class AlpacaBridge:
             return None
 
     def _cancel_working_entry_orders(self, symbol: str) -> None:
+        self.assert_account_mode_safety()
         if getattr(self, "dry_run", False):
             self.mutation_counters.record("cancel_order", True)
             logger.info("[DRY-RUN MUTATION BLOCKED] _cancel_working_entry_orders %s", symbol)

@@ -349,6 +349,46 @@ def test_swing_risk_basis_store_and_unrealized_r():
         assert 'AAPL' not in load_risk_store(path=store_file)
 
 
+def test_risk_store_respects_config_data_dir_isolation():
+    from unittest import mock
+    from strategies.swing_risk_store import (
+        get_default_risk_store_path,
+        save_risk_basis,
+        load_risk_store,
+        PositionRiskBasis,
+        DEFAULT_RISK_STORE_PATH,
+    )
+    import config as config_mod
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        with mock.patch.object(config_mod, "DATA_DIR", tmp_path):
+            # 1. Path must dynamically resolve to tmp_path / swing_position_risk.json
+            resolved = get_default_risk_store_path()
+            assert resolved == tmp_path / "swing_position_risk.json"
+
+            # 2. Saving without explicit path argument MUST write into tmp_path and NOT production
+            basis = PositionRiskBasis(
+                symbol="ISOLATION_TEST",
+                entry_price=200.0,
+                initial_stop_price=190.0,
+                initial_risk_per_share=10.0,
+                initial_total_risk=100.0,
+                shares=10,
+                entry_timestamp_utc="2026-09-10T12:00:00Z",
+            )
+            save_risk_basis(basis)  # path=None
+
+            # Assert file created in temp directory
+            assert (tmp_path / "swing_position_risk.json").exists()
+            loaded_tmp = load_risk_store()
+            assert "ISOLATION_TEST" in loaded_tmp
+
+            # Assert production file is UNTOUCHED
+            prod_store = load_risk_store(path=DEFAULT_RISK_STORE_PATH)
+            assert "ISOLATION_TEST" not in prod_store
+
+
 # ─── 9. Permanent Max Concurrent Positions & Mutation Counters Tests ────────
 
 def test_eighth_position_is_rejected_at_stage0_limit():

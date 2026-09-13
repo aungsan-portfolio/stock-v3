@@ -1,5 +1,5 @@
 """
-tests/test_p0_forensic_replays.py -- 12 Mandatory Deterministic Replay Tests for P0 Hardening.
+tests/test_p0_forensic_replays.py -- 13 Mandatory Deterministic Replay Tests for P0 Hardening.
 
 Covers:
   1. test_stale_primary_and_stale_fallback_rejects_both
@@ -14,6 +14,7 @@ Covers:
   10. test_direction_aware_chase_favorable_quote
   11. test_noise_floor_fail_closed_rejection
   12. test_ledger_reconciliation_roundtrip
+  13. test_stale_primary_and_unauthorized_fallback_fails_closed
 """
 
 import os
@@ -369,6 +370,43 @@ class TestP0ForensicReplays(unittest.TestCase):
         total_broker_pnl = sum(t.broker_realized_pnl for t in trades)
         # Expected broker realized PnL from forensic baseline is +$12.22
         self.assertAlmostEqual(total_broker_pnl, 12.22, places=2)
+
+    # ─────────────────────────────────────────────────────────────
+    # Replay Test 13: Stale Primary & Unauthorized Fallback Fails Closed
+    # ─────────────────────────────────────────────────────────────
+    def test_stale_primary_and_unauthorized_fallback_fails_closed(self):
+        """When primary returns stale bars and fallback raises 403 Forbidden / Unauthorized, fail-closed rejects symbol."""
+        now = datetime.now(timezone.utc)
+        stale_time = now - timedelta(minutes=15)
+
+        stale_df = pd.DataFrame(
+            {"open": [100.0], "high": [101.0], "low": [99.0], "close": [100.5], "volume": [1000]},
+            index=[stale_time],
+        )
+
+        mock_client = MagicMock()
+        stale_bars = MagicMock()
+        stale_bars.df = stale_df
+
+        # Primary call succeeds with stale data; Fallback call raises 403 Forbidden / Unauthorized
+        mock_client.get_stock_bars.side_effect = [
+            stale_bars,
+            Exception("403 Client Error: Forbidden for url: https://data.alpaca.markets/v2/stocks/bars?feed=sip (subscription required)"),
+        ]
+
+        with patch("strategies.intraday_data._get_alpaca_credentials", return_value=("test_key", "test_sec")), \
+             patch("strategies.intraday_data._get_alpaca_client", return_value=mock_client), \
+             patch("strategies.session.is_market_open", return_value=True), \
+             self.assertLogs("strategies.intraday_data", level="WARNING") as cm:
+
+            res = fetch_batch_intraday_alpaca(["AAPL"], interval="5m", lookback_days=1, purpose="ENTRY_SIGNAL")
+            # Must fail closed: symbol must NOT be in results
+            self.assertNotIn("AAPL", res, "Symbol must be strictly excluded when fallback is unauthorized")
+            # Must log FALLBACK_UNAUTHORIZED
+            self.assertTrue(
+                any("FALLBACK_UNAUTHORIZED" in log_msg for log_msg in cm.output),
+                f"Expected FALLBACK_UNAUTHORIZED in log messages, got: {cm.output}",
+            )
 
 
 if __name__ == "__main__":

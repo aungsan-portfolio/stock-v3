@@ -333,6 +333,21 @@ DAYTRADE_BATCH_FETCH_ENABLED        = os.environ.get("DAYTRADE_BATCH_FETCH_ENABL
 DAYTRADE_BATCH_FETCH_MAX_CHUNK      = int(os.environ.get("DAYTRADE_BATCH_FETCH_MAX_CHUNK", "25"))
 DAYTRADE_BATCH_FETCH_TIMEOUT_S      = float(os.environ.get("DAYTRADE_BATCH_FETCH_TIMEOUT_S", "6.0"))
 DAYTRADE_BATCH_FETCH_MIN_COVERAGE   = float(os.environ.get("DAYTRADE_BATCH_FETCH_MIN_COVERAGE", "0.95"))
+DAYTRADE_STARTUP_CADENCE_GRACE_S    = float(os.environ.get("DAYTRADE_STARTUP_CADENCE_GRACE_S", "60.0"))
+MAX_ALLOWED_CHASE                   = float(os.environ.get("MAX_ALLOWED_CHASE", "0.15"))
+DAYTRADE_BAR_PUBLICATION_TIMEOUT_S        = float(os.environ.get("DAYTRADE_BAR_PUBLICATION_TIMEOUT_S", "90.0"))
+DAYTRADE_BAR_PUBLICATION_POLL_INTERVAL_S  = float(os.environ.get("DAYTRADE_BAR_PUBLICATION_POLL_INTERVAL_S", "5.0"))
+DAYTRADE_REQUIRE_ENTRY_READINESS          = os.environ.get("DAYTRADE_REQUIRE_ENTRY_READINESS", "true").lower() in ("true", "1")
+
+
+# ── Latency Remediation & Resilient Recovery Settings ──
+DAYTRADE_RECOVERY_MAX_WORKERS          = int(os.environ.get("DAYTRADE_RECOVERY_MAX_WORKERS", "4"))
+DAYTRADE_SYMBOL_FETCH_TIMEOUT_SECONDS   = float(os.environ.get("DAYTRADE_SYMBOL_FETCH_TIMEOUT_SECONDS", "2.5"))
+DAYTRADE_RECOVERY_MAX_CANDIDATES       = int(os.environ.get("DAYTRADE_RECOVERY_MAX_CANDIDATES", "5"))
+DAYTRADE_RECOVERY_TOTAL_TIMEOUT_SECONDS = float(os.environ.get("DAYTRADE_RECOVERY_TOTAL_TIMEOUT_SECONDS", "8.0"))
+ALPACA_DATA_CONNECT_TIMEOUT            = float(os.environ.get("ALPACA_DATA_CONNECT_TIMEOUT", "0.75"))
+ALPACA_DATA_READ_TIMEOUT               = float(os.environ.get("ALPACA_DATA_READ_TIMEOUT", "1.75"))
+
 
 
 DATA_HEALTH_SETTINGS = {
@@ -369,6 +384,75 @@ IBKR_MARKET_DATA_TYPE = 3
 # ── Alpaca ───────────────────────────────────────
 ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets"
 ALPACA_DATA_FEED      = "iex"
+
+# Chunked batch fetch & data feed settings
+ALPACA_CHUNK_SIZE: int = int(os.environ.get("ALPACA_CHUNK_SIZE", 5))
+ALPACA_CHUNK_DELAY_MS: int = int(os.environ.get("ALPACA_CHUNK_DELAY_MS", 200))
+ALPACA_CHUNK_TIMEOUT_SECONDS: float = float(os.environ.get("ALPACA_CHUNK_TIMEOUT_SECONDS", 2.0))
+ALPACA_SUBSCRIPTION_TIER: str = os.environ.get("ALPACA_SUBSCRIPTION_TIER", "free").lower().strip()
+
+# WebSocket keepalive & connection management
+ALPACA_WS_PING_INTERVAL_SECONDS: int = int(os.environ.get("ALPACA_WS_PING_INTERVAL_SECONDS", 20))
+ALPACA_WS_PING_TIMEOUT_SECONDS: int = int(os.environ.get("ALPACA_WS_PING_TIMEOUT_SECONDS", 10))
+ALPACA_WS_MAX_QUEUE: int = int(os.environ.get("ALPACA_WS_MAX_QUEUE", 1024))
+
+
+def _require_positive_int(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return value
+
+
+def _require_non_negative_int(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    return value
+
+
+def _require_positive_float(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ValueError(f"{name} must be a positive float, got {value!r}")
+    return float(value)
+
+
+def validate_alpaca_runtime_config() -> None:
+    """
+    Validates Alpaca daytrade runtime configuration.
+    Must only be called explicitly during bot startup, NEVER at module import time.
+    """
+    _require_positive_int("ALPACA_CHUNK_SIZE", ALPACA_CHUNK_SIZE)
+    _require_non_negative_int("ALPACA_CHUNK_DELAY_MS", ALPACA_CHUNK_DELAY_MS)
+    _require_positive_float("ALPACA_CHUNK_TIMEOUT_SECONDS", ALPACA_CHUNK_TIMEOUT_SECONDS)
+    tier = str(ALPACA_SUBSCRIPTION_TIER).lower().strip()
+    if tier not in ("free", "unlimited"):
+        raise ValueError(f"ALPACA_SUBSCRIPTION_TIER must be 'free' or 'unlimited', got {ALPACA_SUBSCRIPTION_TIER!r}")
+    _require_positive_int("ALPACA_WS_PING_INTERVAL_SECONDS", ALPACA_WS_PING_INTERVAL_SECONDS)
+    _require_positive_int("ALPACA_WS_PING_TIMEOUT_SECONDS", ALPACA_WS_PING_TIMEOUT_SECONDS)
+    _require_positive_int("ALPACA_WS_MAX_QUEUE", ALPACA_WS_MAX_QUEUE)
+    validate_institutional_safety_config()
+
+
+def validate_institutional_safety_config() -> None:
+    """Validates parameters for cadence, publication, coverage, and chase protection."""
+    import sys
+    cfg = sys.modules.get("config", sys.modules[__name__])
+    pub_timeout = float(getattr(cfg, "DAYTRADE_BAR_PUBLICATION_TIMEOUT_S", 90.0))
+    poll_interval = float(getattr(cfg, "DAYTRADE_BAR_PUBLICATION_POLL_INTERVAL_S", 5.0))
+    coverage = float(getattr(cfg, "DAYTRADE_BATCH_FETCH_MIN_COVERAGE", 0.95))
+    max_chase = float(getattr(cfg, "MAX_ALLOWED_CHASE", 0.15))
+
+    if pub_timeout <= 0:
+        raise ValueError(f"DAYTRADE_BAR_PUBLICATION_TIMEOUT_S must be positive, got {pub_timeout}")
+    if not (0 < poll_interval <= 30):
+        raise ValueError(f"DAYTRADE_BAR_PUBLICATION_POLL_INTERVAL_S must be in (0, 30], got {poll_interval}")
+    if poll_interval >= pub_timeout:
+        raise ValueError(f"DAYTRADE_BAR_PUBLICATION_POLL_INTERVAL_S ({poll_interval}) must be less than timeout ({pub_timeout})")
+    if not (0.0 < coverage <= 1.0):
+        raise ValueError(f"DAYTRADE_BATCH_FETCH_MIN_COVERAGE must be in (0.0, 1.0], got {coverage}")
+    if max_chase <= 0:
+        raise ValueError(f"MAX_ALLOWED_CHASE must be positive, got {max_chase}")
+
+
 
 # ── Logging ──────────────────────────────────────
 LOG_FILE            = LOG_DIR / "stock_engine.log"
@@ -1024,6 +1108,14 @@ class Settings:
 
     # Alpaca
     ALPACA_PAPER_BASE_URL: str = ALPACA_PAPER_BASE_URL
+    ALPACA_DATA_FEED: str = ALPACA_DATA_FEED
+    ALPACA_CHUNK_SIZE: int = ALPACA_CHUNK_SIZE
+    ALPACA_CHUNK_DELAY_MS: int = ALPACA_CHUNK_DELAY_MS
+    ALPACA_CHUNK_TIMEOUT_SECONDS: float = ALPACA_CHUNK_TIMEOUT_SECONDS
+    ALPACA_SUBSCRIPTION_TIER: str = ALPACA_SUBSCRIPTION_TIER
+    ALPACA_WS_PING_INTERVAL_SECONDS: int = ALPACA_WS_PING_INTERVAL_SECONDS
+    ALPACA_WS_PING_TIMEOUT_SECONDS: int = ALPACA_WS_PING_TIMEOUT_SECONDS
+    ALPACA_WS_MAX_QUEUE: int = ALPACA_WS_MAX_QUEUE
     TRADE_STREAM_START_TIMEOUT_SECONDS: float = TRADE_STREAM_START_TIMEOUT_SECONDS
     TRADE_STREAM_STOP_TIMEOUT_SECONDS: float = TRADE_STREAM_STOP_TIMEOUT_SECONDS
     TRADE_STREAM_RECONNECT_MAX_ATTEMPTS: int = TRADE_STREAM_RECONNECT_MAX_ATTEMPTS

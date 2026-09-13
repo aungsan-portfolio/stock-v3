@@ -10,6 +10,7 @@ import logging
 import math
 import threading
 import time
+from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Optional, Tuple
 
@@ -20,6 +21,7 @@ from strategies.position_sizer import calculate_shares, estimated_cost
 from strategies.trade_journal import log_trade, today_trade_count
 from strategies.order_idempotency import idempotency_manager
 from strategies.webhook import send_discord_alert
+from strategies.execution_geometry import calculate_minimum_stop_distance
 
 logger = logging.getLogger(__name__)
 
@@ -227,21 +229,26 @@ def get_adaptive_stop_multiplier(symbol: str, beta: float = 1.0, earnings_near: 
 
 def _compute_noise_floor(signal: TradeSignal, df: Optional[object] = None) -> float:
     """
-    Calculate noise floor based on 10-period ATR (Average True Range).
-    Returns max(0.08, ATR10 * 0.75) to ensure minimum stop distance.
+    Calculate noise floor based on ATR using shared execution geometry.
+    Returns baseline noise floor with use_buffer=False for order manager veto checks.
     """
     import pandas as pd
     atr_period = getattr(config, "NOISE_FLOOR_ATR_PERIOD", 10)
-    atr_multiplier = getattr(config, "NOISE_FLOOR_ATR_MULTIPLIER", 0.75)
-    abs_min = getattr(config, "NOISE_FLOOR_ABS_MIN", 0.08)
+    abs_min = float(getattr(config, "NOISE_FLOOR_ABS_MIN", 0.08))
+    tick_size = 0.01 if signal.entry_price >= 1.0 else 0.0001
 
     # 1. Check signal's explicit atr attribute first
     if hasattr(signal, "atr") and getattr(signal, "atr", None) is not None:
         try:
             sig_atr = float(getattr(signal, "atr"))
             if sig_atr > 0:
-                noise_floor = max(abs_min, sig_atr * atr_multiplier)
-                return noise_floor
+                noise_floor = calculate_minimum_stop_distance(
+                    atr=sig_atr,
+                    spread_floor=0.0,
+                    tick_size=tick_size,
+                    use_buffer=False,
+                )
+                return max(abs_min, noise_floor)
         except Exception:
             pass
 
@@ -259,12 +266,18 @@ def _compute_noise_floor(signal: TradeSignal, df: Optional[object] = None) -> fl
             ], axis=1).max(axis=1)
 
             atr = float(tr.tail(atr_period).mean())
-            noise_floor = max(abs_min, atr * atr_multiplier)
-            logger.debug(
-                "[NOISE FLOOR] %s: ATR(%d)=%.4f x %.2f = %.4f (abs_min=%.2f)",
-                signal.symbol, atr_period, atr, atr_multiplier, noise_floor, abs_min
-            )
-            return noise_floor
+            if atr > 0:
+                noise_floor = calculate_minimum_stop_distance(
+                    atr=atr,
+                    spread_floor=0.0,
+                    tick_size=tick_size,
+                    use_buffer=False,
+                )
+                logger.debug(
+                    "[NOISE FLOOR] %s: ATR(%d)=%.4f noise_floor=%.4f (abs_min=%.2f)",
+                    signal.symbol, atr_period, atr, noise_floor, abs_min
+                )
+                return max(abs_min, noise_floor)
     except Exception as e:
         logger.debug("[NOISE FLOOR] ATR calc failed for %s: %s. Using fallback.", signal.symbol, e)
 
@@ -282,13 +295,9 @@ def compute_effective_noise_floor(
 ) -> float:
     """Compute authoritative effective noise floor:
     max(atr_noise_floor, spread_noise_floor, tick_size_floor, configured_min)
+    using shared execution geometry with use_buffer=False.
     """
-    atr_noise_floor = _compute_noise_floor(signal, df)
-
-    # Tick size floor (SEC Rule 612)
     tick_size_floor = 0.01 if signal.entry_price >= 1.0 else 0.0001
-
-    # Configured minimum
     configured_min = float(getattr(config, "NOISE_FLOOR_ABS_MIN", 0.08))
 
     # Spread noise floor
@@ -302,6 +311,45 @@ def compute_effective_noise_floor(
         except Exception:
             pass
 
+    # Extract ATR if available
+    effective_atr = None
+    if hasattr(signal, "atr") and getattr(signal, "atr", None) is not None:
+        try:
+            val = float(getattr(signal, "atr"))
+            if val > 0:
+                effective_atr = val
+        except Exception:
+            pass
+
+    if effective_atr is None and df is not None and hasattr(df, "empty") and not df.empty:
+        atr_period = getattr(config, "NOISE_FLOOR_ATR_PERIOD", 10)
+        if len(df) >= atr_period:
+            try:
+                import pandas as pd
+                high = df["high"].tail(atr_period + 1)
+                low = df["low"].tail(atr_period + 1)
+                close_prev = df["close"].shift(1).tail(atr_period + 1)
+                tr = pd.concat([
+                    high - low,
+                    (high - close_prev).abs(),
+                    (low - close_prev).abs(),
+                ], axis=1).max(axis=1)
+                calc_atr = float(tr.tail(atr_period).mean())
+                if calc_atr > 0:
+                    effective_atr = calc_atr
+            except Exception:
+                pass
+
+    if effective_atr is not None and effective_atr > 0:
+        base_geometry_noise = calculate_minimum_stop_distance(
+            atr=effective_atr,
+            spread_floor=spread_noise_floor,
+            tick_size=tick_size_floor,
+            use_buffer=False,
+        )
+        return max(base_geometry_noise, configured_min)
+
+    atr_noise_floor = _compute_noise_floor(signal, df)
     return max(atr_noise_floor, spread_noise_floor, tick_size_floor, configured_min)
 
 
@@ -1004,9 +1052,11 @@ def execute_signal(
     requested_shares: Optional[int] = None,
     entry_limit_price: Optional[float] = None,
     regime_result: Optional[object] = None,
+    entry_readiness: Optional[object] = None,
 ) -> dict:
     """Execute a trade signal through the full pipeline."""
-    from strategies.base import TradeSignal
+    from strategies.base import TradeSignal, EntryReadiness
+    from strategies.constants import OrderIntent, EXIT_INTENTS
     if not isinstance(signal, TradeSignal):
         raise TypeError(f"Production execute_signal accepts TradeSignal only; received {type(signal).__name__}")
     if hasattr(signal, "candidate_id") or type(signal).__name__ in ("ShadowCandidate", "ShadowTrade"):
@@ -1034,6 +1084,41 @@ def execute_signal(
             "trailing_stop_init": (getattr(signal, "atr", 0) > 0),
         },
     }
+
+    # ── P0-3 Execution Boundary: Intent Classification & Entry Readiness Gate ──
+    signal_intent = getattr(signal, "intent", OrderIntent.ENTRY)
+    if signal_intent in EXIT_INTENTS:
+        logger.info("[EXECUTION BOUNDARY] %s intent is %s (exit path); bypassing entry readiness gates.", signal.symbol, signal_intent)
+    else:
+        # Strict Fail-Closed Entry Readiness Gate
+        if getattr(config, "DAYTRADE_REQUIRE_ENTRY_READINESS", True):
+            if entry_readiness is None:
+                result["status"] = "REJECTED"
+                result["reason"] = "ENTRY_READINESS_CONTEXT_MISSING: Entry signal attempted without cycle readiness context"
+                logger.warning("[EXECUTION BOUNDARY FAIL-CLOSED] %s rejected: %s", signal.symbol, result["reason"])
+                return result
+
+            if not getattr(entry_readiness, "entry_allowed", False):
+                supp_msg = getattr(entry_readiness, "suppression_reason", "Suppressed by data-readiness gate")
+                result["status"] = "REJECTED"
+                result["reason"] = f"ENTRY_READINESS_SUPPRESSED: {supp_msg}"
+                logger.info("[ENTRY READINESS GATE] %s rejected: %s", signal.symbol, result["reason"])
+                return result
+
+            import time
+            exp_time = getattr(entry_readiness, "expires_at", 0.0)
+            if time.time() > exp_time:
+                result["status"] = "REJECTED"
+                result["reason"] = f"ENTRY_READINESS_EXPIRED: Token expired at {exp_time}"
+                logger.warning("[ENTRY READINESS EXPIRED] %s rejected: %s", signal.symbol, result["reason"])
+                return result
+
+            readiness_bar_ts = getattr(entry_readiness, "bar_ts", None)
+            if signal.bar_timestamp and readiness_bar_ts and signal.bar_timestamp != readiness_bar_ts:
+                result["status"] = "REJECTED"
+                result["reason"] = f"ENTRY_READINESS_BAR_MISMATCH: signal bar {signal.bar_timestamp} != readiness bar {readiness_bar_ts}"
+                logger.warning("[ENTRY READINESS BAR MISMATCH] %s rejected: %s", signal.symbol, result["reason"])
+                return result
 
     if not dry_run:
         paper_reason = _assert_paper_broker(bridge)
@@ -1100,7 +1185,12 @@ def execute_signal(
         max_allowed_chase = float(strat_cfg["max_chase"])
 
     if chase > (max_allowed_chase + 1e-6):
-        chase_reason = f"REJECTED_MAX_CHASE_EXCEEDED: unfavorable chase ${chase:.4f} > max allowed chase ${max_allowed_chase:.4f}"
+        stop_dist = abs(signal.entry_price - signal.stop_price)
+        chase_to_stop_ratio_pct = (chase / stop_dist * 100.0) if stop_dist > 1e-6 else 0.0
+        chase_reason = (
+            f"REJECTED_MAX_CHASE_EXCEEDED: unfavorable chase ${chase:.4f} > max allowed chase ${max_allowed_chase:.4f} "
+            f"(signal_px={signal.entry_price:.2f}, exec_px={executable_signal.entry_price:.2f}, chase/stop={chase_to_stop_ratio_pct:.1f}%)"
+        )
         result["reason"] = chase_reason
         logger.info("[CHASE GUARD] Blocked %s: %s", signal.symbol, chase_reason)
         return result
@@ -1586,16 +1676,31 @@ def execute_signal(
                 max_allowed_chase = float(strat_cfg["max_chase"])
 
             if unf_chase > max_allowed_chase:
+                stop_dist = abs(signal.entry_price - signal.stop_price)
+                chase_to_stop_ratio_pct = (unf_chase / stop_dist * 100.0) if stop_dist > 1e-6 else 0.0
+                q_ts = getattr(quote_res.quote, "timestamp", 0.0)
+                if isinstance(q_ts, datetime):
+                    quote_age_ms = max(0.0, (datetime.now(timezone.utc) - q_ts.astimezone(timezone.utc)).total_seconds() * 1000.0)
+                elif isinstance(q_ts, (int, float)) and q_ts > 0:
+                    quote_age_ms = max(0.0, (time.time() - float(q_ts)) * 1000.0)
+                else:
+                    quote_age_ms = 0.0
+
                 idempotency_manager.release(
                     signal.symbol,
                     side=signal.side,
                     reason=f"chase_exceeded:unfavorable_chase={unf_chase:.4f}>max={max_allowed_chase:.4f}",
                 )
                 result["status"] = "VETOED"
-                result["reason"] = f"Execution Quote Gate: Unfavorable chase ${unf_chase:.4f} exceeds safety guard ${max_allowed_chase:.4f}"
+                result["reason"] = (
+                    f"Execution Quote Gate: Unfavorable chase ${unf_chase:.4f} exceeds safety guard ${max_allowed_chase:.4f} "
+                    f"(chase/stop={chase_to_stop_ratio_pct:.1f}%, quote_age={quote_age_ms:.1f}ms)"
+                )
                 logger.warning(
-                    "[CHASE GUARD VETO] %s: unfavorable chase $%.4f > allowed $%.4f (signal=%.2f, executable=%.2f)",
-                    signal.symbol, unf_chase, max_allowed_chase, signal.entry_price, exec_price
+                    "[CHASE GUARD VETO] %s: unfavorable chase $%.4f > allowed $%.4f "
+                    "(signal_px=%.2f, exec_px=%.2f, quote_age=%.1fms, stop_dist=$%.4f, chase/stop=%.1f%%)",
+                    signal.symbol, unf_chase, max_allowed_chase, signal.entry_price, exec_price,
+                    quote_age_ms, stop_dist, chase_to_stop_ratio_pct
                 )
                 return result
 

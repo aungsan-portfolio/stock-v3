@@ -338,3 +338,32 @@ class TestTimeBasedExit:
         )
         assert triggered is False
         assert "let run" in reason
+
+    def test_close_position_pre_exit_flat_returns_true(self):
+        from unittest.mock import MagicMock
+        from alpaca_bridge import AlpacaBridge
+        bridge = AlpacaBridge(mode="daytrade", dry_run=False)
+        bridge._connected = True
+        bridge.get_position = MagicMock(return_value=0)
+        bridge._client = MagicMock()
+
+        # Should immediately return True without submitting broker orders
+        res = bridge.close_position("QQQ")
+        assert res is True
+        bridge._client.close_position.assert_not_called()
+
+    def test_close_position_with_timeout_keyword_argument_compatibility(self):
+        from unittest.mock import MagicMock
+        from alpaca_bridge import AlpacaBridge
+        import order_exec
+        bridge = AlpacaBridge(mode="daytrade", dry_run=False)
+        bridge._connected = True
+        bridge.get_position = MagicMock(side_effect=[10, 0])
+        mock_close_order = MagicMock()
+        mock_close_order.id = "close-123"
+        bridge._client = MagicMock()
+        bridge._client.close_position.return_value = mock_close_order
+
+        # Mock _await_order_outcome to accept both timeout and timeout_seconds
+        res = bridge.close_position("AAPL")
+        assert res is True

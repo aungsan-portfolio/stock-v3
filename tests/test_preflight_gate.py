@@ -92,15 +92,19 @@ def test_preflight_audit_go_status():
     with tempfile.TemporaryDirectory() as td:
         report_file = Path(td) / "test_preflight.json"
         
-        with patch("preflight.check_data_freshness", return_value=GateResult("Data", "CRITICAL", True, "ok", {})), \
-             patch("preflight.check_broker_reconciliation", return_value=GateResult("Broker", "CRITICAL", True, "ok", {})), \
-             patch("preflight.check_position_protection", return_value=GateResult("Protection", "CRITICAL", True, "ok", {})), \
-             patch("preflight.check_portfolio_exposure", return_value=GateResult("Exposure", "WARNING", True, "ok", {})), \
-             patch("preflight.check_event_and_models", return_value=GateResult("Events", "WARNING", True, "ok", {})):
+        with patch("preflight.check_data_freshness", return_value=GateResult("Data", "CRITICAL", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_intraday_data_readiness", return_value=GateResult("Intraday Data Readiness", "CRITICAL", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_broker_reconciliation", return_value=GateResult("Broker", "CRITICAL", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_position_protection", return_value=GateResult("Protection", "CRITICAL", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_portfolio_exposure", return_value=GateResult("Exposure", "WARNING", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_event_and_models", return_value=GateResult("Events", "WARNING", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_trade_stream_readiness", return_value=GateResult("Trade Stream Readiness", "CRITICAL", True, "Stream HEALTHY", {}, status="PASS")):
             
             report = run_preflight_audit(save_report=True, report_path=str(report_file))
             assert report.status == "GO"
+            assert report.critical_pass == 5
             assert report.critical_fail == 0
+            assert report.critical_not_verified == 0
             assert report.warning_fail == 0
             assert report_file.exists()
 
@@ -111,34 +115,73 @@ def test_preflight_audit_go_status():
 def test_preflight_audit_go_with_warnings():
     import tempfile
     from pathlib import Path
+    from preflight import PreflightDecision
     with tempfile.TemporaryDirectory() as td:
         report_file = Path(td) / "test_preflight.json"
         
-        with patch("preflight.check_data_freshness", return_value=GateResult("Data", "CRITICAL", True, "ok", {})), \
-             patch("preflight.check_broker_reconciliation", return_value=GateResult("Broker", "CRITICAL", True, "ok", {})), \
-             patch("preflight.check_position_protection", return_value=GateResult("Protection", "CRITICAL", True, "ok", {})), \
-             patch("preflight.check_portfolio_exposure", return_value=GateResult("Exposure", "WARNING", False, "High NVDA exposure", {})), \
-             patch("preflight.check_event_and_models", return_value=GateResult("Events", "WARNING", True, "ok", {})):
+        with patch("preflight.check_data_freshness", return_value=GateResult("Data", "CRITICAL", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_intraday_data_readiness", return_value=GateResult("Intraday Data Readiness", "CRITICAL", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_broker_reconciliation", return_value=GateResult("Broker", "CRITICAL", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_position_protection", return_value=GateResult("Protection", "CRITICAL", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_portfolio_exposure", return_value=GateResult("Exposure", "WARNING", False, "High NVDA exposure", {}, status="WARN")), \
+             patch("preflight.check_event_and_models", return_value=GateResult("Events", "WARNING", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_trade_stream_readiness", return_value=GateResult("Trade Stream Readiness", "CRITICAL", True, "Stream HEALTHY", {}, status="PASS")):
             
             report = run_preflight_audit(save_report=True, report_path=str(report_file))
-            assert report.status == "GO_WITH_WARNINGS"
+            assert report.decision == PreflightDecision.GO
+            assert report.status == "GO"
+            assert report.entry_allowed is True
+            assert report.critical_pass == 5
             assert report.critical_fail == 0
             assert report.warning_fail == 1
+            assert report.warning_count == 1
+            assert len(report.warnings) == 1
+            assert "High NVDA exposure" in report.warnings[0]
 
 
 def test_preflight_audit_nogo_on_critical_fail():
     import tempfile
     from pathlib import Path
+    from preflight import PreflightDecision
     with tempfile.TemporaryDirectory() as td:
         report_file = Path(td) / "test_preflight.json"
         
-        with patch("preflight.check_data_freshness", return_value=GateResult("Data", "CRITICAL", True, "ok", {})), \
-             patch("preflight.check_broker_reconciliation", return_value=GateResult("Broker", "CRITICAL", False, "orphan order", {})), \
-             patch("preflight.check_position_protection", return_value=GateResult("Protection", "CRITICAL", True, "ok", {})), \
-             patch("preflight.check_portfolio_exposure", return_value=GateResult("Exposure", "WARNING", True, "ok", {})), \
-             patch("preflight.check_event_and_models", return_value=GateResult("Events", "WARNING", True, "ok", {})):
+        with patch("preflight.check_data_freshness", return_value=GateResult("Data", "CRITICAL", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_intraday_data_readiness", return_value=GateResult("Intraday Data Readiness", "CRITICAL", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_broker_reconciliation", return_value=GateResult("Broker", "CRITICAL", False, "orphan order", {}, status="FAIL")), \
+             patch("preflight.check_position_protection", return_value=GateResult("Protection", "CRITICAL", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_portfolio_exposure", return_value=GateResult("Exposure", "WARNING", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_event_and_models", return_value=GateResult("Events", "WARNING", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_trade_stream_readiness", return_value=GateResult("Trade Stream Readiness", "CRITICAL", True, "Stream HEALTHY", {}, status="PASS")):
             
             report = run_preflight_audit(save_report=True, report_path=str(report_file))
-            assert report.status == "NO-GO"
+            assert report.decision == PreflightDecision.NO_GO
+            assert report.status == "NO_GO"
+            assert report.entry_allowed is False
             assert report.critical_fail == 1
             assert "Trading Disabled" in report.summary
+
+
+def test_preflight_audit_unverified_stream_yields_conditional_go():
+    import tempfile
+    from pathlib import Path
+    from preflight import PreflightDecision
+    with tempfile.TemporaryDirectory() as td:
+        report_file = Path(td) / "test_preflight.json"
+
+        with patch("preflight.check_data_freshness", return_value=GateResult("Data", "CRITICAL", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_intraday_data_readiness", return_value=GateResult("Intraday Data Readiness", "CRITICAL", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_broker_reconciliation", return_value=GateResult("Broker", "CRITICAL", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_position_protection", return_value=GateResult("Protection", "CRITICAL", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_portfolio_exposure", return_value=GateResult("Exposure", "WARNING", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_event_and_models", return_value=GateResult("Events", "WARNING", True, "ok", {}, status="PASS")), \
+             patch("preflight.check_trade_stream_readiness", return_value=GateResult("Trade Stream Readiness", "CRITICAL", False, "No bridge", {}, status="NOT_VERIFIED")):
+
+            report = run_preflight_audit(save_report=True, report_path=str(report_file))
+            assert report.decision == PreflightDecision.GO_WITH_ENTRY_HOLD
+            assert report.status == "GO_WITH_ENTRY_HOLD"
+            assert report.entry_allowed is False
+            assert report.critical_pass == 4
+            assert report.critical_fail == 0
+            assert report.critical_not_verified == 1
+            assert "Trading Engine Active with Entry Hold" in report.summary

@@ -706,7 +706,9 @@ def scan(symbols: List[str] = None, max_candidates: int = None) -> List[ScanCand
         if api_key and secret_key:
             from alpaca.data.historical import StockHistoricalDataClient
             from alpaca.data.requests import StockLatestQuoteRequest
+            from strategies.intraday_data import configure_alpaca_data_client_timeouts
             data_client = StockHistoricalDataClient(api_key, secret_key)
+            configure_alpaca_data_client_timeouts(data_client)
             # Batch fetch quotes for chunk
             quote_dict = data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbols[:100], feed="iex"))
     except Exception as exc:

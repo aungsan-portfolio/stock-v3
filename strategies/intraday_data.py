@@ -8,15 +8,20 @@ import logging
 import asyncio
 import time
 import pickle
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, Dict, List, Tuple, Any
 from dataclasses import dataclass
+from enum import Enum
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 import pandas as pd
 import numpy as np
 import yfinance as yf
 import os
 import threading
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
 import config
 from strategies.performance import profile_latency
@@ -28,6 +33,195 @@ logger = logging.getLogger(__name__)
 _cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'cache')
 os.makedirs(_cache_dir, exist_ok=True)
 os.environ['YFINANCE_DATA'] = _cache_dir
+
+
+class DataProvider(str, Enum):
+    ALPACA = "alpaca"
+    YFINANCE = "yfinance"
+
+
+@dataclass(frozen=True)
+class HttpTimeoutBudget:
+    connect_seconds: float = 0.75
+    read_seconds: float = 1.75
+    pool_seconds: float = 0.50
+
+    @property
+    def total_seconds(self) -> float:
+        return self.connect_seconds + self.read_seconds + self.pool_seconds
+
+
+ALPACA_TIMEOUT = HttpTimeoutBudget()
+
+
+class MarketDataTransportTimeout(TimeoutError):
+    pass
+
+
+class MarketDataCapacityError(RuntimeError):
+    pass
+
+
+class RecoverableMarketDataError(Exception):
+    pass
+
+
+class MarketDataUnavailableError(Exception):
+    pass
+
+
+# ── Dedicated Position ATR Cache (Independent from bar cache) ──
+@dataclass(frozen=True)
+class CachedAtr:
+    symbol: str
+    interval: str
+    atr: float
+    source_bar_timestamp: datetime
+    computed_at_monotonic: float
+
+
+_position_atr_cache: Dict[Tuple[str, str], CachedAtr] = {}
+_position_atr_lock = threading.Lock()
+
+
+def update_position_atr_cache(symbol: str, interval: str, atr: float, source_bar_timestamp: Any) -> None:
+    with _position_atr_lock:
+        _position_atr_cache[(symbol.upper().strip(), interval)] = CachedAtr(
+            symbol=symbol.upper().strip(),
+            interval=interval,
+            atr=float(atr),
+            source_bar_timestamp=source_bar_timestamp,
+            computed_at_monotonic=time.monotonic(),
+        )
+
+
+def _bar_timestamp_is_acceptable(source_bar_timestamp: Any, interval: str = "5m", max_bar_delay_seconds: float = 600.0) -> bool:
+    try:
+        now_utc = pd.Timestamp.now(tz="UTC")
+        ts = pd.Timestamp(source_bar_timestamp)
+        if ts.tz is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        delay = (now_utc - ts).total_seconds()
+        return 0 <= delay <= max_bar_delay_seconds
+    except Exception:
+        return False
+
+
+def get_position_atr_if_fresh(
+    symbol: str,
+    *,
+    interval: str = "5m",
+    max_age_seconds: float = 360.0,
+) -> Optional[float]:
+    with _position_atr_lock:
+        cached = _position_atr_cache.get((symbol.upper().strip(), interval))
+    if cached is None:
+        return None
+    age = time.monotonic() - cached.computed_at_monotonic
+    if age > max_age_seconds:
+        return None
+    if not _bar_timestamp_is_acceptable(cached.source_bar_timestamp, interval=interval):
+        return None
+    return cached.atr
+
+
+def clear_position_atr_cache() -> None:
+    with _position_atr_lock:
+        _position_atr_cache.clear()
+
+
+# ── Bounded Alpaca Client Execution Bridge ──
+ALPACA_CALL_WORKERS = 4
+ALPACA_CALL_QUEUE_SIZE = 4
+ALPACA_FUTURE_TIMEOUT_SECONDS = 2.5
+
+_alpaca_call_pool = ThreadPoolExecutor(
+    max_workers=ALPACA_CALL_WORKERS,
+    thread_name_prefix="alpaca-bars",
+)
+_alpaca_call_slots = threading.BoundedSemaphore(
+    ALPACA_CALL_WORKERS + ALPACA_CALL_QUEUE_SIZE
+)
+
+MARKET_DATA_METRICS = {
+    "executor_active": 0,
+    "executor_queue_depth": 0,
+    "saturation_total": 0,
+    "soft_timeout_total": 0,
+    "transport_timeout_total": 0,
+    "late_completion_total": 0,
+}
+_metrics_lock = threading.Lock()
+
+
+def get_market_data_metrics() -> dict:
+    with _metrics_lock:
+        return dict(MARKET_DATA_METRICS)
+
+
+def _sdk_get_stock_bars_soft_bounded(client, request, timeout: Optional[float] = None):
+    acquired = _alpaca_call_slots.acquire(blocking=False)
+    if not acquired:
+        with _metrics_lock:
+            MARKET_DATA_METRICS["saturation_total"] += 1
+        raise MarketDataCapacityError("Alpaca market-data executor is saturated")
+
+    with _metrics_lock:
+        MARKET_DATA_METRICS["executor_active"] += 1
+
+    def invoke():
+        try:
+            return client.get_stock_bars(request)
+        finally:
+            _alpaca_call_slots.release()
+            with _metrics_lock:
+                MARKET_DATA_METRICS["executor_active"] = max(0, MARKET_DATA_METRICS["executor_active"] - 1)
+
+    future = _alpaca_call_pool.submit(invoke)
+    eff_timeout = timeout if timeout is not None else ALPACA_FUTURE_TIMEOUT_SECONDS
+    try:
+        return future.result(timeout=eff_timeout)
+    except (TimeoutError, FutureTimeoutError) as ex:
+        cancelled = future.cancel()
+        with _metrics_lock:
+            MARKET_DATA_METRICS["soft_timeout_total"] += 1
+        if not cancelled:
+            def _track_late():
+                try:
+                    future.result()
+                    with _metrics_lock:
+                        MARKET_DATA_METRICS["late_completion_total"] += 1
+                except Exception:
+                    pass
+            threading.Thread(target=_track_late, daemon=True).start()
+        logger.error(
+            "Alpaca SDK call exceeded soft deadline: timeout=%.2fs cancelled=%s",
+            eff_timeout, cancelled,
+        )
+        raise MarketDataTransportTimeout(
+            f"Alpaca SDK call exceeded caller deadline ({eff_timeout:.2f}s)"
+        ) from ex
+    except (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout, requests.exceptions.Timeout) as rex:
+        with _metrics_lock:
+            MARKET_DATA_METRICS["transport_timeout_total"] += 1
+        raise MarketDataTransportTimeout(f"Alpaca transport timeout: {rex}") from rex
+
+
+class TimeoutHTTPAdapter(HTTPAdapter):
+    """HTTP adapter enforcing hard connect and read timeouts at socket transport level."""
+    def __init__(self, connect_timeout: float = 0.75, read_timeout: float = 1.75, max_retries: Optional[Retry] = None, **kwargs):
+        self.connect_timeout = float(connect_timeout)
+        self.read_timeout = float(read_timeout)
+        if max_retries is None:
+            max_retries = Retry(total=1, backoff_factor=0.2, status_forcelist=[429, 500, 502, 503, 504], raise_on_status=False)
+        super().__init__(max_retries=max_retries, **kwargs)
+
+    def send(self, request, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = (self.connect_timeout, self.read_timeout)
+        return super().send(request, **kwargs)
 
 
 def _ensure_asyncio_event_loop() -> None:
@@ -108,6 +302,22 @@ def _get_alpaca_credentials() -> Tuple[str, str]:
     return key, secret
 
 
+def _has_alpaca_credentials() -> bool:
+    key, secret = _get_alpaca_credentials()
+    return bool(key and secret)
+
+
+def configure_alpaca_data_client_timeouts(client) -> None:
+    """Configures socket connect and read timeouts on an Alpaca data client session."""
+    if client is not None and hasattr(client, "_session"):
+        connect_t = float(getattr(config, "ALPACA_DATA_CONNECT_TIMEOUT", 0.75))
+        read_t = float(getattr(config, "ALPACA_DATA_READ_TIMEOUT", 1.75))
+        retries = Retry(total=1, backoff_factor=0.2, status_forcelist=[429, 500, 502, 503, 504], raise_on_status=False)
+        adapter = TimeoutHTTPAdapter(connect_timeout=connect_t, read_timeout=read_t, max_retries=retries)
+        client._session.mount("https://", adapter)
+        client._session.mount("http://", adapter)
+
+
 def _get_alpaca_client():
     global _alpaca_client
     if _alpaca_client is None:
@@ -116,8 +326,11 @@ def _get_alpaca_client():
                 api_key, secret_key = _get_alpaca_credentials()
                 if api_key and secret_key:
                     from alpaca.data.historical import StockHistoricalDataClient
-                    _alpaca_client = StockHistoricalDataClient(api_key, secret_key)
+                    client = StockHistoricalDataClient(api_key, secret_key)
+                    configure_alpaca_data_client_timeouts(client)
+                    _alpaca_client = client
     return _alpaca_client
+
 
 
 def _cache_key(
@@ -673,13 +886,35 @@ def _bars_to_frame(bars) -> pd.DataFrame:
     ])
 
 
+def _normalize_data_feed(feed: Any = None) -> Any:
+    """Normalize string or DataFeed enum to alpaca.data.enums.DataFeed."""
+    try:
+        from alpaca.data.enums import DataFeed
+        if isinstance(feed, DataFeed):
+            return feed
+        feed_str = str(feed or getattr(config, "ALPACA_DATA_FEED", "iex")).lower().strip()
+        if feed_str == "sip":
+            return DataFeed.SIP
+        elif feed_str == "otc":
+            return DataFeed.OTC
+        return DataFeed.IEX
+    except Exception:
+        return str(feed or "iex").lower().strip()
+
+
 def fetch_intraday_alpaca(
     symbol: str,
     interval: str = None,
     lookback_days: int = None,
     prepost: bool = False,
     purpose: str = "ENTRY_SIGNAL",
+    feed: Optional[str] = None,
+    timeout: Optional[float] = None,
 ) -> pd.DataFrame:
+    """Alpaca only.
+    This function must not invoke yfinance and must not try additional
+    feeds unless the caller explicitly requests them.
+    """
     api_key, secret_key = _get_alpaca_credentials()
     if not api_key or not secret_key:
         return pd.DataFrame()
@@ -708,7 +943,7 @@ def fetch_intraday_alpaca(
         from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-        from alpaca.data.enums import Adjustment
+        from alpaca.data.enums import Adjustment, DataFeed
         from datetime import timezone
 
         client = _get_alpaca_client()
@@ -723,54 +958,27 @@ def fetch_intraday_alpaca(
         elif interval == "1h":
             tf = TimeFrame.Hour
 
-        bars_dict = None
-        primary_feed = str(getattr(config, "ALPACA_DATA_FEED", "iex")).lower()
-        backup_feed = "sip" if primary_feed == "iex" else "iex"
+        tier = str(getattr(config, "ALPACA_SUBSCRIPTION_TIER", "free")).lower().strip()
+        if tier == "free":
+            chosen_feed = DataFeed.IEX
+        else:
+            chosen_feed = _normalize_data_feed(feed or getattr(config, "ALPACA_DATA_FEED", "iex"))
 
-        try:
-            req = StockBarsRequest(
-                symbol_or_symbols=symbol.upper(),
-                timeframe=tf,
-                start=start,
-                feed=primary_feed,
-                adjustment=Adjustment.ALL,
-            )
-            bars_dict = client.get_stock_bars(req)
-        except Exception as primary_err:
-            logger.debug("Alpaca %s feed error for %s (%s). Trying %s feed.", primary_feed.upper(), symbol, primary_err, backup_feed.upper())
-            try:
-                req = StockBarsRequest(
-                    symbol_or_symbols=symbol.upper(),
-                    timeframe=tf,
-                    start=start,
-                    feed=backup_feed,
-                    adjustment=Adjustment.ALL,
-                )
-                bars_dict = client.get_stock_bars(req)
-            except Exception as backup_err:
-                logger.warning("Alpaca data feed error for %s (%s).", symbol, backup_err)
-                return pd.DataFrame()
-
-        # If primary feed returned empty, try fallback feed before giving up
-        if not hasattr(bars_dict, "df") or bars_dict.df.empty:
-            try:
-                req = StockBarsRequest(
-                    symbol_or_symbols=symbol.upper(),
-                    timeframe=tf,
-                    start=start,
-                    feed=backup_feed,
-                    adjustment=Adjustment.ALL,
-                )
-                bars_dict = client.get_stock_bars(req)
-            except Exception:
-                pass
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol.upper().strip(),
+            timeframe=tf,
+            start=start,
+            feed=chosen_feed,
+            adjustment=Adjustment.ALL,
+        )
+        bars_dict = _sdk_get_stock_bars_soft_bounded(client, req, timeout=timeout)
 
         if not hasattr(bars_dict, "df") or bars_dict.df.empty:
             return pd.DataFrame()
 
         df = bars_dict.df
         if isinstance(df.index, pd.MultiIndex):
-            df = df.xs(symbol.upper(), level="symbol")
+            df = df.xs(symbol.upper().strip(), level="symbol")
 
         df = df.rename(columns={
             "open": "open",
@@ -786,8 +994,9 @@ def fetch_intraday_alpaca(
             _write_cache(key, df.copy())
         return df
     except Exception as e:
-        logger.warning("Alpaca data fetch failed for %s: %s", symbol, e)
+        logger.warning("Alpaca data fetch failed for %s (feed=%s): %s", symbol, feed, e)
         return pd.DataFrame()
+
 
 
 def fetch_batch_intraday_alpaca(
@@ -796,6 +1005,7 @@ def fetch_batch_intraday_alpaca(
     lookback_days: int = None,
     prepost: bool = False,
     purpose: str = "ENTRY_SIGNAL",
+    total_timeout_seconds: Optional[float] = None,
 ) -> Dict[str, pd.DataFrame]:
     """Fetch 5m bars for multiple symbols in a single vectorized Alpaca REST request."""
     if not symbols:
@@ -808,7 +1018,7 @@ def fetch_batch_intraday_alpaca(
     interval = interval or config.INTRADAY_INTERVAL
     lookback_days = lookback_days or config.INTRADAY_LOOKBACK_DAYS
 
-    clean_symbols = [str(s).upper().strip() for s in symbols if str(s).strip()]
+    clean_symbols = list(dict.fromkeys(str(s).upper().strip() for s in symbols if str(s).strip()))
     if not clean_symbols:
         return {}
 
@@ -836,6 +1046,13 @@ def fetch_batch_intraday_alpaca(
     if not pending_symbols:
         return results
 
+    start_mono = time.monotonic()
+    def _rem():
+        if total_timeout_seconds is None:
+            return None
+        return max(0.01, total_timeout_seconds - (time.monotonic() - start_mono))
+
+
     try:
         from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.data.requests import StockBarsRequest
@@ -856,8 +1073,19 @@ def fetch_batch_intraday_alpaca(
         elif interval == "1h":
             tf = TimeFrame.Hour
 
-        primary_feed = str(getattr(config, "ALPACA_DATA_FEED", "iex")).lower()
-        backup_feed = "sip" if primary_feed == "iex" else "iex"
+        chunk_size = max(1, int(getattr(config, "ALPACA_CHUNK_SIZE", 5)))
+        chunk_delay_ms = max(0, int(getattr(config, "ALPACA_CHUNK_DELAY_MS", 200)))
+        chunk_timeout_s = float(getattr(config, "ALPACA_CHUNK_TIMEOUT_SECONDS", 2.0))
+        tier = str(getattr(config, "ALPACA_SUBSCRIPTION_TIER", "free")).lower().strip()
+        is_free_tier = (tier == "free")
+
+        from alpaca.data.enums import DataFeed
+        if is_free_tier:
+            primary_feed = DataFeed.IEX
+            backup_feed = None
+        else:
+            primary_feed = _normalize_data_feed(getattr(config, "ALPACA_DATA_FEED", "iex"))
+            backup_feed = DataFeed.SIP if primary_feed == DataFeed.IEX else DataFeed.IEX
 
         def _extract_symbol_df(raw_df: pd.DataFrame, sym: str) -> pd.DataFrame:
             if raw_df is None or raw_df.empty:
@@ -889,86 +1117,156 @@ def fetch_batch_intraday_alpaca(
             sym_df.index.name = "datetime"
             return sym_df
 
-        # 1. Fetch Primary Feed
-        primary_bars = None
-        try:
-            req = StockBarsRequest(
-                symbol_or_symbols=pending_symbols,
-                timeframe=tf,
-                start=start,
-                feed=primary_feed,
-                adjustment=Adjustment.ALL,
-            )
-            primary_bars = client.get_stock_bars(req)
-        except Exception as primary_err:
-            logger.debug("[BATCH FETCH] Alpaca %s feed error for %s (%s).", primary_feed.upper(), pending_symbols, primary_err)
+        chunks = [pending_symbols[i : i + chunk_size] for i in range(0, len(pending_symbols), chunk_size)]
+        num_chunks = len(chunks)
 
-        primary_raw_df = getattr(primary_bars, "df", None) if primary_bars is not None else None
-        stale_or_missing_symbols: List[str] = []
-
-        for sym in pending_symbols:
-            key = _cache_key(sym, interval, lookback_days, prepost, source="alpaca_api")
-            sym_df = _extract_symbol_df(primary_raw_df, sym) if primary_raw_df is not None else pd.DataFrame()
-            if sym_df.empty:
-                stale_or_missing_symbols.append(sym)
-                continue
-
-            validated_df = _validate_intraday_data(
-                sym_df, sym, interval, validate_staleness=validate_staleness, purpose=purpose
-            )
-            if not validated_df.empty:
-                _write_cache(key, validated_df.copy())
-                results[sym] = validated_df
-            else:
-                stale_or_missing_symbols.append(sym)
-
-        # 2. Independent Fallback Pipeline for Stale or Missing Symbols
-        if stale_or_missing_symbols:
-            logger.info(
-                "[BATCH FETCH FALLBACK] Attempting %s feed for %d symbols: %s",
-                backup_feed.upper(), len(stale_or_missing_symbols), stale_or_missing_symbols,
-            )
-            try:
-                backup_req = StockBarsRequest(
-                    symbol_or_symbols=stale_or_missing_symbols,
-                    timeframe=tf,
-                    start=start,
-                    feed=backup_feed,
-                    adjustment=Adjustment.ALL,
+        for chunk_idx, chunk_symbols in enumerate(chunks):
+            rem_t = _rem()
+            if total_timeout_seconds is not None and (rem_t is None or rem_t <= 0.05):
+                logger.warning(
+                    "[BATCH FETCH TIMEOUT] Total budget exhausted (%.2fs remaining) before chunk %d/%d.",
+                    rem_t or 0.0, chunk_idx + 1, num_chunks,
                 )
-                backup_bars = client.get_stock_bars(backup_req)
-                backup_raw_df = getattr(backup_bars, "df", None) if backup_bars is not None else None
+                break
 
-                for sym in stale_or_missing_symbols:
+            this_timeout = min(chunk_timeout_s, rem_t) if rem_t is not None else chunk_timeout_s
+
+            try:
+                # 1. Fetch Primary Feed for this chunk
+                primary_bars = None
+                try:
+                    req = StockBarsRequest(
+                        symbol_or_symbols=chunk_symbols,
+                        timeframe=tf,
+                        start=start,
+                        feed=primary_feed,
+                        adjustment=Adjustment.ALL,
+                    )
+                    primary_bars = _sdk_get_stock_bars_soft_bounded(client, req, timeout=this_timeout)
+                except Exception as primary_err:
+                    feed_name = getattr(primary_feed, "value", str(primary_feed)).upper()
+                    logger.debug("[BATCH FETCH] Alpaca %s feed error for chunk %s (%s).", feed_name, chunk_symbols, primary_err)
+
+                primary_raw_df = getattr(primary_bars, "df", None) if primary_bars is not None else None
+                stale_or_missing_symbols: List[str] = []
+
+                for sym in chunk_symbols:
                     key = _cache_key(sym, interval, lookback_days, prepost, source="alpaca_api")
-                    fb_df = _extract_symbol_df(backup_raw_df, sym) if backup_raw_df is not None else pd.DataFrame()
-                    if fb_df.empty:
-                        logger.warning("[BATCH FETCH REJECTED] %s: No data from fallback %s feed.", sym, backup_feed.upper())
+                    sym_df = _extract_symbol_df(primary_raw_df, sym) if primary_raw_df is not None else pd.DataFrame()
+                    if sym_df.empty:
+                        stale_or_missing_symbols.append(sym)
                         continue
 
-                    # Fallback generation is validated independently with its own freshness check
-                    fb_validated_df = _validate_intraday_data(
-                        fb_df, sym, interval, validate_staleness=validate_staleness, purpose=purpose
+                    validated_df = _validate_intraday_data(
+                        sym_df, sym, interval, validate_staleness=validate_staleness, purpose=purpose
                     )
-                    if not fb_validated_df.empty:
-                        logger.info("[BATCH FETCH FALLBACK ACCEPTED] %s: Accepted fresh bars from %s feed.", sym, backup_feed.upper())
-                        _write_cache(key, fb_validated_df.copy())
-                        results[sym] = fb_validated_df
+                    if not validated_df.empty:
+                        _write_cache(key, validated_df.copy())
+                        results[sym] = validated_df
                     else:
+                        stale_or_missing_symbols.append(sym)
+
+                # 2. Fallback handling for stale or missing symbols
+                if stale_or_missing_symbols:
+                    if is_free_tier:
+                        logger.debug("[BATCH FETCH] Free tier detected: SIP fallback bypassed.")
+                    elif backup_feed is None or backup_feed == primary_feed:
                         logger.warning(
-                            "[BATCH FETCH REJECTED] %s: Fallback %s bars also stale/invalid. Strictly excluded.",
-                            sym, backup_feed.upper(),
+                            "[BATCH FETCH FALLBACK SKIPPED] status=FALLBACK_SOURCE_SAME_AS_PRIMARY. "
+                            "Refusing duplicate query. Fail-closed: %d stale symbols excluded.",
+                            len(stale_or_missing_symbols),
                         )
-            except Exception as backup_err:
-                logger.warning("[BATCH FETCH] Alpaca fallback %s feed failed: %s", backup_feed.upper(), backup_err)
+                    else:
+                        rem_fb = _rem()
+                        fb_timeout = min(chunk_timeout_s, rem_fb) if rem_fb is not None else chunk_timeout_s
+                        backup_name = getattr(backup_feed, "value", str(backup_feed)).upper()
+                        logger.info(
+                            "[BATCH FETCH FALLBACK] Attempting %s feed for %d symbols: %s",
+                            backup_name, len(stale_or_missing_symbols), stale_or_missing_symbols,
+                        )
+                        try:
+                            backup_req = StockBarsRequest(
+                                symbol_or_symbols=stale_or_missing_symbols,
+                                timeframe=tf,
+                                start=start,
+                                feed=backup_feed,
+                                adjustment=Adjustment.ALL,
+                            )
+                            backup_bars = _sdk_get_stock_bars_soft_bounded(client, backup_req, timeout=fb_timeout)
+                            backup_raw_df = getattr(backup_bars, "df", None) if backup_bars is not None else None
+
+                            for sym in stale_or_missing_symbols:
+                                key = _cache_key(sym, interval, lookback_days, prepost, source="alpaca_api")
+                                fb_df = _extract_symbol_df(backup_raw_df, sym) if backup_raw_df is not None else pd.DataFrame()
+                                if fb_df.empty:
+                                    logger.warning("[BATCH FETCH REJECTED] status=FALLBACK_UNAVAILABLE symbol=%s: No bars from %s feed.", sym, backup_name)
+                                    continue
+
+                                fb_validated_df = _validate_intraday_data(
+                                    fb_df, sym, interval, validate_staleness=validate_staleness, purpose=purpose
+                                )
+                                if not fb_validated_df.empty:
+                                    logger.info("[BATCH FETCH FALLBACK ACCEPTED] status=FALLBACK_FRESH symbol=%s: Accepted from %s feed.", sym, backup_name)
+                                    _write_cache(key, fb_validated_df.copy())
+                                    results[sym] = fb_validated_df
+                                else:
+                                    logger.warning(
+                                        "[BATCH FETCH REJECTED] status=FALLBACK_STALE symbol=%s: Fallback %s bars also stale/invalid. Strictly excluded.",
+                                        sym, backup_name,
+                                    )
+                        except Exception as backup_err:
+                            err_str = str(backup_err).lower()
+                            if any(w in err_str for w in ("unauthorized", "forbidden", "403", "subscription", "not permit")):
+                                fb_status = "FALLBACK_UNAUTHORIZED"
+                            elif any(w in err_str for w in ("rate limit", "429", "too many requests")):
+                                fb_status = "FALLBACK_RATE_LIMITED"
+                            else:
+                                fb_status = "FALLBACK_UNAVAILABLE"
+                            logger.warning(
+                                "[BATCH FETCH FALLBACK FAILED] status=%s feed=%s error=%s. Fail-closed: %d stale symbols excluded.",
+                                fb_status, backup_name, backup_err, len(stale_or_missing_symbols),
+                            )
+            except Exception as chunk_exc:
+                logger.warning(
+                    "[BATCH FETCH CHUNK FAILED] Chunk %d/%d failed for symbols %s: %s",
+                    chunk_idx + 1, num_chunks, chunk_symbols, chunk_exc,
+                )
+
+            # Apply delay between chunks (not after the final chunk)
+            if chunk_idx < num_chunks - 1 and chunk_delay_ms > 0:
+                time.sleep(chunk_delay_ms / 1000.0)
+
+        elapsed = time.monotonic() - start_mono
+        coverage_pct = (len(results) / len(clean_symbols)) * 100.0 if clean_symbols else 100.0
+        logger.info(
+            f"[CHUNK FETCH DONE] Retrieved {len(results)}/{len(clean_symbols)} symbols "
+            f"across {num_chunks} chunks in {elapsed:.2f}s (coverage={coverage_pct:.1f}%)"
+        )
+        min_coverage_pct = float(getattr(config, "DAYTRADE_BATCH_FETCH_MIN_COVERAGE", 0.95)) * 100.0
+        if coverage_pct < min_coverage_pct:
+            logger.warning(
+                f"[CHUNK FETCH WARNING] Batch coverage {coverage_pct:.1f}% below minimum {min_coverage_pct:.1f}%"
+            )
 
         return results
     except Exception as e:
         logger.warning("[BATCH FETCH] Alpaca batch fetch failed: %s", e)
         return results
-    except Exception as e:
-        logger.warning("[BATCH FETCH] Alpaca batch fetch failed: %s", e)
-        return results
+
+
+# Deprecated compatibility alias.
+# Remove after all internal callers use fetch_batch_intraday_alpaca.
+_fetch_bars_batch_alpaca = fetch_batch_intraday_alpaca
+
+
+
+def _is_usable_intraday_data(df: Optional[pd.DataFrame], interval: str = "5m") -> bool:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return False
+    required_cols = {"open", "high", "low", "close", "volume"}
+    if not required_cols.issubset(set(df.columns)):
+        return False
+    return len(df) > 0
 
 
 @profile_latency(sample_rate=1.0)
@@ -986,8 +1284,8 @@ def fetch_intraday(
     interval = interval or config.INTRADAY_INTERVAL
     lookback_days = lookback_days or config.INTRADAY_LOOKBACK_DAYS
 
-    has_alpaca_keys = bool(os.environ.get("APCA_API_KEY_ID") and os.environ.get("APCA_API_SECRET_KEY"))
-    if bridge is not None and bridge.is_connected:
+    has_alpaca_keys = _has_alpaca_credentials()
+    if bridge is not None and getattr(bridge, "is_connected", False):
         source = "alpaca"
     elif has_alpaca_keys:
         source = "alpaca_api"
@@ -1011,11 +1309,44 @@ def fetch_intraday(
             symbol,
         )
 
-    if bridge is None or not bridge.is_connected:
-        df_alpaca = fetch_intraday_alpaca(symbol, interval, lookback_days, prepost, purpose=purpose)
-        if not df_alpaca.empty:
-            return df_alpaca
-        return fetch_intraday_yfinance(symbol, interval, lookback_days, prepost)
+    if bridge is None or not getattr(bridge, "is_connected", False):
+        if _has_alpaca_credentials():
+            providers = [
+                (DataProvider.ALPACA, "iex"),
+                (DataProvider.ALPACA, "sip"),
+            ]
+        else:
+            providers = [
+                (DataProvider.YFINANCE, None),
+            ]
+
+        for provider, feed in providers:
+            try:
+                if provider == DataProvider.ALPACA:
+                    df = fetch_intraday_alpaca(
+                        symbol,
+                        interval=interval,
+                        lookback_days=lookback_days,
+                        prepost=prepost,
+                        purpose=purpose,
+                        feed=feed,
+                    )
+                else:
+                    df = fetch_intraday_yfinance(
+                        symbol,
+                        interval=interval,
+                        lookback_days=lookback_days,
+                        prepost=prepost,
+                        purpose=purpose,
+                    )
+                if _is_usable_intraday_data(df, interval=interval):
+                    return df
+            except Exception as exc:
+                logger.warning(
+                    "Market-data attempt failed: symbol=%s provider=%s feed=%s purpose=%s error=%r",
+                    symbol, getattr(provider, "value", provider), feed, purpose, exc,
+                )
+        return pd.DataFrame()
 
     fallback_key = _cache_key(
         symbol,
@@ -1039,7 +1370,7 @@ def fetch_intraday(
             "[CACHE INVALIDATED] %s cached fallback data failed validation",
             symbol,
         )
-        
+
     try:
         bars = []
         for attempt in range(1, 4):
@@ -1055,12 +1386,15 @@ def fetch_intraday(
             bridge.ib.sleep(attempt)
 
         if not bars:
-            logger.warning("No broker intraday data returned for %s after 3 attempts. Falling back to yfinance.", symbol)
-            df = fetch_intraday_yfinance(symbol, interval, lookback_days, prepost)
+            logger.warning("No broker intraday data returned for %s after 3 attempts. Falling back to data providers.", symbol)
+            if _has_alpaca_credentials():
+                df = fetch_intraday_alpaca(symbol, interval=interval, lookback_days=lookback_days, prepost=prepost, purpose=purpose)
+            else:
+                df = fetch_intraday_yfinance(symbol, interval=interval, lookback_days=lookback_days, prepost=prepost, purpose=purpose)
             if not df.empty:
                 _write_cache(fallback_key, df.copy())
             return df
-            
+
         df = _bars_to_frame(bars)
         df = df.rename(columns={"date": "datetime"})
         df.set_index("datetime", inplace=True)
@@ -1070,11 +1404,15 @@ def fetch_intraday(
         logger.debug("Fetched %d broker bars for %s", len(df), symbol)
         return df
     except Exception as e:
-        logger.exception("Failed to fetch broker data for %s: %s. Falling back to yfinance.", symbol, e)
-        df = fetch_intraday_yfinance(symbol, interval, lookback_days, prepost, purpose=purpose)
+        logger.exception("Failed to fetch broker data for %s: %s. Falling back to data providers.", symbol, e)
+        if _has_alpaca_credentials():
+            df = fetch_intraday_alpaca(symbol, interval=interval, lookback_days=lookback_days, prepost=prepost, purpose=purpose)
+        else:
+            df = fetch_intraday_yfinance(symbol, interval=interval, lookback_days=lookback_days, prepost=prepost, purpose=purpose)
         if not df.empty:
             _write_cache(fallback_key, df.copy())
         return df
+
 
 
 def fetch_intraday_batch(
@@ -1203,13 +1541,13 @@ def fetch_intraday_yfinance(
             dfs = []
             end_date = datetime.datetime.now()
             start_date = end_date - datetime.timedelta(days=lookback_days)
-            
+
             current_start = start_date
             while current_start < end_date:
                 current_end = min(current_start + datetime.timedelta(days=7), end_date)
                 start_str = current_start.strftime("%Y-%m-%d")
                 end_str = current_end.strftime("%Y-%m-%d")
-                
+
                 chunk_df = yf.download(
                     yf_symbol,
                     start=start_str,
@@ -1222,7 +1560,7 @@ def fetch_intraday_yfinance(
                 if not chunk_df.empty:
                     dfs.append(chunk_df)
                 current_start = current_end
-                
+
             if dfs:
                 df = pd.concat(dfs)
                 df = df[~df.index.duplicated(keep='first')]
@@ -1241,19 +1579,15 @@ def fetch_intraday_yfinance(
             "yfinance intraday error for %s (period=%s, interval=%s): %s",
             symbol, period, interval, str(e),
         )
-        # Attempt Alpaca fallback on yfinance exception
-        return fetch_intraday_alpaca(symbol, interval, lookback_days, prepost, purpose=purpose)
+        return pd.DataFrame()
 
     if df.empty:
-        # Fallback to Alpaca data feed if yfinance is empty or rate-limited
-        df_alpaca = fetch_intraday_alpaca(symbol, interval, lookback_days, prepost, purpose=purpose)
-        if not df_alpaca.empty:
-            return df_alpaca
         logger.debug(
             "yfinance EMPTY intraday %s (period=%s, interval=%s).",
             symbol, period, interval,
         )
-        return df
+        return pd.DataFrame()
+
 
     df = _normalize_columns(df)
     for col in ("open", "high", "low", "close", "volume"):
@@ -1292,7 +1626,10 @@ def fetch_daily_alpaca(symbol: str, lookback_days: int = None) -> pd.DataFrame:
         from alpaca.data.enums import Adjustment
         from datetime import timezone
 
-        client = StockHistoricalDataClient(api_key, secret_key)
+        client = _get_alpaca_client()
+        if client is None:
+            client = StockHistoricalDataClient(api_key, secret_key)
+            configure_alpaca_data_client_timeouts(client)
         start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
         bars_dict = None
         try:
@@ -1368,7 +1705,7 @@ def fetch_daily(symbol: str, lookback_days: int = None, bridge = None) -> pd.Dat
     fallback_df = _read_cache(fallback_key, ttl=config.CACHE_TTL_SECONDS)
     if fallback_df is not None:
         return fallback_df.copy()
-        
+
     try:
         bars = []
         for attempt in range(1, 4):
@@ -1382,7 +1719,7 @@ def fetch_daily(symbol: str, lookback_days: int = None, bridge = None) -> pd.Dat
                 break
             logger.debug(f"broker daily fetch failed for {symbol} (attempt {attempt}/3). Retrying in {attempt}s...")
             bridge.ib.sleep(attempt)
-            
+
         if not bars:
             logger.warning("No broker daily data returned for %s after 3 attempts. Falling back to Alpaca/yfinance.", symbol)
             if has_alpaca_keys:
@@ -1394,7 +1731,7 @@ def fetch_daily(symbol: str, lookback_days: int = None, bridge = None) -> pd.Dat
             if not df.empty:
                 _write_cache(fallback_key, df.copy())
             return df
-            
+
         df = _bars_to_frame(bars)
         df = df.rename(columns={"date": "datetime"})
         df.set_index("datetime", inplace=True)
@@ -1592,5 +1929,12 @@ def get_intraday_features(
 
     if features is None or features.empty:
         return pd.DataFrame()
+
+    if "atr" in features.columns and len(features) > 0:
+        last_val = features["atr"].iloc[-1]
+        last_ts = features.index[-1]
+        if not pd.isna(last_val) and last_val > 0:
+            update_position_atr_cache(symbol, interval, float(last_val), last_ts)
+
     return features
 

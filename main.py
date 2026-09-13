@@ -1967,19 +1967,40 @@ def cmd_live_readiness(args) -> int:
 
 # -- Automated Pre-Flight Go / No-Go Gate ---------------------------------------
 def cmd_preflight(args) -> int:
-    """Run 4-layer Pre-Flight Verification Gate:
+    """Run automated Pre-Flight Verification Gate:
     1. Data Freshness (SPY/QQQ latest bars)
-    2. Broker Reconciliation (Alpaca Paper, 0 duplicates, 0 orphans)
+    2. Broker Reconciliation (Alpaca Paper, 0 duplicates, 0 orphans, total flatness)
     3. Position Protection (100% covering stop loss orders)
-    4. Event Risk & Model Freshness (Event Guard phase, RF/LSTM models)
+    4. Portfolio Exposure & Risk Limits
+    5. Event Risk & Model Freshness (Event Guard phase, RF/LSTM models)
+    6. Trade Stream Readiness (WebSocket heartbeat, thread, subscription, HEALTHY state)
 
-    Exit code: 0 if GO (all critical gates pass), 1 if NO-GO.
+    Exit code: 0 if GO (all critical gates pass), 1 if NO-GO or CONDITIONAL_GO.
     """
-    from preflight import run_preflight_audit, print_preflight_scorecard
+    from preflight import PreflightDecision, run_preflight_audit, print_preflight_scorecard
     save_report = not bool(getattr(args, "no_save", False))
-    report = run_preflight_audit(save_report=save_report)
-    print_preflight_scorecard(report)
-    return 0 if report.status == "GO" else 1
+    bridge = None
+    if not getattr(args, "offline", False):
+        try:
+            from alpaca_bridge import AlpacaBridge
+            bridge = AlpacaBridge(mode="daytrade")
+            if not bridge.connect():
+                logger.warning("Could not connect Alpaca bridge for pre-flight audit")
+                bridge = None
+        except Exception as exc:
+            logger.warning("Error initializing Alpaca bridge for preflight: %s", exc)
+            bridge = None
+
+    try:
+        report = run_preflight_audit(bridge=bridge, stage="PREFLIGHT_8PM", save_report=save_report)
+        print_preflight_scorecard(report)
+        return 0 if report.decision in (PreflightDecision.GO, PreflightDecision.GO_WITH_ENTRY_HOLD) else 1
+    finally:
+        if bridge is not None:
+            try:
+                bridge.disconnect()
+            except Exception:
+                pass
 
 
 # -- Emergency kill-switch: cancel orders + flatten positions (PAPER) ----------
@@ -2815,6 +2836,14 @@ def cmd_daytrade_bot(args) -> int:
     from strategies.orchestrator import evaluate_and_execute
     from strategies.session import is_market_open, session_status, now_eastern
     
+    # Runtime configuration validation (explicit execution startup only)
+    try:
+        config.validate_alpaca_runtime_config()
+    except ValueError as ve:
+        logger.critical("🚨 [CONFIG_VALIDATION_ERROR] Alpaca configuration invalid: %s", ve)
+        print(f"\n🚨 [CONFIG_VALIDATION_ERROR] Alpaca configuration invalid: {ve}\n")
+        sys.exit(1)
+
     print(f"\n{'='*60}")
     print("  AUTOMATED DAY TRADING BOT STARTED")
     print(f"{'='*60}\n")
@@ -2824,13 +2853,45 @@ def cmd_daytrade_bot(args) -> int:
         print("  ERROR: Cannot connect to Alpaca paper broker.\n")
         sys.exit(1)
 
+    expected_acct = getattr(config, "EXPECTED_PAPER_ACCOUNT_ID", None) or "PA3UODIC5JTA"
     try:
-        from preflight import run_preflight_audit, print_preflight_scorecard
+        from alpaca_bridge import AccountModeViolation
+        bridge.assert_account_mode_safety(expected_account_id=expected_acct)
+    except AccountModeViolation as amv:
+        logger.critical("🚨 [ACCOUNT_MODE_VIOLATION] Startup safety rejected: %s", amv)
+        print(f"\n🚨 [ACCOUNT_MODE_VIOLATION] Startup safety rejected: {amv}\n")
+        bridge.disconnect()
+        sys.exit(6)
+    except Exception as exc:
+        logger.critical("🚨 [STARTUP_SAFETY_ERROR] %s", exc)
+        print(f"\n🚨 [STARTUP_SAFETY_ERROR] {exc}\n")
+        bridge.disconnect()
+        sys.exit(6)
+
+    actual_acct = bridge.account_id
+    if actual_acct != expected_acct:
+        print(f"🚨 [ACCOUNT ABORT] Connected account {actual_acct} does not match required paper account {expected_acct}!")
+        bridge.disconnect()
+        sys.exit(6)
+
+    print(f"{'='*60}")
+    print("  [ACCOUNT CHECK: PAPER APPROVED]")
+    print(f"  Execution Mode : PAPER (Execution-Enabled Live Paper Session)")
+    print(f"  Account ID     : {actual_acct}")
+    print(f"  Target Account : {expected_acct}")
+    print(f"{'='*60}\n")
+
+    try:
+        from preflight import PreflightDecision, run_preflight_audit, print_preflight_scorecard
         pf_report = run_preflight_audit(bridge=bridge, save_report=True)
         print_preflight_scorecard(pf_report)
-        if pf_report.status != "GO":
-            print(f"🚨 PRE-FLIGHT VERIFICATION FAILED ({pf_report.status}) — Halting new entries.")
-            bridge.entry_gate.halt("Pre-flight audit failed")
+        if pf_report.decision == PreflightDecision.NO_GO:
+            print(f"🚨 PRE-FLIGHT VERIFICATION FAILED ({pf_report.status}) — Halting new entries: {pf_report.hold_reason}")
+            bridge.entry_gate.halt(f"Pre-flight audit failed: {pf_report.hold_reason}")
+        elif pf_report.decision == PreflightDecision.GO_WITH_ENTRY_HOLD:
+            print(f"🟡 PRE-FLIGHT AUDIT: GO_WITH_ENTRY_HOLD — {pf_report.hold_reason}. Trading engine active; entries held until bar close.")
+        else:
+            print("🟢 PRE-FLIGHT AUDIT: GO — Trading operations and entries fully approved.")
 
         recon = bridge.reconcile_startup_state()
         _print_startup_reconciliation(recon)
@@ -2935,51 +2996,113 @@ def cmd_daytrade_bot(args) -> int:
     except Exception as wd_exc:
         print(f"Warning: Failed to start EOD watchdog: {wd_exc}")
 
-    _already_flattened = False
-    _flatten_lock = threading.Lock()
+    shutdown_requested = threading.Event()
+    shutdown_signal = None
+    _shutdown_lock = threading.Lock()
+    _shutdown_result = None
+
+    def halt_new_entries_safely(b) -> bool:
+        try:
+            entry_gate = getattr(b, "entry_gate", None)
+            if entry_gate is None:
+                logger.warning("Shutdown entry halt skipped: entry gate unavailable")
+                return False
+            entry_gate.halt("Shutdown requested")
+            return True
+        except Exception:
+            logger.exception("Failed to halt new entries during shutdown")
+            return False
 
     def handle_graceful_exit(signum, frame):
-        acquired = _flatten_lock.acquire(blocking=False)
-        if not acquired:
-            print(f"⚠️ Signal {signum} received again — forcing immediate exit.")
-            import os as os_module
-            os_module._exit(0)
-
-        if watchdog:
-            try:
-                watchdog.stop()
-            except Exception:
-                pass
-
-        if bg_scanner:
-            try:
-                bg_scanner.stop()
-            except Exception:
-                pass
-        try:
-            print(f"\n[SIGNAL] Received signal {signum}. Initiating Smart Shutdown Guard...")
-            bridge.flatten_on_shutdown(only_unprotected=True)
-            acct_id = getattr(bridge, "_account_id", getattr(bridge, "account_id", "ACTIVE"))
-            print(f"✅ Flatten completed. Sub-Account {acct_id} secured.")
-        except Exception as e:
-            print(f"❌ Error during shutdown position evaluation: {e}")
-            try:
-                bridge.disconnect()
-            except Exception:
-                pass
-        finally:
-            import os as os_module
-            os_module._exit(0)
+        nonlocal shutdown_signal
+        shutdown_signal = signum
+        shutdown_requested.set()
 
     # Register handlers
     sig_module.signal(sig_module.SIGTERM, handle_graceful_exit)
     sig_module.signal(sig_module.SIGINT, handle_graceful_exit)
 
+    def perform_controlled_shutdown(b, sig=None, reason="SESSION_END") -> int:
+        nonlocal _shutdown_result
+        with _shutdown_lock:
+            if _shutdown_result is not None:
+                return _shutdown_result
+
+            print(f"\n{'='*60}")
+            print(f"  PERFORMING CONTROLLED SHUTDOWN (Signal: {sig}, Reason: {reason})")
+            print(f"{'='*60}\n")
+
+            if watchdog:
+                try:
+                    watchdog.stop()
+                except Exception:
+                    pass
+
+            if bg_scanner:
+                try:
+                    bg_scanner.stop()
+                except Exception:
+                    pass
+
+            halt_new_entries_safely(b)
+
+            sync_ok = True
+            try:
+                print("Synchronizing final pending trade fills to journal...")
+                if hasattr(b, "sync_today_trades_to_journal"):
+                    b.sync_today_trades_to_journal()
+            except Exception as sync_exc:
+                logger.error("[SHUTDOWN] Final journal sync failed: %s", sync_exc)
+                sync_ok = False
+
+            snapshot = None
+            try:
+                print("Asserting broker position flatness and working orders...")
+                if hasattr(b, "verify_shutdown_positions"):
+                    snapshot = b.verify_shutdown_positions(
+                        timeout_seconds=5.0,
+                        reason=f"SIGNAL_{sig}" if sig else reason
+                    )
+            except Exception as v_exc:
+                logger.error("[SHUTDOWN] verify_shutdown_positions failed: %s", v_exc)
+
+            if snapshot:
+                print(f"[SHUTDOWN STATUS] Overall: {snapshot.get('overall_status')} | Positions: {snapshot.get('position_status')} | Orders: {snapshot.get('order_status')}")
+                if snapshot.get("persisted_to"):
+                    print(f"[SHUTDOWN SNAPSHOT] Persisted to: {snapshot.get('persisted_to')}")
+                if snapshot.get("exit_code") != 0:
+                    print(f"🚨 [SHUTDOWN WARNING] Non-clean shutdown status. Failures: {snapshot.get('failures')}")
+                exit_code = snapshot.get("exit_code", 0)
+                if not sync_ok and exit_code == 0:
+                    exit_code = 5
+
+                if exit_code == 2 or snapshot.get("position_status") == "VERIFIED_NON_FLAT":
+                    print("\n" + "#" * 78)
+                    print("🚨 [CRITICAL ALERT: MANUAL OPERATOR INTERVENTION REQUIRED]")
+                    print("🚨 RESIDUAL UNCLOSED BROKER POSITIONS DETECTED (VERIFIED_NON_FLAT)!")
+                    print("🚨 AUTOMATED FLATTENING IS NOT AUTHORIZED (NO AUTO-LIQUIDATION).")
+                    print("🚨 ACTION REQUIRED:")
+                    print("🚨   1. Immediately log in to Alpaca Web Dashboard: https://app.alpaca.markets")
+                    print("🚨   2. Inspect open positions for account and manually close residual exposure.")
+                    print("🚨   3. Review shutdown snapshot file for symbol and share discrepancies.")
+                    print("#" * 78 + "\n")
+            else:
+                exit_code = 3 if (b and getattr(b, "is_connected", False)) else 0
+
+            try:
+                if b and hasattr(b, "disconnect"):
+                    b.disconnect()
+            except Exception:
+                pass
+
+            _shutdown_result = exit_code
+            return exit_code
+
     try:
         from strategies.error_handler import TradingErrorHandler
         error_handler = TradingErrorHandler(bridge=bridge)
         _scanner_stale_blocked = False
-        while True:
+        while not shutdown_requested.is_set():
             current_time = time.time()
             if watchdog:
                 try:
@@ -2990,14 +3113,29 @@ def cmd_daytrade_bot(args) -> int:
             if not is_market_open():
                 from strategies.session import is_postmarket
                 if is_postmarket():
-                    print(f"[{session_status()}] Market closed. EOD reached, exiting cleanly.")
-                    print("Flattening all positions before exit...")
-                    _already_flattened = True
-                    bridge.flatten_all()
-                    sys.exit(0)
+                    print(f"\n[{session_status()}] Market closed. EOD reached.")
+                    exit_code = perform_controlled_shutdown(bridge, reason="EOD_MARKET_CLOSED")
+                    print("\n" + "=" * 70)
+                    print("  [SESSION COMPLETE — TERMINAL HELD OPEN FOR MORNING OPERATOR REVIEW]")
+                    print("  Broker state verified. All logs and decisions are permanently saved.")
+                    print("  Log file: logs/stock_engine.log")
+                    print("  The terminal will remain open until you manually close it or press Ctrl+C.")
+                    print("=" * 70 + "\n")
+                    last_standby_ts = 0.0
+                    try:
+                        while not shutdown_requested.is_set():
+                            now_ts = time.time()
+                            if now_ts - last_standby_ts >= 300.0:  # Every 5 minutes
+                                from datetime import datetime
+                                print(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Standby — Terminal held open for review (Press Ctrl+C to exit).")
+                                last_standby_ts = now_ts
+                            shutdown_requested.wait(timeout=10)
+                    except (KeyboardInterrupt, SystemExit):
+                        pass
+                    return exit_code
 
                 print(f"[{session_status()}] Market closed. Waiting...")
-                time.sleep(60)
+                shutdown_requested.wait(timeout=60)
                 continue
 
             allow_new_entries = not getattr(bridge.entry_gate, "halted", False)
@@ -3073,6 +3211,9 @@ def cmd_daytrade_bot(args) -> int:
                     watchlist = [s for s in watchlist if s not in blacked_out]
                     print(f"  [EARNINGS BLACKOUT] Removed {blacked_out} from watchlist")
 
+            if shutdown_requested.is_set():
+                break
+
             evaluate_and_execute(
                 watchlist=watchlist,
                 bridge=bridge,
@@ -3082,56 +3223,20 @@ def cmd_daytrade_bot(args) -> int:
             )
 
             print("Sleeping for 30 seconds before next evaluation...")
-            time.sleep(30)
-            
+            shutdown_requested.wait(timeout=30)
+
     except KeyboardInterrupt:
-        if watchdog:
-            try:
-                watchdog.stop()
-            except Exception:
-                pass
-        if not _already_flattened:
-            _already_flattened = True
-            try:
-                bridge.flatten_all()
-            except Exception as e:
-                try:
-                    print(f"Error flattening positions during KeyboardInterrupt: {e}")
-                except Exception:
-                    pass
-        try:
-            print("\nStopping bot...")
-        except Exception:
-            pass
-        sys.exit(0)
+        shutdown_requested.set()
     except Exception as exc:
-        if watchdog:
-            try:
-                watchdog.stop()
-            except Exception:
-                pass
-        if not _already_flattened:
-            _already_flattened = True
-            try:
-                bridge.flatten_all()
-            except Exception as e:
-                try:
-                    print(f"Error flattening positions during loop crash: {e}")
-                except Exception:
-                    pass
-        try:
-            print(f"\n🚨 CRITICAL ERROR: Unhandled exception in bot loop: {exc}")
-        except Exception:
-            pass
-        sys.exit(1)
+        logger.exception("Unhandled exception in bot loop: %s", exc)
+        print(f"\n🚨 CRITICAL ERROR: Unhandled exception in bot loop: {exc}")
     finally:
-        if bg_scanner:
-            try:
-                bg_scanner.stop()
-            except Exception:
-                pass
-        bridge.disconnect()
-    return 0
+        exit_code = perform_controlled_shutdown(
+            bridge,
+            sig=shutdown_signal,
+            reason="GRACEFUL_SIGNAL_EXIT" if shutdown_requested.is_set() else "LOOP_TERMINATED"
+        )
+    return exit_code
 
 
 def cmd_daytrade_train(args) -> int:
@@ -3148,8 +3253,17 @@ def cmd_daytrade_train(args) -> int:
 
 
 def main() -> int:
+    if "--live" in sys.argv:
+        print("\n" + "=" * 70)
+        print("🚨 ACCOUNT MODE ABORT:")
+        print("The --live option is not supported by this paper-only build.")
+        print("Use --live-paper for execution-enabled Alpaca paper trading.")
+        print("No broker request was submitted.")
+        print("=" * 70 + "\n")
+        return 6
 
-    parser = argparse.ArgumentParser(description="Stock Prediction Engine â€” IBKR Paper Trading")
+    parser = argparse.ArgumentParser(description="Stock Prediction Engine — IBKR Paper Trading")
+    parser.add_argument("--mode", choices=["daytrade", "swing"], default=None, help="Top-level shortcut mode (e.g. --mode daytrade)")
     sub = parser.add_subparsers(dest="command")
 
     # M5A: DISPLAY-ONLY language flag for safe, read-only coach/report commands.
@@ -3168,7 +3282,7 @@ def main() -> int:
     # Daytrading subcommands
     p_dt_scan = sub.add_parser("daytrade-scan", help="Premarket/open-session scanner (Day Trading)")
     p_dt_scan.add_argument("--top-n", type=int, default=10)
-    p_dt_scan.add_argument("--live", action="store_true", help="Auto-refresh scanner results")
+    p_dt_scan.add_argument("--watch", "--refresh", dest="watch", action="store_true", help="Auto-refresh scanner results")
 
     p_dt_signals = sub.add_parser("daytrade-signals", help="Evaluate strategy signals on symbols (Day Trading)")
     p_dt_signals.add_argument("--symbols", nargs="+", default=None)
@@ -3443,8 +3557,18 @@ def main() -> int:
         "--no-save", action="store_true",
         help="Do not save the JSON audit report to reports/preflight_report.json",
     )
+    p_pf.add_argument(
+        "--offline", action="store_true",
+        help="Run preflight in offline mode without attaching live broker bridge",
+    )
 
     args = parser.parse_args()
+    if args.command is None and getattr(args, "mode", None):
+        if args.mode == "daytrade":
+            return cmd_daytrade_bot(args)
+        elif args.mode == "swing":
+            return cmd_paper(args)
+
     if args.command == "preflight":
         return cmd_preflight(args)
     if args.command == "daytrade-scan":

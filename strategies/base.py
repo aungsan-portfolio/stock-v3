@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import pandas as pd
 
-from strategies.constants import StrategyName
+from strategies.constants import StrategyName, OrderIntent, EXIT_INTENTS
 
 
 @dataclass
@@ -26,6 +26,7 @@ class TradeSignal:
     risk_per_share: float
     reason: str
     pattern_name: Optional[str] = None
+    intent: OrderIntent = OrderIntent.ENTRY
     metadata: dict = field(default_factory=dict)
     signal_id: str = field(default_factory=lambda: uuid4().hex)
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -93,3 +94,19 @@ class BaseStrategy:
 
     def evaluate(self, symbol: str, df: pd.DataFrame) -> Optional[TradeSignal]:
         raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class EntryReadiness:
+    """Cycle-bound execution context token required for entry order placement."""
+    entry_allowed: bool
+    suppression_reason: Optional[str]
+    cycle_id: str
+    bar_ts: str
+    created_at: float
+    expires_at: float
+
+    def is_expired(self, now: Optional[float] = None) -> bool:
+        import time
+        t = time.time() if now is None else now
+        return t > self.expires_at

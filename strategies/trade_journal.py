@@ -11,9 +11,111 @@ from typing import Optional
 import config
 from strategies.session import is_market_day, now_eastern
 
+from decimal import Decimal, InvalidOperation
+
 logger = logging.getLogger(__name__)
 
-_journal_lock = threading.Lock()
+_journal_lock = threading.RLock()
+_journal_reconciliation_lock = _journal_lock
+
+def get_journal_lock() -> threading.RLock:
+    """Return shared re-entrant lock for serialized journal reconciliation."""
+    return _journal_lock
+
+def canonical_decimal(value) -> str:
+    """Format decimal numbers canonically (e.g. 57 -> '57', 57.000 -> '57', 0.25 -> '0.25')."""
+    if value is None:
+        return "0"
+    try:
+        d = Decimal(str(value))
+        normalized = d.normalize()
+        text = format(normalized, "f")
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text or "0"
+    except (InvalidOperation, TypeError, ValueError):
+        return str(value)
+
+def is_economic_fill(record: dict) -> bool:
+    """Check if a journal record represents a valid economic execution fill."""
+    if not isinstance(record, dict):
+        return False
+    event_type = str(record.get("event_type") or record.get("type") or "").upper()
+    if event_type != "FILL":
+        return False
+    order_id = record.get("broker_order_id") or record.get("order_id")
+    if not order_id:
+        return False
+    try:
+        qty = Decimal(str(record.get("qty", "0")))
+        return qty > 0
+    except Exception:
+        return False
+
+class OrderFillState:
+    """Cumulative fill state for a specific broker order."""
+    def __init__(self, broker_order_id: str = ""):
+        self.broker_order_id = broker_order_id
+        self.logged_qty = Decimal("0")
+        self.logged_notional = Decimal("0")
+        self.execution_ids = set()
+
+    def add_fill(self, qty: Decimal, price: Decimal, exec_id: Optional[str] = None):
+        self.logged_qty += qty
+        self.logged_notional += qty * price
+        if exec_id:
+            self.execution_ids.add(str(exec_id))
+
+def load_journal_order_fill_state(records, account_id: Optional[str] = None, trading_date=None) -> Dict[Tuple[str, str, str, str, str], OrderFillState]:
+    """
+    Build cumulative filled quantities and execution IDs by scoped key:
+    (account_id, trading_date, broker_order_id, symbol, side)
+    """
+    import pytz
+    states: Dict[Tuple[str, str, str, str, str], OrderFillState] = {}
+    target_date_str = str(trading_date) if trading_date is not None else None
+    target_acc_str = str(account_id) if account_id is not None else None
+
+    for r in records:
+        if not is_economic_fill(r):
+            continue
+
+        rec_acc = str(r.get("account_id") or target_acc_str or "ALPACA")
+        if target_acc_str and rec_acc != target_acc_str and rec_acc != "ALPACA" and target_acc_str != "ALPACA":
+            continue
+
+        # When target_acc_str is provided and rec_acc is default 'ALPACA' (legacy record), treat it as target_acc_str
+        scoped_acc = target_acc_str if (target_acc_str and rec_acc == "ALPACA") else rec_acc
+
+        ts_str = r.get("timestamp") or r.get("journal_write_timestamp_utc")
+        rec_date_str = None
+        if ts_str:
+            try:
+                dt = datetime.fromisoformat(ts_str)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                et_tz = pytz.timezone("US/Eastern")
+                rec_date_str = str(dt.astimezone(et_tz).date())
+            except Exception:
+                rec_date_str = None
+
+        if target_date_str and rec_date_str and rec_date_str != target_date_str:
+            continue
+
+        order_id = str(r.get("broker_order_id") or r.get("order_id") or "")
+        symbol = str(r.get("symbol") or "").upper()
+        side = str(r.get("side") or "").upper()
+
+        key = (scoped_acc, rec_date_str or target_date_str or "", order_id, symbol, side)
+        if key not in states:
+            states[key] = OrderFillState(broker_order_id=order_id)
+
+        qty = Decimal(str(r.get("qty", "0")))
+        price = Decimal(str(r.get("fill_price", "0.0")))
+        exec_id = r.get("execution_id") or r.get("fill_id")
+        states[key].add_fill(qty, price, exec_id)
+
+    return states
 
 def log_trade(
     symbol: str,
@@ -59,7 +161,7 @@ def log_trade(
     path.parent.mkdir(parents=True, exist_ok=True)
     with _journal_lock:
         with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record) + "\n")
+            fh.write(json.dumps(record, default=str) + "\n")
     logger.info("Journal: %s %s %s @ %.2f | stop=%.2f target=%.2f",
                 side, qty, symbol, entry_price, stop_price, target_price)
 
@@ -93,8 +195,8 @@ def log_fill(
     # Primary key precedence: execution_id is primary; order_id alone is NEVER fill identity
     if execution_id and str(execution_id).strip():
         primary_fill_id = str(execution_id).strip()
-        is_synthetic = False
-        requires_reconciliation = False
+        is_synthetic = bool(kwargs.get("is_synthetic_key", kwargs.get("synthetic", primary_fill_id.startswith("SYNTH:"))))
+        requires_reconciliation = bool(kwargs.get("requires_reconciliation", is_synthetic))
     else:
         # Degraded synthetic key includes (account_id, order_id, side, qty, px, timestamp)
         synth_acc = account_id or "ACC"
@@ -127,13 +229,14 @@ def log_fill(
         "price_tier": price_tier,
         "broker_position_before": broker_position_before,
         "broker_position_after": broker_position_after,
+        "account_id": str(account_id or "ALPACA"),
         **kwargs,
     }
     path = journal_file or config.DAYTRADE_TRADE_JOURNAL_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     with _journal_lock:
         with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record) + "\n")
+            fh.write(json.dumps(record, default=str) + "\n")
     if slippage is not None and fill_latency_ms is not None:
         logger.info(
             "Fill logged: %s %d %s @ %.2f (Slippage: %.4f, Latency: %.1fms)",
