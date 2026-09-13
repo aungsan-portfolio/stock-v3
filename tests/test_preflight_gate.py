@@ -12,6 +12,7 @@ from preflight import (
     check_data_freshness,
     check_event_and_models,
     check_portfolio_exposure,
+    check_position_protection,
     run_preflight_audit,
 )
 
@@ -185,3 +186,70 @@ def test_preflight_audit_unverified_stream_yields_conditional_go():
             assert report.critical_fail == 0
             assert report.critical_not_verified == 1
             assert "Trading Engine Active with Entry Hold" in report.summary
+
+
+def test_check_position_protection_reports_accurate_protected_count():
+    """Verify that positions with covering stops report accurate non-zero protected count."""
+    mock_bridge = MagicMock()
+    mock_bridge._connected = True
+    mock_bridge.reconcile_startup_state.return_value = {
+        "protect": {
+            "checked": 3,
+            "protected": ["AAPL", "MSFT", "NVDA"],
+            "unprotected": [],
+            "repaired": [],
+            "failed": [],
+            "clean": True,
+        }
+    }
+
+    res = check_position_protection(bridge=mock_bridge)
+    assert res.passed is True
+    assert res.category == "CRITICAL"
+    assert "3 protected, 0 unprotected" in res.message
+    assert res.details["protected"] == ["AAPL", "MSFT", "NVDA"]
+    assert res.details["clean"] is True
+
+
+def test_check_position_protection_with_repaired_stops():
+    """Verify that repaired stops count towards protected positions and pass preflight."""
+    mock_bridge = MagicMock()
+    mock_bridge._connected = True
+    mock_bridge.reconcile_startup_state.return_value = {
+        "protect": {
+            "checked": 2,
+            "protected": ["AAPL", "GOOGL"],
+            "unprotected": ["GOOGL"],
+            "repaired": ["GOOGL"],
+            "failed": [],
+            "clean": True,
+        }
+    }
+
+    res = check_position_protection(bridge=mock_bridge)
+    assert res.passed is True
+    assert res.category == "CRITICAL"
+    assert "2 protected, 1 repaired, 0 unprotected" in res.message
+    assert res.details["repaired"] == ["GOOGL"]
+
+
+def test_check_position_protection_fails_on_unprotected_or_failed():
+    """Verify that failed or unrepairable positions trigger CRITICAL gate failure."""
+    mock_bridge = MagicMock()
+    mock_bridge._connected = True
+    mock_bridge.reconcile_startup_state.return_value = {
+        "protect": {
+            "checked": 2,
+            "protected": ["AAPL"],
+            "unprotected": ["TSLA"],
+            "repaired": [],
+            "failed": ["TSLA"],
+            "clean": False,
+        }
+    }
+
+    res = check_position_protection(bridge=mock_bridge)
+    assert res.passed is False
+    assert res.category == "CRITICAL"
+    assert "Unprotected positions detected" in res.message
+

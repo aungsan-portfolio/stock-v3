@@ -931,6 +931,32 @@ class AlpacaBridge:
                 count += 1
         return count
 
+    def get_broker_events_path(self) -> Path:
+        """
+        Resolves and validates the broker event audit trail path.
+
+        Process isolation guarantees:
+        1. Explicit configuration via config.BROKER_EVENTS_PATH or os.environ['BROKER_EVENTS_PATH']
+           takes highest precedence.
+        2. Default fallback is Path('logs/broker_events.jsonl').
+        3. If running in multi-process canary mode (MULTI_PROCESS_CANARY=1), rejects any
+           generic un-isolated 'broker_events.jsonl' path to prevent cross-process clobbering:
+           Daytrade service must set: BROKER_EVENTS_PATH=logs/daytrade_broker_events.jsonl
+           Swing service must set:    BROKER_EVENTS_PATH=logs/swing_broker_events.jsonl
+
+        Note on Concurrency:
+        _broker_event_write_lock (threading.Lock) provides process-local synchronization only.
+        Multi-process safety between Daytrade and Swing relies on strict file-path separation.
+        """
+        configured_path = getattr(config_module, "BROKER_EVENTS_PATH", None) or os.environ.get("BROKER_EVENTS_PATH")
+        p = Path(configured_path or "logs/broker_events.jsonl")
+
+        if p.name == "broker_events.jsonl" and os.environ.get("MULTI_PROCESS_CANARY"):
+            raise RuntimeError(
+                "Shared broker event path is not permitted for the Session 3 multi-process canary"
+            )
+        return p
+
     def _set_stream_state_for_generation(
         self,
         generation: int,
@@ -1315,8 +1341,7 @@ class AlpacaBridge:
 
             # Record always-on trade update stream to broker_events.jsonl
             try:
-                configured_path = getattr(config_module, "BROKER_EVENTS_PATH", None)
-                broker_ev_path = Path(configured_path or "logs/broker_events.jsonl")
+                broker_ev_path = self.get_broker_events_path()
                 broker_ev_path.parent.mkdir(parents=True, exist_ok=True)
                 with _broker_event_write_lock:
                     with open(broker_ev_path, "a", encoding="utf-8") as f_ev:
@@ -2541,7 +2566,16 @@ class AlpacaBridge:
                         message="startup: long(s) with no resting GTC protective stop",
                         symbols=list(snapshot["unprotected_longs"]))
 
-        protect = {"checked": 0, "unprotected": [], "repaired": [], "failed": []}
+        protected_longs = list(snapshot.get("protected_longs", []))
+        unprotected_longs = list(snapshot.get("unprotected_longs", []))
+        protect = {
+            "checked": len(protected_longs) + len(unprotected_longs),
+            "protected": list(protected_longs),
+            "unprotected": list(unprotected_longs),
+            "repaired": [],
+            "failed": [],
+            "clean": len(unprotected_longs) == 0,
+        }
         if snapshot["unprotected_longs"]:
             protect = self.ensure_protective_stops()
             if protect.get("repaired"):
@@ -2553,6 +2587,10 @@ class AlpacaBridge:
                     positions = self.positions_plain()
                     working = self.working_orders_plain()
                     snapshot = reconciliation.build_snapshot(positions, working)
+                protect["protected"] = list(snapshot.get("protected_longs", []))
+                protect["unprotected"] = list(snapshot.get("unprotected_longs", []))
+                protect["checked"] = len(protect["protected"]) + len(protect["unprotected"])
+                protect["clean"] = len(protect.get("failed", [])) == 0 and len(protect["unprotected"]) == 0
 
         auto_cleaned_orphans = []
         if snapshot["orphan_exits"]:
@@ -2807,7 +2845,21 @@ class AlpacaBridge:
         return current_open_stop_risk, pending_entry_risk, active_position_symbols, pending_new_symbols
 
     def ensure_protective_stops(self) -> dict:
-        report = {"checked": 0, "unprotected": [], "repaired": [], "failed": []}
+        """
+        Audit and repair covering protective stops on all open positions.
+
+        Reporting contract:
+          checked: Count of open positions audited.
+          protected: Final list of confirmed protected symbols (existing + repaired).
+          unprotected: Initial list of symbols lacking a protective stop when scanned.
+          repaired: Symbols where a new GTC stop was successfully submitted.
+          failed: Symbols where protection could not be placed (triggers entry gate HALT).
+          clean: True when failed is empty and all positions are protected in final state.
+
+        Note: A repaired symbol will appear in unprotected (initial state), repaired,
+        and protected (final state).
+        """
+        report = {"checked": 0, "protected": [], "unprotected": [], "repaired": [], "failed": [], "clean": False}
         self._require_connection()
         try:
             positions = self._client.get_all_positions()
@@ -2866,6 +2918,8 @@ class AlpacaBridge:
                 stop_side = OrderSide.BUY
 
             if existing_stop is not None or order_exec.has_gtc_protective_stop(symbol, abs_qty, working):
+                if symbol not in report["protected"]:
+                    report["protected"].append(symbol)
                 continue
 
             report["unprotected"].append(symbol)
@@ -2880,6 +2934,8 @@ class AlpacaBridge:
                     stop_price=stop_price
                 ))
                 report["repaired"].append(symbol)
+                if symbol not in report["protected"]:
+                    report["protected"].append(symbol)
                 logger.warning("Startup: repaired GTC protection stop for %s x%.2f at %.2f", symbol, abs_qty, stop_price)
             except Exception as exc:
                 err_str = str(exc)
@@ -2913,6 +2969,8 @@ class AlpacaBridge:
                                 stop_price=stop_price
                             ))
                             report["repaired"].append(symbol)
+                            if symbol not in report["protected"]:
+                                report["protected"].append(symbol)
                             has_stop_protection = True
                             logger.warning("Startup: successfully repaired real GTC protection stop for %s x%.2f at %.2f", symbol, abs_qty, stop_price)
                         except Exception as retry_exc:
@@ -2922,10 +2980,14 @@ class AlpacaBridge:
                     logger.info("Startup: %s is confirmed protected by broker stop order.", symbol)
                     if symbol not in report["repaired"]:
                         report["repaired"].append(symbol)
+                    if symbol not in report["protected"]:
+                        report["protected"].append(symbol)
                 else:
                     self.entry_gate.halt()
-                    report["failed"].append(symbol)
+                    if symbol not in report["failed"]:
+                        report["failed"].append(symbol)
                     logger.error("Startup: long %s is held by orders without a downside stop loss leg -> HALT for safety: %s", symbol, exc)
+        report["clean"] = len(report["failed"]) == 0 and len(report["protected"]) == report["checked"]
         return report
 
     def flatten_all(self, confirm: bool = False) -> dict:
@@ -4417,7 +4479,7 @@ class AlpacaBridge:
             logger.info("No long in %s — skipping SELL (Stage 0 swing is long-only / ALLOW_SHORT=False)", symbol)
             return False
 
-        inverse_etfs = getattr(config, "INVERSE_ETF_SYMBOLS", set())
+        inverse_etfs = getattr(config_module, "INVERSE_ETF_SYMBOLS", set())
         if symbol.upper().strip() in inverse_etfs:
             logger.info("Skipped %s: Inverse ETFs cannot be sold short (Long-only hedge)", symbol)
             return False

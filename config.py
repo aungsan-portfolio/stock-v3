@@ -711,7 +711,17 @@ SPY_TREND_GUARD_ENABLED         = True
 SPY_TREND_GUARD_SYMBOL          = "SPY"
 
 MAX_RISK_PER_TRADE_PCT = 0.3
-MAX_DAILY_LOSS_PCT      = 0.9
+
+# Day Trading daily loss percentage cap:
+# Percentage points: 0.9 means 0.9% of equity. (DO NOT use decimal fraction 0.009 here)
+# Compare with SWING_MAX_DAILY_LOSS_PCT above which is a fractional ratio (0.01 means 1.0%).
+MAX_DAILY_LOSS_PCT = float(os.environ.get("MAX_DAILY_LOSS_PCT", "0.9"))
+if not 0.0 < MAX_DAILY_LOSS_PCT <= 10.0:
+    raise ValueError(
+        "MAX_DAILY_LOSS_PCT must be greater than 0 "
+        "and no greater than 10.0 percentage points; "
+        "1.0 means 1.0% of equity"
+    )
 MAX_DAILY_LOSS_DOLLARS  = MAX_DAILY_LOSS_DAYTRADE
 MAX_TRADES_PER_DAY = 100
 MAX_CONSECUTIVE_LOSSES = 10

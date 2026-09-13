@@ -16,7 +16,7 @@ import threading
 from unittest import mock
 import pytest
 
-from alpaca_bridge import AlpacaBridge, StreamState, BrokerOrderCheck, ShutdownResult
+from alpaca_bridge import AlpacaBridge, StreamState, BrokerOrderCheck, ShutdownResult, AccountModeViolation
 from observability import get_latch_state_machine, LatchTrigger
 
 
@@ -131,9 +131,10 @@ class TestP1StreamLifecycleAndInvariants:
         bridge = AlpacaBridge(mode="swing")
         stop_evt = threading.Event()
         try:
-            with mock.patch.object(bridge, "_run_trade_stream", side_effect=lambda s: stop_evt.wait(5.0)):
+            with mock.patch.object(bridge, "_run_trade_stream", side_effect=lambda *args, **kwargs: stop_evt.wait(5.0)):
                 fake_stream = mock.MagicMock()
                 fake_stream._running = True
+                fake_stream._endpoint = "wss://paper-api.alpaca.markets/v2/stream"
 
                 with mock.patch("alpaca_bridge.TradingStream", return_value=fake_stream):
                     # Start stream 1
@@ -247,16 +248,46 @@ class TestP1PostReconnectReconciliation:
         bridge = AlpacaBridge(mode="swing")
         bridge._connected = True
 
-        # Set multiple halts: 1 recovery-specific, 1 macro regime halt, 1 manual halt
+        # Set multiple halts: transient recovery halts vs latched safety halts
         bridge.entry_gate.halt("TRADE_STREAM_DISCONNECTED")
-        bridge.entry_gate.halt("MARKET_REGIME_RISK_OFF")
+        bridge.entry_gate.halt("BROKER_RECONCILIATION_PENDING")
+        bridge.entry_gate.halt("LATCHED_PROTECTION_FAILURE")
+        bridge.entry_gate.halt("LATCHED_DAILY_LOSS_BREACH")
         bridge.entry_gate.halt("MANUAL_OPERATOR_HALT")
 
-        # Execute clean recovery
+        # Execute recovery clearance
         bridge._clear_recovery_halts()
 
-        # TRADE_STREAM_DISCONNECTED should be gone, but MARKET_REGIME_RISK_OFF and MANUAL_OPERATOR_HALT must remain!
-        assert bridge.entry_gate.halted is True
+        # Transient recovery halts should be removed
         assert "TRADE_STREAM_DISCONNECTED" not in bridge.entry_gate.reasons
-        assert "MARKET_REGIME_RISK_OFF" in bridge.entry_gate.reasons
+        assert "BROKER_RECONCILIATION_PENDING" not in bridge.entry_gate.reasons
+
+        # Critical safety and latched halts must permanently remain
+        assert bridge.entry_gate.halted is True
+        assert "LATCHED_PROTECTION_FAILURE" in bridge.entry_gate.reasons
+        assert "LATCHED_DAILY_LOSS_BREACH" in bridge.entry_gate.reasons
         assert "MANUAL_OPERATOR_HALT" in bridge.entry_gate.reasons
+
+    def test_missing_stream_endpoint_fail_closed(self):
+        """Verify that missing endpoint or live endpoint triggers immediate AccountModeViolation."""
+        bridge = AlpacaBridge(mode="swing")
+        mock_stream_no_endpoint = mock.MagicMock(spec=[])
+        with pytest.raises(AccountModeViolation, match="missing '_endpoint' attribute"):
+            bridge._assert_paper_stream_endpoint(mock_stream_no_endpoint)
+
+        mock_stream_live_endpoint = mock.MagicMock()
+        mock_stream_live_endpoint._endpoint = "wss://api.alpaca.markets/v2/stream"
+        with pytest.raises(AccountModeViolation, match="endpoint safety violation"):
+            bridge._assert_paper_stream_endpoint(mock_stream_live_endpoint)
+
+    def test_latched_desync_not_auto_released(self):
+        """Verify that StreamState.LATCHED_DESYNC cannot be cleared by _clear_recovery_halts."""
+        bridge = AlpacaBridge(mode="swing")
+        bridge._stream_state = StreamState.LATCHED_DESYNC
+        bridge.entry_gate.halt("LATCHED_PROTECTION_FAILURE")
+
+        bridge._clear_recovery_halts()
+
+        assert bridge.stream_state == StreamState.LATCHED_DESYNC
+        assert bridge.entry_gate.halted is True
+        assert "LATCHED_PROTECTION_FAILURE" in bridge.entry_gate.reasons

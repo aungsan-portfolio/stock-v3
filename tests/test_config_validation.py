@@ -122,3 +122,33 @@ class TestConfigValidation:
 
         for name, count in counts.items():
             assert count == 1, f"Expected {name} to be assigned exactly once, found {count} assignments."
+
+    def test_max_daily_loss_pct_default_and_override_in_subprocess(self):
+        import subprocess
+        import sys
+        import os
+
+        # 1. Default value is 0.9 percentage points
+        code_default = "import config\nassert config.MAX_DAILY_LOSS_PCT == 0.9\n"
+        res = subprocess.run([sys.executable, "-c", code_default], capture_output=True, text=True)
+        assert res.returncode == 0, f"Default check failed: {res.stderr}"
+
+        # 2. Env override to 1.0
+        env = os.environ.copy()
+        env["MAX_DAILY_LOSS_PCT"] = "1.0"
+        code_override = "import config\nassert abs(config.MAX_DAILY_LOSS_PCT - 1.0) < 1e-6\n"
+        res_env = subprocess.run([sys.executable, "-c", code_override], env=env, capture_output=True, text=True)
+        assert res_env.returncode == 0, f"Env override check failed: {res_env.stderr}"
+
+    @pytest.mark.parametrize("bad_val", ["0.0", "-1.0", "10.5", "100.0"])
+    def test_max_daily_loss_pct_bounds_validation_in_subprocess(self, bad_val):
+        import subprocess
+        import sys
+        import os
+        env = os.environ.copy()
+        env["MAX_DAILY_LOSS_PCT"] = bad_val
+        code = "import config"
+        res = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+        assert res.returncode != 0
+        assert "MAX_DAILY_LOSS_PCT must be greater than 0 and no greater than 10.0 percentage points" in res.stderr
+

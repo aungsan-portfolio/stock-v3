@@ -368,19 +368,33 @@ def check_position_protection(bridge: Any = None) -> GateResult:
         unprotected = protect.get("unprotected", [])
         failed = protect.get("failed", [])
         protected = protect.get("protected", [])
+        repaired = protect.get("repaired", [])
+        checked = protect.get("checked", len(protected) + len(unprotected))
 
-        passed = len(unprotected) == 0 and len(failed) == 0
-        msg = (
-            f"100% Position Protection verified ({len(protected)} protected, 0 unprotected)"
-            if passed
-            else f"Unprotected positions detected: {unprotected or failed}"
-        )
+        clean = protect.get("clean", len(failed) == 0 and len(protected) == checked)
+        passed = bool(clean) and len(failed) == 0
+
+        if passed:
+            repair_str = f", {len(repaired)} repaired" if repaired else ""
+            msg = f"100% Position Protection verified ({len(protected)} protected{repair_str}, 0 unprotected)"
+        else:
+            remaining_unprotected = [s for s in unprotected if s not in repaired]
+            unresolved = remaining_unprotected if remaining_unprotected else failed
+            msg = f"Unprotected positions detected: {unresolved}"
+
         return GateResult(
             name="Position Protection",
             category="CRITICAL",
             passed=passed,
             message=msg,
-            details={"protected": protected, "unprotected": unprotected, "failed": failed},
+            details={
+                "checked": checked,
+                "protected": protected,
+                "unprotected": unprotected,
+                "repaired": repaired,
+                "failed": failed,
+                "clean": clean,
+            },
         )
     except Exception as exc:
         return GateResult(

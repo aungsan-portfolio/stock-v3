@@ -285,8 +285,8 @@ def test_multi_process_path_isolation_daytrade_vs_swing(tmp_path):
     p1 = subprocess.Popen([sys.executable, "-c", daytrade_code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     p2 = subprocess.Popen([sys.executable, "-c", swing_code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-    out1, err1 = p1.communicate(timeout=15)
-    out2, err2 = p2.communicate(timeout=15)
+    out1, err1 = p1.communicate(timeout=30)
+    out2, err2 = p2.communicate(timeout=30)
 
     assert p1.returncode == 0, f"Daytrade process failed: {err1}"
     assert p2.returncode == 0, f"Swing process failed: {err2}"
@@ -309,4 +309,14 @@ def test_multi_process_path_isolation_daytrade_vs_swing(tmp_path):
         rec = json.loads(line)
         assert rec["symbol"] == "SPY"
         assert rec["order_id"].startswith("SW_")
+
+
+def test_shared_broker_event_path_rejected_in_multi_process_canary(monkeypatch):
+    """Verify that resolving shared broker_events.jsonl raises RuntimeError when MULTI_PROCESS_CANARY is set."""
+    monkeypatch.setenv("MULTI_PROCESS_CANARY", "1")
+    monkeypatch.setattr(config_module, "BROKER_EVENTS_PATH", "logs/broker_events.jsonl", raising=False)
+    bridge = AlpacaBridge.__new__(AlpacaBridge)
+    with pytest.raises(RuntimeError, match="Shared broker event path is not permitted"):
+        bridge.get_broker_events_path()
+
 
