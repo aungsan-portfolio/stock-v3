@@ -1,0 +1,71 @@
+# Forensic Verdict Record: AAPL Mock-Leak Quarantine
+
+**Date**: 2026-09-26  
+**Auditor**: Forensic Analysis Engine  
+**Status**: APPROVED & LOCKED  
+
+```text
+=== VERDICT RECORD: AAPL MOCK-LEAK QUARANTINE (2026-09-26) ===
+Subject : trade_journal_production_clean.jsonl lines 730, 824
+          AAPL 100sh $150->$140, pnl -$1,000 each, "Emergency flatten exit"
+Verdict : SYNTHETIC TEST LEAKAGE — QUARANTINED (flag-only, reversible,
+          raw untouched; source SHA-256 18f476e23d490b6b9aa9f6fa5d427688d3056c1ab658654dac5f4357a4d6f982 verified post-run)
+
+Evidence:
+  V1 broker truth : logs/broker_events.jsonl AAPL fills (Sep) = qty 1.0 @
+                    $339.76 / $339.97 / $340.23 only. ZERO 100sh/$150/$140.
+                    [evidence class: LOCAL event log, not direct API query —
+                     direct Alpaca API cross-check = optional addendum]
+  V2 provenance   : (a) 2026-09-05 = Saturday — live fill impossible
+                    (b) mock contract verbatim in tests/
+                        test_swing_execution_safety.py:863,1178
+                        (AAPL qty=100, avg=150, stop=140)
+                    (c) notes string emitted at trailing_stop.py:1623
+                    (d) verbatim duplicates in trade_journal_archive_jul22
+  V3 gate ledger  : ledger starts 2026-09-17 -> 09-05/09-09 dates are
+                    PRE-LEDGER (absence there is not independent proof).
+                    Positive proof: only AAPL PASS anywhere = 09-21, qty=11,
+                    cid=se3-AAPL-B-mome-20260921-e43e0986b88aaa71.
+                    No 100-share AAPL PASS exists.
+  V4 risk snapshot: swing_position_risk.json — AAPL absent
+
+Precision notes:
+  - 09-05 record: Saturday alone kills live-fill possibility outright.
+  - 09-09 record (Wednesday): rests on V1 + V2(d) + fingerprint, not calendar.
+  - Quarantine fingerprint requires ALL 6 mock fields to match (reversible).
+
+OV-1 RESOLVED (2026-09-26): Dual-path test-data egress confirmed.
+  (1) 2026-09-05 16:03 UTC record: tests/test_swing_execution_safety.py
+      invoked log_trade without journal_file override -> default production
+      path (Saturday, no market dependency in journaling).
+  (2) 2026-09-09 12:37 UTC record: originated from second direct test execution on
+      2026-09-09 (write-time stamp), persisted through reconstruct->reconcile
+      passthrough (commit 109bee2) which lacked lane flagging; is_validation=True
+      filter admitted unflagged mock records into production clean journal.
+  Preventive coverage: Patch 1 tripwire, Patch 2 lane guard, Patch 3 provenance.
+OPEN ITEM OV-2: 25 legacy UNKNOWNs (Jul-Aug) permanently unattributable —
+  documented, accepted.
+
+Addendum (2026-09-26 Post-Run Verification & Governance Sign-off):
+  1. Archive Recovery Caveat: The 6 trades recovered via `archive_join_20260722`
+     were re-tagged from UNKNOWN to RECONCILED with cryptographic provenance markers.
+     Named strategy attribution was not assigned because the source archive itself
+     used "RECONCILED" as a placeholder (proving attribution degradation existed
+     in the July archive pipeline).
+  2. Historical Regime vs. September Bleed:
+     - July–August Legacy Era: Profitable (+$59.29, PF 1.40, WR 32.0%).
+     - September Era: Sharp degradation driven by regime transition, execution friction,
+       and sector cluster cap false blocks.
+  3. Master Audit Metrics (N=64 active closed trades, post-quarantine):
+     - UNKNOWN (July/Aug): n=25, WR=32.0%, PF=1.40, PnL=+$59.29
+     - RECONCILED (10 native + 6 archive): n=16, WR=31.2%, PF=0.47, PnL=-$167.19
+     - MOMENTUM_SCALP: n=13, WR=7.7%, PF=0.00, PnL=-$467.15
+     - VWAP_BOUNCE: n=10, WR=10.0%, PF=0.00, PnL=-$142.36
+     - TOTAL: n=64, WR=23.4%, PF=0.33, Net PnL=-$717.41, Exp=-$11.21
+  4. Real-Money Trading Gate: STRICTLY BLOCKED (Negative expectancy, PF 0.33 < 1.25).
+  5. Governance Provenance:
+     - Proposed by: Antigravity (Forensic Auditor)
+     - Approved by: Aung San (Principal)
+     - Date: 2026-09-26
+```
+
