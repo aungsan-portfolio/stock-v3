@@ -135,6 +135,10 @@ def log_trade(
     signal_id: Optional[str] = None,
     **kwargs,
 ):
+    cid = str(kwargs.get("client_order_id") or order_id or signal_id or "")
+    if cid.startswith("val_"):
+        raise RuntimeError(f"HARD LANE GUARD: Validation order {cid} routed to production trade journal!")
+
     p = float(entry_price or exit_price or 0.0)
     price_tier = "5-10" if (5.0 <= p < 10.0) else (">10" if p >= 10.0 else "<5")
 
@@ -187,7 +191,10 @@ def log_fill(
     account_id: Optional[str] = None,
     **kwargs,
 ):
-    """Log an actual execution fill event with latency and slippage."""
+    cid = str(client_order_id or broker_order_id or order_id or signal_id or "")
+    if cid.startswith("val_"):
+        raise RuntimeError(f"HARD LANE GUARD: Validation order {cid} routed to production trade journal!")
+
     now_utc_str = datetime.now(timezone.utc).isoformat()
     if not price_tier and fill_price > 0:
         price_tier = "5-10" if (5.0 <= fill_price < 10.0) else (">10" if fill_price >= 10.0 else "<5")

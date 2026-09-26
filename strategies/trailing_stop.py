@@ -1594,11 +1594,13 @@ class DynamicTrailingStopManager:
                                 pnl_val = (exit_price - current_state.entry_price) * qty_closed if current_state.side == "BUY" else (current_state.entry_price - exit_price) * qty_closed
                                 
                                 try:
-                                    if getattr(current_state, "is_validation", False):
+                                    cid_str = str(getattr(current_state, "order_id", "") or "")
+                                    is_val = getattr(current_state, "is_validation", False) or cid_str.startswith("val_")
+                                    if is_val:
                                         try:
                                             from strategies.validation_lane import record_validation_exit
                                             record_validation_exit(
-                                                order_id=str(getattr(current_state, "order_id", "") or ""),
+                                                order_id=cid_str,
                                                 exit_price=exit_price,
                                                 qty=float(qty_closed),
                                                 side="SELL" if current_state.side == "BUY" else "BUY",
@@ -1608,11 +1610,25 @@ class DynamicTrailingStopManager:
                                         except Exception as val_e:
                                             logger.error("Failed to record validation exit: %s", val_e)
                                     else:
+                                        # HARD LANE GUARD: Validation order must NEVER route to production journal
+                                        if cid_str.startswith("val_"):
+                                            raise RuntimeError(f"HARD LANE GUARD: Validation order {cid_str} routed to production trade journal!")
+
+                                        from strategies.order_idempotency import parse_strategy_from_client_id
+                                        strat_name = _normalize_strategy_name(getattr(current_state, "strategy", None))
+                                        if strat_name == "UNKNOWN" and cid_str:
+                                            strat_name = parse_strategy_from_client_id(cid_str)
+                                        if strat_name == "UNKNOWN" and getattr(current_state, "signal_id", None):
+                                            sig_id = str(getattr(current_state, "signal_id", ""))
+                                            strat_name = parse_strategy_from_client_id(sig_id)
+                                            if strat_name == "UNKNOWN":
+                                                strat_name = "DAYTRADE_SCALP"
+
                                         from strategies.trade_journal import log_trade
                                         log_trade(
                                             symbol=symbol,
                                             side="SELL" if current_state.side == "BUY" else "BUY",
-                                            strategy=_normalize_strategy_name(getattr(current_state, "strategy", None)) if _normalize_strategy_name(getattr(current_state, "strategy", None)) != "UNKNOWN" else ("DAYTRADE_SCALP" if getattr(current_state, "signal_id", None) else "UNKNOWN"),
+                                            strategy=strat_name,
                                             qty=int(qty_closed),
                                             entry_price=current_state.entry_price,
                                             stop_price=current_state.stop_price,
@@ -1625,6 +1641,8 @@ class DynamicTrailingStopManager:
                                             signal_id=getattr(current_state, "signal_id", None)
                                         )
                                 except Exception as e_log:
+                                    if "HARD LANE GUARD" in str(e_log):
+                                        raise
                                     logger.error("Failed to log emergency close to journal: %s", e_log)
                         self._save_state()
             except Exception as e:
@@ -1682,11 +1700,8 @@ class DynamicTrailingStopManager:
                 current_state.remediation_in_progress = False
                 if close_ok:
                     try:
-                        from strategies.trade_journal import log_trade
-                        raw_strat = getattr(current_state, "strategy", None)
-                        strat_str = _normalize_strategy_name(raw_strat)
-                        if strat_str == "UNKNOWN" and getattr(current_state, "signal_id", None):
-                            strat_str = "DAYTRADE_SCALP"
+                        cid_str = str(getattr(current_state, "order_id", "") or "")
+                        is_val = getattr(current_state, "is_validation", False) or cid_str.startswith("val_")
 
                         exit_price = getattr(current_state, "stop_price", 0.0) or 0.0
                         if bridge and hasattr(bridge, "market_price"):
@@ -1702,11 +1717,11 @@ class DynamicTrailingStopManager:
                         qty_val = abs(float(position_qty or getattr(current_state, "qty", 1.0)))
                         pnl_val = (exit_price - entry_price) * qty_val if side == "BUY" else (entry_price - exit_price) * qty_val
 
-                        if getattr(current_state, "is_validation", False):
+                        if is_val:
                             try:
                                 from strategies.validation_lane import record_validation_exit
                                 record_validation_exit(
-                                    order_id=str(getattr(current_state, "order_id", "") or ""),
+                                    order_id=cid_str,
                                     exit_price=exit_price,
                                     qty=float(qty_val),
                                     side="SELL" if side == "BUY" else "BUY",
@@ -1716,6 +1731,22 @@ class DynamicTrailingStopManager:
                             except Exception as val_e:
                                 logger.error("Failed to record validation exit: %s", val_e)
                         else:
+                            # HARD LANE GUARD: Validation order must NEVER route to production journal
+                            if cid_str.startswith("val_"):
+                                raise RuntimeError(f"HARD LANE GUARD: Validation order {cid_str} routed to production trade journal!")
+
+                            from strategies.order_idempotency import parse_strategy_from_client_id
+                            raw_strat = getattr(current_state, "strategy", None)
+                            strat_str = _normalize_strategy_name(raw_strat)
+                            if strat_str == "UNKNOWN" and cid_str:
+                                strat_str = parse_strategy_from_client_id(cid_str)
+                            if strat_str == "UNKNOWN" and getattr(current_state, "signal_id", None):
+                                sig_id = str(getattr(current_state, "signal_id", ""))
+                                strat_str = parse_strategy_from_client_id(sig_id)
+                                if strat_str == "UNKNOWN":
+                                    strat_str = "DAYTRADE_SCALP"
+
+                            from strategies.trade_journal import log_trade
                             log_trade(
                                 symbol=symbol,
                                 side="SELL" if side == "BUY" else "BUY",
@@ -1732,9 +1763,11 @@ class DynamicTrailingStopManager:
                                 signal_id=getattr(current_state, "signal_id", None),
                             )
                         logger.info(
-                            f"[EMERGENCY FLATTEN JOURNAL] {symbol} | exit_px={exit_price} | strategy={strat_str} | pnl={pnl_val:.2f}"
+                            f"[EMERGENCY FLATTEN JOURNAL] {symbol} | exit_px={exit_price} | strategy={strat_str if not is_val else 'VALIDATION'} | pnl={pnl_val:.2f}"
                         )
                     except Exception as e_log:
+                        if "HARD LANE GUARD" in str(e_log):
+                            raise
                         logger.error("Failed to log emergency flatten close to journal: %s", e_log)
             self._save_state()
 

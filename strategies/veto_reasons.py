@@ -42,6 +42,7 @@ class VetoReason(str, Enum):
     CONSECUTIVE_LOSS_LIMIT = "CONSECUTIVE_LOSS_LIMIT"
     DUPLICATE_ORDER = "DUPLICATE_ORDER"
     IDEMPOTENCY_HELD = "IDEMPOTENCY_HELD"
+    STRATEGY_DISABLED = "STRATEGY_DISABLED"
 
 
 # Hard-veto codes that legitimately trigger symbol-level skip suppression

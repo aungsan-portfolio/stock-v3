@@ -199,7 +199,7 @@ def run_attribution_pipeline(
                 if cid_strat != "UNKNOWN":
                     rec["strategy"] = cid_strat
                     rec["attribution_recovered"] = True
-                    rec["attribution_method"] = "CLIENT_ORDER_ID_PREFIX"
+                    rec["recovered_via"] = "client_order_id_parse"
                     recovered_by_client_id += 1
                     output_lines.append(rec)
                     audit_log.append(f"  [RECOVER:CID] Line {line_no:4d}: {sym} on {j_date} (cid={cid}) -> {cid_strat}")
@@ -210,7 +210,7 @@ def run_attribution_pipeline(
                     matched = pass_by_order_id[order_id]
                     rec["strategy"] = matched["strategy"]
                     rec["attribution_recovered"] = True
-                    rec["attribution_method"] = "DIRECT_ORDER_ID"
+                    rec["recovered_via"] = "gate_order_id_join"
                     recovered_by_order_id += 1
                     output_lines.append(rec)
                     audit_log.append(f"  [RECOVER:ORDER_ID] Line {line_no:4d}: {sym} on {j_date} -> {matched['strategy']}")
@@ -233,7 +233,7 @@ def run_attribution_pipeline(
                     if best_match and min_diff < 5.0:  # within $5.00 price variance
                         rec["strategy"] = best_match["strategy"]
                         rec["attribution_recovered"] = True
-                        rec["attribution_method"] = "SESSION_DATE_TIEBREAK"
+                        rec["recovered_via"] = "gate_session_tiebreak"
                         recovered_by_gate_session += 1
                         output_lines.append(rec)
                         audit_log.append(f"  [RECOVER:GATE_SESSION] Line {line_no:4d}: {sym} on {j_date} -> {best_match['strategy']}")
@@ -245,7 +245,7 @@ def run_attribution_pipeline(
                     arch_strat = archive_jul22_map[archive_key]
                     rec["strategy"] = arch_strat
                     rec["attribution_recovered"] = True
-                    rec["attribution_method"] = "ARCHIVE_EXACT_MATCH"
+                    rec["recovered_via"] = "archive_join_20260722"
                     recovered_by_archive += 1
                     output_lines.append(rec)
                     audit_log.append(f"  [RECOVER:ARCHIVE] Line {line_no:4d}: {sym} on {j_date} (Entry={entry_price}, Qty={qty}) -> {arch_strat}")

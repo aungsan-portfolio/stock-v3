@@ -31,6 +31,38 @@ STATUS_RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
 
 TERMINAL_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired", "done_for_day"}
 
+STRATEGY_PREFIX_MAP: Dict[str, str] = {
+    "mome": "MOMENTUM_SCALP",
+    "vwap": "VWAP_BOUNCE",
+    "gapa": "GAP_AND_GO",
+    "gap": "GAP_AND_GO",
+    "orb": "ORB",
+    "cand": "CANDLESTICK",
+    "mean": "MEAN_REVERSION",
+}
+
+RECOVERED_VIA_VALID_VALUES: Set[str] = {
+    "client_order_id_parse",
+    "gate_order_id_join",
+    "gate_session_tiebreak",
+    "archive_join_20260722",
+}
+
+
+def parse_strategy_from_client_id(client_order_id: Optional[str]) -> str:
+    """
+    Extract canonical strategy name from deterministic client_order_id.
+    Standard format: se3-{SYMBOL}-{SIDE[:1]}-{STRAT[:4]}-{SESSION_DATE}-{DIGEST[:16]}
+    Returns 'UNKNOWN' if prefix unrecognized or format invalid.
+    """
+    if not client_order_id or not isinstance(client_order_id, str):
+        return "UNKNOWN"
+    parts = client_order_id.strip().split("-")
+    if len(parts) >= 6 and parts[0] == "se3":
+        code = parts[3].lower().strip()
+        return STRATEGY_PREFIX_MAP.get(code, "UNKNOWN")
+    return "UNKNOWN"
+
 
 def build_client_order_id(
     symbol: str,

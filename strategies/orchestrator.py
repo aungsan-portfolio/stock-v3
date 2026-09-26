@@ -1754,6 +1754,45 @@ def evaluate_and_execute(
     for sig in all_signals:
         sym = sig.symbol.upper().strip()
 
+        # Check strategy global enablement gate (Loss containment)
+        strat_key = getattr(sig.strategy, "name", str(sig.strategy)).upper().replace("STRATEGYNAME.", "").strip()
+        is_strat_enabled = True
+        if strat_key in ("MOMENTUM_SCALP", "STRATEGY_MOMENTUM_SCALP"):
+            is_strat_enabled = getattr(config, "MOMENTUM_SCALP_ENABLED", getattr(config, "STRATEGY_MOMENTUM_SCALP_ENABLED", True))
+        elif strat_key in ("VWAP_BOUNCE", "STRATEGY_VWAP_BOUNCE"):
+            is_strat_enabled = getattr(config, "VWAP_BOUNCE_ENABLED", getattr(config, "STRATEGY_VWAP_BOUNCE_ENABLED", True))
+        elif strat_key in ("ORB", "STRATEGY_ORB"):
+            is_strat_enabled = getattr(config, "STRATEGY_ORB_ENABLED", False)
+        elif strat_key in ("GAP_AND_GO", "STRATEGY_GAP_AND_GO"):
+            is_strat_enabled = getattr(config, "STRATEGY_GAP_AND_GO_ENABLED", True)
+        elif strat_key in ("CANDLESTICK", "STRATEGY_CANDLESTICK"):
+            is_strat_enabled = getattr(config, "STRATEGY_CANDLESTICK_ENABLED", True)
+        elif strat_key in ("MEAN_REVERSION", "STRATEGY_MEAN_REVERSION"):
+            is_strat_enabled = getattr(config, "STRATEGY_MEAN_REVERSION_ENABLED", True)
+
+        if not is_strat_enabled:
+            logger.info("Skipped %s: strategy %s is disabled by configuration (governance loss containment)", sig.symbol, sig.strategy)
+            try:
+                from strategies.gate_ledger import log_gate_decision
+                from strategies.veto_reasons import VetoReason
+                log_gate_decision(
+                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                    symbol=sig.symbol,
+                    bar=getattr(sig, "bar_timestamp", "") or "",
+                    strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                    stage="STAGE_REGIME",
+                    decision="REJECT",
+                    reason_code=VetoReason.STRATEGY_DISABLED,
+                    human_message=f"Strategy {sig.strategy} is disabled by configuration (governance loss containment)",
+                    terminal_decision=True,
+                    blocked_by="STAGE_REGIME",
+                    raw_conf=getattr(sig, "confidence", 0.0),
+                    final_conf=getattr(sig, "confidence", 0.0),
+                )
+            except Exception:
+                pass
+            continue
+
         # Regime-aware strategy filtering
         tex_cfg = getattr(config, "MARKET_REGIME_SETTINGS", {}).get(market_tex, {})
         raw_allowed = tex_cfg.get("allowed_strategies", None)
