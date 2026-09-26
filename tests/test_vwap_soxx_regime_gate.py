@@ -45,8 +45,10 @@ class TestVWAPSOXXRegimeGate(unittest.TestCase):
 
         self.orig_realtime = getattr(config, "REQUIRE_REALTIME_DATA_FOR_ORDERS", True)
         self.orig_spy_guard = getattr(config, "SPY_TREND_GUARD_ENABLED", True)
+        self.orig_entry_readiness = getattr(config, "DAYTRADE_REQUIRE_ENTRY_READINESS", True)
         config.REQUIRE_REALTIME_DATA_FOR_ORDERS = False
         config.SPY_TREND_GUARD_ENABLED = False
+        config.DAYTRADE_REQUIRE_ENTRY_READINESS = False
 
         self._count_patch = patch("strategies.order_manager.today_trade_count", return_value=0)
         self._count_patch.start()
@@ -55,6 +57,7 @@ class TestVWAPSOXXRegimeGate(unittest.TestCase):
         self._count_patch.stop()
         config.REQUIRE_REALTIME_DATA_FOR_ORDERS = self.orig_realtime
         config.SPY_TREND_GUARD_ENABLED = self.orig_spy_guard
+        config.DAYTRADE_REQUIRE_ENTRY_READINESS = self.orig_entry_readiness
         om.reset_session_skip_state()
         with om._pending_order_contexts_lock:
             om._pending_order_contexts.clear()
@@ -81,7 +84,7 @@ class TestVWAPSOXXRegimeGate(unittest.TestCase):
             requires_opening_buffer=False,
             position_scale=0.5,
             confidence_boost=0.0,
-            data={"SOXX": {"pct": soxx_pct, "source": "test"}},
+            data={"SOXX": {"pct": soxx_pct, "source": "test", "status": "VALID"}},
         )
 
     def test_1_blocks_vwap_bounce_long_in_caution_when_soxx_weak(self):
@@ -146,8 +149,8 @@ class TestVWAPSOXXRegimeGate(unittest.TestCase):
             self.assertNotIn("Regime/SOXX Gate VETO", res.get("reason", ""))
             self.assertEqual(res["status"], "DRY_RUN")
 
-    def test_7_soxx_missing_none_fails_open_with_warning(self):
-        """Test 7: When SOXX data is None/unavailable, fail-open (do not freeze strategy) and log warning."""
+    def test_7_soxx_missing_none_fails_closed(self):
+        """Test 7: When SOXX data is None/unavailable, fail-closed (block VWAP_BOUNCE entry)."""
         sig = self._create_signal(symbol="QQQ", strategy=StrategyName.VWAP_BOUNCE, side="BUY")
         regime = MarketRegimeResult(
             mode=MODE_CAUTION,
@@ -159,14 +162,11 @@ class TestVWAPSOXXRegimeGate(unittest.TestCase):
             data={},  # No SOXX data
         )
 
-        with patch("strategies.regime_engine.get_soxx_pct_change", return_value=None), \
-             patch("strategies.order_manager.pre_trade_check", return_value=None), \
-             self.assertLogs("strategies.order_manager", level="WARNING") as cm:
+        with patch("strategies.order_manager.pre_trade_check", return_value=None):
             res = om.execute_signal(sig, bridge=self.bridge, equity=100000.0, current_pnl=0.0, dry_run=True, regime_result=regime)
-            self.assertNotIn("Regime/SOXX Gate VETO", res.get("reason", ""))
-            self.assertEqual(res["status"], "DRY_RUN")
-            self.assertTrue(any("SOXX data unavailable" in log_msg for log_msg in cm.output))
-            self.assertTrue(any("SOXX data unavailable" in log_msg for log_msg in cm.output))
+            self.assertEqual(res["status"], "REJECTED")
+            self.assertIn("Regime/SOXX Gate VETO", res["reason"])
+            self.assertIn("unavailable or invalid", res["reason"])
 
 
 class TestORBShadowFunnelAccounting(unittest.TestCase):

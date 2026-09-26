@@ -183,12 +183,13 @@ def check_intraday_data_readiness(
     stale_symbols = []
     hold_symbols = []
     symbol_ages = {}
-    interval_seconds = 300.0
-    max_recoverable_delay = interval_seconds + grace_seconds  # 360.0s
+    symbol_telemetry = {}
+    interval_seconds = float(getattr(config, "INTRADAY_BAR_SECONDS", 300.0))
+    max_recoverable_delay = float(getattr(config, "PREFLIGHT_MAX_RECOVERABLE_DELAY_SECONDS", interval_seconds + grace_seconds))
 
     for sym in anchor_symbols:
         try:
-            df = fetch_intraday(sym, interval="5m", bridge=bridge)
+            df = fetch_intraday(sym, interval="5m", bridge=bridge, purpose="PREFLIGHT")
             if df is None or df.empty:
                 stale_symbols.append(f"{sym}:NO_DATA")
                 continue
@@ -203,13 +204,23 @@ def check_intraday_data_readiness(
             )
             age = float(completed_bar.post_close_delay_seconds)
             symbol_ages[sym] = round(age, 1)
+            symbol_telemetry[sym] = {
+                "bar_start_ts": completed_bar.start_time.isoformat() if hasattr(completed_bar.start_time, "isoformat") else str(completed_bar.start_time),
+                "bar_close_ts": completed_bar.close_time.isoformat() if hasattr(completed_bar.close_time, "isoformat") else str(completed_bar.close_time),
+                "current_ts": now_utc.isoformat(),
+                "completed_bar_age": round(age, 1),
+                "publication_delay": round(float(getattr(completed_bar, "publication_delay", age)), 1),
+            }
 
             if age > max_recoverable_delay:
-                stale_symbols.append(f"{sym}:{age:.0f}s > {max_recoverable_delay:.0f}s")
+                stale_symbols.append(f"{sym}:{age:.1f}s > {max_recoverable_delay:.1f}s")
             elif age > grace_seconds:
-                hold_symbols.append(f"{sym}:{age:.0f}s")
+                hold_symbols.append(f"{sym}:{age:.1f}s")
         except Exception as exc:
             stale_symbols.append(f"{sym}:{exc}")
+
+    from strategies.intraday_data import get_feed_provenance
+    feed_prov = get_feed_provenance()
 
     if stale_symbols:
         return GateResult(
@@ -218,7 +229,7 @@ def check_intraday_data_readiness(
             passed=False,
             status="FAIL",
             message=f"Stale anchor bars (>1 interval behind or missing): {', '.join(stale_symbols)}",
-            details={"stale_symbols": stale_symbols, "ages": symbol_ages, "grace": grace_seconds},
+            details={"stale_symbols": stale_symbols, "ages": symbol_ages, "telemetry": symbol_telemetry, "grace": grace_seconds, "max_recoverable_delay": max_recoverable_delay, "feed_provenance": feed_prov},
         )
 
     if hold_symbols:
@@ -228,7 +239,7 @@ def check_intraday_data_readiness(
             passed=True,
             status="ENTRY_HOLD",
             message=f"Mid-bar startup: Anchor bars valid within current forming interval ({', '.join(hold_symbols)} > {grace_seconds:.0f}s); entries held until next bar close",
-            details={"entry_hold": True, "hold_symbols": hold_symbols, "ages": symbol_ages, "grace": grace_seconds},
+            details={"entry_hold": True, "hold_symbols": hold_symbols, "ages": symbol_ages, "telemetry": symbol_telemetry, "grace": grace_seconds, "max_recoverable_delay": max_recoverable_delay, "feed_provenance": feed_prov},
         )
 
     return GateResult(
@@ -237,7 +248,7 @@ def check_intraday_data_readiness(
         passed=True,
         status="PASS",
         message=f"Anchor bars fresh within {grace_seconds}s ({', '.join(f'{k}={v}s' for k, v in symbol_ages.items())})",
-        details={"ages": symbol_ages, "grace": grace_seconds},
+        details={"ages": symbol_ages, "telemetry": symbol_telemetry, "grace": grace_seconds, "max_recoverable_delay": max_recoverable_delay, "feed_provenance": feed_prov},
     )
 
 
@@ -290,7 +301,12 @@ def check_broker_reconciliation(bridge: Any = None) -> GateResult:
         duplicate_refs = snap.get("duplicate_refs", [])
 
         is_flat = (total_open_positions == 0)
-        passed = clean and is_flat and len(orphan_exits) == 0 and len(duplicate_refs) == 0
+        from strategies.session import is_market_open
+        market_open = is_market_open()
+        if market_open:
+            passed = clean and len(orphan_exits) == 0 and len(duplicate_refs) == 0
+        else:
+            passed = clean and is_flat and len(orphan_exits) == 0 and len(duplicate_refs) == 0
 
         details = {
             "clean": clean,
@@ -313,8 +329,9 @@ def check_broker_reconciliation(bridge: Any = None) -> GateResult:
             )
             status = "PASS"
         else:
+            reason = "flatness required pre-market" if (not is_flat and not market_open) else f"clean={clean}"
             msg = (
-                f"Broker reconciliation mismatch: clean={clean}, open_positions={total_open_positions} "
+                f"Broker reconciliation mismatch ({reason}): clean={clean}, open_positions={total_open_positions} "
                 f"(longs={n_longs}, shorts={n_shorts}), working_orders={n_orders}, "
                 f"duplicates={len(duplicate_refs)}, orphans={len(orphan_exits)}"
             )
@@ -747,6 +764,12 @@ def print_preflight_scorecard(report: PreflightReport) -> None:
         print(f"  UTC Clock  : {report.wall_clock_utc}")
     print(f"  Git Commit : {report.git_commit}  |  Config Hash: {report.config_hash}")
     print(f"  Model Hash : {report.model_hash}  |  Operator   : {report.operator}")
+    try:
+        from strategies.intraday_data import get_feed_provenance
+        fp = get_feed_provenance()
+        print(f"  Data Feed  : {fp['actual_feed'].upper()} ({fp['feed_capability']}) | Tier: {fp['subscription_tier']}")
+    except Exception:
+        pass
     print("-" * 68)
 
     for g in report.gates:
@@ -774,7 +797,21 @@ def print_preflight_scorecard(report: PreflightReport) -> None:
     print("=" * 68)
 
     if report.decision == PreflightDecision.GO:
-        print("  🏆 FINAL DECISION: 🟢 GO  (Trading Operations Fully Approved, Entries Allowed)")
+        market_open_now = False
+        premarket_now = False
+        try:
+            from strategies.session import is_market_open, is_premarket
+            market_open_now = is_market_open()
+            premarket_now = is_premarket()
+        except Exception:
+            pass
+
+        if market_open_now:
+            print("  🏆 FINAL DECISION: 🟢 GO  (Trading Operations Fully Approved, Market Open: Entries Allowed)")
+        elif premarket_now:
+            print("  🏆 FINAL DECISION: 🟢 GO  (System Operationally Ready | Market Session: PRE-MARKET | Entry Gate: OFF_MARKET_STANDBY | Result: Ready, Not Trading)")
+        else:
+            print("  🏆 FINAL DECISION: 🟢 GO  (System Operationally Ready | Market Session: NOT OPEN YET | Entry Gate: OFF_MARKET_STANDBY | Result: Ready, Not Trading)")
     elif report.decision == PreflightDecision.GO_WITH_ENTRY_HOLD:
         print(f"  ⚠️ FINAL DECISION: 🟡 GO_WITH_ENTRY_HOLD  (Trading Engine Active, Entries On Hold: {report.hold_reason})")
     else:

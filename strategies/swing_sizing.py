@@ -39,13 +39,13 @@ class UnsupportedSwingDirection(RuntimeError):
 # Stage 0 Frozen Risk Constants
 RISK_FRACTION: float = 0.005  # 0.50% equity risk budget
 CONFIGURED_MAX_RISK_DOLLARS: float = 500.00  # Hard dollar ceiling at $100k equity (Hard enforced)
-TARGET_DEPLOYED_EXPOSURE_PCT: float = 0.10  # 10% target deployment (Soft guideline)
-STAGE_0_GROSS_EXPOSURE_PCT: float = 0.15   # 15% hard portfolio exposure ceiling (Hard enforced)
+TARGET_DEPLOYED_EXPOSURE_PCT: float = 0.20  # 20% target deployment (Soft guideline)
+STAGE_0_GROSS_EXPOSURE_PCT: float = 0.28   # 28% hard portfolio exposure ceiling (Hard enforced)
 MAX_SYMBOL_EXPOSURE_PCT: float = 0.10      # 10% max per symbol (Hard enforced)
 SECTOR_EXPOSURE_CAP_PCT: float = 0.25      # 25% max gross notional exposure per sector (Hard enforced)
 MAX_CLUSTER_RISK_PCT: float = 0.0125       # 1.25% max cumulative open stop risk per correlated cluster (Hard enforced)
 AGGREGATE_OPEN_STOP_HEAT_PCT: float = 0.025 # 2.50% max total open risk (Hard enforced)
-MAX_CONCURRENT_POSITIONS: int = 7          # Hard position count ceiling (Hard enforced)
+from strategies.rotation_config import MAX_CONCURRENT_POSITIONS  # Canonical Single Source of Truth
 MAX_DAILY_LOSS_DOLLARS: float = 300.00     # Bridge circuit breaker ceiling (Hard enforced)
 MAX_ADV_PARTICIPATION_RATE: float = 0.01   # 1.00% ADV liquidity ceiling (Hard enforced)
 

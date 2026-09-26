@@ -18,6 +18,11 @@ from strategies.order_manager import (
     _pending_order_contexts,
     _pending_order_contexts_lock,
 )
+from strategies.trailing_stop import (
+    DynamicTrailingStopManager,
+    compute_canonical_post_fill_distances,
+)
+
 
 
 class TestGeometryHardGuards(unittest.TestCase):
@@ -25,10 +30,13 @@ class TestGeometryHardGuards(unittest.TestCase):
     def setUp(self):
         with _pending_order_contexts_lock:
             _pending_order_contexts.clear()
+        self._orig_entry_readiness = getattr(config, "DAYTRADE_REQUIRE_ENTRY_READINESS", True)
+        config.DAYTRADE_REQUIRE_ENTRY_READINESS = False
 
     def tearDown(self):
         with _pending_order_contexts_lock:
             _pending_order_contexts.clear()
+        config.DAYTRADE_REQUIRE_ENTRY_READINESS = self._orig_entry_readiness
 
     def test_noise_floor_option_a_rejection(self):
         """When stop distance < effective noise floor, signal is deterministically rejected."""
@@ -201,6 +209,134 @@ class TestGeometryHardGuards(unittest.TestCase):
 
         mock_bridge.close_position.assert_called_once_with("TSLA")
 
+    # ─────────────────────────────────────────────────────────────
+    # Phase A Correctness Tests: Post-Fill Geometry Contract
+    # ─────────────────────────────────────────────────────────────
+    def test_spy_geometry_rebuild_does_not_jump_to_50_bps(self):
+        """Historical Replay (2026-09-23): Rebuild must stay on canonical 5-bps basis ($769.90) and NOT jump to 50 bps ($766.49)."""
+        manager = DynamicTrailingStopManager()
+        # SPY fill: $770.34, initial proposed stop $770.03 (dist $0.31 < 5 bps floor $0.38517)
+        # Canonical rebuild: min_req = $0.38517, min_rebuild = round(0.38517 * 1.15, 2) = $0.44
+        # Rebuilt stop = 770.34 - 0.44 = 769.90
+        resulting_stop = manager.validate_and_rebuild_geometry(
+            symbol="SPY",
+            signal_price=770.34,
+            fill_price=770.34,
+            initial_stop=770.03,
+            target_price=776.12,
+            side="BUY",
+        )
+        self.assertEqual(resulting_stop, 769.90)
+        self.assertNotEqual(resulting_stop, 766.49, "Rebuild must NOT jump to 50 bps ($766.49)")
+        stop_dist = round(770.34 - resulting_stop, 2)
+        self.assertEqual(stop_dist, 0.44)
+
+    def test_post_fill_distance_exactly_at_5_bps(self):
+        """Exact 5-bps boundary: When distance == exactly 5 bps (fill=100.00, stop=99.95), valid intact without rebuild."""
+        manager = DynamicTrailingStopManager()
+        # $100.00 * 0.0005 = $0.05. Stop distance = 100.00 - 99.95 = $0.05.
+        resulting_stop = manager.validate_and_rebuild_geometry(
+            symbol="TEST",
+            signal_price=100.00,
+            fill_price=100.00,
+            initial_stop=99.95,
+            target_price=101.00,
+            side="BUY",
+        )
+        self.assertEqual(resulting_stop, 99.95)
+
+    def test_post_fill_distance_below_5_bps_rebuilds_at_canonical_floor(self):
+        """Below 5-bps boundary: When distance < 5 bps (fill=100.00, stop=99.96, dist=0.04), rebuilds to canonical floor."""
+        manager = DynamicTrailingStopManager()
+        # min_required = $0.05, min_rebuild = round(0.05 * 1.15, 2) = $0.06
+        # Rebuilt stop = 100.00 - 0.06 = 99.94
+        resulting_stop = manager.validate_and_rebuild_geometry(
+            symbol="TEST",
+            signal_price=100.00,
+            fill_price=100.00,
+            initial_stop=99.96,
+            target_price=101.00,
+            side="BUY",
+        )
+        self.assertEqual(resulting_stop, 99.94)
+
+    def test_post_fill_low_priced_symbol_absolute_floor(self):
+        """Low-priced stocks: Absolute floor $0.05 takes precedence when 5 bps is smaller than $0.05."""
+        manager = DynamicTrailingStopManager()
+        # fill=10.00 (5 bps = $0.005 < $0.05 floor). min_required = $0.05, min_rebuild = $0.06.
+        resulting_stop = manager.validate_and_rebuild_geometry(
+            symbol="PENNY",
+            signal_price=10.00,
+            fill_price=10.00,
+            initial_stop=9.98,  # dist = $0.02 < $0.05
+            target_price=10.50,
+            side="BUY",
+        )
+        self.assertEqual(resulting_stop, 9.94)
+
+    def test_post_fill_normal_valid_stop_preserved(self):
+        """Normal scalp stop: Stop distance >= 5 bps is preserved untouched."""
+        manager = DynamicTrailingStopManager()
+        resulting_stop = manager.validate_and_rebuild_geometry(
+            symbol="QQQ",
+            signal_price=400.00,
+            fill_price=400.00,
+            initial_stop=398.00,  # dist = $2.00 >> $0.20
+            target_price=404.00,
+            side="BUY",
+        )
+        self.assertEqual(resulting_stop, 398.00)
+
+    def test_post_fill_repeated_rebuild_idempotent(self):
+        """Anti-Widening Invariant: Re-evaluating a rebuilt stop is strictly idempotent with zero progressive widening."""
+        manager = DynamicTrailingStopManager()
+        # Step 1: Initial rebuild from invalid $770.03
+        first_pass_stop = manager.validate_and_rebuild_geometry(
+            symbol="SPY",
+            signal_price=770.34,
+            fill_price=770.34,
+            initial_stop=770.03,
+            target_price=776.12,
+            side="BUY",
+        )
+        self.assertEqual(first_pass_stop, 769.90)
+
+        # Step 2: Feed the rebuilt stop back into the validator
+        second_pass_stop = manager.validate_and_rebuild_geometry(
+            symbol="SPY",
+            signal_price=770.34,
+            fill_price=770.34,
+            initial_stop=first_pass_stop,
+            target_price=776.12,
+            side="BUY",
+        )
+        self.assertEqual(second_pass_stop, 769.90, "Repeated evaluation must NOT widen stop further")
+
+    def test_post_fill_long_short_symmetry(self):
+        """Symmetry Invariant: Short position obeys identical 5-bps canonical floor and rebuild offset above fill."""
+        manager = DynamicTrailingStopManager()
+        # SHORT: fill=100.00, initial_stop=100.04 (dist=$0.04 < $0.05). min_rebuild = $0.06.
+        # Rebuilt stop = 100.00 + 0.06 = 100.06.
+        resulting_stop = manager.validate_and_rebuild_geometry(
+            symbol="TEST",
+            signal_price=100.00,
+            fill_price=100.00,
+            initial_stop=100.04,
+            target_price=98.00,
+            side="SELL",
+        )
+        self.assertEqual(resulting_stop, 100.06)
+
+    def test_time_exit_interaction_contract(self):
+        """Policy Isolation: Geometry calculation is a pure function and does not alter time-exit timeouts."""
+        from strategies.trailing_stop import MAX_HOLD_MINUTES
+        # Time-exit threshold remains untouched at 25.0 minutes
+        self.assertEqual(MAX_HOLD_MINUTES, 25.0)
+        req, reb = compute_canonical_post_fill_distances(770.34, decimals=2)
+        self.assertAlmostEqual(req, 0.38517, places=4)
+        self.assertEqual(reb, 0.44)
+
 
 if __name__ == "__main__":
     unittest.main()
+

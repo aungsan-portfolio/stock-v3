@@ -37,6 +37,7 @@ def clean_om_state(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "REQUIRE_REALTIME_DATA_FOR_ORDERS", False)
     monkeypatch.setattr(config, "SPY_TREND_GUARD_ENABLED", False)
     monkeypatch.setattr(config, "VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED", False)
+    monkeypatch.setattr(config, "DAYTRADE_REQUIRE_ENTRY_READINESS", False)
     with om._pending_order_contexts_lock:
         om._pending_order_contexts.clear()
     om.reset_session_skip_state()

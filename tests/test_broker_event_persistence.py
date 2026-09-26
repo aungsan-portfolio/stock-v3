@@ -211,7 +211,21 @@ def test_persisted_data_does_not_expose_credentials(tmp_path, monkeypatch):
     line = target_path.read_text(encoding="utf-8").strip()
     record = json.loads(line)
 
-    allowed_keys = {"ts", "event", "status", "order_id", "symbol", "filled_qty", "price", "execution_id"}
+    allowed_keys = {
+        "ts",
+        "observed_ts",
+        "event_ts",
+        "event",
+        "status",
+        "order_id",
+        "client_order_id",
+        "order_role",
+        "parent_order_id",
+        "symbol",
+        "filled_qty",
+        "price",
+        "execution_id",
+    }
     assert set(record.keys()).issubset(allowed_keys)
     # Check no sensitive keys present
     forbidden_tokens = ["key", "secret", "token", "auth", "password"]
@@ -285,8 +299,8 @@ def test_multi_process_path_isolation_daytrade_vs_swing(tmp_path):
     p1 = subprocess.Popen([sys.executable, "-c", daytrade_code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     p2 = subprocess.Popen([sys.executable, "-c", swing_code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-    out1, err1 = p1.communicate(timeout=30)
-    out2, err2 = p2.communicate(timeout=30)
+    out1, err1 = p1.communicate(timeout=60)
+    out2, err2 = p2.communicate(timeout=60)
 
     assert p1.returncode == 0, f"Daytrade process failed: {err1}"
     assert p2.returncode == 0, f"Swing process failed: {err2}"

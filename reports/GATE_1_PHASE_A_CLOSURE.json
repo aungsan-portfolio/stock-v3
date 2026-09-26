@@ -1,0 +1,79 @@
+{
+  "phase": "GATE_1_PHASE_A",
+  "closure_status": "CLOSED_AND_LOCKED",
+  "completion_timestamp_utc": "2026-09-19T08:08:00+00:00",
+  "git_commit": "7c39d2cb444f1cc14fe9d64f79c2efd950f65845",
+  "schema_version": "2.0",
+  "golden_master_verification": {
+    "sha256": "8a35d1e08ef09e17532ef2fe1debdcb23a732a73137af86f80129ca1cd126030",
+    "status": "PASS",
+    "side_effects_detected": false,
+    "strategy_logic_modified": false
+  },
+  "hardening_items_audit": {
+    "item_1_t4_channel_separation": {
+      "status": "PASS",
+      "t4a_rest_ack_tracked": true,
+      "t4b_stream_ack_tracked": true,
+      "t4e_broker_reported_time_tracked": true,
+      "canonical_t4_resolution": "MIN(T4a, T4b)"
+    },
+    "item_2_clock_domain_protection": {
+      "status": "PASS",
+      "process_instance_id_enforced": true,
+      "host_id_enforced": true,
+      "cross_process_monotonic_guard": true,
+      "utc_delta_fallback_on_restart": true
+    },
+    "item_3_configurable_quote_freshness": {
+      "status": "PASS",
+      "config_driven_max_quote_age": true,
+      "marketability_scope_recorded": true,
+      "nbbo_verified_boolean_enforced": true
+    },
+    "item_4_reporter_sample_quality": {
+      "status": "PASS",
+      "null_percentiles_on_zero_sample": true,
+      "insufficient_sample_under_20": true,
+      "descriptive_p99_under_100": true,
+      "missingness_rates_computed": true
+    },
+    "item_5_spy_forensic_vocabulary": {
+      "status": "PASS",
+      "classification": "UNATTRIBUTED_ACCEPTED_TO_FILL_WAIT",
+      "classification_reason": "QUOTE_TRADE_TIMELINE_UNAVAILABLE",
+      "causal_claim_permitted": false,
+      "historical_replay_t4_t3_ms": 5,
+      "historical_replay_t5_t4_ms": 284705,
+      "historical_replay_t6_t5_ms": 1947
+    }
+  },
+  "test_verification_summary": {
+    "gate1_telemetry_and_forensic_tests": {
+      "test_file": "tests/test_gate1_latency_telemetry.py + tests/test_spy_forensic_replay.py + tests/test_golden_master_invariants.py",
+      "total": 11,
+      "passed": 11,
+      "failed": 0
+    },
+    "safety_regression_suite": {
+      "test_files": [
+        "tests/test_risk_guards.py",
+        "tests/test_execution_geometry_sync.py",
+        "tests/test_geometry_hard_guards.py",
+        "tests/test_phase_a_geometry_contracts.py",
+        "tests/test_phase_a_ledger_conservation.py",
+        "tests/test_phase_a_suppression_safety.py",
+        "tests/test_sept15_replay_gate.py",
+        "tests/test_p0_p1_patches.py"
+      ],
+      "total": 63,
+      "passed": 63,
+      "failed": 0
+    },
+    "total_verified_test_count": 74
+  },
+  "gate_transition": {
+    "gate_1_phase_a": "LOCKED",
+    "gate_1_phase_b": "AUTHORIZED_READY"
+  }
+}

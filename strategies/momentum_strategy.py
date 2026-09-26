@@ -41,6 +41,12 @@ class MomentumScalpStrategy(BaseStrategy):
         volume = float(last.get("volume", 0))
         vol_ma = float(last.get("volume_ma", 1))
 
+        if hasattr(df, "index") and len(df.index) > 0:
+            last_idx = df.index[-1]
+            bar_ts = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
+        else:
+            bar_ts = str(last.get("timestamp", ""))
+
         if any(np.isnan(v) for v in [ema9, ema20, atr]):
             return None
         if atr <= 0:
@@ -120,6 +126,7 @@ class MomentumScalpStrategy(BaseStrategy):
                     risk_per_share=risk,
                     reason=f"Momentum scalp LONG: {' | '.join(reasons)}",
                     metadata={"checks_passed": buy_checks, "ema9": ema9, "ema20": ema20},
+                    bar_timestamp=bar_ts,
                 )
 
         allow_short = getattr(config, "ALLOW_SHORT", False)
@@ -168,6 +175,7 @@ class MomentumScalpStrategy(BaseStrategy):
                     risk_per_share=risk,
                     reason=f"Momentum scalp SHORT: {' | '.join(reasons)}",
                     metadata={"checks_passed": sell_checks, "ema9": ema9, "ema20": ema20},
+                    bar_timestamp=bar_ts,
                 )
 
         return None

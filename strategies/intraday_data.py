@@ -18,6 +18,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import os
+import json
 import threading
 import requests
 from requests.adapters import HTTPAdapter
@@ -161,6 +162,60 @@ def get_market_data_metrics() -> dict:
         return dict(MARKET_DATA_METRICS)
 
 
+_feed_telemetry = {
+    "stale_bar_consecutive": 0,
+    "stale_observation_total": 0,
+    "stale_bar_total": 0,  # Backward compatibility mirror for stale_observation_total (cumulative checks)
+    "stale_bar_skip_count": 0,
+    "poll_count": 0,
+    "last_batch_duration_seconds": 0.0,
+    "batch_timeout_count": 0,
+    "last_batch_timestamp": 0.0,
+    "total_bars_fetched": 0,
+}
+_feed_telemetry_lock = threading.Lock()
+_last_stale_bar_ts: Dict[str, Any] = {}
+
+
+def get_intraday_feed_telemetry() -> dict:
+    with _feed_telemetry_lock:
+        data = dict(_feed_telemetry)
+        data["last_stale_bar_ts"] = dict(_last_stale_bar_ts)
+        return data
+
+
+def reset_intraday_feed_telemetry() -> None:
+    with _feed_telemetry_lock:
+        _feed_telemetry["stale_bar_consecutive"] = 0
+        _feed_telemetry["stale_observation_total"] = 0
+        _feed_telemetry["stale_bar_total"] = 0
+        _feed_telemetry["stale_bar_skip_count"] = 0
+        _feed_telemetry["poll_count"] = 0
+        _feed_telemetry["last_batch_duration_seconds"] = 0.0
+        _feed_telemetry["batch_timeout_count"] = 0
+        _feed_telemetry["last_batch_timestamp"] = 0.0
+        _feed_telemetry["total_bars_fetched"] = 0
+    _last_stale_bar_ts.clear()
+
+
+def get_feed_provenance() -> dict:
+    tier = str(getattr(config, "ALPACA_SUBSCRIPTION_TIER", "free")).lower().strip()
+    cfg_feed = str(getattr(config, "ALPACA_DATA_FEED", "iex")).lower().strip()
+    if tier == "free":
+        actual_feed = "iex"
+        capability = "IEX_ONLY (~2.5% US Volume / Single Exchange)"
+    else:
+        actual_feed = cfg_feed
+        capability = "SIP_CONSOLIDATED (100% US National Volume)" if cfg_feed == "sip" else "IEX_ONLY (~2.5% US Volume / Single Exchange)"
+    return {
+        "configured_feed": cfg_feed,
+        "actual_feed": actual_feed,
+        "subscription_tier": tier,
+        "feed_capability": capability,
+        "bar_source": "alpaca_api",
+    }
+
+
 def _sdk_get_stock_bars_soft_bounded(client, request, timeout: Optional[float] = None):
     acquired = _alpaca_call_slots.acquire(blocking=False)
     if not acquired:
@@ -246,10 +301,10 @@ class ValidatedBarBatch:
 def should_validate_staleness(purpose: Optional[str], lookback_days: Optional[int]) -> bool:
     """
     Determines whether staleness validation must be enforced.
-    Strict Invariant: Real-time decision contexts (ENTRY_SIGNAL, REALTIME, EXECUTION)
+    Strict Invariant: Real-time decision contexts (ENTRY_SIGNAL, REALTIME, EXECUTION, PREFLIGHT)
     MUST validate freshness unconditionally, even if historical lookback_days > 1.
     """
-    if str(purpose or "").upper() in ("ENTRY_SIGNAL", "REALTIME", "EXECUTION"):
+    if str(purpose or "").upper() in ("ENTRY_SIGNAL", "REALTIME", "EXECUTION", "PREFLIGHT"):
         return True
     return bool(lookback_days is not None and lookback_days <= 1)
 
@@ -375,6 +430,15 @@ def _read_cache(key: str, ttl: int = None) -> Optional[pd.DataFrame]:
             if (time.time() - mtime) > limit:
                 return None
             df = pd.read_json(cache_file, orient="split")
+            meta_file = cache_file + ".meta"
+            if os.path.exists(meta_file):
+                try:
+                    with open(meta_file, "r", encoding="utf-8") as f:
+                        loaded_attrs = json.load(f)
+                        if isinstance(loaded_attrs, dict):
+                            df.attrs.update(loaded_attrs)
+                except Exception as meta_e:
+                    logger.debug(f"Failed to read cache metadata for {key}: {meta_e}")
             return df
         except Exception as e:
             logger.debug(f"Failed to read JSON cache for {key}: {e}")
@@ -390,6 +454,20 @@ def _write_cache(key: str, df: pd.DataFrame):
         try:
             df.to_json(temp_file, orient="split", date_format="iso")
             os.replace(temp_file, cache_file)
+            if getattr(df, "attrs", None):
+                meta_file = cache_file + ".meta"
+                meta_temp = meta_file + ".tmp"
+                try:
+                    with open(meta_temp, "w", encoding="utf-8") as f:
+                        json.dump(dict(df.attrs), f)
+                    os.replace(meta_temp, meta_file)
+                except Exception as meta_e:
+                    logger.debug(f"Failed to write cache metadata for {key}: {meta_e}")
+                    if os.path.exists(meta_temp):
+                        try:
+                            os.remove(meta_temp)
+                        except Exception:
+                            pass
         except Exception as e:
             logger.warning(f"Failed to write JSON cache for {key}: {e}")
             if os.path.exists(temp_file):
@@ -532,6 +610,11 @@ class CompletedBar:
     start_time: pd.Timestamp
     close_time: pd.Timestamp
     post_close_delay_seconds: float
+    bar_start_ts: Optional[pd.Timestamp] = None
+    bar_close_ts: Optional[pd.Timestamp] = None
+    current_ts: Optional[pd.Timestamp] = None
+    completed_bar_age: float = 0.0
+    publication_delay: float = 0.0
 
 
 def _normalize_utc_timestamp(
@@ -661,14 +744,18 @@ def select_last_completed_bar(
 
     bar_start = normalized_index[selected_position]
     bar_close = close_times[selected_position]
+    delay_sec = float((normalized_now - bar_close).total_seconds())
 
     return CompletedBar(
         row=df.iloc[selected_position],
         start_time=bar_start,
         close_time=bar_close,
-        post_close_delay_seconds=float(
-            (normalized_now - bar_close).total_seconds()
-        ),
+        post_close_delay_seconds=delay_sec,
+        bar_start_ts=bar_start,
+        bar_close_ts=bar_close,
+        current_ts=normalized_now,
+        completed_bar_age=delay_sec,
+        publication_delay=delay_sec,
     )
 
 
@@ -825,7 +912,9 @@ def _validate_intraday_data(
                 current_time = pd.Timestamp.now(tz="UTC")
                 future_tolerance = float(getattr(config, "BAR_FUTURE_TOLERANCE_SECONDS", 5.0))
 
-                if purpose == "POSITION_MONITORING":
+                if purpose == "PREFLIGHT":
+                    grace_seconds = float(getattr(config, "PREFLIGHT_MAX_RECOVERABLE_DELAY_SECONDS", 360.0))
+                elif purpose == "POSITION_MONITORING":
                     grace_seconds = float(getattr(config, "POSITION_ATR_MAX_AGE_SECONDS", 360.0))
                 else:
                     grace_seconds = float(getattr(config, "ENTRY_BAR_CLOSE_GRACE_SECONDS", getattr(config, "BAR_CLOSE_GRACE_SECONDS", 60.0)))
@@ -848,6 +937,31 @@ def _validate_intraday_data(
                         return _quarantine("invalid_bar_data")
 
                 delay_seconds = completed_bar.post_close_delay_seconds
+                bar_id = getattr(completed_bar, "close_time", None) or getattr(completed_bar, "start_time", None)
+
+                with _feed_telemetry_lock:
+                    _feed_telemetry["poll_count"] += 1
+                    if delay_seconds <= grace_seconds:
+                        if purpose == "ENTRY_SIGNAL":
+                            # Fresh completed bar resets consecutive stale counter for entry gate
+                            _feed_telemetry["stale_bar_consecutive"] = 0
+                            _feed_telemetry["stale_bar_skip_count"] = 0
+                    else:
+                        # Cumulative stale observations recorded across all polling ticks
+                        _feed_telemetry["stale_observation_total"] += 1
+                        _feed_telemetry["stale_bar_total"] = _feed_telemetry["stale_observation_total"]
+                        last_ts = _last_stale_bar_ts.get(symbol)
+                        if last_ts != bar_id:
+                            # Only ENTRY_SIGNAL stale bars increment the entry circuit-breaker counter
+                            if purpose == "ENTRY_SIGNAL":
+                                _feed_telemetry["stale_bar_consecutive"] += 1
+                                _feed_telemetry["stale_bar_skip_count"] = _feed_telemetry["stale_bar_consecutive"]
+                            else:
+                                _feed_telemetry["stale_monitoring_count"] = _feed_telemetry.get("stale_monitoring_count", 0) + 1
+                            _last_stale_bar_ts[symbol] = bar_id
+                        else:
+                            # Same bar timestamp re-polled within intra-bar cadence: do NOT increment consecutive
+                            pass
 
                 if delay_seconds > grace_seconds:
                     msg = f"Data validation: {symbol} completed bar is stale: post-close delay={delay_seconds:.1f}s (grace={grace_seconds:.1f}s, purpose={purpose}). Skipping candle for this cycle."
@@ -991,6 +1105,13 @@ def fetch_intraday_alpaca(
         validate_staleness = should_validate_staleness(purpose, lookback_days)
         df = _validate_intraday_data(df, symbol, interval, validate_staleness=validate_staleness, purpose=purpose)
         if not df.empty:
+            feed_name = getattr(chosen_feed, "value", str(chosen_feed)).lower().strip()
+            df.attrs["feed_identity"] = feed_name
+            df.attrs["requested_feed"] = feed_name
+            df.attrs["subscription_tier"] = tier
+            if hasattr(df, "index") and len(df.index) > 0:
+                last_idx = df.index[-1]
+                df.attrs["bar_end_utc"] = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
             _write_cache(key, df.copy())
         return df
     except Exception as e:
@@ -1123,6 +1244,8 @@ def fetch_batch_intraday_alpaca(
         for chunk_idx, chunk_symbols in enumerate(chunks):
             rem_t = _rem()
             if total_timeout_seconds is not None and (rem_t is None or rem_t <= 0.05):
+                with _feed_telemetry_lock:
+                    _feed_telemetry["batch_timeout_count"] += 1
                 logger.warning(
                     "[BATCH FETCH TIMEOUT] Total budget exhausted (%.2fs remaining) before chunk %d/%d.",
                     rem_t or 0.0, chunk_idx + 1, num_chunks,
@@ -1161,6 +1284,13 @@ def fetch_batch_intraday_alpaca(
                         sym_df, sym, interval, validate_staleness=validate_staleness, purpose=purpose
                     )
                     if not validated_df.empty:
+                        feed_name = getattr(primary_feed, "value", str(primary_feed)).lower().strip()
+                        validated_df.attrs["feed_identity"] = feed_name
+                        validated_df.attrs["requested_feed"] = feed_name
+                        validated_df.attrs["subscription_tier"] = tier
+                        if hasattr(validated_df, "index") and len(validated_df.index) > 0:
+                            last_idx = validated_df.index[-1]
+                            validated_df.attrs["bar_end_utc"] = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
                         _write_cache(key, validated_df.copy())
                         results[sym] = validated_df
                     else:
@@ -1207,6 +1337,13 @@ def fetch_batch_intraday_alpaca(
                                 )
                                 if not fb_validated_df.empty:
                                     logger.info("[BATCH FETCH FALLBACK ACCEPTED] status=FALLBACK_FRESH symbol=%s: Accepted from %s feed.", sym, backup_name)
+                                    fb_feed_name = getattr(backup_feed, "value", str(backup_feed)).lower().strip()
+                                    fb_validated_df.attrs["feed_identity"] = fb_feed_name
+                                    fb_validated_df.attrs["requested_feed"] = fb_feed_name
+                                    fb_validated_df.attrs["subscription_tier"] = tier
+                                    if hasattr(fb_validated_df, "index") and len(fb_validated_df.index) > 0:
+                                        last_idx = fb_validated_df.index[-1]
+                                        fb_validated_df.attrs["bar_end_utc"] = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
                                     _write_cache(key, fb_validated_df.copy())
                                     results[sym] = fb_validated_df
                                 else:
@@ -1237,6 +1374,11 @@ def fetch_batch_intraday_alpaca(
                 time.sleep(chunk_delay_ms / 1000.0)
 
         elapsed = time.monotonic() - start_mono
+        with _feed_telemetry_lock:
+            _feed_telemetry["last_batch_duration_seconds"] = elapsed
+            _feed_telemetry["last_batch_timestamp"] = time.time()
+            _feed_telemetry["total_bars_fetched"] += len(results)
+
         coverage_pct = (len(results) / len(clean_symbols)) * 100.0 if clean_symbols else 100.0
         logger.info(
             f"[CHUNK FETCH DONE] Retrieved {len(results)}/{len(clean_symbols)} symbols "

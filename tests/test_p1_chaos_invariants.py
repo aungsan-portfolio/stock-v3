@@ -32,6 +32,7 @@ class TestP1StreamLifecycleSoak:
             with mock.patch.object(bridge, "_run_trade_stream", side_effect=lambda s: stop_evt.wait(5.0)):
                 fake_stream = mock.MagicMock()
                 fake_stream._running = True
+                fake_stream._endpoint = "wss://paper-api.alpaca.markets/stream"
 
                 with mock.patch("alpaca_bridge.TradingStream", return_value=fake_stream):
                     # Connect and establish stream
@@ -82,6 +83,7 @@ class TestP1StreamLifecycleSoak:
         with mock.patch.object(bridge, "_run_trade_stream", side_effect=lambda s: stop_evt.wait(5.0)):
             fake_stream = mock.MagicMock()
             fake_stream._running = True
+            fake_stream._endpoint = "wss://paper-api.alpaca.markets/stream"
             with mock.patch("alpaca_bridge.TradingStream", return_value=fake_stream):
                 bridge._start_trade_stream("key", "secret")
                 assert bridge.stream_state == StreamState.AUTHENTICATED_UNRECONCILED

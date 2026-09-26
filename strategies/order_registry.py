@@ -19,6 +19,8 @@ def register_order_expected_price(
     symbol: Optional[str] = None,
     strategy: Optional[str] = None,
     signal_id: Optional[str] = None,
+    is_validation: bool = False,
+    client_order_id: Optional[str] = None,
 ) -> None:
     if not order_id:
         return
@@ -32,6 +34,8 @@ def register_order_expected_price(
             "symbol": str(symbol).upper() if symbol else "",
             "strategy": str(strategy) if strategy else "UNKNOWN",
             "signal_id": str(signal_id) if signal_id else None,
+            "is_validation": bool(is_validation),
+            "client_order_id": str(client_order_id) if client_order_id else None,
         }
 
 def get_registered_order(order_id: str) -> Optional[Dict[str, Any]]:
@@ -40,3 +44,12 @@ def get_registered_order(order_id: str) -> Optional[Dict[str, Any]]:
     order_key = str(order_id).strip()
     with _lock:
         return _ORDER_REGISTRY.get(order_key)
+
+
+def is_validation_order(order_id: str) -> bool:
+    """Return True if the order is tagged as a validation lane order."""
+    reg = get_registered_order(order_id)
+    if reg:
+        return bool(reg.get("is_validation", False))
+    return False
+

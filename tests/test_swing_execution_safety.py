@@ -954,6 +954,7 @@ def test_behavioral_production_path_and_concurrency():
                     symbol=sym, action="BUY", confidence=0.75,
                     rf_score=0.5, lstm_score=0.5, xgb_score=0.5, trans_score=0.5, tech_score=0.5,
                     price=100.0, reason="test",
+                    adx=30.0, vix=15.0, spy_price=500.0, spy_sma50=480.0, sma50_slope=0.50, quote_age_seconds=5.0,
                 )
                 setattr(s, "atr_14", 2.0)
                 setattr(s, "regime", "TRENDING_BULL")
@@ -1018,6 +1019,7 @@ def test_execute_signal_daily_loss_gate_behavioral():
                     symbol=sym, action="BUY", confidence=0.75,
                     rf_score=0.5, lstm_score=0.5, xgb_score=0.5, trans_score=0.5, tech_score=0.5,
                     price=100.0, reason="test",
+                    adx=30.0, vix=15.0, spy_price=500.0, spy_sma50=480.0, sma50_slope=0.50, quote_age_seconds=5.0,
                 )
                 setattr(s, "atr_14", 2.0)
                 setattr(s, "regime", "TRENDING_BULL")

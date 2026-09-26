@@ -42,25 +42,46 @@ def isolate_config():
 
 
 @pytest.fixture(autouse=True)
-def mock_market_open(monkeypatch, tmp_path):
+def mock_market_open(monkeypatch):
+    import pathlib
+    import tempfile
     import strategies.session
     import strategies.trailing_stop
+    import strategies.orchestrator
     from strategies.halt_manager import halt_manager
     from strategies.intraday_risk import reset_risk_state
+    from strategies.regime_engine import MarketRegimeResult, MODE_RISK_ON
+
     halt_manager.reset_all()
     reset_risk_state()
-    test_journal = tmp_path / "test_daytrade_journal.jsonl"
+    strategies.orchestrator._skipped_bar_ids.clear()
+    strategies.orchestrator._last_evaluated_5m_bar_str = None
+    test_journal = pathlib.Path(tempfile.gettempdir()) / f"test_daytrade_journal_{id(monkeypatch)}.jsonl"
     monkeypatch.setattr(config, "DAYTRADE_TRADE_JOURNAL_FILE", test_journal)
     monkeypatch.setattr(strategies.session, "is_market_open", lambda: True)
     monkeypatch.setattr(strategies.trailing_stop, "is_market_open", lambda: True)
     monkeypatch.setattr(strategies.session, "is_past_opening_buffer", lambda *a, **kw: True)
     monkeypatch.setattr(config, "ENFORCE_GLOBAL_OPENING_BUFFER", False)
+    monkeypatch.setattr(config, "DAYTRADE_STARTUP_CADENCE_GRACE_S", 999999.0)
+    monkeypatch.setattr(config, "DAYTRADE_BAR_PUBLICATION_TIMEOUT_S", 999999.0)
     monkeypatch.setattr(config, "MARKET_REGIME_SETTINGS", {
         "TRENDING": {"allowed_strategies": None},
         "SIDEWAYS": {"allowed_strategies": None},
         "TRANSITIONING": {"allowed_strategies": None},
         "VOLATILE": {"allowed_strategies": None},
     })
+    monkeypatch.setattr(
+        "strategies.regime_engine.evaluate_market_regime",
+        lambda *a, **kw: MarketRegimeResult(
+            mode=MODE_RISK_ON,
+            score=2,
+            allow_new_longs=True,
+            requires_opening_buffer=False,
+            position_scale=1.0,
+            confidence_boost=0.0,
+            halt_new_entries=False,
+        ),
+    )
 
 
 # ----------------------------------------------------------------------
@@ -1057,15 +1078,26 @@ def test_regression_outage_positions_raise_fail_closed():
     bridge.positions_plain.side_effect = RuntimeError("Alpaca API Outage")
     bridge.get_positions.side_effect = RuntimeError("Alpaca API Outage")
     
+    import time
+    from strategies.base import EntryReadiness
+    readiness = EntryReadiness(
+        entry_allowed=True,
+        suppression_reason=None,
+        cycle_id="test_cycle",
+        bar_ts="2026-09-11T10:00:00+00:00",
+        created_at=time.time(),
+        expires_at=time.time() + 300.0,
+    )
     sig = TradeSignal(
         symbol="AAPL", side="BUY", entry_price=100.0, stop_price=90.0, target_price=120.0,
-        risk_per_share=10.0, confidence=0.85, strategy="ORB", atr=1.0, reason=""
+        risk_per_share=10.0, confidence=0.85, strategy="ORB", atr=1.0, reason="",
+        bar_timestamp="2026-09-11T10:00:00+00:00",
     )
     
     import pandas as pd
     mock_spy_df = pd.DataFrame([{"open": 500.0, "close": 501.0}, {"open": 500.0, "close": 501.0}])
     with mock.patch("strategies.intraday_data.fetch_intraday", return_value=mock_spy_df):
-        res = execute_signal(sig, bridge=bridge, equity=100000.0, current_pnl=0.0, dry_run=False)
+        res = execute_signal(sig, bridge=bridge, equity=100000.0, current_pnl=0.0, dry_run=False, entry_readiness=readiness)
         assert res["status"] == "REJECTED"
         assert "Risk guard failure" in res["reason"]
 

@@ -31,6 +31,7 @@ class TradeSignal:
     signal_id: str = field(default_factory=lambda: uuid4().hex)
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     bar_timestamp: Optional[str] = None
+    decision_feed: Optional[str] = None
 
     @property
     def signal_hash(self) -> str:

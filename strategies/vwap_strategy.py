@@ -95,18 +95,28 @@ class VWAPBounceStrategy(BaseStrategy):
         volume = float(last.get("volume", 0))
         vol_ma = float(last.get("volume_ma", 1))
 
-        bar_ts = str(df.index[-1]) if hasattr(df, "index") and len(df.index) > 0 else str(last.get("timestamp", ""))
+        if hasattr(df, "index") and len(df.index) > 0:
+            last_idx = df.index[-1]
+            bar_ts = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
+        else:
+            bar_ts = str(last.get("timestamp", ""))
 
         # BUY Logic
         if pullback_touched and held_above and rsi < config.VWAP_RSI_OVERBOUGHT:
             tick_size = 0.01 if price >= 1.0 else 0.0001
             precision = 2 if price >= 1.0 else 4
             pullback_low = float(tail["low"].iloc[-reclaim_bars - 2 : -1].min())
-            structural_stop = max(pullback_low, vwap_lower) - tick_size
-            raw_risk = price - structural_stop
+            # Strict geometry contract: structural stop must be strictly below (price - tick_size)
+            valid_supports = [lvl for lvl in (pullback_low, vwap_lower) if np.isfinite(lvl) and lvl < (price - tick_size)]
+            if valid_supports:
+                structural_stop = max(valid_supports) - tick_size
+                raw_risk = price - structural_stop
+            else:
+                structural_stop = float("nan")
+                raw_risk = -1.0
 
             # Defect 4: Validate raw structural risk (reject if negative, zero, or non-finite)
-            if not np.isfinite(raw_risk) or raw_risk <= 0:
+            if not np.isfinite(raw_risk) or raw_risk <= 0 or not np.isfinite(structural_stop) or structural_stop >= (price - tick_size):
                 logger.debug(
                     "[SIGNAL GEOMETRY] symbol=%s side=BUY rejected | invalid raw structural risk: price=%.4f structural_stop=%.4f raw_risk=%.4f",
                     symbol, price, structural_stop, raw_risk
@@ -229,11 +239,17 @@ class VWAPBounceStrategy(BaseStrategy):
             tick_size = 0.01 if price >= 1.0 else 0.0001
             precision = 2 if price >= 1.0 else 4
             rally_high = float(tail["high"].iloc[-reclaim_bars - 2 : -1].max())
-            structural_stop = min(rally_high, vwap_upper) + tick_size
-            raw_risk = structural_stop - price
+            # Strict geometry contract: structural stop must be strictly above (price + tick_size)
+            valid_resistances = [lvl for lvl in (rally_high, vwap_upper) if np.isfinite(lvl) and lvl > (price + tick_size)]
+            if valid_resistances:
+                structural_stop = min(valid_resistances) + tick_size
+                raw_risk = structural_stop - price
+            else:
+                structural_stop = float("nan")
+                raw_risk = -1.0
 
             # Defect 4: Validate raw structural risk (reject if negative, zero, or non-finite)
-            if not np.isfinite(raw_risk) or raw_risk <= 0:
+            if not np.isfinite(raw_risk) or raw_risk <= 0 or not np.isfinite(structural_stop) or structural_stop <= (price + tick_size):
                 logger.debug(
                     "[SIGNAL GEOMETRY] symbol=%s side=SELL rejected | invalid raw structural risk: price=%.4f structural_stop=%.4f raw_risk=%.4f",
                     symbol, price, structural_stop, raw_risk

@@ -316,6 +316,14 @@ class CandlestickPatternStrategy(BaseStrategy):
             return None
 
         pattern_str = ", ".join(patterns)
+        bar_ts = ""
+        if hasattr(row, "name") and hasattr(row.name, "isoformat"):
+            bar_ts = row.name.isoformat()
+        elif hasattr(row, "name") and row.name is not None:
+            bar_ts = str(row.name)
+        elif "timestamp" in row:
+            bar_ts = str(row.get("timestamp", ""))
+
         sig = TradeSignal(
             symbol=symbol,
             strategy=self.name,
@@ -329,6 +337,7 @@ class CandlestickPatternStrategy(BaseStrategy):
             reason=f"{side} signal - patterns: {pattern_str}",
             pattern_name=pattern_str,
             metadata={"patterns": patterns, "rsi": rsi, "sma20": sma20},
+            bar_timestamp=bar_ts,
         )
         if not sig.is_valid:
             logger.debug("Invalid signal skipped: %s", sig)

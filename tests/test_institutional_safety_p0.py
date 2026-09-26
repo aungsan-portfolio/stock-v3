@@ -148,7 +148,22 @@ def test_raw_precision_confidence_gating():
     from zoneinfo import ZoneInfo
     now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
 
+    from strategies.regime_engine import MarketRegimeResult, MODE_RISK_ON
+    mock_regime = MarketRegimeResult(
+        mode=MODE_RISK_ON,
+        score=0,
+        allow_new_longs=True,
+        allow_new_shorts=False,
+        halt_new_entries=False,
+        requires_opening_buffer=False,
+        position_scale=1.0,
+        confidence_boost=0.0,
+        market_texture="TRENDING",
+        reasons=["Deterministic test regime"],
+    )
+
     with patch("strategies.orchestrator.datetime") as mock_dt, \
+         patch("strategies.regime_engine.evaluate_market_regime", return_value=mock_regime), \
          patch("strategies.orchestrator.evaluate_symbols_parallel", return_value=eval_result), \
          patch("strategies.orchestrator._min_confidence_for", return_value=0.6000000), \
          patch("strategies.orchestrator.execute_signal") as mock_exec, \

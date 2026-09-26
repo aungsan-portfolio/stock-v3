@@ -1,4 +1,6 @@
 from datetime import datetime, timezone
+from pathlib import Path
+import os
 import time
 import math
 import logging
@@ -114,6 +116,134 @@ def _inverse_etf_entry_allowed(regime_res, sig: TradeSignal) -> bool:
     if getattr(regime_res, "mode", "") in (MODE_RISK_OFF, MODE_CAUTION):
         return bool(getattr(regime_res, "halt_new_entries", False))
     return False
+
+
+SIGNAL_FEATURE_COLUMNS = [
+    "timestamp",
+    "timestamp_et",
+    "symbol",
+    "trigger_price",
+    "entry_price",
+    "stop_price",
+    "target_price",
+    "side",
+    "confidence",
+    "raw_confidence",
+    "correlation_penalty",
+    "max_correlation",
+    "risk_per_share",
+    "rr_ratio",
+    "regime_score",
+    "regime_mode",
+    "regime_texture",
+    "market_texture",
+    "spy_pct",
+    "qqq_pct",
+    "soxx_pct",
+    "sizing_pct",
+    "halt_entries",
+    "would_have_entered",
+    "signal_type",
+    "strategy",
+    "signal_id",
+]
+
+
+def export_candidate_signals(
+    signals: list,
+    regime: Optional[object] = None,
+    market_texture: str = "TRENDING",
+    export_dir: str = "data/exports",
+) -> None:
+    """
+    Write candidate signals to daily CSV for ML training (daytrade-train).
+    Appends to today's file; creates it with headers if new.
+    """
+    if not signals:
+        return
+
+    try:
+        from pathlib import Path
+        import csv
+        import pytz
+        from datetime import timezone
+        _ET = pytz.timezone("America/New_York")
+
+        Path(export_dir).mkdir(parents=True, exist_ok=True)
+        now_utc = datetime.now(timezone.utc)
+        today_str = datetime.now(_ET).strftime("%Y%m%d")
+        filepath = os.path.join(export_dir, f"signals_{today_str}.csv")
+
+        write_header = not os.path.exists(filepath) or os.path.getsize(filepath) == 0
+
+        ts_utc = now_utc.isoformat()
+        ts_et = datetime.now(_ET).strftime("%Y-%m-%d %H:%M:%S")
+
+        reg_score = getattr(regime, "score", 0)
+        reg_mode = getattr(regime, "mode", "UNKNOWN")
+        reg_texture = getattr(regime, "market_texture", market_texture)
+        sizing_pct = f"{getattr(regime, 'position_scale', 1.0):.2f}"
+        halt_entries = getattr(regime, "halt_new_entries", False)
+
+        reg_data = getattr(regime, "data", {}) or {}
+        spy_pct = reg_data.get("SPY", {}).get("pct", "")
+        qqq_pct = reg_data.get("QQQ", {}).get("pct", "")
+        soxx_pct = reg_data.get("SOXX", {}).get("pct", "")
+
+        rows = []
+        for sig in signals:
+            strat_val = getattr(sig, "strategy", "UNKNOWN")
+            strat_str = strat_val.value if hasattr(strat_val, "value") else str(strat_val)
+            meta = getattr(sig, "metadata", {}) or {}
+
+            entry_px = float(getattr(sig, "entry_price", 0.0) or 0.0)
+            stop_px = float(getattr(sig, "stop_price", 0.0) or 0.0)
+            target_px = float(getattr(sig, "target_price", 0.0) or 0.0)
+            dist = abs(entry_px - stop_px)
+            reward = abs(target_px - entry_px)
+            rr = getattr(sig, "reward_risk_ratio", None)
+            if rr is None or rr <= 0:
+                rr = round(reward / dist, 2) if dist > 1e-6 else 2.0
+
+            rows.append({
+                "timestamp": ts_utc,
+                "timestamp_et": ts_et,
+                "symbol": getattr(sig, "symbol", "").upper().strip(),
+                "trigger_price": entry_px,
+                "entry_price": entry_px,
+                "stop_price": stop_px,
+                "target_price": target_px,
+                "side": getattr(sig, "side", "BUY").upper(),
+                "confidence": float(getattr(sig, "confidence", 0.70)),
+                "raw_confidence": float(meta.get("raw_confidence", getattr(sig, "confidence", 0.70))),
+                "correlation_penalty": float(meta.get("correlation_penalty", 1.0)),
+                "max_correlation": float(meta.get("max_correlation", 0.0)),
+                "risk_per_share": float(getattr(sig, "risk_per_share", dist)),
+                "rr_ratio": float(rr),
+                "regime_score": reg_score,
+                "regime_mode": reg_mode,
+                "regime_texture": reg_texture,
+                "market_texture": market_texture,
+                "spy_pct": spy_pct,
+                "qqq_pct": qqq_pct,
+                "soxx_pct": soxx_pct,
+                "sizing_pct": sizing_pct,
+                "halt_entries": halt_entries,
+                "would_have_entered": True,
+                "signal_type": strat_str,
+                "strategy": strat_str,
+                "signal_id": getattr(sig, "signal_id", ""),
+            })
+
+        with open(filepath, "a", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=SIGNAL_FEATURE_COLUMNS)
+            if write_header:
+                writer.writeheader()
+            writer.writerows(rows)
+
+        logger.debug("[SIGNAL EXPORT] Exported %d candidate signals to %s", len(rows), filepath)
+    except Exception as exp_err:
+        logger.debug("[SIGNAL EXPORT] Failed exporting signals: %s", exp_err)
 
 
 def _prepare_closed_bars(df):
@@ -433,6 +563,13 @@ def _evaluate_on_df(symbol: str, df, market_texture: str = "TRENDING") -> List[T
                     signal.metadata = copy.copy(raw_signal.metadata)
                     signal.metadata['raw_confidence'] = signal.confidence
                     signal.confidence = scorer.calculate_risk_adjusted_confidence(signal)
+                    if not signal.bar_timestamp and hasattr(df, "index") and len(df.index) > 0:
+                        last_idx = df.index[-1]
+                        signal.bar_timestamp = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
+                    if not getattr(signal, "decision_feed", None):
+                        feed_id = getattr(df, "attrs", {}).get("feed_identity")
+                        if feed_id:
+                            signal.decision_feed = str(feed_id).lower().strip()
                     signals.append(signal)
                 else:
                     failures.append(f"{strategy.name}: INVALID (reward/risk or geometry)")
@@ -449,6 +586,13 @@ def _evaluate_on_df(symbol: str, df, market_texture: str = "TRENDING") -> List[T
             if mr_signal is not None:
                 mr_signal.metadata['raw_confidence'] = mr_signal.confidence
                 mr_signal.confidence = scorer.calculate_risk_adjusted_confidence(mr_signal)
+                if not mr_signal.bar_timestamp and hasattr(df, "index") and len(df.index) > 0:
+                    last_idx = df.index[-1]
+                    mr_signal.bar_timestamp = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
+                if not getattr(mr_signal, "decision_feed", None):
+                    feed_id = getattr(df, "attrs", {}).get("feed_identity")
+                    if feed_id:
+                        mr_signal.decision_feed = str(feed_id).lower().strip()
                 signals.append(mr_signal)
         except Exception as mr_err:
             logger.exception("MeanReversionStrategy failed for %s: %s", symbol, mr_err)
@@ -813,6 +957,23 @@ def evaluate_symbols_parallel(symbols: List[str], bridge: object = None, market_
             "Suppressing entry evaluation to avoid universe selection bias. Positions/risk management remains active.",
             reason,
         )
+        try:
+            from strategies.gate_ledger import log_gate_decision
+            from strategies.veto_reasons import VetoReason
+            log_gate_decision(
+                evaluation_id=f"cov_{int(time.time())}",
+                symbol="UNIVERSE",
+                bar="",
+                stage="STAGE_COVERAGE",
+                decision="REJECT",
+                reason_code=VetoReason.LOW_COVERAGE,
+                human_message=reason,
+                terminal_decision=True,
+                blocked_by="STAGE_COVERAGE",
+                metadata={"coverage": coverage, "required": min_coverage, "missing": missing_symbols},
+            )
+        except Exception:
+            pass
         return EvaluationResult(
             entry_signals=(),
             entry_allowed=False,
@@ -856,6 +1017,10 @@ def evaluate_symbols_parallel(symbols: List[str], bridge: object = None, market_
 
 def apply_portfolio_correlation(signals: List[TradeSignal], open_positions: List, bridge: object = None) -> List[TradeSignal]:
     """Applies portfolio correlation checks to signals."""
+    # ── Patch A: Correlation Empty-Input Guard ──
+    if not signals:
+        return []
+
     from strategies.correlation import CorrelationAnalyzer, PortfolioPosition
     from strategies.position_sizer import calculate_shares
 
@@ -929,6 +1094,49 @@ def apply_portfolio_correlation(signals: List[TradeSignal], open_positions: List
 
     return [s for s in signals if s.confidence > 0.0]
 
+
+def _classify_execution_rejection(reason_str: str) -> tuple:
+    """Map execution rejection reason strings to authoritative typed stages and VetoReason codes."""
+    from strategies.veto_reasons import VetoReason
+    raw = str(reason_str).strip().lower()
+    r = raw.replace("-", "_")
+
+    # 1. Counter-Trend Short Veto
+    if "counter_trend" in r or "countertrend" in r or "counter trend" in raw:
+        return "STAGE_COUNTERTREND_GUARD", VetoReason.COUNTER_TREND_SHORT_VETO
+
+    # 2. Sector / Tech Cluster Cap
+    if "cluster cap" in raw or "cluster_cap" in r or "tech cluster" in raw or "tech_cluster" in r or "sector concentration" in raw or "sector_concentration" in r:
+        return "STAGE_SECTOR_CLUSTER_CAP", VetoReason.TECH_CLUSTER_CAP
+
+    # 3. Real-Time Quote Health (freshness, inverted quotes, stale quotes)
+    if "quote health" in raw or "stale quote" in raw or "quote_health" in r or "stale_quote" in r or ("quote" in raw and "stale" in raw):
+        return "STAGE_QUOTE_HEALTH", VetoReason.STALE_QUOTE
+    if "inverted quote" in raw or "inverted_quote" in r or "spread" in raw:
+        return "STAGE_QUOTE_HEALTH", VetoReason.EXCESSIVE_SPREAD
+
+    # 4. Other known typed execution/policy reasons
+    if "suppression" in raw or "cooldown" in raw:
+        return "STAGE_COOLDOWN", VetoReason.SESSION_COOLDOWN
+    if "chase" in raw:
+        return "STAGE_MAX_CHASE", VetoReason.MAX_CHASE
+    if "trend guard" in raw or "trend_guard" in r or "spy 5m" in raw or "spy_5m" in r or "spy benchmark" in raw or ("blocking" in raw and "spy" in raw):
+        return "STAGE_SPY_GUARD", VetoReason.SPY_BEARISH_5M
+    if "soxx" in raw:
+        return "STAGE_SOXX_GUARD", VetoReason.SOXX_TECH_LONG_VETO
+    if "noise floor" in raw or "noise_floor" in r or "critically tight" in raw or "critically_tight" in r:
+        return "STAGE_NOISE_FLOOR", VetoReason.NOISE_FLOOR
+    if "position size is 0" in raw or "0 shares" in raw or "shares=0" in raw or "zero position" in raw or "zero_position" in r:
+        return "STAGE_POSITION_SIZE", VetoReason.ZERO_POSITION_SIZE
+    if "entry readiness" in raw or "entry_readiness" in r:
+        return "STAGE_ENTRY_READINESS", VetoReason.ENTRY_READINESS_FAILED
+    if "price ordering" in raw or "price_ordering" in r or "geometry" in raw:
+        return "STAGE_GEOMETRY", VetoReason.INVALID_GEOMETRY
+
+    # 5. Fallback strictly for true unhandled broker rejection errors
+    return "STAGE_ORDER_EXECUTION", "ORDER_REJECTED"
+
+
 def evaluate_and_execute(
     watchlist: List[str],
     bridge: object,
@@ -940,6 +1148,15 @@ def evaluate_and_execute(
     """Evaluates strategies for symbols in the watchlist and executes trades."""
     if not prime_broker_state:
         logger.debug("prime_broker_state=False is deprecated and ignored")
+
+    global _effective_config_dumped
+    if "_effective_config_dumped" not in globals() or not _effective_config_dumped:
+        try:
+            from strategies.gate_ledger import dump_effective_config_startup
+            dump_effective_config_startup(logger)
+            _effective_config_dumped = True
+        except Exception as d_err:
+            logger.debug("Config dump error: %s", d_err)
 
     logger.info(f"[ORCHESTRATOR POLL] Polling cycle started for {len(watchlist)} watchlist symbols | allow_new_entries={allow_new_entries}")
     print(f"[ORCHESTRATOR POLL] Polling cycle started for {len(watchlist)} watchlist symbols | allow_new_entries={allow_new_entries}")
@@ -1127,10 +1344,11 @@ def evaluate_and_execute(
             elif regime_res.mode == MODE_DATA_DEGRADED:
                 logger.critical("[DATA DEGRADED HALT] %s", regime_res.summary())
             else:
-                logger.warning("[MARKET REGIME RISK_OFF/HALT] New long day trades disabled (Score: %d). Summary: %s", regime_res.score, regime_res.summary())
+                mode_str = getattr(regime_res, "mode", "UNKNOWN")
+                logger.warning("[MARKET ENTRY HALT] New long day trades disabled (mode=%s score=%d). Summary: %s", mode_str, regime_res.score, regime_res.summary())
                 inverse_exempt = getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
                 if inverse_exempt and regime_res is not None:
-                    logger.info("[INVERSE ETF EXEMPT] RISK_OFF active but inverse ETF entries remain eligible (SPDN/SQQQ/SH etc.)")
+                    logger.info("[INVERSE ETF EXEMPT] Entry halt active; eligible inverse ETFs remain enabled (mode=%s score=%d)", mode_str, regime_res.score)
         elif regime_res.mode == MODE_CAUTION:
             logger.info("[MARKET REGIME CAUTION] Fallback watchlist active after 09:45 EST buffer (50%% sizing). Summary: %s", regime_res.summary())
     except Exception as r_exc:
@@ -1365,6 +1583,55 @@ def evaluate_and_execute(
     market_tex = getattr(regime_res, "market_texture", "TRENDING") if regime_res else "TRENDING"
     should_run_eval = bool(can_evaluate_signals and should_evaluate_5m_bar)
 
+    # ── Phase A Execution Health Gate & Synchronous Reaper Sweep ──
+    try:
+        from strategies.order_manager import reap_expired_entry_orders
+        reap_expired_entry_orders(
+            bridge=bridge,
+            current_closed_bar_start=completed_5m_bar_ts,
+            worker_id="orchestrator_poll_sweep",
+        )
+    except Exception as sweep_err:
+        logger.warning("[ORCHESTRATOR SWEEP] Pre-eval sweep error: %s", sweep_err)
+
+    try:
+        from strategies.execution_health import get_execution_health
+        from strategies.intraday_data import get_intraday_feed_telemetry
+        feed_tel = get_intraday_feed_telemetry()
+        health_gate = get_execution_health(
+            bridge=bridge,
+            bar_age_seconds=bar_age,
+            feed_telemetry=feed_tel,
+        )
+        if not health_gate.allows_new_entries:
+            if not should_evaluate_5m_bar and health_gate.status.value == "stale":
+                logger.debug(
+                    "[EXECUTION HEALTH GATE] Intra-bar cadence (%s): %s (bar_age=%.1fs). Waiting for next 5m bar boundary.",
+                    health_gate.status.value,
+                    health_gate.summary,
+                    health_gate.bar_age_seconds or 0.0,
+                )
+            else:
+                logger.warning(
+                    "[EXECUTION HEALTH GATE] %s (status=%s, bar_age=%.1fs, latency=%.1fms, stale_skips=%d). "
+                    "New entries blocked for this cycle.",
+                    health_gate.summary,
+                    health_gate.status.value,
+                    health_gate.bar_age_seconds or 0.0,
+                    health_gate.broker_latency_ms or 0.0,
+                    feed_tel.get("stale_bar_skip_count", 0),
+                )
+            allow_new_entries = False
+            can_evaluate_signals = False
+            should_run_eval = False
+        else:
+            logger.debug("[EXECUTION HEALTH GATE] %s", health_gate.summary)
+    except Exception as h_err:
+        logger.error("[EXECUTION HEALTH GATE] Evaluation failed, failing closed: %s", h_err)
+        allow_new_entries = False
+        can_evaluate_signals = False
+        should_run_eval = False
+
     import uuid
     cycle_id = uuid.uuid4().hex[:12]
     eval_result: Optional[EvaluationResult] = None
@@ -1418,6 +1685,18 @@ def evaluate_and_execute(
 
     all_signals = apply_portfolio_correlation(all_signals, cached_open_positions, bridge=bridge)
 
+    # ── Signal Export Hook for ML Training ──
+    if all_signals:
+        try:
+            export_candidate_signals(
+                signals=all_signals,
+                regime=regime_res,
+                market_texture=market_tex,
+                export_dir=str(Path(config.DATA_DIR) / "exports"),
+            )
+        except Exception as exp_err:
+            logger.debug("Candidate signal export hook failed: %s", exp_err)
+
     def get_signal_sorting_key(sig):
         strat_cfg = getattr(config, "STRATEGY_SETTINGS", {}).get(sig.strategy)
         priority = getattr(strat_cfg, "priority", 10) if strat_cfg else 10
@@ -1435,11 +1714,18 @@ def evaluate_and_execute(
     near_misses = []
 
     active_symbols = set()
+    active_position_sides = {}
     pending_symbols = set()
+    validation_routed_symbols = {}
     if broker_state_available:
-        active_symbols = {
-            p.contract.symbol.upper().strip() for p in cached_open_positions if p.position != 0
-        }
+        for p in cached_open_positions:
+            qty = getattr(p, "position", 0.0) or 0.0
+            if qty != 0:
+                p_sym = getattr(getattr(p, "contract", None), "symbol", None)
+                if p_sym:
+                    clean_sym = str(p_sym).upper().strip()
+                    active_symbols.add(clean_sym)
+                    active_position_sides[clean_sym] = "BUY" if float(qty) > 0 else "SELL"
         pending_symbols = set()
         for o in open_orders:
             o_sym = getattr(o, "symbol", None)
@@ -1453,6 +1739,17 @@ def evaluate_and_execute(
                 logger.error("Failed to extract symbol from order object: %s. Disabling new entries this cycle (fail-closed).", o)
                 if live_paper:
                     allow_new_entries = False
+
+    def _can_route_validation_candidate(sig, routed_map, active_sides):
+        sym_u = sig.symbol.upper().strip()
+        if sym_u in routed_map:
+            return False, f"Duplicate validation candidate in cycle (already routed {routed_map[sym_u]})"
+        if sym_u in active_sides:
+            curr_side = active_sides[sym_u]
+            sig_side = "BUY" if sig.side.upper().strip() in ("BUY", "LONG") else "SELL"
+            if sig_side != curr_side:
+                return False, f"Opposing validation candidate {sig_side} conflicts with active {curr_side} position"
+        return True, ""
 
     for sig in all_signals:
         sym = sig.symbol.upper().strip()
@@ -1469,6 +1766,25 @@ def evaluate_and_execute(
             )
         elif allowed_strats is not None and sig.strategy not in allowed_strats:
             logger.info("Skipped %s: strategy %s not allowed in market texture '%s'", sig.symbol, sig.strategy, market_tex)
+            try:
+                from strategies.gate_ledger import log_gate_decision
+                from strategies.veto_reasons import VetoReason
+                log_gate_decision(
+                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                    symbol=sig.symbol,
+                    bar=getattr(sig, "bar_timestamp", "") or "",
+                    strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                    stage="STAGE_REGIME",
+                    decision="REJECT",
+                    reason_code=VetoReason.REGIME_RISK_OFF,
+                    human_message=f"Strategy {sig.strategy} not allowed in market texture '{market_tex}'",
+                    terminal_decision=True,
+                    blocked_by="STAGE_REGIME",
+                    raw_conf=getattr(sig, "confidence", 0.0),
+                    final_conf=getattr(sig, "confidence", 0.0),
+                )
+            except Exception:
+                pass
             continue
 
         # Check strategy-specific time cutoff
@@ -1484,6 +1800,25 @@ def evaluate_and_execute(
                     sig.strategy,
                     strat_cfg.entry_cutoff_time
                 )
+                try:
+                    from strategies.gate_ledger import log_gate_decision
+                    from strategies.veto_reasons import VetoReason
+                    log_gate_decision(
+                        evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                        symbol=sig.symbol,
+                        bar=getattr(sig, "bar_timestamp", "") or "",
+                        strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                        stage="STAGE_REGIME",
+                        decision="REJECT",
+                        reason_code=VetoReason.ENTRY_CUTOFF_TIME,
+                        human_message=f"Past entry cutoff time {strat_cfg.entry_cutoff_time}",
+                        terminal_decision=True,
+                        blocked_by="STAGE_REGIME",
+                        raw_conf=getattr(sig, "confidence", 0.0),
+                        final_conf=getattr(sig, "confidence", 0.0),
+                    )
+                except Exception:
+                    pass
                 continue
 
         # ── Lunch Chop Filter (11:30 AM - 1:30 PM ET) ──
@@ -1506,14 +1841,96 @@ def evaluate_and_execute(
                         "Skipped %s: Entry blocked during Midday Lunch Chop Zone (Score: %.1f/100 < 60) | %s",
                         sig.symbol, l_score, l_reason
                     )
+                    try:
+                        from strategies.gate_ledger import log_gate_decision
+                        from strategies.veto_reasons import VetoReason
+                        log_gate_decision(
+                            evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                            symbol=sig.symbol,
+                            bar=getattr(sig, "bar_timestamp", "") or "",
+                            strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                            stage="STAGE_LUNCH_CHOP",
+                            decision="REJECT",
+                            reason_code=VetoReason.LUNCH_CHOP_ZONE,
+                            human_message=f"Lunch score {l_score:.1f} < 60 | {l_reason}",
+                            terminal_decision=True,
+                            blocked_by="STAGE_LUNCH_CHOP",
+                            raw_conf=getattr(sig, "confidence", 0.0),
+                            final_conf=getattr(sig, "confidence", 0.0),
+                            metadata={"lunch_score": l_score, "lunch_reason": l_reason},
+                        )
+                    except Exception:
+                        pass
+
+                    if getattr(config, "VALIDATION_LANE_ENABLED", False):
+                        can_val, val_arb_reason = _can_route_validation_candidate(sig, validation_routed_symbols, active_position_sides)
+                        if not can_val:
+                            logger.info("[VALIDATION ARBITRATION] Skipped %s: %s", sig.symbol, val_arb_reason)
+                        else:
+                            try:
+                                from strategies.validation_lane import evaluate_and_route_validation_candidate
+                                val_res = evaluate_and_route_validation_candidate(
+                                    signal=sig,
+                                    bridge=bridge,
+                                    policy_stage="STAGE_LUNCH_CHOP",
+                                    policy_reason_code="LUNCH_CHOP_ZONE",
+                                    policy_reason_msg=f"Lunch score {l_score:.1f} < 60 | {l_reason}",
+                                    regime_mode=getattr(regime_res, "mode", "NEUTRAL") if regime_res else "NEUTRAL",
+                                    market_texture=market_tex if 'market_tex' in locals() else "UNKNOWN",
+                                    fixed_shares=getattr(config, "VALIDATION_LANE_SHARES", 1),
+                                    dry_run=not live_paper,
+                                    regime_result=regime_res,
+                                )
+                                if val_res and val_res.get("status") in ("PLACED", "DRY_RUN"):
+                                    validation_routed_symbols[sym] = sig.side.upper().strip()
+                            except Exception as val_err:
+                                logger.warning("[VALIDATION ROUTE ERROR] Failed to route %s: %s", sig.symbol, val_err)
                     continue
 
 
         if sym in active_symbols:
             logger.info("Skipped %s: active position already exists", sig.symbol)
+            try:
+                from strategies.gate_ledger import log_gate_decision
+                from strategies.veto_reasons import VetoReason
+                log_gate_decision(
+                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                    symbol=sig.symbol,
+                    bar=getattr(sig, "bar_timestamp", "") or "",
+                    strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                    stage="STAGE_ACTIVE_POSITION",
+                    decision="REJECT",
+                    reason_code=VetoReason.DUPLICATE_ORDER,
+                    human_message="Active position already exists for symbol",
+                    terminal_decision=True,
+                    blocked_by="STAGE_ACTIVE_POSITION",
+                    raw_conf=getattr(sig, "confidence", 0.0),
+                    final_conf=getattr(sig, "confidence", 0.0),
+                )
+            except Exception:
+                pass
             continue
         if sym in pending_symbols:
             logger.info("Skipped %s: working order already pending", sig.symbol)
+            try:
+                from strategies.gate_ledger import log_gate_decision
+                from strategies.veto_reasons import VetoReason
+                log_gate_decision(
+                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                    symbol=sig.symbol,
+                    bar=getattr(sig, "bar_timestamp", "") or "",
+                    strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                    stage="STAGE_PENDING_ORDER",
+                    decision="REJECT",
+                    reason_code=VetoReason.DUPLICATE_ORDER,
+                    human_message="Working order already pending for symbol",
+                    terminal_decision=True,
+                    blocked_by="STAGE_PENDING_ORDER",
+                    raw_conf=getattr(sig, "confidence", 0.0),
+                    final_conf=getattr(sig, "confidence", 0.0),
+                )
+            except Exception:
+                pass
             continue
 
         # Viability Gate: check strategy/regime confidence floor before deduplication
@@ -1558,10 +1975,81 @@ def evaluate_and_execute(
                     "[NEAR-MISS] %s: Missed gate by %.4f (confidence=%.4f, required=%.4f) [base=%.3f, vol_adj=%.3f, rr_adj=%.3f, reg_adj=%.3f]",
                     sig.symbol, diff, sig.confidence, min_conf, base_conf, vol_adj, rr_adj, reg_adj
                 )
+
+            try:
+                from strategies.gate_ledger import log_gate_decision
+                from strategies.veto_reasons import VetoReason
+                log_gate_decision(
+                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                    symbol=sig.symbol,
+                    bar=getattr(sig, "bar_timestamp", "") or "",
+                    strategy=strat_name,
+                    stage="STAGE_CONFIDENCE",
+                    decision="REJECT",
+                    reason_code=VetoReason.CONFIDENCE_BELOW_FLOOR,
+                    human_message=f"Confidence {sig.confidence:.4f} < {min_conf:.4f}",
+                    terminal_decision=True,
+                    blocked_by="STAGE_CONFIDENCE",
+                    raw_conf=base_conf,
+                    final_conf=sig.confidence,
+                    required_conf=min_conf,
+                    metadata={
+                        "vol_adj": vol_adj,
+                        "rr_adj": rr_adj,
+                        "reg_adj": reg_adj,
+                        "vol_pct": vol_pct,
+                        "near_miss": (0 < diff <= 0.005),
+                    },
+                )
+            except Exception:
+                pass
+
+            if getattr(config, "VALIDATION_LANE_ENABLED", False):
+                can_val, val_arb_reason = _can_route_validation_candidate(sig, validation_routed_symbols, active_position_sides)
+                if not can_val:
+                    logger.info("[VALIDATION ARBITRATION] Skipped %s: %s", sig.symbol, val_arb_reason)
+                else:
+                    try:
+                        from strategies.validation_lane import evaluate_and_route_validation_candidate
+                        val_res = evaluate_and_route_validation_candidate(
+                            signal=sig,
+                            bridge=bridge,
+                            policy_stage="STAGE_CONFIDENCE",
+                            policy_reason_code="CONFIDENCE_BELOW_FLOOR",
+                            policy_reason_msg=f"Confidence {sig.confidence:.4f} < {min_conf:.4f}",
+                            regime_mode=reg_mode,
+                            market_texture=market_tex if 'market_tex' in locals() else "UNKNOWN",
+                            fixed_shares=getattr(config, "VALIDATION_LANE_SHARES", 1),
+                            dry_run=not live_paper,
+                            regime_result=regime_res,
+                        )
+                        if val_res and val_res.get("status") in ("PLACED", "DRY_RUN"):
+                            validation_routed_symbols[sym] = sig.side.upper().strip()
+                    except Exception as val_err:
+                        logger.warning("[VALIDATION ROUTE ERROR] Failed to route %s: %s", sig.symbol, val_err)
             continue
 
         if sym in seen_symbols:
             logger.info("[SIGNAL DISPOSITION] Skipped %s: duplicate signal in this cycle (superseded by previous candidate)", sym)
+            try:
+                from strategies.gate_ledger import log_gate_decision
+                from strategies.veto_reasons import VetoReason
+                log_gate_decision(
+                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                    symbol=sig.symbol,
+                    bar=getattr(sig, "bar_timestamp", "") or "",
+                    strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                    stage="STAGE_PENDING_ORDER",
+                    decision="REJECT",
+                    reason_code=VetoReason.DUPLICATE_ORDER,
+                    human_message="Duplicate signal in cycle superseded by higher priority candidate",
+                    terminal_decision=True,
+                    blocked_by="STAGE_PENDING_ORDER",
+                    raw_conf=getattr(sig, "confidence", 0.0),
+                    final_conf=getattr(sig, "confidence", 0.0),
+                )
+            except Exception:
+                pass
             continue
         seen_symbols.add(sym)
 
@@ -1570,17 +2058,93 @@ def evaluate_and_execute(
         sig_rsi = _extract_signal_rsi(sig)
         if sig.side.upper() in ("BUY", "LONG") and sig_rsi >= rsi_max:
             logger.info("Skipped %s: RSI %.1f >= %.1f (Overbought BUY entry filter)", sig.symbol, sig_rsi, rsi_max)
+            try:
+                from strategies.gate_ledger import log_gate_decision
+                from strategies.veto_reasons import VetoReason
+                log_gate_decision(
+                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                    symbol=sig.symbol,
+                    bar=getattr(sig, "bar_timestamp", "") or "",
+                    strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                    stage="STAGE_RSI_FILTER",
+                    decision="REJECT",
+                    reason_code=VetoReason.RSI_OVERBOUGHT,
+                    human_message=f"RSI {sig_rsi:.1f} >= {rsi_max:.1f} (Overbought)",
+                    terminal_decision=True,
+                    blocked_by="STAGE_RSI_FILTER",
+                    raw_conf=getattr(sig, "confidence", 0.0),
+                    final_conf=getattr(sig, "confidence", 0.0),
+                )
+            except Exception:
+                pass
             continue
         if sig.side.upper() in ("SELL", "SHORT") and sig_rsi <= rsi_min:
             logger.info("Skipped %s: RSI %.1f <= %.1f (Oversold SHORT entry filter)", sig.symbol, sig_rsi, rsi_min)
+            try:
+                from strategies.gate_ledger import log_gate_decision
+                from strategies.veto_reasons import VetoReason
+                log_gate_decision(
+                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                    symbol=sig.symbol,
+                    bar=getattr(sig, "bar_timestamp", "") or "",
+                    strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                    stage="STAGE_RSI_FILTER",
+                    decision="REJECT",
+                    reason_code=VetoReason.RSI_OVERSOLD,
+                    human_message=f"RSI {sig_rsi:.1f} <= {rsi_min:.1f} (Oversold)",
+                    terminal_decision=True,
+                    blocked_by="STAGE_RSI_FILTER",
+                    raw_conf=getattr(sig, "confidence", 0.0),
+                    final_conf=getattr(sig, "confidence", 0.0),
+                )
+            except Exception:
+                pass
             continue
         if _is_inverse_etf_signal(sig) and sig.side.upper() in ("SELL", "SHORT"):
             logger.info("Skipped %s: Inverse ETFs cannot be sold short (Long-only hedge)", sig.symbol)
+            try:
+                from strategies.gate_ledger import log_gate_decision
+                from strategies.veto_reasons import VetoReason
+                log_gate_decision(
+                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                    symbol=sig.symbol,
+                    bar=getattr(sig, "bar_timestamp", "") or "",
+                    strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                    stage="STAGE_GEOMETRY",
+                    decision="REJECT",
+                    reason_code=VetoReason.INVALID_GEOMETRY,
+                    human_message="Inverse ETFs cannot be sold short",
+                    terminal_decision=True,
+                    blocked_by="STAGE_GEOMETRY",
+                    raw_conf=getattr(sig, "confidence", 0.0),
+                    final_conf=getattr(sig, "confidence", 0.0),
+                )
+            except Exception:
+                pass
             continue
 
         geom_ok, geom_msg = validate_executable_geometry(sig)
         if not geom_ok:
             logger.info("[PRE-EXECUTION GEOMETRY VETO] %s: %s", sig.symbol, geom_msg)
+            try:
+                from strategies.gate_ledger import log_gate_decision
+                from strategies.veto_reasons import VetoReason
+                log_gate_decision(
+                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                    symbol=sig.symbol,
+                    bar=getattr(sig, "bar_timestamp", "") or "",
+                    strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                    stage="STAGE_GEOMETRY",
+                    decision="REJECT",
+                    reason_code=VetoReason.INVALID_GEOMETRY,
+                    human_message=geom_msg,
+                    terminal_decision=True,
+                    blocked_by="STAGE_GEOMETRY",
+                    raw_conf=getattr(sig, "confidence", 0.0),
+                    final_conf=getattr(sig, "confidence", 0.0),
+                )
+            except Exception:
+                pass
             continue
 
         deduped_signals.append(sig)
@@ -1612,6 +2176,25 @@ def evaluate_and_execute(
                 _inverse_etf_entry_allowed(regime_res, sig),
                 _is_inverse_etf_signal(sig),
             )
+            try:
+                from strategies.gate_ledger import log_gate_decision
+                from strategies.veto_reasons import VetoReason
+                log_gate_decision(
+                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                    symbol=sig.symbol,
+                    bar=getattr(sig, "bar_timestamp", "") or "",
+                    strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                    stage="STAGE_REGIME",
+                    decision="REJECT",
+                    reason_code=VetoReason.REGIME_RISK_OFF,
+                    human_message="New entries disabled this cycle by Regime / Halt Manager",
+                    terminal_decision=True,
+                    blocked_by="STAGE_REGIME",
+                    raw_conf=getattr(sig, "confidence", 0.0),
+                    final_conf=getattr(sig, "confidence", 0.0),
+                )
+            except Exception:
+                pass
             continue
 
         effective_equity = equity
@@ -1668,12 +2251,68 @@ def evaluate_and_execute(
             )
             if result["status"] in {"PLACED", "DRY_RUN"}:
                 error_handler.reset()
-            elif result["reason"].startswith("Order failed:"):
-                error_handler.record(RuntimeError(result["reason"]))
+                try:
+                    from strategies.gate_ledger import log_gate_decision
+                    log_gate_decision(
+                        evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                        symbol=sig.symbol,
+                        bar=getattr(sig, "bar_timestamp", "") or "",
+                        strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                        stage="STAGE_ORDER_SUBMIT",
+                        decision="PASS",
+                        reason_code="ORDER_SUBMITTED",
+                        human_message=f"Order submitted status={result.get('status')}",
+                        terminal_decision=True,
+                        blocked_by=None,
+                        raw_conf=getattr(sig, "confidence", 0.0),
+                        metadata={
+                            "order_status": result.get("status"),
+                            "shares": result.get("shares"),
+                            "parent_order_id": result.get("parent_order_id"),
+                            "client_order_id": result.get("client_order_id"),
+                            "stop_order_id": result.get("stop_order_id"),
+                            "tp_order_id": result.get("tp_order_id"),
+                        },
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    from strategies.gate_ledger import log_gate_decision
+                    c_stage, c_reason = _classify_execution_rejection(result.get("reason", ""))
+                    log_gate_decision(
+                        evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                        symbol=sig.symbol,
+                        bar=getattr(sig, "bar_timestamp", "") or "",
+                        strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                        stage=c_stage,
+                        decision="REJECT",
+                        reason_code=c_reason,
+                        human_message=result.get("reason", "Order execution rejected"),
+                        terminal_decision=True,
+                        blocked_by=c_stage,
+                        raw_conf=getattr(sig, "confidence", 0.0),
+                        final_conf=getattr(sig, "confidence", 0.0),
+                        metadata={"shares": result.get("shares", 0), "order_result": result.get("reason")},
+                    )
+                except Exception:
+                    pass
+                if result["reason"].startswith("Order failed:"):
+                    error_handler.record(RuntimeError(result["reason"]))
         except Exception as e:
             logger.exception(f"Error executing signal: {e}")
             print(f"Error executing signal: {e}")
-            error_handler.record(e)
+            if error_handler:
+                error_handler.record(e)
+    try:
+        from strategies.order_manager import reap_expired_entry_orders
+        reap_expired_entry_orders(
+            bridge=bridge,
+            current_closed_bar_start=completed_5m_bar_ts if 'completed_5m_bar_ts' in locals() else None,
+            worker_id="orchestrator_post_eval_sweep",
+        )
+    except Exception as sweep_err:
+        logger.warning("[ORCHESTRATOR SWEEP] Post-eval sweep error: %s", sweep_err)
 
     try:
         from strategies.watchdog import touch_orchestrator_heartbeat

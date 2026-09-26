@@ -43,6 +43,100 @@ def get_soxx_pct_change() -> Optional[float]:
         return _last_soxx_pct
 
 
+def clear_soxx_cache() -> None:
+    """Clear the cached SOXX percentage change to prevent stale reuse."""
+    global _last_soxx_pct
+    with _last_soxx_lock:
+        _last_soxx_pct = None
+
+
+# ── Benchmark Score Hysteresis Deadbands ─────────────────────────────────────
+_SPY_ESCALATE_THRESHOLD = -0.75   # step to -2 when SPY < this
+_SPY_DEESC_FROM_2_TO_1  = -0.70   # recover above this to drop back to -1
+_SPY_DEESC_FROM_1_TO_0  = -0.35   # recover above this to drop back to  0
+
+_QQQ_ESCALATE_THRESHOLD = -1.00   # step to -2 when QQQ < this
+_QQQ_DEESC_FROM_2_TO_1  = -0.90   # recover above this to drop back to -1
+_QQQ_DEESC_FROM_1_TO_0  = -0.45   # recover above this to drop back to  0
+
+_factor_hysteresis_lock = threading.Lock()
+_last_spy_factor: Optional[int] = None
+_last_qqq_factor: Optional[int] = None
+
+
+def reset_factor_hysteresis() -> None:
+    """Reset hysteresis state. Call at session start and from tests."""
+    global _last_spy_factor, _last_qqq_factor
+    with _factor_hysteresis_lock:
+        _last_spy_factor = None
+        _last_qqq_factor = None
+
+
+def _apply_spy_hysteresis(spy_pct: Optional[float]) -> int:
+    """
+    Return hysteresis-smoothed SPY factor score.
+    Escalates immediately; de-escalates only after recovery clears deadband.
+    """
+    if spy_pct is None:
+        return 0
+
+    global _last_spy_factor
+    with _factor_hysteresis_lock:
+        prev = _last_spy_factor
+
+        if spy_pct < _SPY_ESCALATE_THRESHOLD:        # < -0.75 -> -2
+            new_factor = -2
+        elif spy_pct < -0.40:                        # < -0.40 -> at most -1
+            if prev is not None and prev <= -2:
+                new_factor = -2 if spy_pct < _SPY_DEESC_FROM_2_TO_1 else -1
+            else:
+                new_factor = -1
+        else:                                        # >= -0.40 -> 0 or -1
+            if prev is not None and prev <= -2:
+                new_factor = -2 if spy_pct < _SPY_DEESC_FROM_2_TO_1 else (
+                             -1 if spy_pct < _SPY_DEESC_FROM_1_TO_0 else 0)
+            elif prev is not None and prev == -1:
+                new_factor = -1 if spy_pct < _SPY_DEESC_FROM_1_TO_0 else 0
+            else:
+                new_factor = 0
+
+        _last_spy_factor = new_factor
+        return new_factor
+
+
+def _apply_qqq_hysteresis(qqq_pct: Optional[float]) -> int:
+    """
+    Return hysteresis-smoothed QQQ factor score.
+    Same escalate-fast / de-escalate-slow principle as SPY.
+    """
+    if qqq_pct is None:
+        return 0
+
+    global _last_qqq_factor
+    with _factor_hysteresis_lock:
+        prev = _last_qqq_factor
+
+        if qqq_pct < _QQQ_ESCALATE_THRESHOLD:        # < -1.00 -> -2
+            new_factor = -2
+        elif qqq_pct < -0.50:                        # < -0.50 -> at most -1
+            if prev is not None and prev <= -2:
+                new_factor = -2 if qqq_pct < _QQQ_DEESC_FROM_2_TO_1 else -1
+            else:
+                new_factor = -1
+        else:                                        # >= -0.50 -> 0 or -1
+            if prev is not None and prev <= -2:
+                new_factor = -2 if qqq_pct < _QQQ_DEESC_FROM_2_TO_1 else (
+                             -1 if qqq_pct < _QQQ_DEESC_FROM_1_TO_0 else 0)
+            elif prev is not None and prev == -1:
+                new_factor = -1 if qqq_pct < _QQQ_DEESC_FROM_1_TO_0 else 0
+            else:
+                new_factor = 0
+
+        _last_qqq_factor = new_factor
+        return new_factor
+
+
+
 def detect_market_texture(adx: float = 20.0, bb_width: float = 0.02, atr_ratio: float = 1.0, price_change_5m: float = 0.0) -> str:
     """
     Classifies market texture into TRENDING, SIDEWAYS, VOLATILE, or TRANSITIONING.
@@ -229,6 +323,16 @@ class MarketRegimeResult:
     diagnostic_status: str = DIAGNOSTIC_VALID
     diagnostic_message: Optional[str] = None
 
+    def _buffer_display(self) -> str:
+        """Human-readable opening buffer status for log/summary output."""
+        if not self.requires_opening_buffer:
+            return "False"
+        try:
+            from strategies.session import is_past_opening_buffer
+            return "ELAPSED(past_0945)" if is_past_opening_buffer(15) else "ACTIVE(wait_0945)"
+        except Exception:
+            return str(self.requires_opening_buffer)
+
     def summary(self) -> str:
         if self.reasons:
             reasons_str = " | ".join(self.reasons)
@@ -239,8 +343,10 @@ class MarketRegimeResult:
         return (
             f"[REGIME] mode={self.mode} texture={self.market_texture} diag={self.diagnostic_status} score={self.score:+d} "
             f"allow_longs={self.allow_new_longs} halt_entries={self.halt_new_entries} "
-            f"max_trades={self.max_trades_day} open_buffer_0945={self.requires_opening_buffer} "
-            f"sizing={self.position_scale*100:.0f}% boost=+{self.confidence_boost:.2f} reasons=[{reasons_str}]"
+            f"max_trades={0 if (self.halt_new_entries or not self.allow_new_longs) else self.max_trades_day} "
+            f"open_buffer_0945={self._buffer_display()} "
+            f"sizing={0 if (self.halt_new_entries or not self.allow_new_longs) else int(self.position_scale*100)}% "
+            f"boost=+{self.confidence_boost:.2f} reasons=[{reasons_str}]"
         )
 
 
@@ -332,29 +438,43 @@ def _get_premarket_pct_change(symbol: str, bridge=None) -> Tuple[Optional[float]
 
 def _check_data_health(bridge=None) -> Tuple[bool, str, Dict[str, Any]]:
     """
-    Pre-flight evaluation of freshness and presence for critical macro benchmark data (SPY/QQQ).
+    Pre-flight evaluation of freshness and presence for critical macro benchmark data (SPY/QQQ/SOXX).
     Fail-closed: Returns (is_healthy=False, reason, data) upon missing data, stale timestamps, or exception.
     Freshness math strictly uses epoch float (time.time()) to remain timezone safe.
     """
+    global _last_soxx_pct
+    clear_soxx_cache()
     health_data: Dict[str, Any] = {}
     try:
         health_cfg = getattr(config, "DATA_HEALTH_SETTINGS", {})
-        critical_symbols = health_cfg.get("critical_symbols", ["SPY", "QQQ"])
+        critical_symbols = health_cfg.get("critical_symbols", ["SPY", "QQQ", "SOXX"])
         stale_thresholds = health_cfg.get("stale_threshold_s", {})
         default_stale_thresh = float(stale_thresholds.get("_default", 180.0))
         now_epoch = time.time()
 
         for sym in critical_symbols:
             pct, source, ts = _get_premarket_pct_change(sym, bridge)
-            health_data[sym] = {"pct": pct, "source": source, "timestamp": ts}
+            thresh_s = float(stale_thresholds.get(sym, default_stale_thresh))
+
             if pct is None:
+                health_data[sym] = {"pct": None, "source": source, "timestamp": ts, "status": "MISSING"}
                 return False, f"{sym} benchmark data unavailable", health_data
 
-            thresh_s = float(stale_thresholds.get(sym, default_stale_thresh))
-            if ts is not None:
-                age_s = now_epoch - ts
-                if age_s > thresh_s:
-                    return False, f"{sym} benchmark data stale ({age_s:.1f}s > {thresh_s:.1f}s threshold)", health_data
+            if ts is None:
+                health_data[sym] = {"pct": pct, "source": source, "timestamp": None, "status": "STALE"}
+                return False, f"{sym} benchmark data un-timestamped", health_data
+
+            age_s = now_epoch - ts
+            if age_s > thresh_s:
+                health_data[sym] = {"pct": pct, "source": source, "timestamp": ts, "status": "STALE"}
+                return False, f"{sym} benchmark data stale ({age_s:.1f}s > {thresh_s:.1f}s threshold)", health_data
+
+            health_data[sym] = {"pct": pct, "source": source, "timestamp": ts, "status": "VALID"}
+
+        # SOXX cache populated ONLY from a valid current snapshot
+        if "SOXX" in health_data and health_data["SOXX"].get("status") == "VALID":
+            with _last_soxx_lock:
+                _last_soxx_pct = health_data["SOXX"]["pct"]
 
         return True, "Critical benchmarks healthy", health_data
     except Exception as exc:
@@ -373,7 +493,7 @@ def evaluate_market_regime(
     Factors & Scoring:
       - SPY premarket < -0.75%: -2 pts, < -0.40%: -1 pt
       - QQQ premarket < -1.00%: -2 pts, < -0.50%: -1 pt
-      - Chip ETF (SOXX) < -2.00%: -2 pts, < -1.00%: -1 pt, > +2.00%: +1 pt (Symmetric, 0 pts if unavailable)
+      - Chip ETF (SOXX) < -2.00%: -2 pts, < -1.00%: -1 pt, > +2.00%: +1 pt (Symmetric, fail-closed when missing)
       - Dynamic Scanner Candidates == 0: -2 pts
     """
     # 0. Pre-Flight Data Health Gate (Fail-Closed)
@@ -404,35 +524,30 @@ def evaluate_market_regime(
     factor_scores: Dict[str, int] = {}
     data: Dict[str, Any] = dict(health_data)
 
-    # 1. Benchmark Index Changes (SPY / QQQ) — guaranteed available and fresh by DataHealth gate
+    # 1. Benchmark Index Changes (SPY / QQQ) — with hysteresis deadbands to prevent flapping
     spy_pct = health_data["SPY"]["pct"]
     spy_source = health_data["SPY"]["source"]
-    if spy_pct < -0.75:
-        factor_scores["SPY"] = -2
-        reasons.append(f"SPY benchmark down {spy_pct:.2f}% (< -0.75%) [{spy_source}]")
-    elif spy_pct < -0.40:
-        factor_scores["SPY"] = -1
+    spy_factor = _apply_spy_hysteresis(spy_pct)
+    factor_scores["SPY"] = spy_factor
+    if spy_factor == -2:
+        reasons.append(f"SPY benchmark down {spy_pct:.2f}% (< -0.75% / hyst) [{spy_source}]")
+    elif spy_factor == -1:
         reasons.append(f"SPY benchmark weak {spy_pct:.2f}% [{spy_source}]")
-    else:
-        factor_scores["SPY"] = 0
 
     qqq_pct = health_data["QQQ"]["pct"]
     qqq_source = health_data["QQQ"]["source"]
-    if qqq_pct < -1.00:
-        factor_scores["QQQ"] = -2
-        reasons.append(f"QQQ tech index down {qqq_pct:.2f}% (< -1.00%) [{qqq_source}]")
-    elif qqq_pct < -0.50:
-        factor_scores["QQQ"] = -1
+    qqq_factor = _apply_qqq_hysteresis(qqq_pct)
+    factor_scores["QQQ"] = qqq_factor
+    if qqq_factor == -2:
+        reasons.append(f"QQQ tech index down {qqq_pct:.2f}% (< -1.00% / hyst) [{qqq_source}]")
+    elif qqq_factor == -1:
         reasons.append(f"QQQ tech index weak {qqq_pct:.2f}% [{qqq_source}]")
-    else:
-        factor_scores["QQQ"] = 0
 
-    # 2. Chip Sector Shock Check (SOXX) — Optional sector indicator (no penalty when missing, symmetric scoring)
-    soxx_pct, soxx_source, _ = _get_premarket_pct_change("SOXX", bridge)
-    global _last_soxx_pct
-    with _last_soxx_lock:
-        _last_soxx_pct = soxx_pct
-    data["SOXX"] = {"pct": soxx_pct, "source": soxx_source}
+    # 2. Chip Sector Shock Check (SOXX) — Consumes validated SOXX snapshot (no second unvalidated fetch)
+    soxx_info = health_data.get("SOXX", {})
+    soxx_pct = soxx_info.get("pct")
+    soxx_source = soxx_info.get("source", "health_snapshot")
+    data["SOXX"] = dict(soxx_info)
     if soxx_pct is not None:
         if soxx_pct < -2.00:
             factor_scores["SOXX"] = -2
@@ -446,7 +561,7 @@ def evaluate_market_regime(
         else:
             factor_scores["SOXX"] = 0
     else:
-        reasons.append("SOXX_data_unavailable (optional sector signal, zero penalty)")
+        factor_scores["SOXX"] = 0
 
     # 3. Dynamic Universe Quality Signal
     data["scanner_candidate_count"] = scanner_candidate_count

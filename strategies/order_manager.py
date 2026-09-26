@@ -12,7 +12,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from collections import defaultdict
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any, Union
 
 import config
 from strategies.base import TradeSignal
@@ -22,8 +22,48 @@ from strategies.trade_journal import log_trade, today_trade_count
 from strategies.order_idempotency import idempotency_manager
 from strategies.webhook import send_discord_alert
 from strategies.execution_geometry import calculate_minimum_stop_distance
+from strategies.entry_lifecycle import entry_lifecycle, EntryLifecycleState
+import order_audit
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_bar_ts(ts: Any) -> Optional[datetime]:
+    """Convert a supported bar timestamp (string, datetime, pd.Timestamp) to an aware UTC datetime."""
+    if ts is None:
+        return None
+
+    if hasattr(ts, "to_pydatetime"):
+        try:
+            ts = ts.to_pydatetime()
+        except Exception:
+            pass
+
+    if isinstance(ts, str):
+        value = ts.strip()
+        if not value:
+            return None
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        try:
+            ts = datetime.fromisoformat(value)
+        except Exception:
+            try:
+                import pandas as pd
+                pdt = pd.Timestamp(value)
+                ts = pdt.to_pydatetime()
+            except Exception:
+                logger.warning("Could not parse bar timestamp string into datetime: %r", value)
+                return None
+
+    if not isinstance(ts, datetime):
+        return None
+
+    if ts.tzinfo is None:
+        # Upstream naive timestamps are assumed UTC
+        ts = ts.replace(tzinfo=timezone.utc)
+
+    return ts.astimezone(timezone.utc)
 
 
 class BrokerIdempotencyUnsupported(RuntimeError):
@@ -80,16 +120,42 @@ def check_session_suppression(symbol: str) -> Tuple[bool, str]:
         return False, ""
 
 
-def record_hard_veto_skip(symbol: str, reason: str, bar_timestamp: str = ""):
+def record_hard_veto_skip(symbol: str, reason: Union[str, Any], bar_timestamp: str = ""):
     """Increments skip counter when noise floor / tight stop hard vetoes occur, deduplicated per bar fingerprint."""
+    from strategies.veto_reasons import VetoReason, HARD_VETO_CODES
+
     sym = symbol.upper().strip()
-    HARD_VETO_REASONS = ["critically tight", "noise floor", "atr", "veto line"]
-    if not any(r.lower() in reason.lower() for r in HARD_VETO_REASONS):
+    is_hard_veto = False
+
+    if isinstance(reason, VetoReason):
+        is_hard_veto = reason in HARD_VETO_CODES
+        reason_str = reason.value
+    elif isinstance(reason, str):
+        try:
+            enum_val = VetoReason(reason)
+            is_hard_veto = enum_val in HARD_VETO_CODES
+        except ValueError:
+            # Exact phrase check (Strictly excludes 'atr' substring contamination)
+            EXACT_HARD_VETO_PHRASES = [
+                "critically tight",
+                "noise floor",
+                "rejected_noise_floor_breach",
+                "critical_stop",
+                "invalid_structural_stop",
+                "veto line",
+            ]
+            reason_lower = reason.lower()
+            is_hard_veto = any(phrase in reason_lower for phrase in EXACT_HARD_VETO_PHRASES)
+        reason_str = reason
+    else:
+        return
+
+    if not is_hard_veto:
         return
 
     with _session_state_lock:
         # Deduplicate repeat logs for identical geometry within 3600 seconds (session-level) across identical veto reasons
-        fingerprint = f"{sym}:{bar_timestamp}:{reason.strip()[:80]}"
+        fingerprint = f"{sym}:{bar_timestamp}:{reason_str.strip()[:80]}"
         now = time.time()
         last_seen = _seen_veto_fingerprints.get(fingerprint, 0)
 
@@ -977,6 +1043,213 @@ def on_broker_fill_event(
         )
 
 
+MAX_ENTRY_ORDER_TTL_SECONDS: float = float(getattr(config, "MAX_ENTRY_ORDER_TTL_SECONDS", 60.0))
+
+
+def reap_expired_entry_orders(
+    bridge: object,
+    trailing_manager: Optional[object] = None,
+    current_closed_bar_start: Optional[datetime] = None,
+    worker_id: Optional[str] = None,
+    lifecycle: Optional[object] = None,
+) -> List[dict]:
+    """
+    Scans pending entries for TTL expiry or closed-bar supersession (Amendment 1 & 2).
+    Coordinates via CAS lock so concurrent background reaper and synchronous sweep
+    never double-cancel or race (Amendment 1).
+    Enforces exact protective stop verification before releasing idempotency (Amendment 3 & 4).
+    """
+    target_lifecycle = lifecycle if lifecycle is not None else entry_lifecycle
+    wid = worker_id or f"worker_{threading.get_ident()}"
+    expired = target_lifecycle.get_expired_entries(
+        now=time.time(),
+        current_closed_bar_start=current_closed_bar_start,
+    )
+    if not expired:
+        return []
+
+    reaped_results = []
+
+    for entry in expired:
+        order_id = entry.parent_order_id
+        sym = entry.symbol
+        side = entry.signal.side
+
+        # 1. CAS transition from WORKING -> TTL_EXPIRED (Amendment 1)
+        cas_ok = target_lifecycle.compare_and_swap_state(
+            order_id=order_id,
+            expected=EntryLifecycleState.WORKING,
+            new_state=EntryLifecycleState.TTL_EXPIRED,
+            worker_id=wid,
+        )
+        if not cas_ok:
+            continue
+
+        logger.info(
+            "[REAPER] Claimed expired entry order_id=%s symbol=%s worker=%s (expired_at=%.1f, age=%.1fs)",
+            order_id, sym, wid, entry.expires_at, time.time() - entry.submitted_at
+        )
+
+        # 2. Transition to CANCEL_REQUESTED and dispatch broker cancel
+        target_lifecycle.update_state(order_id, EntryLifecycleState.CANCEL_REQUESTED)
+        cancel_res = None
+        try:
+            if hasattr(bridge, "cancel_order"):
+                cancel_res = bridge.cancel_order(order_id)
+        except Exception as c_exc:
+            logger.warning("[REAPER] Error requesting cancel for %s parent=%s: %s", sym, order_id, c_exc)
+
+        # 3. Transition to RECONCILING
+        target_lifecycle.update_state(order_id, EntryLifecycleState.RECONCILING)
+
+        # 4. Query broker order truth
+        order_truth = None
+        if hasattr(bridge, "get_order_truth"):
+            try:
+                order_truth = bridge.get_order_truth(order_id)
+            except Exception as t_exc:
+                logger.warning("[REAPER] Error fetching order truth for %s: %s", order_id, t_exc)
+
+        filled_qty = 0.0
+        avg_price = 0.0
+        is_terminal = False
+
+        if order_truth is not None:
+            filled_qty = float(order_truth.filled_qty or 0.0)
+            avg_price = float(order_truth.filled_avg_price or 0.0)
+            is_terminal = order_truth.is_terminal
+        else:
+            # Fallback for mock bridges or legacy adapters
+            if hasattr(bridge, "get_order"):
+                try:
+                    raw_o = bridge.get_order(order_id)
+                    if isinstance(raw_o, dict):
+                        filled_qty = float(raw_o.get("filled_qty", 0.0) or 0.0)
+                        avg_price = float(raw_o.get("filled_avg_price", 0.0) or 0.0)
+                        status_str = str(raw_o.get("status", "")).lower().strip()
+                        is_terminal = status_str in ("filled", "canceled", "cancelled", "expired", "rejected")
+                    elif raw_o is not None:
+                        filled_qty = float(getattr(raw_o, "filled_qty", 0.0) or 0.0)
+                        avg_price = float(getattr(raw_o, "filled_avg_price", 0.0) or 0.0)
+                        status_str = str(getattr(raw_o, "status", "")).lower().strip()
+                        is_terminal = status_str in ("filled", "canceled", "cancelled", "expired", "rejected")
+                except Exception as get_err:
+                    logger.warning("[REAPER] Fallback get_order failed for %s: %s", order_id, get_err)
+            else:
+                filled_qty = float(entry.cumulative_filled_qty or 0.0)
+                avg_price = float(entry.average_fill_price or 0.0)
+                is_terminal = (cancel_res is not None and bool(getattr(cancel_res, "is_already_terminal", False)))
+
+        # Update entry with canonical fill stats
+        if filled_qty > 0:
+            entry.cumulative_filled_qty = filled_qty
+        if avg_price > 0:
+            entry.average_fill_price = avg_price
+
+        # 5. Evaluate fill state
+        if filled_qty <= 0:
+            # Clean cancel: no fill at broker
+            idempotency_manager.release(sym, side=side, reason="ttl_expired_unfilled")
+            target_lifecycle.finalize_entry(order_id, reason="TTL_EXPIRED_UNFILLED")
+            with _pending_order_contexts_lock:
+                _pending_order_contexts.pop(order_id, None)
+            logger.info(
+                "[REAPER SUCCESS] Parent %s for %s cleanly reaped (0 filled). Reservation released.",
+                order_id, sym
+            )
+            reaped_results.append({
+                "order_id": order_id,
+                "symbol": sym,
+                "filled_qty": 0.0,
+                "status": "CANCELED_UNFILLED",
+            })
+        else:
+            # Partial or full fill during cancellation (Amendment 3 & 4)
+            logger.warning(
+                "[REAPER PARTIAL FILL DETECTED] Parent %s for %s filled %.4f shares @ $%.4f. Protecting position...",
+                order_id, sym, filled_qty, avg_price
+            )
+            target_lifecycle.update_state(order_id, EntryLifecycleState.PARTIAL_FILL_PROTECTING)
+
+            prot_ok, prot_msg = target_lifecycle.reconcile_and_protect_partial_entry(
+                bridge=bridge,
+                entry=entry,
+                intended_filled_qty=filled_qty,
+            )
+
+            if prot_ok:
+                # Exact protection verified: safely release reservation (Amendment 3)
+                idempotency_manager.release(sym, side=side, reason="partial_fill_protected")
+                target_lifecycle.finalize_entry(order_id, reason=f"PARTIAL_FILL_PROTECTED:{prot_msg}")
+                with _pending_order_contexts_lock:
+                    _pending_order_contexts.pop(order_id, None)
+                logger.info(
+                    "[REAPER SUCCESS] Parent %s for %s protected with stop %s. Reservation released.",
+                    order_id, sym, prot_msg
+                )
+                reaped_results.append({
+                    "order_id": order_id,
+                    "symbol": sym,
+                    "filled_qty": filled_qty,
+                    "status": "PARTIAL_FILL_PROTECTED",
+                    "stop_id": prot_msg,
+                })
+            else:
+                # Protection failed: FAIL CLOSED (Amendment 3/4)
+                # Keep symbol reservation locked, log critical alert
+                logger.critical(
+                    "[REAPER PROTECTION FAILURE] Parent %s for %s failed protection: %s. "
+                    "FAIL-CLOSED: Reservation retained to block further entries.",
+                    order_id, sym, prot_msg
+                )
+                target_lifecycle._fail_protection(bridge, entry, f"Reaper protection failure: {prot_msg}")
+                reaped_results.append({
+                    "order_id": order_id,
+                    "symbol": sym,
+                    "filled_qty": filled_qty,
+                    "status": "PROTECTION_FAILED",
+                    "error": prot_msg,
+                })
+
+    return reaped_results
+
+
+class EntryOrderReaper(threading.Thread):
+    """
+    Dedicated background worker thread checking for expired pending entry orders
+    every 1-2 seconds (Amendment 1). Coordinates safely with synchronous sweeps
+    using CAS locks.
+    """
+    def __init__(
+        self,
+        bridge: object,
+        trailing_manager: Optional[object] = None,
+        interval_seconds: float = 1.0,
+    ):
+        super().__init__(name="EntryOrderReaper", daemon=True)
+        self.bridge = bridge
+        self.trailing_manager = trailing_manager
+        self.interval_seconds = max(0.5, float(interval_seconds))
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:
+        logger.info("[ENTRY REAPER THREAD] Started (interval=%.1fs)", self.interval_seconds)
+        while not self._stop_event.is_set():
+            try:
+                reap_expired_entry_orders(
+                    bridge=self.bridge,
+                    trailing_manager=self.trailing_manager,
+                    worker_id=f"bg_reaper_{self.ident}",
+                )
+            except Exception as exc:
+                logger.exception("[ENTRY REAPER THREAD] Unexpected error in reaper loop: %s", exc)
+            self._stop_event.wait(self.interval_seconds)
+        logger.info("[ENTRY REAPER THREAD] Stopped")
+
+
 
 def _assert_paper_broker(bridge: object) -> str:
     """Verifies that broker runtime identity is strictly a paper-trading account."""
@@ -1105,7 +1378,6 @@ def execute_signal(
                 logger.info("[ENTRY READINESS GATE] %s rejected: %s", signal.symbol, result["reason"])
                 return result
 
-            import time
             exp_time = getattr(entry_readiness, "expires_at", 0.0)
             if time.time() > exp_time:
                 result["status"] = "REJECTED"
@@ -1114,10 +1386,35 @@ def execute_signal(
                 return result
 
             readiness_bar_ts = getattr(entry_readiness, "bar_ts", None)
-            if signal.bar_timestamp and readiness_bar_ts and signal.bar_timestamp != readiness_bar_ts:
+            signal_bar_dt = _normalize_bar_ts(signal.bar_timestamp)
+            ready_bar_dt = _normalize_bar_ts(readiness_bar_ts)
+
+            if signal_bar_dt is None or ready_bar_dt is None:
                 result["status"] = "REJECTED"
-                result["reason"] = f"ENTRY_READINESS_BAR_MISMATCH: signal bar {signal.bar_timestamp} != readiness bar {readiness_bar_ts}"
-                logger.warning("[ENTRY READINESS BAR MISMATCH] %s rejected: %s", signal.symbol, result["reason"])
+                result["reason"] = (
+                    f"ENTRY_READINESS_BAR_INVALID: signal bar {signal.bar_timestamp!r} "
+                    f"or readiness bar {readiness_bar_ts!r} invalid/missing"
+                )
+                logger.warning(
+                    "[ENTRY READINESS BAR INVALID] %s rejected: signal_bar=%r readiness_bar=%r",
+                    signal.symbol,
+                    signal.bar_timestamp,
+                    readiness_bar_ts,
+                )
+                return result
+
+            if signal_bar_dt != ready_bar_dt:
+                result["status"] = "REJECTED"
+                result["reason"] = (
+                    f"ENTRY_READINESS_BAR_MISMATCH: signal bar {signal_bar_dt.isoformat()} "
+                    f"!= readiness bar {ready_bar_dt.isoformat()}"
+                )
+                logger.warning(
+                    "[ENTRY READINESS BAR MISMATCH] %s rejected: signal_bar=%s readiness_bar=%s",
+                    signal.symbol,
+                    signal_bar_dt.isoformat(),
+                    ready_bar_dt.isoformat(),
+                )
                 return result
 
     if not dry_run:
@@ -1439,6 +1736,56 @@ def execute_signal(
         return result
 
     effective_max_trades = getattr(config, "MAX_DAILY_TRADES", 15)
+
+    # Sprint P1.7 / Fail-Closed Closure: Macro Regime & SOXX Semiconductor Gate on VWAP_BOUNCE Longs
+    if getattr(config, "VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED", True):
+        sig_strat = getattr(signal, "strategy", "")
+        strat_name = sig_strat.value if hasattr(sig_strat, "value") else str(sig_strat)
+        if strat_name.upper() == "VWAP_BOUNCE":
+            if regime_result is None:
+                reason = "Regime/SOXX Gate VETO: Missing regime context for VWAP_BOUNCE (fail-closed)"
+                logger.warning(
+                    "[REGIME/SOXX VETO] symbol=%s strategy=%s: missing regime context -> blocked (fail-closed)",
+                    signal.symbol, strat_name,
+                )
+                result["reason"] = reason
+                return result
+
+            regime_mode = getattr(regime_result, "mode", "UNKNOWN")
+            blocked_regimes = getattr(config, "VWAP_BOUNCE_BLOCKED_REGIMES", ("CAUTION", "RISK_OFF", "DATA_DEGRADED"))
+            if regime_mode in blocked_regimes:
+                soxx_data = getattr(regime_result, "data", {}).get("SOXX", {}) if hasattr(regime_result, "data") else {}
+                if not isinstance(soxx_data, dict):
+                    soxx_data = {}
+                soxx_pct = soxx_data.get("pct")
+                soxx_status = soxx_data.get("status")
+                if soxx_status is None:
+                    soxx_status = "VALID" if soxx_pct is not None else "MISSING"
+
+                threshold = getattr(config, "VWAP_BOUNCE_SOXX_VETO_THRESHOLD", -1.50)
+                if soxx_pct is None or soxx_status != "VALID":
+                    reason = (
+                        f"Regime/SOXX Gate VETO: VWAP_BOUNCE Long blocked for {signal.symbol} during {regime_mode} "
+                        f"— SOXX benchmark data unavailable or invalid ({soxx_status})"
+                    )
+                    logger.warning(
+                        "[REGIME/SOXX VETO] symbol=%s strategy=%s regime=%s soxx_status=%s -> blocked (fail-closed)",
+                        signal.symbol, strat_name, regime_mode, soxx_status,
+                    )
+                    result["reason"] = reason
+                    return result
+                elif soxx_pct <= threshold:
+                    reason = (
+                        f"Regime/SOXX Gate VETO: VWAP_BOUNCE Long blocked for {signal.symbol} during {regime_mode} "
+                        f"with SOXX {soxx_pct:.2f}% (<= {threshold:.2f}%)"
+                    )
+                    logger.warning(
+                        "[REGIME/SOXX VETO] symbol=%s strategy=%s regime=%s soxx=%.2f threshold=%.2f",
+                        signal.symbol, strat_name, regime_mode, soxx_pct, threshold,
+                    )
+                    result["reason"] = reason
+                    return result
+
     if regime_result:
         is_short_entry = (getattr(signal, "side", "BUY").upper() == "SELL")
         if is_short_entry:
@@ -1466,40 +1813,6 @@ def execute_signal(
                     result["reason"] = f"Regime score {getattr(regime_result, 'score', 0)} <= -3 → No new long entries allowed"
                     logger.info("Blocked %s: %s", signal.symbol, result["reason"])
                     return result
-
-                # Sprint P1.7: Macro Regime & SOXX Semiconductor Gate on VWAP_BOUNCE Longs
-                if getattr(config, "VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED", True):
-                    sig_strat = getattr(signal, "strategy", "")
-                    strat_name = sig_strat.value if hasattr(sig_strat, "value") else str(sig_strat)
-                    if strat_name.upper() == "VWAP_BOUNCE":
-                        regime_mode = getattr(regime_result, "mode", "UNKNOWN")
-                        blocked_regimes = getattr(config, "VWAP_BOUNCE_BLOCKED_REGIMES", ("CAUTION", "RISK_OFF", "DATA_DEGRADED"))
-                        if regime_mode in blocked_regimes:
-                            soxx_pct = None
-                            soxx_data = getattr(regime_result, "data", {}).get("SOXX", {}) if hasattr(regime_result, "data") else {}
-                            if isinstance(soxx_data, dict) and "pct" in soxx_data:
-                                soxx_pct = soxx_data.get("pct")
-                            if soxx_pct is None:
-                                from strategies.regime_engine import get_soxx_pct_change
-                                soxx_pct = get_soxx_pct_change()
-
-                            threshold = getattr(config, "VWAP_BOUNCE_SOXX_VETO_THRESHOLD", -1.50)
-                            if soxx_pct is None:
-                                logger.warning(
-                                    "[REGIME/SOXX GATE] SOXX data unavailable. Allowing %s VWAP_BOUNCE entry (fail-open).",
-                                    signal.symbol,
-                                )
-                            elif soxx_pct <= threshold:
-                                reason = (
-                                    f"Regime/SOXX Gate VETO: VWAP_BOUNCE Long blocked for {signal.symbol} during {regime_mode} "
-                                    f"with SOXX {soxx_pct:.2f}% (<= {threshold:.2f}%)"
-                                )
-                                logger.warning(
-                                    "[REGIME/SOXX VETO] symbol=%s strategy=%s regime=%s soxx=%.2f threshold=%.2f",
-                                    signal.symbol, strat_name, regime_mode, soxx_pct, threshold,
-                                )
-                                result["reason"] = reason
-                                return result
 
         if hasattr(regime_result, "max_trades_day") and regime_result.max_trades_day is not None:
             is_inverse = signal.symbol.upper().strip() in getattr(config, "INVERSE_ETF_SYMBOLS", set())
@@ -1616,10 +1929,15 @@ def execute_signal(
             quote_res = validate_execution_quote(
                 bridge=bridge,
                 symbol=signal.symbol,
+                side=signal.side,
                 decision_price=executable_signal.entry_price,
                 max_spread_pct=getattr(config, "MAX_ACCEPTABLE_SPREAD_PCT", 1.0),
                 max_deviation_pct=getattr(config, "MAX_DECISION_DEVIATION_PCT", 1.5),
                 max_age_seconds=getattr(config, "MAX_QUOTE_AGE_SECONDS", 10.0),
+                decision_feed=getattr(executable_signal, "decision_feed", None) or getattr(signal, "decision_feed", None),
+                bar_timestamp=getattr(executable_signal, "bar_timestamp", None) or getattr(signal, "bar_timestamp", None),
+                max_bar_age_seconds=getattr(config, "MAX_BAR_STALENESS_SECONDS", 300.0),
+                require_feed_concordance=getattr(config, "REQUIRE_FEED_CONCORDANCE", False),
             )
         except Exception as quote_exc:
             idempotency_manager.release(
@@ -1791,6 +2109,25 @@ def execute_signal(
 
     # Phase B: Broker Submission (Deterministic single call)
     try:
+        try:
+            q_age_val = locals().get("quote_age_ms")
+            order_audit.lifecycle_tracker.record_submission(
+                client_order_id=client_order_id,
+                symbol=signal.symbol,
+                side=signal.side,
+                limit_price=limit_price,
+                requested_qty=shares,
+                bid=locals().get("q_bid"),
+                ask=locals().get("q_ask"),
+                quote_age_ms=q_age_val,
+                decision_price=signal.entry_price,
+                signal_id=getattr(signal, "signal_id", None),
+                signal_family_id=getattr(signal, "signal_family_id", None) or signal_metadata.get("signal_family_id"),
+                feed_source=getattr(config, "ALPACA_FEED", "IEX"),
+            )
+        except Exception as audit_snap_exc:
+            logger.debug("[ORDER AUDIT] Failed to record submission snapshot: %s", audit_snap_exc)
+
         order = _place_bracket_order_once(
             bridge,
             symbol=signal.symbol,
@@ -1976,6 +2313,15 @@ def execute_signal(
     )
     parent_order_id = str(parent_id) if parent_id else ""
 
+    if parent_order_id:
+        try:
+            order_audit.lifecycle_tracker.record_ack(
+                broker_order_id=parent_order_id,
+                client_order_id=client_order_id,
+            )
+        except Exception as audit_ack_exc:
+            logger.debug("[ORDER AUDIT] Failed to record ack: %s", audit_ack_exc)
+
     if not parent_order_id:
         result["status"] = "AMBIGUOUS_SUBMIT"
         result["reason"] = (
@@ -2069,6 +2415,23 @@ def execute_signal(
             submitted_target_price=target_price,
         )
 
+        entry_ttl = float(getattr(config, "MAX_ENTRY_ORDER_TTL_SECONDS", MAX_ENTRY_ORDER_TTL_SECONDS))
+        q_age_ms = locals().get("quote_age_ms")
+        q_ts_calc = time.time() - (float(q_age_ms) / 1000.0) if isinstance(q_age_ms, (int, float)) and q_age_ms > 0 else time.time()
+        sig_gen_ts = getattr(signal, "timestamp", None) or signal_metadata.get("timestamp") or time.time()
+        if isinstance(sig_gen_ts, datetime):
+            sig_gen_ts = sig_gen_ts.timestamp()
+        elif isinstance(sig_gen_ts, str):
+            try:
+                sig_gen_ts = float(sig_gen_ts)
+            except ValueError:
+                try:
+                    sig_gen_ts = datetime.fromisoformat(sig_gen_ts.replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    sig_gen_ts = time.time()
+        elif not isinstance(sig_gen_ts, (int, float)):
+            sig_gen_ts = time.time()
+
         entry_lifecycle.register_submission(
             parent_order_id=parent_order_id,
             signal=submitted_signal,
@@ -2078,6 +2441,10 @@ def execute_signal(
             submitted_entry_price=limit_price,
             submitted_stop_price=stop_price,
             submitted_target_price=target_price,
+            expires_at=time.time() + entry_ttl,
+            decision_bar_timestamp=bar_ts,
+            submission_quote_timestamp=q_ts_calc,
+            signal_generation_timestamp=float(sig_gen_ts),
         )
 
         with _pending_order_contexts_lock:
@@ -2106,6 +2473,10 @@ def execute_signal(
     result["reason"] = "Order placed and lifecycle registered"
     result["order"] = order
     result["shares"] = shares
+    result["parent_order_id"] = str(parent_order_id)
+    result["client_order_id"] = str(client_order_id)
+    result["stop_order_id"] = str(stop_id) if stop_id else None
+    result["tp_order_id"] = str(tp_id) if tp_id else None
 
     # Auto confirm fill in backtest / paper simulation mode if enabled
     auto_fill = getattr(config, "PAPER_MODE_AUTO_CONFIRM_FILL", False)

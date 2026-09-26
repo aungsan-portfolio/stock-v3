@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 import live_invariants
 
@@ -117,6 +118,8 @@ class OrderResult:
     avg_fill_price: float = 0.0
     protective_ok: bool = True
     aborted: bool = False
+    stop_order_id: Optional[str] = None
+    tp_order_id: Optional[str] = None
 
     @property
     def is_filled(self) -> bool:

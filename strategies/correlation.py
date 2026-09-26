@@ -48,7 +48,7 @@ class CorrelationAnalyzer:
             bars_per_day = 78 if self.timeframe == "5m" else 390
             lookback_days = max(2, (self.lookback // bars_per_day) + 3)
             
-            df = fetch_intraday(symbol, interval=self.timeframe, lookback_days=lookback_days, bridge=bridge)
+            df = fetch_intraday(symbol, interval=self.timeframe, lookback_days=lookback_days, bridge=bridge, purpose="POSITION_MONITORING")
             if df.empty or len(df) < 10:
                 return None
             # Return last N returns

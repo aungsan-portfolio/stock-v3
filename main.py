@@ -285,8 +285,12 @@ def _place_paper_orders(signals, broker: str = "ibkr", bridge=None, dry_run: boo
                 print(f"  Connected to Alpaca Paper Account | Equity fetch info: {e}\n")
 
             # Run startup reconciliation & risk gate checks
-            recon = _run_paper_startup_checks(bridge)
-            _print_startup_reconciliation(recon)
+            if own_bridge:
+                recon = _run_paper_startup_checks(bridge)
+                _print_startup_reconciliation(recon)
+            else:
+                recon = bridge.reconcile_startup_state(manage_stream_state=False, allow_policy_side_effects=False)
+                _print_startup_reconciliation(recon)
 
             if getattr(bridge.entry_gate, "halted", False):
                 print("⚠️ Trading halted by startup reconciliation / risk gate. Skipping signal execution.")
@@ -305,7 +309,10 @@ def _place_paper_orders(signals, broker: str = "ibkr", bridge=None, dry_run: boo
                     json.dump(bridge.mutation_counters.to_dict(), mcf, indent=2)
 
             # Run post-scan cycle reconciliation before closing connection
-            post_recon = bridge.reconcile_startup_state()
+            post_recon = bridge.reconcile_startup_state(
+                manage_stream_state=False if not own_bridge else True,
+                allow_policy_side_effects=False if not own_bridge else True,
+            )
             post_snap = post_recon.get("snapshot", {})
             if not post_snap.get("clean", True):
                 print(f"⚠️ Post-scan reconciliation warning: {post_snap.get('orphan_exits', [])} orphan exits, {post_recon.get('protect', {}).get('unprotected', [])} unprotected longs")
@@ -434,7 +441,7 @@ def _run_swing_scheduler_loop(args, interval: int, broker: str) -> int:
         connected = False
         max_loop_connect_attempts = 3 if loop_mode else 1
         for conn_attempt in range(1, max_loop_connect_attempts + 1):
-            if bridge.connect():
+            if bridge.connect(start_stream=False):
                 connected = True
                 break
             if conn_attempt < max_loop_connect_attempts:
@@ -480,34 +487,62 @@ def _run_swing_scheduler_loop(args, interval: int, broker: str) -> int:
             print(f"\n--- [SWING SCAN CYCLE #{cycle}] {now_str} ---")
 
             sleep_duration = float(interval)
-            if not is_market_open():
-                print("  [MARKET CLOSED] US Stock Market is currently closed.")
-                if bridge is not None and hasattr(bridge, "get_market_clock"):
-                    try:
-                        clock = bridge.get_market_clock()
-                        if clock and not getattr(clock, "is_open", False):
-                            now_ts = getattr(clock, "timestamp", None)
-                            next_open_ts = getattr(clock, "next_open", None)
-                            if now_ts and next_open_ts:
-                                sec_to_open = max(0.0, (next_open_ts - now_ts).total_seconds())
-                                if 0.0 < sec_to_open < float(interval):
-                                    sleep_duration = max(1.0, min(float(interval), sec_to_open + 5.0))
-                                    print(f"  [MARKET SCHEDULER] Market opens in {sec_to_open:.0f}s. Aligning next scan in {sleep_duration:.0f}s...")
-                    except Exception as clk_err:
-                        pass
+            clock = None
+            clock_query_ok = False
+            if bridge is not None and hasattr(bridge, "get_market_clock"):
+                try:
+                    clock = bridge.get_market_clock()
+                    clock_query_ok = (clock is not None)
+                except Exception as clk_err:
+                    logger.warning("[SWING SCHEDULER] Market clock query failed (fail-closed): %s", clk_err)
+                    clock_query_ok = False
+
+            if not clock_query_ok:
+                print("  ⚠️ [MARKET CLOCK OUTAGE] Broker clock query failed. Failing closed to off-market standby.")
+                if bridge is not None and hasattr(bridge, "pause_trade_stream_for_market_close"):
+                    bridge.pause_trade_stream_for_market_close()
+                sleep_duration = min(float(interval), 60.0)
+            elif not getattr(clock, "is_open", False):
+                print("  [MARKET CLOSED] US Stock Market is currently closed (Broker Clock Truth).")
+                if bridge is not None and hasattr(bridge, "pause_trade_stream_for_market_close"):
+                    bridge.pause_trade_stream_for_market_close()
+
+                now_ts = getattr(clock, "timestamp", None)
+                next_open_ts = getattr(clock, "next_open", None)
+                if now_ts and next_open_ts:
+                    sec_to_open = max(0.0, (next_open_ts - now_ts).total_seconds())
+                    if 0.0 < sec_to_open < float(interval):
+                        sleep_duration = max(1.0, min(float(interval), sec_to_open + 5.0))
+                        print(f"  [MARKET SCHEDULER] Market opens in {sec_to_open:.0f}s. Aligning next scan in {sleep_duration:.0f}s...")
                 if sleep_duration == float(interval):
                     print(f"  Sleeping for {interval//60} minutes ({interval}s) until next checkpoint...")
             else:
-                print("  [MARKET OPEN] Running Swing ML Predictions & Rebalancing...")
-                try:
-                    signals = Predictor().predict_all()
-                    _print_paper_signals_table(signals)
-                    if not args.dry_run:
-                        _place_paper_orders(signals, broker=broker, bridge=bridge)
-                    else:
-                        print("\n⚠️   Dry-run mode — no orders placed.")
-                except Exception as cycle_err:
-                    print(f"  ERROR during swing scan cycle #{cycle}: {cycle_err}")
+                print("  [MARKET OPEN] Broker Clock verifies Regular Trading Session is OPEN.")
+                stream_resumed = True
+                if bridge is not None and hasattr(bridge, "resume_trade_stream_for_market_open"):
+                    stream_resumed = bridge.resume_trade_stream_for_market_open()
+                    if not stream_resumed:
+                        print("  ⚠️ [STREAM DESYNC] Trade stream resume or broker reconciliation failed. Skipping order evaluation this cycle.")
+
+                # If nearing market close, align sleep duration
+                now_ts = getattr(clock, "timestamp", None)
+                next_close_ts = getattr(clock, "next_close", None)
+                if now_ts and next_close_ts:
+                    sec_to_close = max(0.0, (next_close_ts - now_ts).total_seconds())
+                    if 0.0 < sec_to_close < float(interval):
+                        sleep_duration = max(1.0, min(float(interval), sec_to_close + 5.0))
+
+                if stream_resumed:
+                    print("  Running Swing ML Predictions & Rebalancing...")
+                    try:
+                        signals = Predictor().predict_all()
+                        _print_paper_signals_table(signals)
+                        if not args.dry_run:
+                            _place_paper_orders(signals, broker=broker, bridge=bridge)
+                        else:
+                            print("\n⚠️   Dry-run mode — no orders placed.")
+                    except Exception as cycle_err:
+                        print(f"  ERROR during swing scan cycle #{cycle}: {cycle_err}")
 
             print(f"\n  Next Swing Scan in {int(sleep_duration)//60}m {int(sleep_duration)%60}s ({int(sleep_duration)}s). Press Ctrl+C to exit.\n")
             if shutdown_event.wait(timeout=sleep_duration):
@@ -2874,16 +2909,22 @@ def cmd_daytrade_bot(args) -> int:
         bridge.disconnect()
         sys.exit(6)
 
+    from strategies.intraday_data import get_feed_provenance
+    fp = get_feed_provenance()
+
     print(f"{'='*60}")
     print("  [ACCOUNT CHECK: PAPER APPROVED]")
     print(f"  Execution Mode : PAPER (Execution-Enabled Live Paper Session)")
     print(f"  Account ID     : {actual_acct}")
     print(f"  Target Account : {expected_acct}")
+    print(f"  Market Data    : {fp['actual_feed'].upper()} ({fp['feed_capability']}) | Tier: {fp['subscription_tier']}")
     print(f"{'='*60}\n")
 
     try:
         from preflight import PreflightDecision, run_preflight_audit, print_preflight_scorecard
-        pf_report = run_preflight_audit(bridge=bridge, save_report=True)
+        from strategies.session import is_market_open
+        audit_stage = "INTRADAY" if is_market_open() else "PREFLIGHT_8PM"
+        pf_report = run_preflight_audit(bridge=bridge, stage=audit_stage, save_report=True)
         print_preflight_scorecard(pf_report)
         if pf_report.decision == PreflightDecision.NO_GO:
             print(f"🚨 PRE-FLIGHT VERIFICATION FAILED ({pf_report.status}) — Halting new entries: {pf_report.hold_reason}")
@@ -2893,13 +2934,80 @@ def cmd_daytrade_bot(args) -> int:
         else:
             print("🟢 PRE-FLIGHT AUDIT: GO — Trading operations and entries fully approved.")
 
+        # ── Strict Startup Lifecycle Sequencing (Amendment 6) ──
+        print("\n" + "="*60)
+        print("  [STARTUP LIFECYCLE SEQUENCING (PHASE A)]")
+        print("  1. STARTUP INITIALIZATION: Preflight complete.")
+
+        print("  2. BROKER RECONCILIATION")
         recon = bridge.reconcile_startup_state()
         _print_startup_reconciliation(recon)
         if recon.get("halt_new_entries") or getattr(bridge.entry_gate, "halted", False):
-            print("  WARNING: Startup reconciliation halted new entries.\n")
+            print("  ⚠️ Startup reconciliation requested entry halt.")
+
+        print("  3. EXPIRED WORKING ENTRY REAPER")
+        from strategies.order_manager import reap_expired_entry_orders
+        reaped_startup = reap_expired_entry_orders(bridge=bridge, worker_id="startup_sweep")
+        if reaped_startup:
+            print(f"  🧹 Reaped {len(reaped_startup)} expired entry orders on startup.")
+        else:
+            print("  ✅ Zero expired working entry orders on startup.")
+
+        print("  4. PROTECTION VERIFICATION")
+        protection_verified = True
+        pos_list = bridge.get_open_positions() if hasattr(bridge, "get_open_positions") else []
+        for p in pos_list:
+            sym = getattr(p, "symbol", "")
+            qty = abs(float(getattr(p, "qty", getattr(p, "position", 0.0)) or 0.0))
+            if qty > 0 and sym:
+                side = "BUY" if float(getattr(p, "qty", getattr(p, "position", 0.0)) or 0.0) > 0 else "SELL"
+                from strategies.entry_lifecycle import verify_exact_protection
+                v_ok, v_msg, _ = verify_exact_protection(
+                    bridge=bridge,
+                    symbol=sym,
+                    filled_qty=qty,
+                    entry_side=side,
+                    stop_price=float(getattr(p, "avg_entry_price", 0.0) or 0.0) * 0.98,
+                )
+                if not v_ok:
+                    print(f"  🚨 Open position {sym} ({qty} shares) lacks exact verified stop: {v_msg}")
+                    protection_verified = False
+        if not protection_verified:
+            bridge.entry_gate.halt("Startup protection verification failed: unhedged/unprotected positions present")
+            print("  ⚠️ Startup protection verification FAILED. Entries halted (fail-closed).")
+        else:
+            print("  ✅ All existing positions verified protected or account flat.")
+
+        print("  5. EXECUTION HEALTH CHECK")
+        from strategies.execution_health import get_execution_health
+        from strategies.intraday_data import get_intraday_feed_telemetry
+        startup_health = get_execution_health(bridge=bridge, feed_telemetry=get_intraday_feed_telemetry())
+        if not startup_health.allows_new_entries:
+            print(f"  ⚠️ Startup health gate not HEALTHY ({startup_health.status.value}): {startup_health.summary}. Entries halted.")
+            bridge.entry_gate.halt(f"Startup health check: {startup_health.summary}")
+        else:
+            lat = startup_health.broker_latency_ms
+            lat_str = f"{lat:.1f}ms" if lat is not None else "N/A"
+            print(f"  ✅ Execution health gate HEALTHY (broker latency: {lat_str}).")
+
+        startup_entry_hold = (pf_report.decision == PreflightDecision.GO_WITH_ENTRY_HOLD)
+        if (
+            not getattr(bridge.entry_gate, "halted", False)
+            and protection_verified
+            and startup_health.allows_new_entries
+            and pf_report.decision != PreflightDecision.NO_GO
+        ):
+            if startup_entry_hold:
+                print("  6. ENTRIES HELD (MID-BAR STARTUP): Engine active in entry-hold mode; entries held until first completed 5m bar.")
+            else:
+                print("  6. ENTRIES ALLOWED: System healthy. Startup sequence passed.")
+        else:
+            print("  6. ENTRIES HALTED: One or more startup gates held. Running in protective monitoring mode.")
+        print("="*60 + "\n")
+
     except Exception as recon_err:
-        print(f"  WARNING: Startup reconciliation failed: {recon_err}. Halting new entries.")
-        bridge.entry_gate.halt("Startup reconciliation failure")
+        print(f"  WARNING: Startup lifecycle sequence failed: {recon_err}. Halting new entries.")
+        bridge.entry_gate.halt(f"Startup lifecycle failure: {recon_err}")
 
     from strategies.session import is_market_day, _nyse_holidays
     today_et = now_eastern().date()
@@ -2996,6 +3104,15 @@ def cmd_daytrade_bot(args) -> int:
     except Exception as wd_exc:
         print(f"Warning: Failed to start EOD watchdog: {wd_exc}")
 
+    entry_reaper = None
+    try:
+        from strategies.order_manager import EntryOrderReaper
+        entry_reaper = EntryOrderReaper(bridge=bridge, interval_seconds=1.0)
+        entry_reaper.start()
+        print("  ✅ EntryOrderReaper background thread active (1.0s loop).")
+    except Exception as r_exc:
+        logger.warning("[STARTUP] Failed to start EntryOrderReaper background thread: %s", r_exc)
+
     shutdown_requested = threading.Event()
     shutdown_signal = None
     _shutdown_lock = threading.Lock()
@@ -3031,6 +3148,12 @@ def cmd_daytrade_bot(args) -> int:
             print(f"\n{'='*60}")
             print(f"  PERFORMING CONTROLLED SHUTDOWN (Signal: {sig}, Reason: {reason})")
             print(f"{'='*60}\n")
+
+            if entry_reaper:
+                try:
+                    entry_reaper.stop()
+                except Exception:
+                    pass
 
             if watchdog:
                 try:

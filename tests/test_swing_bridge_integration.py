@@ -81,13 +81,13 @@ def test_five_way_clipping_liquidity_binds():
 
 
 def test_five_way_clipping_portfolio_exposure_binds():
-    # Portfolio gross exposure (15% = ,000) almost full
+    # Portfolio gross exposure (28% = $28,000) almost full
     res = calculate_swing_position_size(
         entry_price=100.0,
         stop_price=98.0,
         account_equity=100_000.0,
         available_buying_power=50_000.0,
-        existing_portfolio_exposure=14_200.0,  # Remaining portfolio budget =  -> 8 shares
+        existing_portfolio_exposure=27_200.0,  # Remaining portfolio budget = $800 -> 8 shares
         adv_shares_20=1_000_000.0,
     )
     assert not res.rejected
@@ -102,7 +102,7 @@ def test_five_way_clipping_buying_power_binds():
         entry_price=100.0,
         stop_price=98.0,
         account_equity=100_000.0,
-        available_buying_power=600.0,  # 95% =  -> 5 shares
+        available_buying_power=600.0,  # 95% = $570 -> 5 shares
         adv_shares_20=1_000_000.0,
     )
     assert not res.rejected
@@ -112,13 +112,13 @@ def test_five_way_clipping_buying_power_binds():
 
 
 def test_five_way_clipping_zero_shares_rejection():
-    # Zero remaining portfolio budget -> rejection
+    # Zero remaining portfolio budget (28% = $28,000 full) -> rejection
     res = calculate_swing_position_size(
         entry_price=100.0,
         stop_price=98.0,
         account_equity=100_000.0,
         available_buying_power=50_000.0,
-        existing_portfolio_exposure=15_000.0,  # 100% full
+        existing_portfolio_exposure=28_000.0,  # 100% full under 28% cap
     )
     assert res.rejected
     assert res.shares == 0
@@ -187,7 +187,7 @@ def test_dry_run_blocks_all_broker_mutations():
     bridge._client.submit_order.assert_not_called()
 
     # 5. cancel_order
-    assert bridge.cancel_order('order-999') is True
+    assert bool(bridge.cancel_order('order-999')) is True
     bridge._client.cancel_order_by_id.assert_not_called()
 
     # 6. place_stop_order
@@ -396,19 +396,20 @@ def test_eighth_position_is_rejected_at_stage0_limit():
     bridge._connected = True
     bridge._client = MagicMock()
     bridge._client.get_all_positions.return_value = []
-    # 7 positions already open
+    # 10 positions already open (Capacity = 10)
     bridge.get_open_positions = MagicMock(return_value={
-        "MSFT": 4, "AVGO": 5, "BAC": 32, "JPM": 5, "SPY": 2, "V": 5, "AMZN": 7
+        "MSFT": 4, "AVGO": 5, "BAC": 32, "JPM": 5, "SPY": 2, "V": 5, "AMZN": 7,
+        "COST": 4, "AAPL": 6, "TSLA": 5
     })
     bridge.has_working_order = MagicMock(return_value=False)
     bridge.get_position = MagicMock(return_value=0)
 
-    sig_8 = Signal(
+    sig_11 = Signal(
         symbol="NVDA", action="BUY", confidence=0.85,
         rf_score=0.8, lstm_score=0.8, xgb_score=0.8, trans_score=0.8, tech_score=0.8,
-        price=120.0, reason="test_8th"
+        price=120.0, reason="test_11th"
     )
-    res = bridge.execute_all([sig_8])
+    res = bridge.execute_all([sig_11])
     assert res["placed"] == 0
     assert res["skipped"] == 1
     assert res["reason"] == "MAX_CONCURRENT_POSITIONS_REACHED"

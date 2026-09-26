@@ -2,6 +2,7 @@
 gap_strategy.py -- Gap-and-Go strategy.
 """
 import logging
+import math
 from typing import Optional
 
 import numpy as np
@@ -14,6 +15,70 @@ from strategies.indicators import add_all_indicators
 from strategies.intraday_data import previous_close
 
 logger = logging.getLogger(__name__)
+
+
+def _compute_atr(df: pd.DataFrame, period: int = 14) -> float:
+    """Compute a simple rolling ATR from complete OHLC bars using True Range with previous close."""
+    required = {"high", "low", "close"}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return 0.0
+
+    bars = df.loc[:, ["high", "low", "close"]].copy()
+    bars = bars.apply(pd.to_numeric, errors="coerce")
+    bars = bars.dropna()
+
+    if len(bars) < period + 1:
+        return 0.0
+
+    previous_close = bars["close"].shift(1)
+
+    true_range = pd.concat(
+        [
+            bars["high"] - bars["low"],
+            (bars["high"] - previous_close).abs(),
+            (bars["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    atr = true_range.rolling(
+        window=period,
+        min_periods=period,
+    ).mean().iloc[-1]
+
+    if not math.isfinite(atr) or atr <= 0.01:
+        return 0.0
+
+    return float(atr)
+
+
+def _safe_atr(
+    intraday_df: pd.DataFrame,
+    full_df: pd.DataFrame,
+    period: int = 14,
+    return_source: bool = False,
+):
+    """Use current session ATR, then fall back to complete full-history bars.
+
+    Returns:
+        float if return_source is False, or (float, str) if return_source is True.
+        Source is one of: 'INTRADAY_CURRENT', 'FULL_HISTORY_FALLBACK', 'UNAVAILABLE'.
+    """
+    if intraday_df is not None and "atr" in intraday_df.columns:
+        valid_atr = pd.to_numeric(
+            intraday_df["atr"],
+            errors="coerce",
+        ).dropna()
+        if not valid_atr.empty:
+            current_atr = float(valid_atr.iloc[-1])
+            if math.isfinite(current_atr) and current_atr > 0.01:
+                return (current_atr, "INTRADAY_CURRENT") if return_source else current_atr
+
+    fallback_atr = _compute_atr(full_df, period=period)
+    if fallback_atr > 0.01:
+        return (fallback_atr, "FULL_HISTORY_FALLBACK") if return_source else fallback_atr
+
+    return (0.0, "UNAVAILABLE") if return_source else 0.0
 
 
 def _latest_session(df: pd.DataFrame) -> pd.DataFrame:
@@ -31,6 +96,7 @@ class GapAndGoStrategy(BaseStrategy):
         if not config.STRATEGY_GAP_AND_GO_ENABLED:
             return None
 
+        full_df = df.copy() if df is not None else None
         df = _latest_session(df)
         if len(df) < 10:
             return None
@@ -53,12 +119,25 @@ class GapAndGoStrategy(BaseStrategy):
         last = df.iloc[-1]
         price = float(last["close"])
         vwap = float(last.get("vwap", price))
-        atr = float(last.get("atr", 0))
+        atr, atr_source = _safe_atr(
+            intraday_df=df,
+            full_df=full_df,
+            period=getattr(config, "ATR_PERIOD", 14),
+            return_source=True,
+        )
+        logger.info(
+            "[ATR RESOLUTION] %s atr=%.4f source=%s session_bars=%d history_bars=%d",
+            symbol,
+            atr,
+            atr_source,
+            len(df),
+            len(full_df) if full_df is not None else 0,
+        )
         rsi = float(last.get("rsi", 50))
         volume = float(last.get("volume", 0))
         vol_ma = float(last.get("volume_ma", 1))
 
-        if atr < 0.01 or np.isnan(atr):
+        if atr < 0.01 or not math.isfinite(atr):
             logger.warning("[GAP QUALITY FAIL] %s: ATR=%.4f invalid (< $0.01 threshold). Rejecting.", symbol, atr)
             return None
 
@@ -113,6 +192,12 @@ class GapAndGoStrategy(BaseStrategy):
                 confidence += 0.10
             confidence = min(confidence, 1.0)
 
+            if hasattr(df, "index") and len(df.index) > 0:
+                last_idx = df.index[-1]
+                bar_ts = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
+            else:
+                bar_ts = str(last.get("timestamp", ""))
+
             return TradeSignal(
                 symbol=symbol,
                 strategy=self.name,
@@ -132,6 +217,7 @@ class GapAndGoStrategy(BaseStrategy):
                     "prev_close": prev,
                     "open_price": open_price,
                 },
+                bar_timestamp=bar_ts,
             )
 
         return None

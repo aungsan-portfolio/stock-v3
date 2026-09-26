@@ -11,8 +11,9 @@ Production hardening:
   same heuristic instead of duplicating divergent logic.
 """
 import logging
+import math
 from dataclasses import dataclass, asdict
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -75,9 +76,115 @@ class Signal:
     price: float
     reason: str
     shadow_mode: bool = False
+    adx: Optional[float] = None
+    vix: Optional[float] = None
+    spy_price: Optional[float] = None
+    spy_sma50: Optional[float] = None
+    sma50_slope: Optional[float] = None
+    regime: Optional[str] = None
+    timestamp: Optional[str] = None
+    quote_age_seconds: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def compute_adx(df: pd.DataFrame, period: int = 14) -> Optional[float]:
+    """Computes 14-period Wilder's ADX from daily OHLCV."""
+    if df is None or len(df) < period * 2:
+        return None
+    try:
+        high = df["High"]
+        low = df["Low"]
+        close_prev = df["Close"].shift(1)
+        tr1 = high - low
+        tr2 = (high - close_prev).abs()
+        tr3 = (low - close_prev).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+        up_move = high - high.shift(1)
+        down_move = low.shift(1) - low
+
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+        tr_smooth = pd.Series(tr).ewm(alpha=1.0 / period, adjust=False).mean()
+        plus_di = 100.0 * pd.Series(plus_dm, index=df.index).ewm(alpha=1.0 / period, adjust=False).mean() / tr_smooth
+        minus_di = 100.0 * pd.Series(minus_dm, index=df.index).ewm(alpha=1.0 / period, adjust=False).mean() / tr_smooth
+
+        dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        adx = dx.ewm(alpha=1.0 / period, adjust=False).mean().iloc[-1]
+        return float(adx) if math.isfinite(adx) else None
+    except Exception as exc:
+        logger.debug("Error computing ADX: %s", exc)
+        return None
+
+
+def get_macro_benchmark_indicators() -> Dict[str, Any]:
+    """
+    Fetches SPY and VIX to compute the 5 canonical macro inputs:
+    adx, vix, spy_price, spy_sma50, sma50_slope, and classifies market regime.
+    """
+    from strategies.regime_classifier import classify_market_regime, MarketRegime
+    from strategies.session import now_eastern
+
+    res = {
+        "adx": None,
+        "vix": None,
+        "spy_price": None,
+        "spy_sma50": None,
+        "sma50_slope": None,
+        "regime": MarketRegime.DATA_INVALID.value,
+        "quote_age_seconds": 0.0,
+        "timestamp": now_eastern().isoformat(),
+    }
+
+    try:
+        spy_df = fetch_ohlcv("SPY")
+        if spy_df is not None and len(spy_df) >= 50:
+            spy_px = float(spy_df["Close"].iloc[-1])
+            sma50_series = spy_df["Close"].rolling(50).mean()
+            spy_sma50 = float(sma50_series.iloc[-1])
+            if len(sma50_series.dropna()) >= 2:
+                sma50_slope = float(sma50_series.iloc[-1] - sma50_series.iloc[-2])
+            else:
+                sma50_slope = 0.0
+            adx_val = compute_adx(spy_df, 14)
+
+            res["spy_price"] = round(spy_px, 2)
+            res["spy_sma50"] = round(spy_sma50, 2)
+            res["sma50_slope"] = round(sma50_slope, 4)
+            res["adx"] = round(adx_val, 2) if adx_val is not None else None
+    except Exception as exc:
+        logger.warning("[MACRO BENCHMARK] Failed fetching or computing SPY indicators: %s", exc)
+
+    try:
+        vix_df = None
+        for vix_sym in ("^VIX", "VIX"):
+            try:
+                vix_df = fetch_ohlcv(vix_sym)
+                if vix_df is not None and not vix_df.empty:
+                    break
+            except Exception:
+                continue
+
+        if vix_df is not None and not vix_df.empty:
+            res["vix"] = round(float(vix_df["Close"].iloc[-1]), 2)
+    except Exception as exc:
+        logger.warning("[MACRO BENCHMARK] Failed fetching VIX: %s", exc)
+
+    reg_class = classify_market_regime(
+        adx=res["adx"],
+        vix=res["vix"],
+        spy_price=res["spy_price"],
+        spy_sma50=res["spy_sma50"],
+        sma50_slope=res["sma50_slope"],
+        quote_age_seconds=res["quote_age_seconds"],
+    )
+    res["regime"] = reg_class.regime.value
+    res["allows_new_entries"] = reg_class.allows_new_entries
+    res["regime_reason"] = reg_class.reason
+    return res
 
 
 def technical_score_from_feature_row(row: pd.Series) -> float:
@@ -265,6 +372,18 @@ class Predictor:
             pass
 
         failed_count = 0
+        macro_info = get_macro_benchmark_indicators()
+        logger.info(
+            "[MACRO REGIME] SPY=%s SMA50=%s Slope=%s ADX=%s VIX=%s → Regime: %s (allows_entries=%s)",
+            macro_info.get("spy_price"),
+            macro_info.get("spy_sma50"),
+            macro_info.get("sma50_slope"),
+            macro_info.get("adx"),
+            macro_info.get("vix"),
+            macro_info.get("regime"),
+            macro_info.get("allows_new_entries", False),
+        )
+
         for symbol in symbols:
             try:
                 df = fetch_ohlcv(symbol)
@@ -309,6 +428,11 @@ class Predictor:
                         action = "HOLD"
                         reason = f"{reason} → BLOCKED[{gate.status}]: {gate.reason} → HOLD"
 
+                # Phase 2 macro regime gate: fail closed if macro regime restricts entries
+                if action == "BUY" and not macro_info.get("allows_new_entries", False):
+                    action = "HOLD"
+                    reason = f"{reason} → BLOCKED[{macro_info.get('regime', 'UNKNOWN')}]: {macro_info.get('regime_reason', 'macro regime restricts entries')} → HOLD"
+
                 price = float(df["Close"].iloc[-1])
                 is_shadow = symbol in getattr(self.cfg, "SHADOW_MONITOR", [])
                 if is_shadow:
@@ -325,6 +449,14 @@ class Predictor:
                     price=round(price, 2),
                     reason=reason,
                     shadow_mode=is_shadow,
+                    adx=macro_info.get("adx"),
+                    vix=macro_info.get("vix"),
+                    spy_price=macro_info.get("spy_price"),
+                    spy_sma50=macro_info.get("spy_sma50"),
+                    sma50_slope=macro_info.get("sma50_slope"),
+                    regime=macro_info.get("regime"),
+                    timestamp=macro_info.get("timestamp"),
+                    quote_age_seconds=macro_info.get("quote_age_seconds", 0.0),
                 ))
                 if is_shadow:
                     logger.info(

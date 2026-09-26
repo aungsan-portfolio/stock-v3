@@ -41,5 +41,5 @@ MAX_ROTATIONS_PER_CYCLE      = 1
 SCORE_CONF_WEIGHT            = 0.70
 SCORE_PNL_WEIGHT             = 0.30
 
-# Max concurrent positions allowed in Swing Trading Stage 0
-MAX_CONCURRENT_POSITIONS = 7
+# Max concurrent positions allowed in Swing Trading (Canonical Single Source of Truth)
+MAX_CONCURRENT_POSITIONS = 10

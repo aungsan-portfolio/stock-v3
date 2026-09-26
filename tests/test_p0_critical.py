@@ -27,6 +27,7 @@ def isolate_journal(tmp_path, monkeypatch):
     import config
     fake_journal = tmp_path / "test_trade_journal.jsonl"
     monkeypatch.setattr(config, "DAYTRADE_TRADE_JOURNAL_FILE", fake_journal)
+    monkeypatch.setattr(config, "DAYTRADE_REQUIRE_ENTRY_READINESS", False)
     # Clear any active idempotency locks
     from strategies.order_idempotency import idempotency_manager
     idempotency_manager.reservations.clear()
@@ -226,7 +227,10 @@ def test_execute_signal_p0_auto_fill_disabled_and_idempotency_released():
     )
 
     b = MockBridge()
-    res = execute_signal(signal=sig, bridge=b, equity=10000.0, current_pnl=0.0, dry_run=True)
+    from unittest.mock import patch
+    with patch.object(config, "SPY_TREND_GUARD_ENABLED", False), \
+         patch.object(config, "VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED", False):
+        res = execute_signal(signal=sig, bridge=b, equity=10000.0, current_pnl=0.0, dry_run=True)
     assert res.get("status") == "DRY_RUN"
     # Verify idempotency reservation for MSFT_BUY was released
     key = "MSFT_BUY"
@@ -323,7 +327,10 @@ def test_h2_ambiguous_submit_preserves_idempotency():
     orig_validate = eq.validate_execution_quote
     try:
         eq.validate_execution_quote = lambda **kwargs: eq.ExecutionQuoteResult(valid=True, reason="Mock Valid Quote")
-        res = execute_signal(signal=sig, bridge=b, equity=10000.0, current_pnl=0.0, dry_run=False)
+        from unittest.mock import patch
+        with patch.object(config, "SPY_TREND_GUARD_ENABLED", False), \
+             patch.object(config, "VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED", False):
+            res = execute_signal(signal=sig, bridge=b, equity=10000.0, current_pnl=0.0, dry_run=False)
         assert res.get("status") == "AMBIGUOUS_SUBMIT"
         # Idempotency reservation MUST remain locked for reconciliation (not released)
         assert "AMZN_BUY" in idempotency_manager.reservations
@@ -380,7 +387,10 @@ def test_h3_lifecycle_registration_failure_is_fail_closed():
             raise RuntimeError("Mock lifecycle store error")
         om.register_pending_order = raise_reg_err
 
-        res = execute_signal(signal=sig, bridge=b, equity=10000.0, current_pnl=0.0, dry_run=False)
+        from unittest.mock import patch
+        with patch.object(config, "SPY_TREND_GUARD_ENABLED", False), \
+             patch.object(config, "VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED", False):
+            res = execute_signal(signal=sig, bridge=b, equity=10000.0, current_pnl=0.0, dry_run=False)
         assert res.get("status") in ("AMBIGUOUS_LIFECYCLE", "SUBMITTED_RECONCILIATION_REQUIRED")
         assert "registration failed" in res.get("reason", "").lower()
     finally:
@@ -474,9 +484,11 @@ def test_execute_signal_cache_key_defined():
     orig_validate = eq.validate_execution_quote
     orig_allow_short = getattr(config, "ALLOW_SHORT", False)
     orig_spy_guard = getattr(config, "SPY_TREND_GUARD_ENABLED", True)
+    orig_soxx_gate = getattr(config, "VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED", True)
     try:
         config.ALLOW_SHORT = True
         config.SPY_TREND_GUARD_ENABLED = False
+        config.VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED = False
         eq.validate_execution_quote = lambda **kwargs: eq.ExecutionQuoteResult(valid=True, reason="Mock Valid Quote")
         res = execute_signal(signal=sig, bridge=b, equity=10000.0, current_pnl=0.0, dry_run=False)
         print("DEBUG RESULT:", res)
@@ -485,6 +497,7 @@ def test_execute_signal_cache_key_defined():
     finally:
         config.ALLOW_SHORT = orig_allow_short
         config.SPY_TREND_GUARD_ENABLED = orig_spy_guard
+        config.VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED = orig_soxx_gate
         eq.validate_execution_quote = orig_validate
         from strategies.order_idempotency import idempotency_manager
         idempotency_manager.release_after_reconciliation("SMCI", "BUY", "cleanup_test")

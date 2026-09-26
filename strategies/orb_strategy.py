@@ -53,6 +53,12 @@ class ORBStrategy(BaseStrategy):
         vol_ratio = volume / vol_ma if vol_ma > 0 else 0
         vol_ok = vol_ratio >= config.ORB_MIN_VOLUME_RATIO
 
+        if hasattr(df, "index") and len(df.index) > 0:
+            last_idx = df.index[-1]
+            bar_ts = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
+        else:
+            bar_ts = str(last.get("timestamp", ""))
+
         if price > orb_high and vol_ok and rsi < 75:
             stop = orb_low
             risk = price - stop
@@ -71,6 +77,7 @@ class ORBStrategy(BaseStrategy):
                 risk_per_share=risk,
                 reason=f"ORB breakout above {orb_high:.2f} | vol {vol_ratio:.1f}x | RSI {rsi:.0f}",
                 metadata={"orb_high": orb_high, "orb_low": orb_low, "orb_range": orb_range},
+                bar_timestamp=bar_ts,
             )
 
         allow_short = getattr(config, "ALLOW_SHORT", False)
@@ -96,6 +103,7 @@ class ORBStrategy(BaseStrategy):
                 risk_per_share=risk,
                 reason=f"ORB breakdown below {orb_low:.2f} | vol {vol_ratio:.1f}x | RSI {rsi:.0f}",
                 metadata={"orb_high": orb_high, "orb_low": orb_low, "orb_range": orb_range},
+                bar_timestamp=bar_ts,
             )
 
         return None

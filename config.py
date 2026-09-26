@@ -16,6 +16,18 @@ from typing import List, Optional
 # ── Paths ────────────────────────────────────────
 BASE_DIR        = Path(__file__).parent
 DATA_DIR        = BASE_DIR / "data"
+
+# Auto-load .env into os.environ if present (skipped during automated pytest runs)
+if (BASE_DIR / ".env").exists() and not os.environ.get("PYTEST_CURRENT_TEST"):
+    try:
+        with open(BASE_DIR / ".env", "r", encoding="utf-8") as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if _line and not _line.startswith("#") and "=" in _line:
+                    _k, _v = _line.split("=", 1)
+                    os.environ.setdefault(_k.strip(), _v.strip().strip("'").strip('"'))
+    except Exception:
+        pass
 MODELS_DIR      = BASE_DIR / "models"
 REPORTS_DIR     = BASE_DIR / "reports"
 LOG_DIR         = BASE_DIR / "logs"
@@ -38,7 +50,7 @@ WATCHLIST = [
 
 # ── Shadow Monitor — signals logged, NO orders placed ────────────────────────
 SHADOW_MONITOR = [
-    "CAT", "LLY",
+    "CAT", "LLY", "CVX",
 ]
 
 # ── Hard-to-Borrow Short Blacklist ───────────────
@@ -266,9 +278,9 @@ MAX_DAILY_TRADES     = 100
 TRADE_STREAM_START_TIMEOUT_SECONDS        = 10.0
 TRADE_STREAM_STOP_TIMEOUT_SECONDS         = 8.0
 TRADE_STREAM_RECONNECT_MAX_ATTEMPTS        = 8
-TRADE_STREAM_RECONNECT_BASE_DELAY_SECONDS = 1.0
-TRADE_STREAM_RECONNECT_MAX_DELAY_SECONDS  = 30.0
-TRADE_STREAM_RECONNECT_JITTER_RATIO       = 0.20
+TRADE_STREAM_RECONNECT_BASE_DELAY_SECONDS = float(os.environ.get("TRADE_STREAM_RECONNECT_BASE_DELAY_SECONDS", 2.0))
+TRADE_STREAM_RECONNECT_MAX_DELAY_SECONDS  = float(os.environ.get("TRADE_STREAM_RECONNECT_MAX_DELAY_SECONDS", 30.0))
+TRADE_STREAM_RECONNECT_JITTER_RATIO       = float(os.environ.get("TRADE_STREAM_RECONNECT_JITTER_RATIO", 0.20))
 
 # ── Alpaca Network & HTTP Resilience ────────────
 ALPACA_CONNECT_TIMEOUT_SECONDS            = float(os.environ.get("ALPACA_CONNECT_TIMEOUT", 15.0))
@@ -314,7 +326,7 @@ REQUIRE_REALTIME_DATA_FOR_ORDERS = True
 PAPER_MODE_AUTO_CONFIRM_FILL     = False  # C-02: Only real Alpaca TradingStream fills initialize trailing/lifecycle state
 MAX_QUOTE_SPREAD_PCT             = 0.02
 DECISION_PRICE_MAX_DEVIATION_PCT = 0.05
-MAX_ACCEPTABLE_SPREAD_PCT        = 1.0    # 1.0% max spread
+MAX_ACCEPTABLE_SPREAD_PCT        = 0.75   # 0.75% max spread (authoritative single source of truth)
 MAX_DECISION_DEVIATION_PCT       = 1.5    # 1.5% max price deviation
 MAX_QUOTE_AGE_SECONDS            = 10.0   # 10 seconds max quote staleness
 MARKET_HOURS_GATE_ENABLED        = True
@@ -324,6 +336,7 @@ INTRADAY_BAR_SECONDS             = 300.0  # 5-minute default bar interval
 ENTRY_BAR_CLOSE_GRACE_SECONDS    = 60.0   # 60s pilot grace period post completed bar close for new entry signals (calibrated 2026-09-08: REST median delay ~58s)
 BAR_CLOSE_GRACE_SECONDS          = 60.0   # Backward-compatible alias for entry grace
 POSITION_ATR_MAX_AGE_SECONDS     = 360.0  # 360s max age for active-position ATR updates during mid-bar polling
+PREFLIGHT_MAX_RECOVERABLE_DELAY_SECONDS = float(os.environ.get("PREFLIGHT_MAX_RECOVERABLE_DELAY_SECONDS", "360.0"))  # 360s (300s bar + 60s grace) max recoverable delay for preflight startup audit
 BAR_FUTURE_TOLERANCE_SECONDS     = 5.0    # 5s clock skew tolerance for completed bars
 INTRADAY_DATA_SOURCE_TIMEZONE    = "US/Eastern" # Default fallback timezone for naive bar feeds
 TRAILING_STOP_RECONCILE_TOLERANCE = None  # None defaults dynamically to tick_size / 2.0
@@ -351,10 +364,11 @@ ALPACA_DATA_READ_TIMEOUT               = float(os.environ.get("ALPACA_DATA_READ_
 
 
 DATA_HEALTH_SETTINGS = {
-    "critical_symbols": ["SPY", "QQQ"],
+    "critical_symbols": ["SPY", "QQQ", "SOXX"],
     "stale_threshold_s": {
         "SPY": 60.0,
         "QQQ": 60.0,
+        "SOXX": 60.0,
         "_default": 180.0,
     },
     "recovery_bars": 3,
@@ -390,10 +404,12 @@ ALPACA_CHUNK_SIZE: int = int(os.environ.get("ALPACA_CHUNK_SIZE", 5))
 ALPACA_CHUNK_DELAY_MS: int = int(os.environ.get("ALPACA_CHUNK_DELAY_MS", 200))
 ALPACA_CHUNK_TIMEOUT_SECONDS: float = float(os.environ.get("ALPACA_CHUNK_TIMEOUT_SECONDS", 2.0))
 ALPACA_SUBSCRIPTION_TIER: str = os.environ.get("ALPACA_SUBSCRIPTION_TIER", "free").lower().strip()
+REQUIRE_FEED_CONCORDANCE: bool = os.environ.get("REQUIRE_FEED_CONCORDANCE", "false").lower().strip() in ("true", "1", "yes")
+MAX_BAR_STALENESS_SECONDS: float = float(os.environ.get("MAX_BAR_STALENESS_SECONDS", 300.0))
 
 # WebSocket keepalive & connection management
 ALPACA_WS_PING_INTERVAL_SECONDS: int = int(os.environ.get("ALPACA_WS_PING_INTERVAL_SECONDS", 20))
-ALPACA_WS_PING_TIMEOUT_SECONDS: int = int(os.environ.get("ALPACA_WS_PING_TIMEOUT_SECONDS", 10))
+ALPACA_WS_PING_TIMEOUT_SECONDS: int = int(os.environ.get("ALPACA_WS_PING_TIMEOUT_SECONDS", 60))
 ALPACA_WS_MAX_QUEUE: int = int(os.environ.get("ALPACA_WS_MAX_QUEUE", 1024))
 
 
@@ -701,6 +717,11 @@ LUNCH_CHOP_END   = "13:30"
 GAP_CONTINUATION_MIN_HOLD_BARS = 3
 VOLATILITY_PENALTY_MULTIPLIER = 4.0
 
+# ── Phase C: Two-Lane Active Paper Validation Engine ──────
+VALIDATION_LANE_ENABLED = os.getenv("VALIDATION_LANE_ENABLED", "True").lower() in ("true", "1", "yes")
+VALIDATION_LANE_SHARES = int(os.getenv("VALIDATION_LANE_SHARES", "1"))
+VALIDATION_LANE_LEDGER_PATH = DATA_DIR / "paper_validation_trades.jsonl"
+
 # ── Breakeven Stop Lock ──────────────────────────────
 BREAKEVEN_LOCK_ENABLED          = True
 BREAKEVEN_LOCK_THRESHOLD_ATR    = 1.0   # Lock at +1.0x ATR unrealized profit
@@ -815,7 +836,7 @@ DAYTRADE_ML_MAX_DEPTH = 5
 DAYTRADE_ML_TEST_SIZE = 0.2
 
 DAYTRADE_PAPER_RISK_PCT            = 0.001
-DAYTRADE_MIN_RR                    = 2.0
+DAYTRADE_MIN_RR                    = MIN_RR_RATIO  # Explicit canonical alias (1.50)
 DAYTRADE_ATR_STOP_MULTIPLE         = 1.25
 DAYTRADE_MAX_PAPER_TRADES_PER_RUN  = 1
 MOMENTUM_OVEREXTENSION_ATR_MULT    = 1.25
@@ -903,6 +924,7 @@ SECTOR_MAPPINGS: dict = {
     "XLV": {"sector": "HEALTHCARE", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
     "CAT": {"sector": "INDUSTRIALS", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
     "LLY": {"sector": "HEALTHCARE", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
+    "CVX": {"sector": "ENERGY", "source": "STATIC_CONFIG", "mapping_version": "2026-09-20"},
 }
 
 
@@ -1405,3 +1427,28 @@ def get_settings() -> Settings:
 def set_settings(s: Settings) -> None:
     global _default_settings
     _default_settings = s
+
+
+def get_effective_daytrade_config() -> dict:
+    """Returns a standardized dictionary of all authoritative daytrade runtime parameters."""
+    import sys
+    mod = sys.modules.get(__name__)
+    def _g(key: str, default: Any) -> Any:
+        return getattr(mod, key, default) if mod else globals().get(key, default)
+
+    return {
+        "MIN_RR_RATIO": float(_g("MIN_RR_RATIO", 1.50)),
+        "DAYTRADE_MIN_RR": float(_g("DAYTRADE_MIN_RR", 1.50)),
+        "MAX_ACCEPTABLE_SPREAD_PCT": float(_g("MAX_ACCEPTABLE_SPREAD_PCT", 0.75)),
+        "MAX_ALLOWED_CHASE": float(_g("MAX_ALLOWED_CHASE", 0.15)),
+        "DAYTRADE_BATCH_FETCH_MIN_COVERAGE": float(_g("DAYTRADE_BATCH_FETCH_MIN_COVERAGE", 0.95)),
+        "DAYTRADE_BAR_PUBLICATION_TIMEOUT_S": float(_g("DAYTRADE_BAR_PUBLICATION_TIMEOUT_S", 90.0)),
+        "LUNCH_CHOP_FILTER_ENABLED": bool(_g("LUNCH_CHOP_FILTER_ENABLED", True)),
+        "REENTRY_COOLDOWN_MINUTES": int(_g("REENTRY_COOLDOWN_MINUTES", 45)),
+        "HARD_VETO_SKIP_LIMIT": int(_g("HARD_VETO_SKIP_LIMIT", 5)),
+        "MAX_RISK_PER_TRADE_DOLLARS": float(_g("MAX_RISK_PER_TRADE_DOLLARS", 50.0)),
+        "SOXX_GATE_ENABLED": bool(_g("SOXX_GATE_ENABLED", True)),
+        "MAX_CORRELATED_POSITIONS": int(_g("MAX_CORRELATED_POSITIONS", 2)),
+        "VALIDATION_LANE_ENABLED": bool(_g("VALIDATION_LANE_ENABLED", True)),
+        "VALIDATION_LANE_SHARES": int(_g("VALIDATION_LANE_SHARES", 1)),
+    }

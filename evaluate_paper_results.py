@@ -21,10 +21,11 @@ DEFAULT_CAPITAL = 10000.0
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate trade journal against Production Gates.")
+    default_journal = "reports/trade_journal.jsonl" if Path("reports/trade_journal.jsonl").exists() else "reports/daytrade_journal.jsonl"
     parser.add_argument(
         "--journal",
         type=str,
-        default="reports/daytrade_journal.jsonl",
+        default=default_journal,
         help="Path to the JSONL trade journal file."
     )
     parser.add_argument(
@@ -32,6 +33,12 @@ def parse_args():
         type=float,
         default=DEFAULT_CAPITAL,
         help="Mock initial capital for drawdown tracking."
+    )
+    parser.add_argument(
+        "--cohort",
+        type=str,
+        default=None,
+        help="Filter trade records by cohort (e.g. 'atomic_rotation_v1')."
     )
     return parser.parse_args()
 
@@ -52,35 +59,47 @@ def load_records(journal_path: Path) -> list:
     return records
 
 
-def calculate_metrics(records: list, initial_capital: float) -> dict:
+def calculate_metrics(records: list, initial_capital: float, cohort: str | None = None) -> dict:
+    if cohort is not None:
+        records = [r for r in records if r.get("cohort") == cohort]
+
     trades = []
     fills = []
 
     for r in records:
-        event_type = r.get("event_type")
-        # Trade logs
-        if event_type == "TRADE" and r.get("exit_price") is not None:
+        event_type = r.get("event_type") or r.get("type")
+        # Trade logs (both opened TRADE with exit_price and closed TRADE_CLOSED)
+        if event_type in ("TRADE", "TRADE_CLOSED") and r.get("exit_price") is not None:
             trades.append(r)
         # Fill logs
-        elif event_type == "FILL" or r.get("type") == "FILL":
+        elif event_type == "FILL":
             fills.append(r)
 
     # Sort trades chronologically
     trades.sort(key=lambda t: t.get("timestamp", ""))
 
+    def _get_trade_pnl(t: dict) -> float:
+        val = t.get("pnl")
+        if val is None:
+            val = t.get("realized_pnl")
+        try:
+            return float(val or 0.0)
+        except (ValueError, TypeError):
+            return 0.0
+
     # 1. Total Trades
     n_trades = len(trades)
 
     # 2. Win Rate
-    winning_trades = [t for t in trades if float(t.get("pnl", 0.0) or 0.0) > 0.0]
+    winning_trades = [t for t in trades if _get_trade_pnl(t) > 0.0]
     win_rate = winning_trades_ratio = winning_trades_pct = 0.0
     if n_trades > 0:
         winning_trades_ratio = len(winning_trades) / n_trades
         win_rate = winning_trades_pct = winning_trades_ratio * 100.0
 
     # 3. Profit Factor
-    gross_profit = sum(float(t.get("pnl", 0.0) or 0.0) for t in trades if float(t.get("pnl", 0.0) or 0.0) > 0.0)
-    gross_loss = sum(abs(float(t.get("pnl", 0.0) or 0.0)) for t in trades if float(t.get("pnl", 0.0) or 0.0) < 0.0)
+    gross_profit = sum(_get_trade_pnl(t) for t in trades if _get_trade_pnl(t) > 0.0)
+    gross_loss = sum(abs(_get_trade_pnl(t)) for t in trades if _get_trade_pnl(t) < 0.0)
     
     if gross_loss > 0:
         profit_factor = gross_profit / gross_loss
@@ -94,7 +113,7 @@ def calculate_metrics(records: list, initial_capital: float) -> dict:
     max_dd_pct = 0.0
 
     for t in trades:
-        pnl = float(t.get("pnl", 0.0) or 0.0)
+        pnl = _get_trade_pnl(t)
         equity += pnl
         if equity > peak:
             peak = equity
@@ -117,14 +136,14 @@ def calculate_metrics(records: list, initial_capital: float) -> dict:
 
     # 6. Expectancy and Average PnL Calculations
     import math
-    losing_trades = [t for t in trades if float(t.get("pnl", 0.0) or 0.0) < 0.0]
+    losing_trades = [t for t in trades if _get_trade_pnl(t) < 0.0]
     avg_win = gross_profit / len(winning_trades) if winning_trades else 0.0
     avg_loss = gross_loss / len(losing_trades) if losing_trades else 0.0
     win_fraction = winning_trades_ratio
     loss_fraction = len(losing_trades) / n_trades if n_trades > 0 else 0.0
     expectancy = (win_fraction * avg_win) - (loss_fraction * avg_loss)
 
-    pnls = [float(t.get("pnl", 0.0) or 0.0) for t in trades]
+    pnls = [_get_trade_pnl(t) for t in trades]
     if len(pnls) >= 2:
         mean_pnl = sum(pnls) / len(pnls)
         variance = sum((x - mean_pnl) ** 2 for x in pnls) / (len(pnls) - 1)
@@ -159,7 +178,7 @@ def calculate_metrics(records: list, initial_capital: float) -> dict:
     }
 
 
-def print_report(m: dict):
+def print_report(m: dict, cohort: str | None = None):
     # Pass/Fail evaluation
     gate_n = m["n_trades"] >= 30
     gate_pf = m["profit_factor"] >= 1.25
@@ -173,7 +192,13 @@ def print_report(m: dict):
     print("           PRODUCTION PROMOTION GATES EVALUATION REPORT               ")
     print("======================================================================")
     print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if cohort:
+        print(f"Cohort Filter: {cohort}")
     print(f"Total Closed Trades Evaluated: {m['n_trades']}")
+    if m["n_trades"] == 0:
+        print("----------------------------------------------------------------------")
+        print("[NOTICE] STATUS: NO TRADES FOR SPECIFIED COHORT. Continue paper trading.")
+        sys.exit(1)
     print(f"Final Mock Equity: ${m['final_equity']:.2f}")
     print(f"Gross Profits: ${m['gross_profit']:.2f} | Gross Losses: ${m['gross_loss']:.2f}")
     print("----------------------------------------------------------------------")
@@ -240,8 +265,8 @@ def main():
         print("No trade records found to evaluate.")
         sys.exit(1)
 
-    metrics = calculate_metrics(records, args.capital)
-    print_report(metrics)
+    metrics = calculate_metrics(records, args.capital, args.cohort)
+    print_report(metrics, args.cohort)
 
 
 if __name__ == "__main__":

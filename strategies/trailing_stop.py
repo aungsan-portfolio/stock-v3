@@ -22,11 +22,42 @@ logger = logging.getLogger(__name__)
 
 MAX_REMEDIATION_STRIKES: int = 2
 
+# ── Canonical Post-Fill Protection Geometry Constants ────────────────────────
+POST_FILL_NOISE_FLOOR_BPS: float = 0.0005     # 5 bps (0.05%) price scale floor
+POST_FILL_MIN_ABSOLUTE_BUFFER: float = 0.05    # $0.05 absolute minimum tick buffer
+POST_FILL_REBUILD_BUFFER_MULT: float = 1.15    # Pre-existing 15% safety buffer
+
+
+def compute_canonical_post_fill_distances(
+    fill_price: float, 
+    decimals: int = 2
+) -> Tuple[float, float]:
+    """
+    Authoritative shared calculation for post-fill protection geometry.
+    Ensures validation and rebuild share the exact same canonical distance basis.
+    
+    Returns:
+        Tuple[float, float]: (min_required_distance, min_rebuild_distance)
+    """
+    min_required_distance = max(POST_FILL_MIN_ABSOLUTE_BUFFER, fill_price * POST_FILL_NOISE_FLOOR_BPS)
+    min_rebuild_distance = round(min_required_distance * POST_FILL_REBUILD_BUFFER_MULT, decimals)
+    return min_required_distance, min_rebuild_distance
+
+
 _STOP_ORDER_TYPES = frozenset([
     "stop",
     "stop_limit",
     "trailing_stop",
 ])
+
+
+def _normalize_strategy_name(raw) -> str:
+    """Safely extract string strategy name from enum, string, or object."""
+    if hasattr(raw, "value"):
+        return str(raw.value)
+    if isinstance(raw, str) and raw.strip() and raw.strip() != "UNKNOWN":
+        return raw.strip()
+    return "UNKNOWN"
 
 
 def _classify_held_order(order) -> str:
@@ -44,7 +75,7 @@ def _classify_held_order(order) -> str:
 
     client_id = str(getattr(order, "client_order_id", getattr(order, "orderRef", "")) or "")
     if order_type in ("market", "limit") and (
-        client_id.startswith(("dt_", "exit_", "flatten_", "close_", "sell_", "buy_")) or ":" in client_id
+        client_id.startswith(("dt_", "val_", "exit_", "flatten_", "close_", "sell_", "buy_")) or ":" in client_id
     ):
         return "exit"
 
@@ -80,6 +111,7 @@ class TrailingStopState:
     desired_stop_price: Optional[float] = None
     confirmed_broker_stop_price: Optional[float] = None
     stop_reconciliation_required: bool = False
+    is_validation: bool = False
 
     def __post_init__(self):
         if self.desired_stop_price is None:
@@ -391,7 +423,7 @@ class DynamicTrailingStopManager:
                 last_updated=time.time(),
                 order_id=stop_order_id,
                 qty=qty,
-                strategy=getattr(signal, "strategy", "UNKNOWN"),
+                strategy=_normalize_strategy_name(getattr(signal, "strategy", None)) if _normalize_strategy_name(getattr(signal, "strategy", None)) != "UNKNOWN" else ("DAYTRADE_SCALP" if getattr(signal, "signal_id", None) else "UNKNOWN"),
                 signal_id=getattr(signal, "signal_id", None),
                 entry_time=time.time(),
                 active=True
@@ -421,10 +453,9 @@ class DynamicTrailingStopManager:
         """
         is_short = (side.upper() == "SELL")
         decimals = 4 if fill_price < 1.0 else 2
-        stop_distance = (initial_stop - fill_price) if is_short else (fill_price - initial_stop)
-        # Minimum required broker tick/distance buffer (0.05 min or 5 bps price scale)
-        min_required_distance = max(0.05, fill_price * 0.0005)
-        min_rebuild_distance = round(min_required_distance * 1.15, decimals)
+        stop_distance = round((initial_stop - fill_price) if is_short else (fill_price - initial_stop), decimals)
+        # Canonical post-fill protection geometry distances
+        min_required_distance, min_rebuild_distance = compute_canonical_post_fill_distances(fill_price, decimals)
 
         # 1. Component Validations
         ordering_valid = (
@@ -432,7 +463,7 @@ class DynamicTrailingStopManager:
             if is_short
             else (initial_stop < fill_price and (not target_price or fill_price < target_price))
         )
-        noise_floor_valid = stop_distance >= min_required_distance
+        noise_floor_valid = stop_distance >= (min_required_distance - 1e-6)
         
         min_rr = getattr(config, "MIN_RISK_REWARD_RATIO", getattr(config, "MIN_RR_RATIO", 1.5))
         risk = stop_distance
@@ -467,8 +498,8 @@ class DynamicTrailingStopManager:
             return initial_stop
 
         if not composite_valid:
-            # Fix B: min_rebuild_distance (with 15% buffer) for safe offset
-            stop_offset = max(fill_price * 0.005, min_rebuild_distance)
+            # Fix B: Canonical min_rebuild_distance (5 bps basis with pre-existing 15% buffer)
+            stop_offset = min_rebuild_distance
 
             min_rr = getattr(config, "MIN_RR_RATIO", 1.0)
             if is_short:
@@ -488,17 +519,17 @@ class DynamicTrailingStopManager:
             )
             
             # Post-Rebuild Re-Validation Assertion (Stop distance + R:R Ratio check)
-            rebuilt_stop_dist = (new_stop_price - fill_price) if is_short else (fill_price - new_stop_price)
+            rebuilt_stop_dist = round((new_stop_price - fill_price) if is_short else (fill_price - new_stop_price), decimals)
             rebuilt_tp_dist = (fill_price - new_target_price) if is_short else (new_target_price - fill_price)
             rebuilt_rr = (rebuilt_tp_dist / rebuilt_stop_dist) if rebuilt_stop_dist > 0 else 0.0
             rebuilt_rr_valid = round(rebuilt_rr, 4) >= (min_rr - 1e-4)
 
             if is_short:
-                rebuilt_valid = (new_stop_price > fill_price) and (rebuilt_stop_dist >= min_required_distance) and rebuilt_rr_valid
+                rebuilt_valid = (new_stop_price > fill_price) and (rebuilt_stop_dist >= (min_required_distance - 1e-6)) and rebuilt_rr_valid
                 if target_price and target_price > 0:
                     rebuilt_valid = rebuilt_valid and (fill_price > new_target_price)
             else:
-                rebuilt_valid = (new_stop_price < fill_price) and (rebuilt_stop_dist >= min_required_distance) and rebuilt_rr_valid
+                rebuilt_valid = (new_stop_price < fill_price) and (rebuilt_stop_dist >= (min_required_distance - 1e-6)) and rebuilt_rr_valid
                 if target_price and target_price > 0:
                     rebuilt_valid = rebuilt_valid and (fill_price < new_target_price)
 
@@ -689,7 +720,7 @@ class DynamicTrailingStopManager:
 
             atr = 0.0
             try:
-                df = fetch_intraday(symbol)
+                df = fetch_intraday(symbol, purpose="POSITION_MONITORING")
                 if not df.empty and "atr" in df.columns:
                     atr = float(df["atr"].iloc[-1])
             except Exception:
@@ -711,6 +742,26 @@ class DynamicTrailingStopManager:
                     f"Time-exit clock starts from reconciliation time."
                 )
 
+            is_val_pos = False
+            if open_orders:
+                for o in open_orders:
+                    cid = str(getattr(o, "client_order_id", "") or "")
+                    if cid.startswith("val_"):
+                        is_val_pos = True
+                        break
+            if not is_val_pos and bridge and hasattr(bridge, "get_order_role_info") and stop_order_id:
+                r_info = bridge.get_order_role_info(stop_order_id)
+                if str(r_info.get("client_order_id", "")).startswith("val_"):
+                    is_val_pos = True
+            if not is_val_pos and stop_order_id:
+                try:
+                    from strategies.order_registry import get_registered_order
+                    reg = get_registered_order(str(stop_order_id))
+                    if reg and (reg.get("is_validation") or str(reg.get("client_order_id") or "").startswith("val_")):
+                        is_val_pos = True
+                except Exception:
+                    pass
+
             state = TrailingStopState(
                 symbol=symbol,
                 side=side,
@@ -725,11 +776,12 @@ class DynamicTrailingStopManager:
                 qty=qty,
                 strategy="RECONCILED",
                 entry_time=reconciled_entry_time,
-                active=True
+                active=True,
+                is_validation=is_val_pos,
             )
             self.states[symbol] = state
             self._save_state()
-            logger.info(f"Auto-initialized Trailing Stop for {symbol} from broker: Entry ${avg_cost:.2f}, Stop ${final_stop:.2f}, Order ID {stop_order_id}")
+            logger.info(f"Auto-initialized Trailing Stop for {symbol} from broker: Entry ${avg_cost:.2f}, Stop ${final_stop:.2f}, Order ID {stop_order_id} (is_val={is_val_pos})")
             return state
 
     def _is_valid_stop_order(
@@ -1164,22 +1216,36 @@ class DynamicTrailingStopManager:
                 pnl_val = (exit_price - state.entry_price) * qty_closed if state.side == "BUY" else (state.entry_price - exit_price) * qty_closed
                 
                 try:
-                    from strategies.trade_journal import log_trade
-                    log_trade(
-                        symbol=symbol,
-                        side="SELL" if state.side == "BUY" else "BUY",
-                        strategy=getattr(state, "strategy", "UNKNOWN"),
-                        qty=int(qty_closed),
-                        entry_price=state.entry_price,
-                        stop_price=state.stop_price,
-                        target_price=getattr(state, "target_price", None) or exit_price,
-                        exit_price=exit_price,
-                        exit_reason="STOP_OUT",
-                        pnl=pnl_val,
-                        notes="Stopped out exit",
-                        event_type="TRADE_CLOSED",
-                        signal_id=getattr(state, "signal_id", None)
-                    )
+                    if getattr(state, "is_validation", False):
+                        try:
+                            from strategies.validation_lane import record_validation_exit
+                            record_validation_exit(
+                                order_id=str(getattr(state, "order_id", "") or ""),
+                                exit_price=exit_price,
+                                qty=float(qty_closed),
+                                side="SELL" if state.side == "BUY" else "BUY",
+                                symbol=symbol,
+                                exit_reason="STOP_OUT",
+                            )
+                        except Exception as val_e:
+                            logger.error("Failed to record validation exit: %s", val_e)
+                    else:
+                        from strategies.trade_journal import log_trade
+                        log_trade(
+                            symbol=symbol,
+                            side="SELL" if state.side == "BUY" else "BUY",
+                            strategy=_normalize_strategy_name(getattr(state, "strategy", None)) if _normalize_strategy_name(getattr(state, "strategy", None)) != "UNKNOWN" else ("DAYTRADE_SCALP" if getattr(state, "signal_id", None) else "UNKNOWN"),
+                            qty=int(qty_closed),
+                            entry_price=state.entry_price,
+                            stop_price=state.stop_price,
+                            target_price=getattr(state, "target_price", None) or exit_price,
+                            exit_price=exit_price,
+                            exit_reason="STOP_OUT",
+                            pnl=pnl_val,
+                            notes="Stopped out exit",
+                            event_type="TRADE_CLOSED",
+                            signal_id=getattr(state, "signal_id", None)
+                        )
                 except Exception as e_log:
                     logger.error("Failed to log stopped out exit to journal: %s", e_log)
                 
@@ -1528,22 +1594,36 @@ class DynamicTrailingStopManager:
                                 pnl_val = (exit_price - current_state.entry_price) * qty_closed if current_state.side == "BUY" else (current_state.entry_price - exit_price) * qty_closed
                                 
                                 try:
-                                    from strategies.trade_journal import log_trade
-                                    log_trade(
-                                        symbol=symbol,
-                                        side="SELL" if current_state.side == "BUY" else "BUY",
-                                        strategy=getattr(current_state, "strategy", "UNKNOWN"),
-                                        qty=int(qty_closed),
-                                        entry_price=current_state.entry_price,
-                                        stop_price=current_state.stop_price,
-                                        target_price=getattr(current_state, "target_price", None) or exit_price,
-                                        exit_price=exit_price,
-                                        exit_reason="EMERGENCY_FLATTEN",
-                                        pnl=pnl_val,
-                                        notes="Emergency flatten exit",
-                                        event_type="TRADE_CLOSED",
-                                        signal_id=getattr(current_state, "signal_id", None)
-                                    )
+                                    if getattr(current_state, "is_validation", False):
+                                        try:
+                                            from strategies.validation_lane import record_validation_exit
+                                            record_validation_exit(
+                                                order_id=str(getattr(current_state, "order_id", "") or ""),
+                                                exit_price=exit_price,
+                                                qty=float(qty_closed),
+                                                side="SELL" if current_state.side == "BUY" else "BUY",
+                                                symbol=symbol,
+                                                exit_reason="EMERGENCY_FLATTEN",
+                                            )
+                                        except Exception as val_e:
+                                            logger.error("Failed to record validation exit: %s", val_e)
+                                    else:
+                                        from strategies.trade_journal import log_trade
+                                        log_trade(
+                                            symbol=symbol,
+                                            side="SELL" if current_state.side == "BUY" else "BUY",
+                                            strategy=_normalize_strategy_name(getattr(current_state, "strategy", None)) if _normalize_strategy_name(getattr(current_state, "strategy", None)) != "UNKNOWN" else ("DAYTRADE_SCALP" if getattr(current_state, "signal_id", None) else "UNKNOWN"),
+                                            qty=int(qty_closed),
+                                            entry_price=current_state.entry_price,
+                                            stop_price=current_state.stop_price,
+                                            target_price=getattr(current_state, "target_price", None) or exit_price,
+                                            exit_price=exit_price,
+                                            exit_reason="EMERGENCY_FLATTEN",
+                                            pnl=pnl_val,
+                                            notes="Emergency flatten exit",
+                                            event_type="TRADE_CLOSED",
+                                            signal_id=getattr(current_state, "signal_id", None)
+                                        )
                                 except Exception as e_log:
                                     logger.error("Failed to log emergency close to journal: %s", e_log)
                         self._save_state()
@@ -1600,6 +1680,62 @@ class DynamicTrailingStopManager:
             if current_state:
                 current_state.active = False
                 current_state.remediation_in_progress = False
+                if close_ok:
+                    try:
+                        from strategies.trade_journal import log_trade
+                        raw_strat = getattr(current_state, "strategy", None)
+                        strat_str = _normalize_strategy_name(raw_strat)
+                        if strat_str == "UNKNOWN" and getattr(current_state, "signal_id", None):
+                            strat_str = "DAYTRADE_SCALP"
+
+                        exit_price = getattr(current_state, "stop_price", 0.0) or 0.0
+                        if bridge and hasattr(bridge, "market_price"):
+                            try:
+                                exit_price = bridge.market_price(symbol) or exit_price
+                            except Exception:
+                                pass
+                        if exit_price <= 0.0:
+                            exit_price = getattr(current_state, "entry_price", 0.0)
+
+                        entry_price = getattr(current_state, "entry_price", exit_price)
+                        side = getattr(current_state, "side", "BUY")
+                        qty_val = abs(float(position_qty or getattr(current_state, "qty", 1.0)))
+                        pnl_val = (exit_price - entry_price) * qty_val if side == "BUY" else (entry_price - exit_price) * qty_val
+
+                        if getattr(current_state, "is_validation", False):
+                            try:
+                                from strategies.validation_lane import record_validation_exit
+                                record_validation_exit(
+                                    order_id=str(getattr(current_state, "order_id", "") or ""),
+                                    exit_price=exit_price,
+                                    qty=float(qty_val),
+                                    side="SELL" if side == "BUY" else "BUY",
+                                    symbol=symbol,
+                                    exit_reason="EMERGENCY_FLATTEN",
+                                )
+                            except Exception as val_e:
+                                logger.error("Failed to record validation exit: %s", val_e)
+                        else:
+                            log_trade(
+                                symbol=symbol,
+                                side="SELL" if side == "BUY" else "BUY",
+                                strategy=strat_str,
+                                qty=int(qty_val),
+                                entry_price=entry_price,
+                                stop_price=getattr(current_state, "stop_price", exit_price),
+                                target_price=getattr(current_state, "target_price", None) or exit_price,
+                                exit_price=exit_price,
+                                exit_reason="EMERGENCY_FLATTEN",
+                                pnl=pnl_val,
+                                notes="Emergency flatten forced exit",
+                                event_type="TRADE_CLOSED",
+                                signal_id=getattr(current_state, "signal_id", None),
+                            )
+                        logger.info(
+                            f"[EMERGENCY FLATTEN JOURNAL] {symbol} | exit_px={exit_price} | strategy={strat_str} | pnl={pnl_val:.2f}"
+                        )
+                    except Exception as e_log:
+                        logger.error("Failed to log emergency flatten close to journal: %s", e_log)
             self._save_state()
 
 manager = DynamicTrailingStopManager()

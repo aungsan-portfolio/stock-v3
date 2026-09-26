@@ -310,6 +310,48 @@ class TestRegimeEngine(unittest.TestCase):
         self.assertTrue(r_on.allow_new_longs)
 
 
+    def test_benchmark_score_hysteresis(self):
+        """
+        Verify SPY/QQQ factor scores do not flap at threshold boundaries.
+        Once escalated to -2, should remain -2 until recovery clears deadband.
+        """
+        from strategies.regime_engine import (
+            reset_factor_hysteresis,
+            _apply_spy_hysteresis,
+            _apply_qqq_hysteresis,
+        )
+        reset_factor_hysteresis()
+
+        # Drop below -0.75 -> factor -2
+        self.assertEqual(_apply_spy_hysteresis(-0.76), -2)
+
+        # Recover to -0.74% (in deadband -0.75 to -0.70) -> must STAY at -2 (no flapping)
+        self.assertEqual(_apply_spy_hysteresis(-0.74), -2)
+
+        # Recovery above -0.70 -> steps down to -1
+        self.assertEqual(_apply_spy_hysteresis(-0.68), -1)
+
+        # Drop back to -0.74% -> stays -1 until dropping below -0.75%
+        self.assertEqual(_apply_spy_hysteresis(-0.74), -1)
+
+        # Recovery above -0.35 -> steps down to 0
+        self.assertEqual(_apply_spy_hysteresis(-0.30), 0)
+
+        # QQQ Hysteresis Tests
+        reset_factor_hysteresis()
+        self.assertEqual(_apply_qqq_hysteresis(-1.02), -2)
+        # Recover to -0.99% -> must STAY at -2
+        self.assertEqual(_apply_qqq_hysteresis(-0.99), -2)
+        # Recovery above -0.90 -> steps down to -1
+        self.assertEqual(_apply_qqq_hysteresis(-0.88), -1)
+        # Recovery above -0.45 -> steps down to 0
+        self.assertEqual(_apply_qqq_hysteresis(-0.40), 0)
+
+        # Combined oscillation simulation
+        reset_factor_hysteresis()
+        factors = [_apply_qqq_hysteresis(v) for v in [-1.02, -0.99, -1.04, -0.99, -1.01, -0.99]]
+        self.assertTrue(all(f == -2 for f in factors), f"QQQ should remain at -2; got {factors}")
+
+
 if __name__ == "__main__":
     unittest.main()
-

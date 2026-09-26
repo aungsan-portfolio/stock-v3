@@ -11,6 +11,7 @@ Broker adapter contract:
 """
 from __future__ import annotations
 
+from datetime import datetime
 import logging
 import math
 import threading
@@ -64,6 +65,16 @@ class ProtectionEvaluation:
     target_lineage_outcome: Optional[LineageOutcome] = None
 
 
+class EntryLifecycleState(Enum):
+    WORKING = "working"
+    TTL_EXPIRED = "ttl_expired"
+    CANCEL_REQUESTED = "cancel_requested"
+    RECONCILING = "reconciling"
+    PARTIAL_FILL_PROTECTING = "partial_fill_protecting"
+    FINALIZED = "finalized"
+    REJECTED = "rejected"
+
+
 @dataclass
 class PendingEntry:
     parent_order_id: str
@@ -73,12 +84,28 @@ class PendingEntry:
     stop_order_id: Optional[str]
     target_order_id: Optional[str]
     submitted_at: float = field(default_factory=time.time)
+    expires_at: float = 0.0
+    decision_bar_timestamp: str = ""
+    state: EntryLifecycleState = EntryLifecycleState.WORKING
+    owner_id: Optional[str] = None
     cumulative_filled_qty: float = 0.0
     average_fill_price: float = 0.0
     execution_ids: Set[str] = field(default_factory=set)
     submitted_entry_price: Optional[float] = None
     submitted_stop_price: Optional[float] = None
     submitted_target_price: Optional[float] = None
+    # Forensic Telemetry Timestamps (UTC epoch / ISO)
+    signal_ts: Optional[float] = None
+    submit_ts: Optional[float] = None
+    broker_accepted_ts: Optional[float] = None
+    first_fill_ts: Optional[float] = None
+    last_fill_ts: Optional[float] = None
+    ttl_expiry_ts: Optional[float] = None
+    cancel_request_ts: Optional[float] = None
+    cancel_ack_ts: Optional[float] = None
+    final_order_status_ts: Optional[float] = None
+    final_position_reconcile_ts: Optional[float] = None
+    protection_verified_ts: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +131,117 @@ class EntryOrderLifecycle:
         text = str(value).strip()
         return text or None
 
+    def compare_and_swap_state(
+        self,
+        parent_order_id: object = None,
+        expected_states: Any = None,
+        new_state: Optional[EntryLifecycleState] = None,
+        worker_id: str = "worker",
+        *,
+        order_id: object = None,
+        expected: Any = None,
+    ) -> bool:
+        """
+        Atomic Compare-And-Swap transition enforcing Amendment 1 (Single-Owner Lifecycle).
+        Ensures only one worker (background reaper vs sync sweep) claims and transitions an order.
+        """
+        pid = parent_order_id if parent_order_id is not None else order_id
+        parent_id = self._order_id(pid)
+        if not parent_id or new_state is None:
+            return False
+        exp_input = expected_states if expected_states is not None else expected
+        if isinstance(exp_input, EntryLifecycleState):
+            expected_set = {exp_input}
+        elif exp_input is not None:
+            expected_set = set(exp_input)
+        else:
+            expected_set = {EntryLifecycleState.WORKING}
+
+        with self._lock:
+            entry = self._pending.get(parent_id)
+            if entry is None:
+                return False
+            if entry.state not in expected_set:
+                logger.debug(
+                    "[CAS REJECTED] %s: current state %s not in expected %s (worker: %s, owner: %s)",
+                    parent_id, entry.state, expected_set, worker_id, entry.owner_id
+                )
+                return False
+            old_state = entry.state
+            entry.state = new_state
+            entry.owner_id = worker_id
+            logger.info(
+                "[CAS TRANSITION] %s: %s -> %s claimed by %s",
+                parent_id, old_state.value, new_state.value, worker_id
+            )
+            return True
+
+    def update_state(
+        self,
+        parent_order_id: object = None,
+        new_state: Optional[EntryLifecycleState] = None,
+        *,
+        order_id: object = None,
+    ) -> bool:
+        """Update lifecycle state of an active entry."""
+        pid = parent_order_id if parent_order_id is not None else order_id
+        parent_id = self._order_id(pid)
+        if not parent_id or new_state is None:
+            return False
+        with self._lock:
+            entry = self._pending.get(parent_id)
+            if entry:
+                entry.state = new_state
+                return True
+            return False
+
+    def get_pending_entry(self, parent_order_id: object) -> Optional[PendingEntry]:
+        """Fetch pending entry safely by parent order ID."""
+        parent_id = self._order_id(parent_order_id)
+        with self._lock:
+            return self._pending.get(parent_id)
+
+    def get_expired_entries(
+        self, now: float, current_closed_bar_start: Optional[str] = None
+    ) -> List[PendingEntry]:
+        """
+        Identify working entries that have exceeded TTL or whose decision bar has been superseded.
+        Adheres strictly to Amendment 2 (current_closed_bar_start > decision_bar_timestamp).
+        """
+        expired = []
+        with self._lock:
+            for entry in list(self._pending.values()):
+                if entry.state != EntryLifecycleState.WORKING:
+                    continue
+
+                is_ttl_expired = bool(entry.expires_at > 0 and now >= entry.expires_at)
+                is_bar_superseded = False
+                if current_closed_bar_start and entry.decision_bar_timestamp:
+                    cur_bar = str(current_closed_bar_start).strip()
+                    dec_bar = str(entry.decision_bar_timestamp).strip()
+                    if cur_bar and dec_bar and cur_bar > dec_bar:
+                        is_bar_superseded = True
+
+                if is_ttl_expired or is_bar_superseded:
+                    expired.append(entry)
+        return expired
+
+    def finalize_entry(
+        self,
+        parent_order_id: object = None,
+        reason: str = "",
+        *,
+        order_id: object = None,
+    ) -> Optional[PendingEntry]:
+        """Mark entry finalized and remove from pending tracking."""
+        pid = parent_order_id if parent_order_id is not None else order_id
+        parent_id = self._order_id(pid)
+        with self._lock:
+            entry = self._pending.pop(parent_id, None)
+            if entry:
+                entry.state = EntryLifecycleState.FINALIZED
+            return entry
+
     def register_submission(
         self,
         *,
@@ -115,8 +253,13 @@ class EntryOrderLifecycle:
         submitted_entry_price: Optional[float] = None,
         submitted_stop_price: Optional[float] = None,
         submitted_target_price: Optional[float] = None,
+        expires_at: Optional[float] = None,
+        decision_bar_timestamp: Optional[str] = None,
+        signal_ts: Optional[float] = None,
+        submit_ts: Optional[float] = None,
+        **kwargs: Any,
     ) -> PendingEntry:
-        """Record a submitted bracket; this does *not* create position state."""
+        """Record a submitted bracket with explicit TTL and bar boundary tracking."""
         parent_id = self._order_id(parent_order_id)
         if parent_id is None:
             raise ValueError("Cannot register entry lifecycle without parent order ID")
@@ -142,6 +285,25 @@ class EntryOrderLifecycle:
             risk_per_share=abs(entry_px - stop_px),
         )
 
+        now_t = time.time()
+        sub_t = submit_ts if submit_ts is not None else now_t
+        exp_t = expires_at if (expires_at is not None and expires_at > 0) else (sub_t + 60.0)
+        bar_ts = str(decision_bar_timestamp or getattr(signal, "bar_timestamp", "") or "").strip()
+
+        sig_t = signal_ts or kwargs.get("signal_generation_timestamp") or sub_t
+        if isinstance(sig_t, datetime):
+            sig_t = sig_t.timestamp()
+        elif isinstance(sig_t, str):
+            try:
+                sig_t = float(sig_t)
+            except ValueError:
+                try:
+                    sig_t = datetime.fromisoformat(sig_t.replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    sig_t = sub_t
+        elif not isinstance(sig_t, (int, float)):
+            sig_t = sub_t
+
         entry = PendingEntry(
             parent_order_id=parent_id,
             symbol=effective_signal.symbol.upper().strip(),
@@ -149,23 +311,34 @@ class EntryOrderLifecycle:
             requested_qty=float(requested_qty),
             stop_order_id=stop_id,
             target_order_id=target_id,
+            submitted_at=sub_t,
+            expires_at=exp_t,
+            decision_bar_timestamp=bar_ts,
+            state=EntryLifecycleState.WORKING,
             submitted_entry_price=entry_px,
             submitted_stop_price=stop_px,
             submitted_target_price=target_px,
+            signal_ts=float(sig_t),
+            submit_ts=sub_t,
+            broker_accepted_ts=now_t,
+            ttl_expiry_ts=exp_t,
         )
         with self._lock:
             if parent_id in self._pending:
                 raise RuntimeError(f"Duplicate pending parent order ID: {parent_id}")
             self._pending[parent_id] = entry
         logger.info(
-            "[ENTRY LIFECYCLE] Registered pending %s parent=%s qty=%.4f stop=%s target=%s",
+            "[ENTRY LIFECYCLE] Registered pending %s parent=%s qty=%.4f stop=%s target=%s ttl=%.1fs bar=%s",
             entry.symbol,
             entry.parent_order_id,
             entry.requested_qty,
             entry.stop_order_id,
             entry.target_order_id,
+            entry.expires_at - entry.submitted_at,
+            entry.decision_bar_timestamp,
         )
         return entry
+
 
     def record_parent_fill(
         self,
@@ -837,10 +1010,214 @@ class EntryOrderLifecycle:
                     "submitted_entry_price": entry.submitted_entry_price,
                     "submitted_stop_price": entry.submitted_stop_price,
                     "submitted_target_price": entry.submitted_target_price,
+                    "state": entry.state.value if hasattr(entry.state, "value") else str(entry.state),
+                    "expires_at": entry.expires_at,
+                    "decision_bar_timestamp": entry.decision_bar_timestamp,
                 }
                 for parent_id, entry in self._pending.items()
             }
 
+    def reconcile_and_protect_partial_entry(
+        self,
+        bridge: object,
+        entry: PendingEntry,
+        intended_filled_qty: float,
+    ) -> Tuple[bool, str]:
+        """
+        Executes explicit partial-fill protection sequence (Amendment 3):
+        1. Check if an active stop covering intended_filled_qty exists.
+        2. If not, place an explicit protective stop for exact intended_filled_qty.
+        3. Register position with TrailingStopManager.
+        4. Verify exact protection via verify_exact_protection().
+        """
+        sym = entry.symbol.upper().strip()
+        side = entry.signal.side.upper().strip()
+        stop_px = entry.submitted_stop_price or entry.signal.stop_price
+        exit_side = "SELL" if side == "BUY" else "BUY"
+
+        # Check existing protection first to prevent duplicate stops
+        ok, reason, active_stop_id = verify_exact_protection(
+            bridge=bridge,
+            symbol=sym,
+            filled_qty=intended_filled_qty,
+            entry_side=side,
+            stop_price=stop_px,
+        )
+        if ok and active_stop_id:
+            logger.info("[PARTIAL FILL] %s already exactly protected by stop_id=%s", sym, active_stop_id)
+            try:
+                self._trailing_manager.apply_confirmed_fill(
+                    entry.signal,
+                    average_fill_price=entry.average_fill_price,
+                    cumulative_qty=intended_filled_qty,
+                    stop_order_id=active_stop_id,
+                    bridge=bridge,
+                    tp_order_id=None,
+                )
+            except Exception as t_exc:
+                logger.warning("[PARTIAL FILL] Trailing manager registration warning: %s", t_exc)
+            return True, active_stop_id
+
+        # If duplicate stops detected, fail closed
+        if "DUPLICATE_STOPS_FORBIDDEN" in reason:
+            return False, reason
+
+        # Place explicit protective stop for exact intended filled quantity
+        stop_id = None
+        if hasattr(bridge, "place_protective_stop"):
+            try:
+                stop_id = bridge.place_protective_stop(
+                    symbol=sym,
+                    side=exit_side,
+                    qty=intended_filled_qty,
+                    stop_price=stop_px,
+                )
+            except Exception as exc:
+                return False, f"FAILED_TO_PLACE_PROTECTIVE_STOP: {exc}"
+        elif hasattr(bridge, "place_stop_order"):
+            try:
+                res = bridge.place_stop_order(
+                    symbol=sym,
+                    side=exit_side,
+                    qty=int(intended_filled_qty),
+                    stop_price=stop_px,
+                )
+                stop_id = res.get("order_id") if res else None
+            except Exception as exc:
+                return False, f"FAILED_TO_PLACE_STOP_ORDER: {exc}"
+
+        if not stop_id:
+            return False, "PROTECTIVE_STOP_SUBMISSION_RETURNED_EMPTY_ID"
+
+        # Register with trailing stop manager
+        try:
+            self._trailing_manager.apply_confirmed_fill(
+                entry.signal,
+                average_fill_price=entry.average_fill_price,
+                cumulative_qty=intended_filled_qty,
+                stop_order_id=stop_id,
+                bridge=bridge,
+                tp_order_id=None,
+            )
+        except Exception as t_exc:
+            logger.warning("[PARTIAL FILL] Trailing manager registration warning: %s", t_exc)
+
+        # Re-verify exact protection
+        ver_ok, ver_reason, final_stop_id = verify_exact_protection(
+            bridge=bridge,
+            symbol=sym,
+            filled_qty=intended_filled_qty,
+            entry_side=side,
+            stop_price=stop_px,
+        )
+        if not ver_ok:
+            return False, f"PROTECTION_VERIFICATION_FAILED_AFTER_PLACEMENT: {ver_reason}"
+
+        return True, final_stop_id or stop_id
+
+
+def verify_exact_protection(
+    bridge: object,
+    symbol: str,
+    filled_qty: float,
+    entry_side: str,
+    stop_price: float,
+) -> Tuple[bool, str, Optional[str]]:
+    """
+    Authoritative Protection Verification strictly enforcing Amendment 3:
+      broker_position_qty == protected_stop_qty == intended_filled_qty
+    Requires:
+      - Correct symbol
+      - Correct exit side (SELL for BUY entry, BUY for SELL entry)
+      - Exactly one active/working protective order covering the position (duplicate stops forbidden)
+      - Broker position matches intended filled qty
+    Returns: (is_verified: bool, reason: str, active_stop_id: Optional[str])
+    """
+    sym = symbol.upper().strip()
+    intended_qty = abs(float(filled_qty))
+    expected_exit_side = "SELL" if entry_side.upper() in ("BUY", "LONG") else "BUY"
+
+    # 1. Fetch broker position truth
+    if hasattr(bridge, "get_position_truth"):
+        pos_truth = bridge.get_position_truth(sym)
+        broker_position_qty = abs(float(pos_truth.qty))
+    else:
+        get_pos = getattr(bridge, "get_position", None)
+        raw_qty = get_pos(sym) if callable(get_pos) else 0.0
+        broker_position_qty = abs(float(raw_qty or 0.0))
+
+    if broker_position_qty != intended_qty:
+        return (
+            False,
+            f"QTY_MISMATCH: broker_position_qty={broker_position_qty:.4f} != intended_filled_qty={intended_qty:.4f}",
+            None,
+        )
+
+    # 2. Query active protective stops for symbol
+    if hasattr(bridge, "get_active_stops_for_symbol"):
+        stops = bridge.get_active_stops_for_symbol(sym)
+    else:
+        # Fallback inspection of active orders
+        get_active = getattr(bridge, "_get_active_orders", None)
+        al_orders = get_active() if callable(get_active) else []
+        stops = []
+        for o in al_orders:
+            if str(getattr(o, "symbol", "")).upper().strip() != sym:
+                continue
+            otype = str(getattr(o, "order_type", getattr(o, "type", ""))).lower().replace("ordertype.", "")
+            if otype in ("stop", "stop_limit", "trailing_stop"):
+                raw_s = getattr(o, "side", "")
+                s_norm = (raw_s.value if hasattr(raw_s, "value") else str(raw_s)).upper().replace("ORDERSIDE.", "").strip()
+                raw_st = getattr(o, "status", "")
+                st_norm = (raw_st.value if hasattr(raw_st, "value") else str(raw_st)).lower().replace("orderstatus.", "").strip()
+                stops.append({
+                    "id": str(getattr(o, "id", "")),
+                    "symbol": sym,
+                    "side": s_norm,
+                    "qty": float(getattr(o, "qty", 0.0) or 0.0),
+                    "stop_price": float(getattr(o, "stop_price", 0.0) or 0.0),
+                    "status": st_norm,
+                })
+
+    # Filter for matching non-terminal stops with correct exit side
+    matching_stops = [
+        s for s in stops
+        if str(s.get("side", "")).upper().replace("ORDERSIDE.", "").strip() == expected_exit_side
+        and str(s.get("status", "")).lower().replace("orderstatus.", "").strip() not in _TERMINAL_STATUSES
+    ]
+
+    # Invariant: Duplicate protective stops are strictly forbidden
+    if len(matching_stops) > 1:
+        return (
+            False,
+            f"DUPLICATE_STOPS_FORBIDDEN: Found {len(matching_stops)} active stops for {sym}: {[s['id'] for s in matching_stops]}",
+            None,
+        )
+
+    if not matching_stops:
+        return (
+            False,
+            f"NO_ACTIVE_STOP: Zero active {expected_exit_side} protective stops found for {sym}",
+            None,
+        )
+
+    active_stop = matching_stops[0]
+    protected_qty = abs(float(active_stop["qty"]))
+
+    if protected_qty != intended_qty:
+        return (
+            False,
+            f"STOP_QTY_MISMATCH: protected_stop_qty={protected_qty:.4f} != intended_filled_qty={intended_qty:.4f}",
+            None,
+        )
+
+    return (
+        True,
+        f"EXACT_PROTECTION_VERIFIED: broker_position={broker_position_qty:.4f} == stop_qty={protected_qty:.4f} == intended={intended_qty:.4f}",
+        active_stop["id"],
+    )
+
 
 from strategies.trailing_stop import manager as _trailing_manager
 entry_lifecycle = EntryOrderLifecycle(_trailing_manager)
+

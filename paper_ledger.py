@@ -122,6 +122,39 @@ def _event_id(record: dict) -> str:
         return ""
 
 
+def _runtime_git_commit() -> str:
+    """Return short git commit for provenance auditing, with safe fallback."""
+    try:
+        from observability.provenance import get_build_provenance
+        return get_build_provenance().commit
+    except Exception:
+        pass
+    try:
+        import subprocess
+        res = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=2)
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _runtime_config_hash() -> str:
+    """Return SHA-256 (first 16 hex chars) of config.py for provenance auditing."""
+    try:
+        cfg_file = getattr(config, "__file__", None)
+        if cfg_file and Path(cfg_file).is_file():
+            h = hashlib.sha256()
+            with open(cfg_file, "rb") as f:
+                while chunk := f.read(8192):
+                    h.update(chunk)
+            return h.hexdigest()[:16]
+    except Exception:
+        pass
+    return "unknown"
+
+
 # ── Writer (append-only, never raises into the caller) ───────────────────────
 def _append(record: dict, ts: Optional[str] = None) -> None:
     """Append one journal event. NEVER raises into the caller (order-path safe).
@@ -172,6 +205,9 @@ def record_entry(signal, result, *, session=None, order_ref=None,
             return
     _append({
         "event": EVENT_ENTRY,
+        "cohort": getattr(config, "ACTIVE_COHORT", "atomic_rotation_v1"),
+        "git_commit": _runtime_git_commit(),
+        "config_hash": _runtime_config_hash(),
         "session": session if session is not None else _default_session(),
         "symbol": _sym(getattr(signal, "symbol", "")),
         "qty": _num(getattr(result, "filled", None)),
@@ -188,11 +224,14 @@ def record_entry(signal, result, *, session=None, order_ref=None,
 
 
 def record_stop(symbol, qty, stop_price, *, hard_stop=None, entry_basis=None,
-                session=None, order_ref=None) -> None:
+                session=None, order_ref=None, cohort=None) -> None:
     """Append a STOP event recording the PRIMARY broker protective stop (the R
     denominator) and, for reference, the catastrophe ``hard_stop``."""
     _append({
         "event": EVENT_STOP,
+        "cohort": cohort or getattr(config, "ACTIVE_COHORT", "atomic_rotation_v1"),
+        "git_commit": _runtime_git_commit(),
+        "config_hash": _runtime_config_hash(),
         "session": session if session is not None else _default_session(),
         "symbol": _sym(symbol),
         "qty": _num(qty),
@@ -227,7 +266,7 @@ def _exec_id_value(exec_id) -> Optional[str]:
 
 def record_exit(symbol, *, exit_kind, exit_avg_price=None, qty=None, result=None,
                 side="SELL", session=None, order_ref=None, exec_id=None, ts=None,
-                decision=None) -> None:
+                decision=None, cohort=None) -> None:
     """Append an EXIT event. Pulls qty/price from an OrderResult when given, else
     uses the explicit ``qty`` / ``exit_avg_price`` (the broker-executions path).
     ``ts`` preserves the real execution time when known (a stop-out that filled in
@@ -251,6 +290,9 @@ def record_exit(symbol, *, exit_kind, exit_avg_price=None, qty=None, result=None
                                       order_ref=order_ref))
     _append({
         "event": EVENT_EXIT,
+        "cohort": cohort or getattr(config, "ACTIVE_COHORT", "atomic_rotation_v1"),
+        "git_commit": _runtime_git_commit(),
+        "config_hash": _runtime_config_hash(),
         "session": session if session is not None else _default_session(),
         "symbol": _sym(symbol),
         "side": str(side or "").upper().strip() or "SELL",
@@ -364,6 +406,7 @@ class PaperTrade:
     tech_score: Optional[float] = None
     model_gate_status: Optional[str] = None
     session: Optional[str] = None
+    cohort: Optional[str] = None
     pnl_included: bool = False
     r_included: bool = False
     exclusion_reason: str = ""
@@ -418,6 +461,7 @@ def _lot_from_entry(e: dict) -> dict:
         "tech_score": _num(e.get("tech_score")),
         "model_gate_status": e.get("model_gate_status"),
         "session": e.get("session"),
+        "cohort": e.get("cohort"),
     }
 
 
@@ -481,12 +525,12 @@ def _attach_stop_to_open_lot(open_lots: "deque[dict]", stop: dict) -> bool:
     return False
 
 
-def _orphan_exit(symbol, exit_ts, exit_price, qty, exit_kind, session, _exp) -> PaperTrade:
+def _orphan_exit(symbol, exit_ts, exit_price, qty, exit_kind, session, _exp, cohort=None) -> PaperTrade:
     """An exit (or surplus portion) with no covering open lot. Never paired
     backwards with a later entry; excluded with a reason."""
     return PaperTrade(
         symbol=symbol, exit_date=exit_ts, exit_price=exit_price, qty=qty,
-        exit_kind=exit_kind, session=session,
+        exit_kind=exit_kind, session=session, cohort=cohort,
         exclusion_reason=_exp.REASON_ORPHAN_EXIT,
         r_exclusion_reason=_exp.R_REASON_NO_PNL)
 
@@ -501,6 +545,7 @@ def _close_trade(symbol: str, lot: dict, qty: float, exit_price, exit_ts,
         confidence=lot.get("confidence"), rf_score=lot.get("rf_score"),
         lstm_score=lot.get("lstm_score"), tech_score=lot.get("tech_score"),
         model_gate_status=lot.get("model_gate_status"), session=lot.get("session"),
+        cohort=lot.get("cohort"),
     )
     entry_price = lot.get("entry_price")
     if entry_price is None or entry_price <= 0:
@@ -593,7 +638,8 @@ def reconstruct_paper_trades(events: List[dict]) -> List[PaperTrade]:
                     continue
                 if not open_lots:
                     trades.append(_orphan_exit(symbol, exit_ts, exit_price,
-                                               remaining, exit_kind, session, _exp))
+                                               remaining, exit_kind, session, _exp,
+                                               cohort=e.get("cohort")))
                     continue
                 while remaining > _EPS and open_lots:
                     lot = open_lots[0]

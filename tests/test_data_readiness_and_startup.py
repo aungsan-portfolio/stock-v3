@@ -328,6 +328,7 @@ def test_chase_guard_telemetry_in_prepare_execution_prices():
         atr=1.0,
         risk_per_share=2.0,
         reason="MOMENTUM_BREAKOUT",
+        bar_timestamp="2026-09-11T10:00:00+00:00",
     )
 
     quote = BrokerQuote(
@@ -382,6 +383,7 @@ def test_chase_guard_telemetry_in_execute_signal():
         atr=0.5,
         risk_per_share=1.0,
         reason="MOMENTUM_BREAKOUT",
+        bar_timestamp="2026-09-11T10:00:00+00:00",
     )
 
     readiness = EntryReadiness(
