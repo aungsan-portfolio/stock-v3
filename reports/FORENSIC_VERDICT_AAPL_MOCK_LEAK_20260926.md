@@ -69,17 +69,46 @@ Addendum (2026-09-26 Post-Run Verification & Governance Sign-off):
      - Proposed by: Antigravity (Forensic Auditor)
      - Approved by: Aung San (Principal)
      - Date: 2026-09-26
-  6. Architectural Amendment Status & Amendment A Interpretation Note:
-     - Amendment A (Winner Preservation / Threshold): VERIFIED WITH INTERPRETATION NOTE, PENDING PRINCIPAL ADJUDICATION.
-       * Upstream (position_rotator.py:444): is_profit_accelerating retains unrealized_r >= 1.0 or pnl_pct >= ROTATION_PROTECT_PROFIT_PCT skip.
-       * Downstream (atomic_rotation.py:544): non-blocking audit logging only.
-       * Reading 1: If amendment intent was strict threshold removal from candidate selection, then threshold remains active -> NOT implemented.
-       * Reading 2: If intent was protecting accelerating winners from discretionary rotation liquidation, upstream skip satisfies this behavior -> SUPERSEDED by design.
-       * Action: Formal status logged as pending principal adjudication.
+  6. Architectural Amendment Status & Amendment A Ratification:
+     - Amendment A (Winner Preservation / Threshold): RATIFIED AS SUPERSEDED BY DESIGN (Reading 2).
+       * Adjudication: Winner protection is fully satisfied upstream in candidate selection (`position_rotator.py:444` `is_profit_accelerating` skip). Downstream execution in `atomic_rotation.py` remains non-blocking audit logging.
+       * Invariant Lock: Regression test added to `tests/test_position_rotator.py` (`test_profit_accelerating_winner_never_rotation_candidate`).
+       * Backlog Disposition: Reading 1 is explicitly dismissed and excluded from post-freeze re-evaluation backlog.
+       * Freeze Discipline: Test-only addition; zero production code modification.
      - Amendment B (Rotator DI): P2 testability refactor logged (call-time DI verified in bridge, non-blocking).
      - Amendment C (ReplacementTruthStatus): VERIFIED & FROZEN (29/29 tests passed in test_atomic_rotation.py).
      - Amendment D (Cancel-then-Close): VERIFIED & FROZEN (6/6 tests passed in test_swing_rotation_hardening.py, 3.0s convergence fail-closed).
      - Amendment E (Journal Isolation Tripwires): APPLIED & LOCKED.
      - Amendment F (Recovered_via Contract): LIVE CONTRACT (recovered_via enum contract live; flatten_reconciled_fallback isolated to journal-metadata namespace).
 ```
+
+## Canonical System Memory (Rev 2 — RATIFIED BY PRINCIPAL 2026-09-27)
+
+```text
+# CANONICAL SYSTEM MEMORY (Rev 2 — RATIFIED BY PRINCIPAL 2026-09-27)
+TRUTH BASELINE: source journal production_clean.jsonl (1,231 rec, 66 closed,
+  SHA 18f476e2..., untouched); recovered artifact = trade_journal_attribution_
+  recovered.jsonl (SHA f31c1069...); quarantine = in-place reversible flags
+  (2 AAPL mocks, -$2,000), NO separate quarantine file.
+LOCKED METRICS (post-quarantine): N=64, PF=0.33, WR=23.4%, Exp=-$11.21, Net=-$717.41.
+LEGACY ERA: Jul-Aug UNKNOWN batch net +$59.29 (PF 1.40); bleed era = Sep regime friction.
+DISABLED (reversible): MOMENTUM_SCALP, VWAP_BOUNCE (memos 2026-09-26);
+  re-entry forward-only N>=20 PF>=1.0 + principal sign-off; backfilled data excluded.
+RECOVERED_VIA registry: client_order_id_parse | gate_order_id_join |
+  gate_session_tiebreak | archive_join_20260722; journal-metadata namespace:
+  flatten_reconciled_fallback; native records = field ABSENT.
+AMENDMENTS: A = RATIFIED SUPERSEDED BY DESIGN (winner protection satisfied
+  upstream via position_rotator.py is_profit_accelerating skip; locked via
+  test_position_rotator.py; Reading 1 excluded from backlog);
+  B = P2 refactor logged; C = verified 29/29; D = verified 6/6 fail-closed;
+  E = applied; F = recovered_via contract live.
+OV-1: CLOSED (dual-path egress, Line B, commit 109bee2 context).
+PHASE C: N=0/30 via tools/phase_c_session_report.py;
+  STRATEGY_DISABLED veto first-occurrence session = wiring verification event.
+REAL MONEY: BLOCKED until Phase C N>=30 clean forward audit passes.
+  Additional promotion thresholds (PF>=1.25 / WR>=40% / Exp>=0) = PROPOSED,
+  NOT RATIFIED — principal sign-off required.
+FREEZE: Rule 6 maintained; 6 breach classes documented.
+```
+
 
