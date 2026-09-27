@@ -458,6 +458,15 @@ class Predictor:
                     timestamp=macro_info.get("timestamp"),
                     quote_age_seconds=macro_info.get("quote_age_seconds", 0.0),
                 ))
+
+                # Option C: Log paired inference (incumbent vs shadow) to data/shadow_predictions.jsonl
+                try:
+                    from shadow_logger import get_shadow_logger
+                    bar_dt = str(df.index[-1].date() if hasattr(df.index[-1], "date") else df.index[-1])
+                    get_shadow_logger().log_prediction_pair(symbol, bar_dt, price, signals[-1], df)
+                except Exception as exc_sh:
+                    logger.debug("[SHADOW] Logger invocation failed for %s: %s", symbol, exc_sh)
+
                 if is_shadow:
                     logger.info(
                         "👁️ %-6s [SHADOW] %s conf=%.2f price=%.2f | %s",
