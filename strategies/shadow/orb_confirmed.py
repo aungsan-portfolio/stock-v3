@@ -139,7 +139,7 @@ class ConfirmedORBStrategy:
             logger.info(
                 "[ORB SHADOW SUMMARY] evaluated=%d candidates=%d outside_window=%d incomplete_range=%d "
                 "no_breakout=%d below_vwap=%d negative_vwap_slope=%d low_breakout_vol=%d rvol_low=%d "
-                "stock_in_play_failed=%d market_unaligned=%d sector_unavailable=%d overextended=%d spread_failed=%d",
+                "stock_in_play_failed=%d market_unaligned=%d sector_unavailable=%d overextended=%d spread_failed=%d zero_risk=%d",
                 stats.evaluated,
                 stats.candidates,
                 stats.outside_window,
@@ -154,6 +154,7 @@ class ConfirmedORBStrategy:
                 stats.sector_unavailable,
                 stats.overextended,
                 stats.spread_failed,
+                stats.zero_risk,
             )
             accounted = (
                 stats.candidates
@@ -227,6 +228,23 @@ class ConfirmedORBStrategy:
             with self._stats_lock:
                 self._cycle_stats.incomplete_range += 1
             return None
+
+        # Ensure canonical indicators exist on df without mutating caller's DataFrame
+        # Uses existing codebase indicator utilities from strategies.indicators
+        # Session-anchored: add_vwap groups by df.index.date (America/New_York session anchor)
+        df = df.copy()
+        df.index = idx_et
+        if "vwap" not in df.columns:
+            from strategies.indicators import add_vwap
+            df = add_vwap(df)
+        if "atr" not in df.columns:
+            from strategies.indicators import add_atr
+            df = add_atr(df, 14)
+            if df["atr"].isna().any():
+                df["atr"] = df["atr"].bfill().fillna((df["high"] - df["low"]).clip(lower=0.01))
+        if "ema9" not in df.columns:
+            from strategies.indicators import add_ema
+            df = add_ema(df, 9, "ema9")
 
         session_date_et = str(idx_et[-1].date())
         current_time_et = idx_et[-1].time()
