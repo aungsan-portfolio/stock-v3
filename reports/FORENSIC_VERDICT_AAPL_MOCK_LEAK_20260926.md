@@ -62,10 +62,24 @@ Addendum (2026-09-26 Post-Run Verification & Governance Sign-off):
      - MOMENTUM_SCALP: n=13, WR=7.7%, PF=0.00, PnL=-$467.15
      - VWAP_BOUNCE: n=10, WR=10.0%, PF=0.00, PnL=-$142.36
      - TOTAL: n=64, WR=23.4%, PF=0.33, Net PnL=-$717.41, Exp=-$11.21
-  4. Real-Money Trading Gate: STRICTLY BLOCKED (Negative expectancy, PF 0.33 < 1.25).
+  4. Real-Money Trading Gate: STRICTLY BLOCKED until Phase C N>=30 clean forward audit passes.
+     Additional promotion thresholds (PF>=1.25, WR>=40%, Exp>=0) are PROPOSED, NOT RATIFIED
+     (principal sign-off required).
   5. Governance Provenance:
      - Proposed by: Antigravity (Forensic Auditor)
      - Approved by: Aung San (Principal)
      - Date: 2026-09-26
+  6. Architectural Amendment Status & Amendment A Interpretation Note:
+     - Amendment A (Winner Preservation / Threshold): VERIFIED WITH INTERPRETATION NOTE, PENDING PRINCIPAL ADJUDICATION.
+       * Upstream (position_rotator.py:444): is_profit_accelerating retains unrealized_r >= 1.0 or pnl_pct >= ROTATION_PROTECT_PROFIT_PCT skip.
+       * Downstream (atomic_rotation.py:544): non-blocking audit logging only.
+       * Reading 1: If amendment intent was strict threshold removal from candidate selection, then threshold remains active -> NOT implemented.
+       * Reading 2: If intent was protecting accelerating winners from discretionary rotation liquidation, upstream skip satisfies this behavior -> SUPERSEDED by design.
+       * Action: Formal status logged as pending principal adjudication.
+     - Amendment B (Rotator DI): P2 testability refactor logged (call-time DI verified in bridge, non-blocking).
+     - Amendment C (ReplacementTruthStatus): VERIFIED & FROZEN (29/29 tests passed in test_atomic_rotation.py).
+     - Amendment D (Cancel-then-Close): VERIFIED & FROZEN (6/6 tests passed in test_swing_rotation_hardening.py, 3.0s convergence fail-closed).
+     - Amendment E (Journal Isolation Tripwires): APPLIED & LOCKED.
+     - Amendment F (Recovered_via Contract): LIVE CONTRACT (recovered_via enum contract live; flatten_reconciled_fallback isolated to journal-metadata namespace).
 ```
 

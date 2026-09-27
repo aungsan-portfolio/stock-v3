@@ -41,6 +41,9 @@ STRATEGY_PREFIX_MAP: Dict[str, str] = {
     "mean": "MEAN_REVERSION",
 }
 
+# Canonical backfill attribution provenance enum values (backfill registry namespace).
+# Note: 'flatten_reconciled_fallback' belongs exclusively to the runtime journal-metadata
+# namespace (emitted during emergency flatten fallbacks) and is not part of this backfill recovery set.
 RECOVERED_VIA_VALID_VALUES: Set[str] = {
     "client_order_id_parse",
     "gate_order_id_join",
