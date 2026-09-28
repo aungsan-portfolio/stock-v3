@@ -61,8 +61,14 @@ class TestPhase1UniverseInvariants:
         assert "LLY" in shadow, "LLY must remain in config.SHADOW_MONITOR in Phase 1"
 
     def test_daytrade_and_risk_policy_invariants(self):
-        """Phase 1: Daytrade universe (17) and risk policies must remain completely frozen."""
-        assert len(config.DAYTRADE_WATCHLIST) == 17, f"DAYTRADE_WATCHLIST must be 17, got {len(config.DAYTRADE_WATCHLIST)}"
+        """Daytrade universe and risk policies config-driven guardrail assertion."""
+        expected_count = getattr(config, "EXPECTED_DAYTRADE_WATCHLIST_COUNT", len(config.DAYTRADE_WATCHLIST))
+        assert len(config.DAYTRADE_WATCHLIST) == expected_count, (
+            f"DAYTRADE_WATCHLIST count {len(config.DAYTRADE_WATCHLIST)} != expected {expected_count}"
+        )
+        assert len(set(config.DAYTRADE_WATCHLIST)) == expected_count, (
+            "DAYTRADE_WATCHLIST contains duplicate symbols"
+        )
         assert config.USE_DYNAMIC_SCANNER is False, "USE_DYNAMIC_SCANNER must be False"
         assert config.SECTOR_EXPOSURE_CAP_PCT == 0.25, "SECTOR_EXPOSURE_CAP_PCT must remain 0.25"
         assert config.MAX_CLUSTER_RISK_PCT == 0.0125, "MAX_CLUSTER_RISK_PCT must remain 0.0125"

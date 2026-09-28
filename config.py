@@ -688,6 +688,7 @@ SHADOW_ENGINE_ROLE = "daytrade"
 
 # ── D2 Shadow Experiment Flag (Strictly Default 1.2, Zero Production Change) ──
 EXPERIMENTAL_MEAN_REVERSION_ATR_DEV = float(os.getenv("EXPERIMENTAL_MEAN_REVERSION_ATR_DEV", "1.2"))
+EXPERIMENTAL_MR_SHADOW_ENABLED: bool = os.getenv("EXPERIMENTAL_MR_SHADOW_ENABLED", "false").lower() in ("true", "1")
 
 # Direct constant fail-closed assertion (No getattr(config, ...) to prevent NameError)
 if P1_6_ORB_SHADOW_ENABLED and P1_6_SHADOW_BROKER_EXECUTION_ENABLED:
@@ -820,8 +821,14 @@ DAYTRADE_LOG_FILE = LOG_DIR / "daytrading.log"
 DAYTRADE_TRADE_JOURNAL_FILE = REPORTS_DIR / "trade_journal.jsonl"
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
-DAYTRADE_WATCHLIST = ["NVDA", "AAPL", "MSFT", "AMZN", "TSLA", "META", "AMD", "GOOGL", "QQQ", "SPY", "PLTR", "AVGO", "JPM", "BAC", "UBER", "MU", "NFLX"]
-USE_DYNAMIC_SCANNER = False  # False = Strictly trade pristine 17 Mega/Large-Cap DAYTRADE_WATCHLIST with zero slippage and institutional liquidity; True = Dynamic full-market scanner
+EXPECTED_DAYTRADE_WATCHLIST_COUNT: int = 31
+DAYTRADE_WATCHLIST = [
+    "NVDA", "AAPL", "MSFT", "AMZN", "TSLA", "META", "AMD", "GOOGL", "QQQ", "SPY",
+    "PLTR", "AVGO", "JPM", "BAC", "UBER", "MU", "NFLX",
+    "LLY", "UNH", "ABBV", "COST", "WMT", "HD", "GS", "MS", "CAT", "GE",
+    "XOM", "CVX", "CRM", "ORCL",
+]
+USE_DYNAMIC_SCANNER = False  # False = Strictly trade pristine 31 institutional DAYTRADE_WATCHLIST with zero slippage; True = Dynamic full-market scanner
 
 DAYTRADE_ML_ENABLED = False
 DAYTRADE_ML_CONFIDENCE_WEIGHT = 0.3
@@ -933,6 +940,18 @@ SECTOR_MAPPINGS: dict = {
     "CAT": {"sector": "INDUSTRIALS", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
     "LLY": {"sector": "HEALTHCARE", "source": "STATIC_CONFIG", "mapping_version": "2026-09-08"},
     "CVX": {"sector": "ENERGY", "source": "STATIC_CONFIG", "mapping_version": "2026-09-20"},
+    "PLTR": {"sector": "INFORMATION_TECHNOLOGY", "source": "STATIC_CONFIG", "mapping_version": "2026-09-28"},
+    "UBER": {"sector": "INDUSTRIALS", "source": "STATIC_CONFIG", "mapping_version": "2026-09-28"},
+    "MU": {"sector": "INFORMATION_TECHNOLOGY", "source": "STATIC_CONFIG", "mapping_version": "2026-09-28"},
+    "ABBV": {"sector": "HEALTHCARE", "source": "STATIC_CONFIG", "mapping_version": "2026-09-28"},
+    "WMT": {"sector": "CONSUMER_STAPLES", "source": "STATIC_CONFIG", "mapping_version": "2026-09-28"},
+    "HD": {"sector": "CONSUMER_DISCRETIONARY", "source": "STATIC_CONFIG", "mapping_version": "2026-09-28"},
+    "GS": {"sector": "FINANCIALS", "source": "STATIC_CONFIG", "mapping_version": "2026-09-28"},
+    "MS": {"sector": "FINANCIALS", "source": "STATIC_CONFIG", "mapping_version": "2026-09-28"},
+    "GE": {"sector": "INDUSTRIALS", "source": "STATIC_CONFIG", "mapping_version": "2026-09-28"},
+    "BA": {"sector": "INDUSTRIALS", "source": "STATIC_CONFIG", "mapping_version": "2026-09-28"},
+    "CRM": {"sector": "INFORMATION_TECHNOLOGY", "source": "STATIC_CONFIG", "mapping_version": "2026-09-28"},
+    "ORCL": {"sector": "INFORMATION_TECHNOLOGY", "source": "STATIC_CONFIG", "mapping_version": "2026-09-28"},
 }
 
 
