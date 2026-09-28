@@ -686,6 +686,9 @@ SHADOW_STRATEGY_VERSION = "ORB_CONFIRMED_V1_FIXED_2R"
 SHADOW_BASE_DIR = "data/shadow"
 SHADOW_ENGINE_ROLE = "daytrade"
 
+# ── D2 Shadow Experiment Flag (Strictly Default 1.2, Zero Production Change) ──
+EXPERIMENTAL_MEAN_REVERSION_ATR_DEV = float(os.getenv("EXPERIMENTAL_MEAN_REVERSION_ATR_DEV", "1.2"))
+
 # Direct constant fail-closed assertion (No getattr(config, ...) to prevent NameError)
 if P1_6_ORB_SHADOW_ENABLED and P1_6_SHADOW_BROKER_EXECUTION_ENABLED:
     raise RuntimeError("Invalid configuration: P1.6 shadow mode cannot enable broker execution")
