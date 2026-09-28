@@ -1707,6 +1707,13 @@ def evaluate_and_execute(
         except Exception:
             pass
 
+    # ── P1.7 MR Shadow Cycle Summary Hook ──
+    if getattr(config, "EXPERIMENTAL_MR_SHADOW_ENABLED", False):
+        try:
+            _get_mr_shadow_runner().log_cycle_summary()
+        except Exception:
+            pass
+
     all_signals = apply_portfolio_correlation(all_signals, cached_open_positions, bridge=bridge)
 
     # ── Signal Export Hook for ML Training ──

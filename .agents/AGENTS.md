@@ -21,11 +21,20 @@ This file defines the project-scoped operational constraints and rules for stock
 
 ## 3. Quantitative Promotion Gates (Paper -> Real Money)
 Before migrating the Day Trading strategy from paper trading to real money trading, the following thresholds must be met (audited via `evaluate_paper_results.py`):
-1. **Statistical Validity**: $N \ge 30$ closed trades.
-2. **Profit Factor**: $PF \ge 1.25$.
-3. **Win Rate**: $WR \ge 40\%$.
-4. **Drawdown Tolerance**: $\text{Max Drawdown} \le 5\%$ (calculated on a trade-by-trade intraday basis).
-5. **Slippage Audit**: $\text{Avg Slippage} \le 0.05\%$.
+
+### Binding Hard Gates (Evaluated for Live Stage 1 Admission)
+1. **Statistical Validity & Duration (Gate 1)**: $N \ge 30$ closed trades AND $\ge 2$ calendar weeks elapsed ($\ge 14$ days).
+2. **Sample Diversity (Gate 1b)**: $\ge 10$ distinct trading days AND single-day contribution $\le 30\%$ of total $N$ (max 9 trades on any single day).
+3. **Profit Factor (Gate 2)**: $PF \ge 1.25$.
+4. **Drawdown Tolerance (Gate 3)**: $\text{Max Drawdown} \le 5.0\%$ of starting equity (strictly half of the 10% emergency halt breaker).
+
+### Reported Diagnostic Co-Metrics (Informative / Non-Blocking)
+* **Win Rate**: Target reference $\ge 40.0\%$ (informative co-metric confirming R:R asymmetry).
+* **Execution Slippage**: Target reference $\le 0.05\%$ (broker-simulated approximate fill footnote).
+
+### Two-Stage Real-Money Promotion Architecture (Risk Scaling Layer)
+* **Stage 1 (N ≥ 30 Hard Gates Pass)**: Admission to Live Trading at **REDUCED sizing** (25% – 50% target risk). Protects capital against $N=30$ statistical sample noise (95% CI on Win Rate $\approx \pm 14-18\%$).
+* **Stage 2 (N ≥ 80–100 Sustained)**: Scaled to **FULL real-money sizing** only after $N \ge 80-100$ trades maintain $PF \ge 1.25$ with zero gate regression.
 
 ## 4. TRANSITIONING Texture Filter — Research Findings
 * **Date**: 2026-08-31

@@ -56,6 +56,9 @@ class MeanReversionShadowRunner:
             self.deviation_mult = float(getattr(config, "EXPERIMENTAL_MEAN_REVERSION_ATR_DEV", 1.2))
         else:
             self.deviation_mult = float(deviation_mult)
+        self._cycle_eval_count: int = 0
+        self._cycle_l1_passed: int = 0
+        self._cycle_all_passed: int = 0
 
     def evaluate_bar(self, symbol: str, df: pd.DataFrame) -> Optional[MeanReversionShadowResult]:
         """Evaluate a single bar DataFrame for Mean Reversion under shadow rules."""
@@ -148,6 +151,12 @@ class MeanReversionShadowRunner:
 
         bar_ts = str(df.index[-1]) if hasattr(df.index[-1], "isoformat") else str(df.index[-1])
 
+        self._cycle_eval_count += 1
+        if l1_passed:
+            self._cycle_l1_passed += 1
+        if all_layers_passed:
+            self._cycle_all_passed += 1
+
         return MeanReversionShadowResult(
             symbol=symbol,
             bar_timestamp=bar_ts,
@@ -167,6 +176,21 @@ class MeanReversionShadowRunner:
             lower_bb_break=lower_bb_break,
             rejection_layer=rejection_layer,
         )
+
+    def log_cycle_summary(self) -> None:
+        """Logs cycle-level evaluation denominator and funnel counts."""
+        if self._cycle_eval_count > 0:
+            pass_rate = (self._cycle_l1_passed / self._cycle_eval_count * 100.0)
+            logger.info(
+                "[MR SHADOW SUMMARY] cycle_evaluated=%d, l1_passed=%d (%.1f%%), all_passed=%d",
+                self._cycle_eval_count,
+                self._cycle_l1_passed,
+                pass_rate,
+                self._cycle_all_passed,
+            )
+            self._cycle_eval_count = 0
+            self._cycle_l1_passed = 0
+            self._cycle_all_passed = 0
 
 
 def log_mr_shadow_candidate(

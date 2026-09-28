@@ -62,7 +62,9 @@ class TestPhase1UniverseInvariants:
 
     def test_daytrade_and_risk_policy_invariants(self):
         """Daytrade universe and risk policies config-driven guardrail assertion."""
-        expected_count = getattr(config, "EXPECTED_DAYTRADE_WATCHLIST_COUNT", len(config.DAYTRADE_WATCHLIST))
+        expected_count = getattr(config, "EXPECTED_DAYTRADE_WATCHLIST_COUNT", None)
+        assert expected_count is not None, "config.EXPECTED_DAYTRADE_WATCHLIST_COUNT must be explicitly defined"
+        assert expected_count == 31, f"EXPECTED_DAYTRADE_WATCHLIST_COUNT must be explicitly 31, got {expected_count}"
         assert len(config.DAYTRADE_WATCHLIST) == expected_count, (
             f"DAYTRADE_WATCHLIST count {len(config.DAYTRADE_WATCHLIST)} != expected {expected_count}"
         )
