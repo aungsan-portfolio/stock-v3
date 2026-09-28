@@ -22,12 +22,16 @@ if exist .env (
         if "!KEY_NAME!"=="DAYTRADE_APCA_API_SECRET_KEY" set "APCA_API_SECRET_KEY=!KEY_VAL!"
         if "!KEY_NAME!"=="DAYTRADE_APCA_API_BASE_URL" set "APCA_API_BASE_URL=!KEY_VAL!"
         if "!KEY_NAME!"=="MAX_BAR_STALENESS_SECONDS" set "MAX_BAR_STALENESS_SECONDS=!KEY_VAL!"
+        if "!KEY_NAME!"=="EXPERIMENTAL_MR_SHADOW_ENABLED" set "EXPERIMENTAL_MR_SHADOW_ENABLED=!KEY_VAL!"
     )
 ) else (
     echo [ERROR] .env file not found. Please create .env from .env.example.
     pause
     exit /b 1
 )
+
+REM Ensure D2 Mean Reversion Shadow Experiment is active (ratified shadow lane)
+if not defined EXPERIMENTAL_MR_SHADOW_ENABLED set "EXPERIMENTAL_MR_SHADOW_ENABLED=true"
 
 REM ---------------------------------------------------------
 REM 3. Validation and Fail-Fast Guards
@@ -95,6 +99,7 @@ echo   Starting Day Trading Engine (Alpaca Paper Account)
 echo   Account Key: !MASKED_KEY!
 echo   Endpoint:    !APCA_API_BASE_URL!
 echo   Python:      !PY_EXE!
+echo   Shadow Exp:  MR_SHADOW=!EXPERIMENTAL_MR_SHADOW_ENABLED!
 echo   Session Log: !SESSION_LOG!
 echo =======================================================
 echo.
