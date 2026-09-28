@@ -55,6 +55,16 @@ from strategies.regime_engine import RegimeStateTracker
 
 _regime_state_tracker = RegimeStateTracker()
 
+_MR_SHADOW_RUNNER = None
+
+def _get_mr_shadow_runner():
+    """Hoisted singleton runner for D2 Mean Reversion shadow experiment."""
+    global _MR_SHADOW_RUNNER
+    if _MR_SHADOW_RUNNER is None:
+        from strategies.shadow.mean_reversion_shadow import MeanReversionShadowRunner
+        _MR_SHADOW_RUNNER = MeanReversionShadowRunner(deviation_mult=0.8)
+    return _MR_SHADOW_RUNNER
+
 _ALL_STRATEGIES = [
     ORBStrategy(),
     VWAPBounceStrategy(),
@@ -548,6 +558,17 @@ def _evaluate_on_df(symbol: str, df, market_texture: str = "TRENDING") -> List[T
                     )
         except Exception as shadow_err:
             logger.warning("[ORB SHADOW ERROR] Shadow evaluation error on %s: %s", symbol, shadow_err)
+
+    # ── P1.7 Mean Reversion Shadow Experiment Hook (D2 Shadow) ──
+    if getattr(config, "EXPERIMENTAL_MR_SHADOW_ENABLED", False):
+        try:
+            from strategies.shadow.mean_reversion_shadow import log_mr_shadow_candidate
+            mr_runner = _get_mr_shadow_runner()
+            mr_result = mr_runner.evaluate_bar(symbol, df)
+            if mr_result is not None and mr_result.l1_passed:
+                log_mr_shadow_candidate(mr_result, market_texture=market_texture)
+        except Exception as mr_err:
+            logger.debug("[MR SHADOW] Evaluation error on %s: %s", symbol, mr_err)
 
     from strategies.scoring import RiskAdjustedSignalScorer
     scorer = RiskAdjustedSignalScorer()

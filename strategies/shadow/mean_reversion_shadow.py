@@ -10,7 +10,9 @@ Evaluates Mean Reversion candidates under shadow lane isolation:
 """
 from dataclasses import dataclass, field
 from datetime import datetime
+import json
 import logging
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
@@ -162,3 +164,41 @@ class MeanReversionShadowRunner:
             lower_bb_break=lower_bb_break,
             rejection_layer=rejection_layer,
         )
+
+
+def log_mr_shadow_candidate(
+    result: MeanReversionShadowResult,
+    market_texture: Optional[str] = None,
+    output_path: Optional[Path] = None,
+) -> None:
+    """Appends an isolated MR shadow candidate record to JSONL (Zero Broker Pollution)."""
+    if output_path is None:
+        base_dir = Path(getattr(config, "SHADOW_BASE_DIR", "data/shadow"))
+        output_path = base_dir / "mean_reversion_shadow.jsonl"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "timestamp": datetime.now().isoformat(),
+        "symbol": result.symbol,
+        "bar_timestamp": result.bar_timestamp,
+        "close": result.close,
+        "vwap": result.vwap,
+        "atr": result.atr,
+        "deviation": result.deviation,
+        "deviation_ratio": result.deviation_ratio,
+        "l1_passed": result.l1_passed,
+        "l2_passed": result.l2_passed,
+        "l3_passed": result.l3_passed,
+        "l4_passed": result.l4_passed,
+        "all_layers_passed": result.all_layers_passed,
+        "rr_ratio": result.rr_ratio,
+        "making_new_low": result.making_new_low,
+        "atr_expanding": result.atr_expanding,
+        "lower_bb_break": result.lower_bb_break,
+        "rejection_layer": result.rejection_layer,
+        "market_texture": market_texture or "UNKNOWN",
+    }
+
+    with open(output_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload) + "\n")

@@ -94,3 +94,36 @@ class TestMeanReversionShadowRunner:
         res = runner.evaluate_bar("AAPL", df)
         assert isinstance(res, MeanReversionShadowResult)
         assert not hasattr(res, "execute")
+
+    def test_log_mr_shadow_candidate_jsonl_output(self, tmp_path):
+        """Test candidate record logging with full telemetry fields."""
+        from strategies.shadow.mean_reversion_shadow import log_mr_shadow_candidate
+        import json
+        
+        df = _make_synth_df(n=30, close_val=100.0, vwap_val=102.0, atr_val=1.0)
+        runner = MeanReversionShadowRunner(deviation_mult=0.8)
+        res = runner.evaluate_bar("MSFT", df)
+        assert res is not None
+
+        out_file = tmp_path / "test_mr_shadow.jsonl"
+        log_mr_shadow_candidate(res, market_texture="TRENDING_UP", output_path=out_file)
+
+        assert out_file.exists()
+        lines = out_file.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        assert record["symbol"] == "MSFT"
+        assert record["market_texture"] == "TRENDING_UP"
+        assert "deviation_ratio" in record
+        assert "making_new_low" in record
+        assert "atr_expanding" in record
+        assert "lower_bb_break" in record
+        assert record["l1_passed"] is True
+
+    def test_hoisted_mr_shadow_runner_singleton(self):
+        """Test that orchestrator uses hoisted singleton without re-instantiation churn."""
+        from strategies.orchestrator import _get_mr_shadow_runner
+        runner1 = _get_mr_shadow_runner()
+        runner2 = _get_mr_shadow_runner()
+        assert runner1 is runner2
+        assert runner1.deviation_mult == pytest.approx(0.8)
