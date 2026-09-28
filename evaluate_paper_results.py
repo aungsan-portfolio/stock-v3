@@ -90,6 +90,13 @@ def calculate_metrics(records: list, initial_capital: float, cohort: str | None 
     # 1. Total Trades
     n_trades = len(trades)
 
+    # 1b. Sample Diversity (Distinct Days >= 10, Single-day contribution <= 30%)
+    from collections import Counter
+    day_counts = Counter(str(t.get("timestamp", ""))[:10] for t in trades if t.get("timestamp"))
+    distinct_days = len(day_counts)
+    max_single_day_trades = max(day_counts.values()) if day_counts else 0
+    max_single_day_pct = (max_single_day_trades / n_trades * 100.0) if n_trades > 0 else 0.0
+
     # 2. Win Rate
     winning_trades = [t for t in trades if _get_trade_pnl(t) > 0.0]
     win_rate = winning_trades_ratio = winning_trades_pct = 0.0
@@ -106,7 +113,7 @@ def calculate_metrics(records: list, initial_capital: float, cohort: str | None 
     else:
         profit_factor = float("inf") if gross_profit > 0 else 1.0
 
-    # 4. Maximum Drawdown
+    # 4. Maximum Drawdown (Closed-trade consecutive peak-to-trough as % of initial starting equity)
     equity = initial_capital
     peak = initial_capital
     max_dd_dollars = 0.0
@@ -118,7 +125,7 @@ def calculate_metrics(records: list, initial_capital: float, cohort: str | None 
         if equity > peak:
             peak = equity
         dd_dollars = peak - equity
-        dd_pct = (dd_dollars / peak) * 100.0 if peak > 0 else 0.0
+        dd_pct = (dd_dollars / initial_capital) * 100.0 if initial_capital > 0 else 0.0
         
         if dd_pct > max_dd_pct:
             max_dd_pct = dd_pct
@@ -160,6 +167,9 @@ def calculate_metrics(records: list, initial_capital: float, cohort: str | None 
 
     return {
         "n_trades": n_trades,
+        "distinct_days": distinct_days,
+        "max_single_day_trades": max_single_day_trades,
+        "max_single_day_pct": max_single_day_pct,
         "win_rate": win_rate,
         "profit_factor": profit_factor,
         "max_dd_pct": max_dd_pct,
@@ -181,12 +191,13 @@ def calculate_metrics(records: list, initial_capital: float, cohort: str | None 
 def print_report(m: dict, cohort: str | None = None):
     # Pass/Fail evaluation
     gate_n = m["n_trades"] >= 30
+    gate_diversity = (m["distinct_days"] >= 10) and (m["max_single_day_pct"] <= 30.0)
     gate_pf = m["profit_factor"] >= 1.25
     gate_wr = m["win_rate"] >= 40.0
     gate_dd = m["max_dd_pct"] <= 5.0
     gate_slip = m["avg_slippage"] <= 0.05
 
-    all_passed = gate_n and gate_pf and gate_wr and gate_dd and gate_slip
+    all_passed = gate_n and gate_diversity and gate_pf and gate_wr and gate_dd and gate_slip
 
     print("======================================================================")
     print("           PRODUCTION PROMOTION GATES EVALUATION REPORT               ")
@@ -211,12 +222,13 @@ def print_report(m: dict, cohort: str | None = None):
     prelim = " (Preliminary - sample size N < 30)" if not gate_n else ""
 
     print(f"1. Statistical Sample Size (N >= 30):   {format_status(gate_n)} (N = {m['n_trades']})")
-    
+    print(f"1b. Sample Diversity (Days >= 10, Day <= 30%): {format_status(gate_diversity)} ({m['distinct_days']} days, max single day = {m['max_single_day_trades']}/{m['n_trades']} [{m['max_single_day_pct']:.1f}%]){prelim}")
     pf_val = f"{m['profit_factor']:.2f}" if m['profit_factor'] != float('inf') else "∞"
     print(f"2. Profit Factor Gate (PF >= 1.25):     {format_status(gate_pf)} (PF = {pf_val}){prelim}")
-    print(f"3. Win Rate Gate (WR >= 40%):           {format_status(gate_wr)} (WR = {m['win_rate']:.1f}%){prelim}")
-    print(f"4. Drawdown Tolerance (Max DD <= 5.0%): {format_status(gate_dd)} (Max DD = {m['max_dd_pct']:.2f}% / ${m['max_dd_dollars']:.2f}){prelim}")
+    print(f"3. Win Rate Gate (WR >= 40%):           {format_status(gate_wr)} (WR = {m['win_rate']:.1f}% - informative co-metric){prelim}")
+    print(f"4. Drawdown Tolerance (Max DD <= 5.0%): {format_status(gate_dd)} (Max DD = {m['max_dd_pct']:.2f}% / ${m['max_dd_dollars']:.2f} on starting equity){prelim}")
     print(f"5. Slippage Audit (Avg Slip <= 0.05%):  {format_status(gate_slip)} (Avg Slip = {m['avg_slippage']:.3f}%){prelim}")
+    print("   * Footnote on Gate 5: Paper fills are broker-simulated — slippage <= 0.05% measurement is approximate and requires empirical re-verification under live quote conditions upon real-money migration.")
     print("----------------------------------------------------------------------")
     print(f"Expectancy & Mathematical Edge (Statistical Robustness):")
     print(f" • Avg Winning Trade: ${m['avg_win']:.2f} | Avg Losing Trade: ${m['avg_loss']:.2f}")
