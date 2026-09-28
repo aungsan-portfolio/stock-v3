@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import random
+import sys
 import threading
 import time
 from collections import deque
@@ -1022,6 +1023,7 @@ class AlpacaBridge:
         self._order_role_lock = threading.Lock()
         self._load_order_role_registry()
         self._account_id: str = "default"
+        self._risk_state_dir: Optional[str] = None
 
     @property
     def account_id(self) -> str:
@@ -1647,17 +1649,37 @@ class AlpacaBridge:
                     self.entry_gate.halt("PERSISTED_STATE_INVALID")
                 raise
 
-            if state.get("date") == et_date and state.get("account_id") == self._account_id:
-                self._start_of_day_equity = float(state.get("start_of_day_equity", acct.equity))
+            broker_last_eq = float(getattr(acct, "last_equity", 0.0) or 0.0)
+            if broker_last_eq <= 0.0:
+                broker_last_eq = float(acct.equity)
+
+            state_prov = state.get("provenance", {}) if isinstance(state, dict) else {}
+            state_source = state_prov.get("source", "") if isinstance(state_prov, dict) else ""
+            has_valid_stamp = (state_source == "broker_last_equity")
+
+            if state.get("date") == et_date and state.get("account_id") == self._account_id and has_valid_stamp:
+                self._start_of_day_equity = broker_last_eq
                 self._start_of_day_equity_date = et_date
                 self._daytrade_suspended = bool(state.get("suspended", False))
-                logger.info("[%s] Restored start-of-day equity: $%.2f, suspended: %s", self._account_id, self._start_of_day_equity, self._daytrade_suspended)
+                logger.info("[%s] Restored verified start-of-day equity: $%.2f (source=%s), suspended: %s",
+                            self._account_id, self._start_of_day_equity, state_source, self._daytrade_suspended)
             else:
-                self._start_of_day_equity = float(acct.equity)
+                self._start_of_day_equity = broker_last_eq
                 self._start_of_day_equity_date = et_date
                 self._daytrade_suspended = False
-                self._save_daytrade_risk_state(et_date, self._start_of_day_equity, False, account_id=self._account_id)
-                logger.info("[%s] Initialized new day start-of-day equity: $%.2f", self._account_id, self._start_of_day_equity)
+                self._save_daytrade_risk_state(
+                    et_date,
+                    self._start_of_day_equity,
+                    False,
+                    account_id=self._account_id,
+                    source="broker_last_equity"
+                )
+                if state and not has_valid_stamp:
+                    logger.warning("[%s] Legacy risk state without broker_last_equity provenance stamp rejected. Re-initialized from broker last_equity: $%.2f",
+                                   self._account_id, self._start_of_day_equity)
+                else:
+                    logger.info("[%s] Initialized new day start-of-day equity from broker last_equity: $%.2f",
+                                self._account_id, self._start_of_day_equity)
 
             # Attach FlightRecorderHandler and restore persisted latch state if present
             try:
@@ -2321,7 +2343,7 @@ class AlpacaBridge:
 
     def _load_daytrade_risk_state(self, account_id: str = None) -> dict:
         acct_id = account_id or getattr(self, "_account_id", "default")
-        base_dir = getattr(self, "_risk_state_dir", None) or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+        base_dir = self._get_risk_state_dir()
         path = os.path.join(base_dir, f'daytrade_risk_state_{acct_id}.json')
         target_path = None
         if os.path.exists(path):
@@ -2374,9 +2396,41 @@ class AlpacaBridge:
 
         return data
 
-    def _save_daytrade_risk_state(self, date_str: str, equity: float, suspended: bool, account_id: str = None):
+    def _get_risk_state_dir(self) -> str:
+        """Returns the directory for persisting daytrade risk state.
+
+        Strict Pytest/Test Guard:
+        If pytest or a test execution environment is detected, automatically diverts
+        to an isolated temporary directory unless a custom `_risk_state_dir` was explicitly
+        injected. This prevents unit and chaos tests from corrupting production risk state.
+        """
+        custom_dir = getattr(self, "_risk_state_dir", None)
+        if custom_dir:
+            return custom_dir
+
+        is_test_env = (
+            "pytest" in sys.modules
+            or "PYTEST_CURRENT_TEST" in os.environ
+            or bool(os.environ.get("TEST_RUNNING"))
+        )
+        if is_test_env:
+            import tempfile
+            test_dir = os.path.join(tempfile.gettempdir(), "stock_engine_test_risk_state")
+            os.makedirs(test_dir, exist_ok=True)
+            return test_dir
+
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+
+    def _save_daytrade_risk_state(
+        self,
+        date_str: str,
+        equity: float,
+        suspended: bool,
+        account_id: str = None,
+        source: str = "broker_last_equity",
+    ):
         acct_id = account_id or getattr(self, "_account_id", "default")
-        base_dir = getattr(self, "_risk_state_dir", None) or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+        base_dir = self._get_risk_state_dir()
         path = os.path.join(base_dir, f'daytrade_risk_state_{acct_id}.json')
         latch_dict = None
         try:
@@ -2386,15 +2440,20 @@ class AlpacaBridge:
             pass
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 import json
-                json.dump({
+                payload = {
                     "account_id": acct_id,
                     "date": date_str,
                     "start_of_day_equity": equity,
                     "suspended": suspended,
+                    "provenance": {
+                        "source": source,
+                        "captured_at": datetime.now(timezone.utc).isoformat(),
+                    },
                     "latch_state": latch_dict,
-                }, f, indent=2)
+                }
+                json.dump(payload, f, indent=2)
         except Exception as e:
             logger.error("Failed to save daytrade risk state: %s", e)
 
@@ -2513,14 +2572,27 @@ class AlpacaBridge:
         return self._call_with_retry(lambda: self._client.get_clock())
 
     def account_daily_pnl(self) -> float:
+        net_liq = self.get_net_liquidation()
         if getattr(self, "_start_of_day_equity", 0.0) <= 0.0:
-            return 0.0
-        return self.get_net_liquidation() - self._start_of_day_equity
+            self.snapshot_start_of_day_equity()
+        sod_eq = getattr(self, "_start_of_day_equity", net_liq)
+        pnl = net_liq - sod_eq
+        logger.debug(
+            "[BASELINE PROVENANCE] net_liq=%.2f last_equity=%.2f formula=(net_liq - last_equity) calendar_day_pnl=%+.2f",
+            net_liq, sod_eq, pnl
+        )
+        return pnl
 
     def snapshot_start_of_day_equity(self) -> float:
         from strategies.session import now_eastern
         et_date = str(now_eastern().date())
         acct_id = getattr(self, "_account_id", "default")
+
+        self._require_connection()
+        acct = self._call_with_retry(lambda: self._client.get_account())
+        broker_last_eq = float(getattr(acct, "last_equity", 0.0) or 0.0)
+        if broker_last_eq <= 0.0:
+            broker_last_eq = float(acct.equity)
 
         # 1. Inspect persisted file/date first (fail-closed before querying broker)
         try:
@@ -2531,26 +2603,39 @@ class AlpacaBridge:
                 self.entry_gate.halt("PERSISTED_STATE_INVALID")
             raise
 
-        # 2. If valid state exists for today and this account: restore/preserve
-        if state and state.get("date") == et_date and state.get("account_id") == acct_id:
-            sod_equity = float(state.get("start_of_day_equity", 0.0))
-            if sod_equity > 0.0:
-                self._start_of_day_equity = sod_equity
-                self._start_of_day_equity_date = et_date
-                self._daytrade_suspended = bool(state.get("suspended", False))
-                logger.info("[%s] Preserved start-of-day equity: $%.2f for date %s", acct_id, self._start_of_day_equity, et_date)
-                return self._start_of_day_equity
+        state_prov = state.get("provenance", {}) if isinstance(state, dict) else {}
+        state_source = state_prov.get("source", "") if isinstance(state_prov, dict) else ""
+        has_valid_stamp = (state_source == "broker_last_equity")
 
-        # Also preserve if in-memory already set for today with positive equity
-        if getattr(self, "_start_of_day_equity_date", None) == et_date and getattr(self, "_start_of_day_equity", 0.0) > 0.0:
+        # 2. If valid state exists for today and this account AND has valid provenance stamp:
+        if (
+            state
+            and state.get("date") == et_date
+            and state.get("account_id") == acct_id
+            and has_valid_stamp
+        ):
+            self._start_of_day_equity = broker_last_eq
+            self._start_of_day_equity_date = et_date
+            self._daytrade_suspended = bool(state.get("suspended", False))
+            logger.info("[%s] Verified start-of-day equity: $%.2f for date %s (source=%s)", acct_id, self._start_of_day_equity, et_date, state_source)
             return self._start_of_day_equity
 
-        # 3. If new date or no state for today: query broker equity and save once
-        current_equity = self.get_net_liquidation()
-        self._start_of_day_equity = current_equity
+        # 3. New date or legacy nominal state -> anchor to broker last_equity
+        self._start_of_day_equity = broker_last_eq
         self._start_of_day_equity_date = et_date
-        self._save_daytrade_risk_state(et_date, current_equity, getattr(self, "_daytrade_suspended", False), account_id=acct_id)
-        logger.info("[%s] Initialized new day start-of-day equity: $%.2f for date %s", acct_id, self._start_of_day_equity, et_date)
+        self._daytrade_suspended = False
+        self._save_daytrade_risk_state(
+            et_date,
+            broker_last_eq,
+            False,
+            account_id=acct_id,
+            source="broker_last_equity"
+        )
+        if state and not has_valid_stamp:
+            logger.warning("[%s] Legacy risk state without broker_last_equity provenance stamp rejected. Re-initialized from broker last_equity: $%.2f for date %s",
+                           acct_id, self._start_of_day_equity, et_date)
+        else:
+            logger.info("[%s] Initialized start-of-day equity from broker last_equity: $%.2f for date %s", acct_id, self._start_of_day_equity, et_date)
         return self._start_of_day_equity
 
     def get_position(self, symbol: str) -> float:

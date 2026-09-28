@@ -1229,6 +1229,7 @@ def evaluate_and_execute(
         allow_new_entries = False
         broker_fetch_ok = False
 
+    equity: float = float(getattr(config, "PDT_MIN_EQUITY", 25000.0))
     if bridge and is_connected:
         try:
             if hasattr(bridge, "ib") and hasattr(bridge.ib, "positions"):
@@ -1293,6 +1294,14 @@ def evaluate_and_execute(
             pct_limit = dollar_limit
 
         governing_limit = min(dollar_limit, pct_limit)
+        anchor_eq = getattr(bridge, "_start_of_day_equity", equity)
+
+        logger.info(
+            "[EVALUATION PROVENANCE] live_equity=%.2f start_of_day_anchor=%.2f formula=(live_equity - start_of_day_anchor) "
+            "calendar_day_pnl=%+.2f governing_limit=-%.2f budget_remaining=%.2f",
+            float(equity), float(anchor_eq),
+            float(current_pnl), float(governing_limit), float(governing_limit + current_pnl)
+        )
 
         try:
             if isinstance(current_pnl, (int, float)) or (hasattr(current_pnl, "__float__") and not hasattr(current_pnl, "mock_calls")):
