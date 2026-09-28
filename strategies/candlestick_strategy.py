@@ -271,14 +271,15 @@ class CandlestickPatternStrategy(BaseStrategy):
 
         rsi_bonus = 0.0
         if side == "BUY":
-            # Calibrate pullback condition: In an uptrend (close > sma20), pullbacks find support
-            # with RSI in the 40-55 zone; outside uptrend, requires deep oversold (RSI < 40).
-            if rsi < 40 or (pd.notna(sma20) and close > sma20 and rsi <= 55):
+            # Approved momentum-confirmation variant: In an uptrend (close > sma20), bullish momentum
+            # is confirmed when RSI > 50 (capturing the diagnosed 55-70 trending range).
+            # Outside trend, deep oversold (RSI < 40) is recognized.
+            if (pd.notna(sma20) and close > sma20 and rsi > 50) or rsi < 40:
                 rsi_bonus = 0.20
         elif side == "SELL":
-            # In a downtrend (close < sma20), rallies face resistance with RSI in 45-60 zone;
-            # outside downtrend, requires deep overbought (RSI > 60).
-            if rsi > 60 or (pd.notna(sma20) and close < sma20 and rsi >= 45):
+            # In a downtrend (close < sma20), bearish momentum is confirmed when RSI < 50.
+            # Outside trend, deep overbought (RSI > 60) is recognized.
+            if (pd.notna(sma20) and close < sma20 and rsi < 50) or rsi > 60:
                 rsi_bonus = 0.20
 
         trend_bonus = 0.0

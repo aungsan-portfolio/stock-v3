@@ -1,15 +1,17 @@
 """tests/test_candlestick_strategy.py -- Unit tests for CandlestickPatternStrategy and D3-a formula calibration.
 
 Verifies:
-1. Two-pattern setups in TRENDING uptrend pullbacks achieve raw confidence 0.80,
+1. Approved Momentum-Confirmation Variant:
+   Two-pattern setups in TRENDING uptrends with momentum confirmation (RSI > 50,
+   specifically capturing the diagnosed 55-70 range) achieve raw confidence 0.80,
    yielding risk_adjusted_confidence ~0.7968 (> 0.6000 gate) after volatility penalty.
 2. Condition 2 Honest Documentation:
-   One-pattern setups in TRENDING uptrend pullbacks achieve raw confidence 0.60.
+   One-pattern setups in TRENDING uptrends with momentum confirmation achieve raw confidence 0.60.
    Under the canonical volatility penalty (vol_pct ~0.10%, multiplier 4.0 -> vol_adj = 0.9960),
    the post-scorer confidence is 0.5976 < 0.6000, which STILL FAILS the gate.
    This is an intentional property: 1-pattern signals require higher confluence to trade.
-3. Extended setups (RSI > 55 in uptrend) correctly do NOT receive the pullback bonus.
-4. Bearish downtrend bounce setups receive symmetric pullback calibration.
+3. Weak momentum setups (RSI <= 50 in uptrend) correctly do NOT receive the momentum bonus.
+4. Bearish downtrend momentum setups (RSI < 50 in downtrend) receive symmetric calibration.
 """
 
 import pytest
@@ -23,20 +25,20 @@ from strategies.order_manager import get_confidence_gate
 
 
 class TestCandlestickConfidenceCalibration:
-    """Test suite for D3-a formula fix in CandlestickPatternStrategy._confidence."""
+    """Test suite for D3-a approved momentum formula fix in CandlestickPatternStrategy._confidence."""
 
-    def test_two_pattern_trending_pullback_unlocks_gate(self):
-        """2-pattern BUY in an uptrend pullback:
+    def test_two_pattern_trending_momentum_unlocks_gate(self):
+        """2-pattern BUY in an uptrend with momentum confirmation:
         base = 0.40
         trend_bonus = 0.20 (close > sma20)
-        rsi_bonus = 0.20 (rsi <= 55 in uptrend pullback)
+        rsi_bonus = 0.20 (rsi > 50, tested at rsi=62.0 in diagnosed 55-70 trending range)
         raw_confidence = 0.80
         vol_adj = 0.9960 (for SPY-like volatility vol_pct=0.001, mult=4.0)
-        risk_adjusted_confidence = 0.80 * 0.9960 = 0.7968 > 0.6000 (REAL UNLOCK).
+        risk_adjusted_confidence = 0.80 * 0.9960 = 0.7968 > 0.6000 (REAL UNLOCK OF 55-70 CASES).
         """
         raw_conf = CandlestickPatternStrategy._confidence(
             pattern_count=2,
-            rsi=48.0,
+            rsi=62.0,
             close=450.0,
             sma20=445.0,
             side="BUY",
@@ -69,12 +71,12 @@ class TestCandlestickConfidenceCalibration:
         # Verifies 2-pattern setup cleanly passes the 0.6000 gate
         assert adjusted_conf >= gate
 
-    def test_one_pattern_trending_pullback_honestly_fails_gate(self):
+    def test_one_pattern_trending_momentum_honestly_fails_gate(self):
         """Condition 2 Honest Documentation:
-        1-pattern BUY in an uptrend pullback:
+        1-pattern BUY in an uptrend with momentum confirmation:
         base = 0.20
         trend_bonus = 0.20 (close > sma20)
-        rsi_bonus = 0.20 (rsi <= 55 in uptrend pullback)
+        rsi_bonus = 0.20 (rsi > 50, tested at rsi=62.0)
         raw_confidence = 0.60
         vol_adj = 0.9960 (for SPY-like volatility vol_pct=0.001, mult=4.0)
         risk_adjusted_confidence = 0.60 * 0.9960 = 0.5976 < 0.6000.
@@ -87,7 +89,7 @@ class TestCandlestickConfidenceCalibration:
         """
         raw_conf = CandlestickPatternStrategy._confidence(
             pattern_count=1,
-            rsi=48.0,
+            rsi=62.0,
             close=450.0,
             sma20=445.0,
             side="BUY",
@@ -116,16 +118,16 @@ class TestCandlestickConfidenceCalibration:
         # 1-pattern signals STILL FAIL the gate (by design)
         assert adjusted_conf < gate
 
-    def test_extended_uptrend_no_pullback_bonus(self):
-        """2-pattern BUY when price is extended/overbought (rsi = 65 > 55):
+    def test_weak_momentum_in_uptrend_no_bonus(self):
+        """2-pattern BUY when price is above SMA20 but momentum is weak (rsi = 45 <= 50):
         base = 0.40
         trend_bonus = 0.20 (close > sma20)
-        rsi_bonus = 0.00 (not a pullback)
+        rsi_bonus = 0.00 (not confirmed: rsi <= 50 and rsi >= 40)
         raw_confidence = 0.60 -> adjusted = 0.5976 < 0.6000 (BLOCKED).
         """
         raw_conf = CandlestickPatternStrategy._confidence(
             pattern_count=2,
-            rsi=65.0,
+            rsi=45.0,
             close=450.0,
             sma20=445.0,
             side="BUY",
@@ -148,16 +150,16 @@ class TestCandlestickConfidenceCalibration:
         )
         assert raw_conf == pytest.approx(0.60, abs=1e-4)
 
-    def test_two_pattern_downtrend_bounce_unlock(self):
-        """2-pattern SELL in a downtrend bounce/rally:
+    def test_two_pattern_downtrend_momentum_unlock(self):
+        """2-pattern SELL in a downtrend with bearish momentum confirmation:
         base = 0.40
         trend_bonus = 0.20 (close < sma20)
-        rsi_bonus = 0.20 (rsi >= 45 in downtrend rally)
+        rsi_bonus = 0.20 (rsi < 50 in downtrend, tested at rsi=42.0)
         raw_confidence = 0.80.
         """
         raw_conf = CandlestickPatternStrategy._confidence(
             pattern_count=2,
-            rsi=48.0,
+            rsi=42.0,
             close=440.0,
             sma20=445.0,
             side="SELL",
