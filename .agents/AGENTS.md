@@ -132,7 +132,7 @@ The following are prohibited without a separately ratified governance amendment:
 * **Aggregate exposure visibility**: REQUIRED
 * **Strategy-policy independence**: REQUIRED
 * **Real-money promotion blockers**: UNCHANGED
-* **Swing Track Provenance Preservation**: The Swing engine's standing canonical status (`ATOMIC-ROTATION-V1` conditionally approved (A)–(F), PF=0.12 / WR=22.7% / DD=27.21%, Real Money BLOCKED) remains permanently stored in its own provenance and is NOT erased or voided; it is strictly quarantined from Daytrade lane records to maintain clean cross-engine accounting hygiene.
+* **Swing Engine Canonical Status**: Option C shadow running; production models remain on verified Aug-29 vintage (`models/lstm_checkpoint.pt`, `models/rf_models.joblib`); gate audit scheduled for November 6; real-money trading strictly BLOCKED without passing quantitative promotion gates.
 
 ## 6. Runtime Code Freeze & Phase C Empirical Sample Collection Gate
 * **Date Ratified**: 2026-09-25
