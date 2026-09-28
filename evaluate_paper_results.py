@@ -40,10 +40,16 @@ def parse_args():
         default=None,
         help="Filter trade records by cohort (e.g. 'atomic_rotation_v1')."
     )
+    parser.add_argument(
+        "--since",
+        type=str,
+        default=None,
+        help="Filter trade records on or after ISO date (e.g. '2026-10-01')."
+    )
     return parser.parse_args()
 
 
-def load_records(journal_path: Path) -> list:
+def load_records(journal_path: Path, since: str | None = None) -> list:
     if not journal_path.exists():
         print(f"Error: Journal file not found at {journal_path}", file=sys.stderr)
         return []
@@ -53,7 +59,12 @@ def load_records(journal_path: Path) -> list:
             line = line.strip()
             if line:
                 try:
-                    records.append(json.loads(line))
+                    rec = json.loads(line)
+                    if since:
+                        ts = str(rec.get("timestamp", ""))[:10]
+                        if ts and ts < since[:10]:
+                            continue
+                    records.append(rec)
                 except json.JSONDecodeError:
                     continue
     return records
@@ -233,7 +244,15 @@ def print_report(m: dict, cohort: str | None = None):
     def format_status(passed: bool) -> str:
         return "[PASS]" if passed else "[FAIL]"
 
-    prelim = " (Preliminary - sample size N < 30 or < 2 weeks)" if not gate_n else ""
+    if not gate_n:
+        if m["n_trades"] < 30 and m["eval_days"] < 14:
+            prelim = " (Preliminary - sample size N < 30 & duration < 14 days)"
+        elif m["n_trades"] < 30:
+            prelim = " (Preliminary - sample size N < 30)"
+        else:
+            prelim = " (Preliminary - duration < 14 calendar days)"
+    else:
+        prelim = ""
 
     print(f"Gate 1.  Sample Size & Time (N >= 30 & >= 2 wks):  {format_status(gate_n)} (N = {m['n_trades']}, {m['eval_weeks']:.1f} wks [{m['eval_days']} days]){prelim}")
     print(f"Gate 1b. Sample Diversity (Days >= 10, Day <= 30%): {format_status(gate_diversity)} ({m['distinct_days']} days, max single day = {m['max_single_day_trades']}/{m['n_trades']} [{m['max_single_day_pct']:.1f}%]){prelim}")
@@ -291,7 +310,7 @@ def main():
         import config
         journal_path = config.DAYTRADE_TRADE_JOURNAL_FILE
 
-    records = load_records(journal_path)
+    records = load_records(journal_path, since=args.since)
     if not records:
         print("No trade records found to evaluate.")
         sys.exit(1)

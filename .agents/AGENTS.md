@@ -36,6 +36,19 @@ Before migrating the Day Trading strategy from paper trading to real money tradi
 * **Stage 1 (N ≥ 30 Hard Gates Pass)**: Admission to Live Trading at **REDUCED sizing** (25% – 50% target risk). Protects capital against $N=30$ statistical sample noise (95% CI on Win Rate $\approx \pm 14-18\%$).
 * **Stage 2 (N ≥ 80–100 Sustained)**: Scaled to **FULL real-money sizing** only after $N \ge 80-100$ trades maintain $PF \ge 1.25$ with zero gate regression.
 
+### Dual-Base Reconciled Portfolio Heat Statement
+* **Paper Testing Baseline ($10,000.00 Equity Base)**:
+  - Daily Loss Circuit Breaker: **$300.00** (`MAX_DAILY_LOSS_DAYTRADE`).
+  - Maximum Daily Equity Heat: **3.0%** of capital ($300 / $10,000).
+  - Per-Trade Risk Cap: $50.00 (`MAX_RISK_PER_TRADE_DOLLARS`), representing **0.5%** of capital (or $100 / 1.0% if unconstrained). Breaker halts trading at cumulative **-6R** (or **-3R** at 1.0%).
+  - Gate 3 Drawdown Ceiling (5.0%): strictly **$500.00** on $10,000 starting equity.
+* **Production / Scaled Live Baseline ($100,000.00 Equity Base)**:
+  - Daily Loss Circuit Breaker: **$300.00** (`MAX_DAILY_LOSS_DAYTRADE`).
+  - Maximum Daily Equity Heat: **0.3%** of capital ($300 / $100,000).
+  - Per-Trade Risk: 0.1% equity ($100.00 on $100,000 capital via `DAYTRADE_PAPER_RISK_PCT = 0.001`). Breaker halts trading at cumulative **-3R**.
+  - Maximum Open Exposure: `MAX_OPEN_POSITIONS = 7` ($700.00 total concurrent open risk). If 3 consecutive positions hit stop, the breaker triggers `FLATTEN_ON_DAILY_LOSS`, capping portfolio heat at 0.3%.
+  - Gate 3 Drawdown Ceiling (5.0%): strictly **$5,000.00** on $100,000 starting equity.
+
 ## 4. TRANSITIONING Texture Filter — Research Findings
 * **Date**: 2026-08-31
 * **Sample**: $N = 322$ rejected signals (walk-forward 5m candle simulation)
@@ -119,6 +132,7 @@ The following are prohibited without a separately ratified governance amendment:
 * **Aggregate exposure visibility**: REQUIRED
 * **Strategy-policy independence**: REQUIRED
 * **Real-money promotion blockers**: UNCHANGED
+* **Swing Track Provenance Preservation**: The Swing engine's standing canonical status (`ATOMIC-ROTATION-V1` conditionally approved (A)–(F), PF=0.12 / WR=22.7% / DD=27.21%, Real Money BLOCKED) remains permanently stored in its own provenance and is NOT erased or voided; it is strictly quarantined from Daytrade lane records to maintain clean cross-engine accounting hygiene.
 
 ## 6. Runtime Code Freeze & Phase C Empirical Sample Collection Gate
 * **Date Ratified**: 2026-09-25

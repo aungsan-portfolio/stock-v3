@@ -205,6 +205,73 @@ def run_labeler():
                 logger.debug("Could not label candidate %s @ %s: %s", sym, bar_ts, e)
 
     logger.info("[LABELER] Successfully labeled %d new MR shadow outcomes", resolved_count)
+    generate_crosstab_report(outcomes_path, report_path)
+
+
+def generate_crosstab_report(outcomes_path: Path, report_path: Path) -> None:
+    """Generates multi-feature cross-tab summary report with explicit outcome mappings."""
+    records = load_jsonl(outcomes_path)
+    if not records:
+        return
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(records)
+
+    # TIME_EXPIRY_30M mapping specification:
+    # 1. 4-way discrete distribution: reported as its own category.
+    # 2. Binary classification: marked-to-market at 30m:
+    #    realized_r > 0 -> WIN (Expiry MTM Gain)
+    #    realized_r <= 0 -> LOSS (Expiry MTM Flat/Loss)
+    df["binary_outcome"] = df.apply(
+        lambda r: "WIN" if r.get("outcome") == "REVERSION" or (r.get("outcome") == "TIME_EXPIRY_30M" and float(r.get("realized_r", 0)) > 0) else "LOSS",
+        axis=1
+    )
+
+    total_n = len(df)
+    counts = df["outcome"].value_counts().to_dict()
+    n_rev = counts.get("REVERSION", 0)
+    n_brk = counts.get("BREAKDOWN", 0)
+    n_amb = counts.get("AMBIGUOUS_INTRABAR", 0)
+    n_exp = counts.get("TIME_EXPIRY_30M", 0)
+
+    lines = [
+        "# Mean Reversion D2 Shadow Experiment — Forward 30m Outcome Cross-Tabulation Report",
+        "",
+        f"- Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        f"- Total Resolved Shadow Setups (N): {total_n}",
+        "",
+        "## 1. Global Discrete Outcome Distribution",
+        "",
+        "| Outcome Category | Count | Distribution % | Binary Classification Mapping |",
+        "|---|---|---|---|",
+        f"| **REVERSION** (Target touched first) | {n_rev} | {n_rev/total_n*100.0:.1f}% | ✅ WIN |",
+        f"| **BREAKDOWN** (Stop touched first) | {n_brk} | {n_brk/total_n*100.0:.1f}% | ❌ LOSS |",
+        f"| **AMBIGUOUS_INTRABAR** (Same bar both) | {n_amb} | {n_amb/total_n*100.0:.1f}% | ❌ LOSS (Conservative) |",
+        f"| **TIME_EXPIRY_30M** (Neither touched in 30m) | {n_exp} | {n_exp/total_n*100.0:.1f}% | ⚖️ MTM (WIN if PnL>0, LOSS if PnL≤0) |",
+        "",
+        "## 2. Multi-Feature Cross-Tabulation Matrix",
+        "",
+        "| Lower BB Break | Making New Low | ATR Expanding | N | Reversion | Breakdown | Ambiguous | Expiry | Win Rate % | Avg Realized R |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+
+    for (bb, nl, atr_exp), grp in df.groupby(["lower_bb_break", "making_new_low", "atr_expanding"]):
+        grp_n = len(grp)
+        grp_rev = int((grp["outcome"] == "REVERSION").sum())
+        grp_brk = int((grp["outcome"] == "BREAKDOWN").sum())
+        grp_amb = int((grp["outcome"] == "AMBIGUOUS_INTRABAR").sum())
+        grp_exp = int((grp["outcome"] == "TIME_EXPIRY_30M").sum())
+        grp_win = int((grp["binary_outcome"] == "WIN").sum())
+        wr = (grp_win / grp_n * 100.0) if grp_n > 0 else 0.0
+        avg_r = float(grp["realized_r"].mean()) if grp_n > 0 else 0.0
+        lines.append(
+            f"| {bb} | {nl} | {atr_exp} | {grp_n} | {grp_rev} | {grp_brk} | {grp_amb} | {grp_exp} | {wr:.1f}% | {avg_r:+.2f}R |"
+        )
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    logger.info("[LABELER] Generated cross-tab report at %s", report_path)
 
 
 if __name__ == "__main__":
