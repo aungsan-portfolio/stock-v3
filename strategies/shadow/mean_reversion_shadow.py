@@ -22,6 +22,9 @@ from strategies.indicators import add_atr, add_ema, add_vwap
 
 logger = logging.getLogger(__name__)
 
+# Canonical shadow threshold for D2 experiment (deviation from VWAP)
+SHADOW_DEVIATION_MULT: float = 0.8
+
 
 @dataclass
 class MeanReversionShadowResult:

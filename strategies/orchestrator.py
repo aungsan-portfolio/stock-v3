@@ -61,8 +61,11 @@ def _get_mr_shadow_runner():
     """Hoisted singleton runner for D2 Mean Reversion shadow experiment."""
     global _MR_SHADOW_RUNNER
     if _MR_SHADOW_RUNNER is None:
-        from strategies.shadow.mean_reversion_shadow import MeanReversionShadowRunner
-        _MR_SHADOW_RUNNER = MeanReversionShadowRunner(deviation_mult=0.8)
+        from strategies.shadow.mean_reversion_shadow import (
+            MeanReversionShadowRunner,
+            SHADOW_DEVIATION_MULT,
+        )
+        _MR_SHADOW_RUNNER = MeanReversionShadowRunner(deviation_mult=SHADOW_DEVIATION_MULT)
     return _MR_SHADOW_RUNNER
 
 _ALL_STRATEGIES = [
@@ -565,7 +568,7 @@ def _evaluate_on_df(symbol: str, df, market_texture: str = "TRENDING") -> List[T
             from strategies.shadow.mean_reversion_shadow import log_mr_shadow_candidate
             mr_runner = _get_mr_shadow_runner()
             mr_result = mr_runner.evaluate_bar(symbol, df)
-            if mr_result is not None and mr_result.l1_passed:
+            if mr_result is not None:
                 log_mr_shadow_candidate(mr_result, market_texture=market_texture)
         except Exception as mr_err:
             logger.debug("[MR SHADOW] Evaluation error on %s: %s", symbol, mr_err)
