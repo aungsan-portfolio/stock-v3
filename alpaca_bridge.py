@@ -757,6 +757,7 @@ class EntryGateMock:
         self.reasons.discard("TRADE_STREAM_DISCONNECTED")
         self.reasons.discard("BROKER_RECONCILIATION_PENDING")
         self.reasons.discard("STREAM_RECOVERY_REQUIRED")
+        self.reasons.discard("STREAM_DEGRADED_OR_DESYNC")
         self.reasons.discard("OFF_MARKET_STANDBY")
         if not self.reasons:
             self.halted = False
@@ -1437,6 +1438,7 @@ class AlpacaBridge:
                 gate.clear("TRADE_STREAM_DISCONNECTED")
                 gate.clear("BROKER_RECONCILIATION_PENDING")
                 gate.clear("STREAM_RECOVERY_REQUIRED")
+                gate.clear("STREAM_DEGRADED_OR_DESYNC")
                 gate.clear("OFF_MARKET_STANDBY")
             else:
                 gate.halted = False
@@ -2175,7 +2177,7 @@ class AlpacaBridge:
 
         try:
             self._transition_stream_state(
-                expected={StreamState.AUTHENTICATED_UNRECONCILED, StreamState.RECONNECTING, StreamState.DEGRADED},
+                expected={StreamState.AUTHENTICATED_UNRECONCILED, StreamState.RECONNECTING, StreamState.DEGRADED, StreamState.LATCHED_DESYNC},
                 new_state=StreamState.RECONCILING,
                 reason="Executing post-reconnect broker truth check",
             )
@@ -3392,13 +3394,16 @@ class AlpacaBridge:
 
                 stp_price = float(o.stop_price) if getattr(o, "stop_price", None) is not None else None
                 lmt_price = float(o.limit_price) if getattr(o, "limit_price", None) is not None else None
-                raw_tif = getattr(o, "time_in_force", "GTC")
+                raw_tif = o.get("time_in_force", "GTC") if isinstance(o, dict) else getattr(o, "time_in_force", "GTC")
                 if hasattr(raw_tif, "_mock_name") or hasattr(raw_tif, "return_value"):
                     tif = "GTC"
                 else:
                     val = getattr(raw_tif, "value", raw_tif)
                     s = str(val or "GTC").upper()
-                    tif = "GTC" if "GTC" in s else (s if s else "GTC")
+                    if getattr(self, "mode", "daytrade") == "daytrade" and s in ("DAY", "GTC"):
+                        tif = "GTC"
+                    else:
+                        tif = "GTC" if "GTC" in s else (s if s else "GTC")
 
                 o_qty = getattr(o, "qty", None)
                 if o_qty is None or str(o_qty).strip() in ("0", "0.0", ""):
@@ -3557,9 +3562,9 @@ class AlpacaBridge:
         if manage_stream_state:
             try:
                 with self._stream_state_lock:
-                    if self._stream_state == StreamState.AUTHENTICATED_UNRECONCILED:
+                    if self._stream_state in (StreamState.AUTHENTICATED_UNRECONCILED, StreamState.LATCHED_DESYNC):
                         self._transition_stream_state(
-                            expected={StreamState.AUTHENTICATED_UNRECONCILED},
+                            expected={StreamState.AUTHENTICATED_UNRECONCILED, StreamState.LATCHED_DESYNC},
                             new_state=StreamState.RECONCILING,
                             reason="Broker reconciliation started",
                         )
