@@ -170,11 +170,13 @@ _feed_telemetry = {
     "poll_count": 0,
     "last_batch_duration_seconds": 0.0,
     "batch_timeout_count": 0,
+    "consecutive_fetch_timeouts": 0,
     "last_batch_timestamp": 0.0,
     "total_bars_fetched": 0,
 }
 _feed_telemetry_lock = threading.Lock()
 _last_stale_bar_ts: Dict[str, Any] = {}
+_last_stale_cycle_bar_id: Optional[Any] = None
 
 
 def get_intraday_feed_telemetry() -> dict:
@@ -185,6 +187,7 @@ def get_intraday_feed_telemetry() -> dict:
 
 
 def reset_intraday_feed_telemetry() -> None:
+    global _last_stale_cycle_bar_id
     with _feed_telemetry_lock:
         _feed_telemetry["stale_bar_consecutive"] = 0
         _feed_telemetry["stale_observation_total"] = 0
@@ -193,9 +196,11 @@ def reset_intraday_feed_telemetry() -> None:
         _feed_telemetry["poll_count"] = 0
         _feed_telemetry["last_batch_duration_seconds"] = 0.0
         _feed_telemetry["batch_timeout_count"] = 0
+        _feed_telemetry["consecutive_fetch_timeouts"] = 0
         _feed_telemetry["last_batch_timestamp"] = 0.0
         _feed_telemetry["total_bars_fetched"] = 0
     _last_stale_bar_ts.clear()
+    _last_stale_cycle_bar_id = None
 
 
 def get_feed_provenance() -> dict:
@@ -954,8 +959,11 @@ def _validate_intraday_data(
                         if last_ts != bar_id:
                             # Only ENTRY_SIGNAL stale bars increment the entry circuit-breaker counter
                             if purpose == "ENTRY_SIGNAL":
-                                _feed_telemetry["stale_bar_consecutive"] += 1
-                                _feed_telemetry["stale_bar_skip_count"] = _feed_telemetry["stale_bar_consecutive"]
+                                global _last_stale_cycle_bar_id
+                                if _last_stale_cycle_bar_id != bar_id:
+                                    _last_stale_cycle_bar_id = bar_id
+                                    _feed_telemetry["stale_bar_consecutive"] += 1
+                                    _feed_telemetry["stale_bar_skip_count"] = _feed_telemetry["stale_bar_consecutive"]
                             else:
                                 _feed_telemetry["stale_monitoring_count"] = _feed_telemetry.get("stale_monitoring_count", 0) + 1
                             _last_stale_bar_ts[symbol] = bar_id
@@ -1246,6 +1254,7 @@ def fetch_batch_intraday_alpaca(
             if total_timeout_seconds is not None and (rem_t is None or rem_t <= 0.05):
                 with _feed_telemetry_lock:
                     _feed_telemetry["batch_timeout_count"] += 1
+                    _feed_telemetry["consecutive_fetch_timeouts"] = _feed_telemetry.get("consecutive_fetch_timeouts", 0) + 1
                 logger.warning(
                     "[BATCH FETCH TIMEOUT] Total budget exhausted (%.2fs remaining) before chunk %d/%d.",
                     rem_t or 0.0, chunk_idx + 1, num_chunks,
@@ -1378,6 +1387,8 @@ def fetch_batch_intraday_alpaca(
             _feed_telemetry["last_batch_duration_seconds"] = elapsed
             _feed_telemetry["last_batch_timestamp"] = time.time()
             _feed_telemetry["total_bars_fetched"] += len(results)
+            if len(results) > 0:
+                _feed_telemetry["consecutive_fetch_timeouts"] = 0
 
         coverage_pct = (len(results) / len(clean_symbols)) * 100.0 if clean_symbols else 100.0
         logger.info(

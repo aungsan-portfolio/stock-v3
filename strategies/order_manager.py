@@ -21,7 +21,9 @@ from strategies.position_sizer import calculate_shares, estimated_cost
 from strategies.trade_journal import log_trade, today_trade_count
 from strategies.order_idempotency import idempotency_manager
 from strategies.webhook import send_discord_alert
-from strategies.execution_geometry import calculate_minimum_stop_distance
+from strategies.execution_geometry import (
+    calculate_minimum_stop_distance, floor_to_tick_float, ceil_to_tick_float,
+)
 from strategies.entry_lifecycle import entry_lifecycle, EntryLifecycleState
 import order_audit
 
@@ -637,7 +639,7 @@ def _validate_signal_prices(
     if is_inverse and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False):
         min_rr = getattr(config, "INVERSE_ETF_MIN_RR_RATIO", 1.40)
     else:
-        min_rr = getattr(config, "MIN_RR_RATIO", 1.0)
+        min_rr = getattr(config, "MIN_RR_RATIO", 1.5)
     rr_ratio = round(target_dist / stop_dist, 4) if stop_dist > 0 else 0.0
     if rr_ratio < (min_rr - 1e-4):
         return f"Risk:Reward ratio {rr_ratio:.2f} is below minimum threshold {min_rr:.2f}"
@@ -657,6 +659,37 @@ def _validate_signal_prices(
             return f"Unrealistic target distance ${target_dist:.2f} ({(target_dist/daily_atr):.1f}x Daily ATR > {max_daily_atr_reach:.1f}x limit)"
 
     return ""
+
+
+def _submission_prices(signal: TradeSignal, executable_entry: float):
+    """Tick-align final prices without shrinking stops or translating MR's VWAP target."""
+    tick_size = 0.01 if executable_entry >= 1.0 else 0.0001
+    precision = 2 if tick_size == 0.01 else 4
+    entry = round(executable_entry, precision)
+    is_long = signal.side.upper().strip() in ("BUY", "LONG")
+    strategy_name = getattr(signal.strategy, "name", str(signal.strategy))
+    anchored = strategy_name == "MEAN_REVERSION" or (signal.metadata or {}).get("target_anchor") == "VWAP"
+    if anchored:
+        stop = (floor_to_tick_float(signal.stop_price, tick_size) if is_long
+                else ceil_to_tick_float(signal.stop_price, tick_size))
+        target = (floor_to_tick_float(signal.target_price, tick_size) if is_long
+                  else ceil_to_tick_float(signal.target_price, tick_size))
+    else:
+        stop_distance = abs(signal.entry_price - signal.stop_price)
+        target_distance = abs(signal.target_price - signal.entry_price)
+        stop = (floor_to_tick_float(entry - stop_distance, tick_size) if is_long
+                else ceil_to_tick_float(entry + stop_distance, tick_size))
+        target = round(entry + target_distance if is_long else entry - target_distance, precision)
+    return entry, stop, target
+
+
+def _cap_submission_shares(shares, checked_risk_dollars, checked_notional, risk_per_share, entry_price):
+    """Never increase either the already-approved total risk or notional after repricing."""
+    if not all(math.isfinite(float(v)) and float(v) > 0 for v in
+               (shares, checked_risk_dollars, checked_notional, risk_per_share, entry_price)):
+        return 0
+    return min(int(shares), math.floor(checked_risk_dollars / risk_per_share + 1e-9),
+               math.floor(checked_notional / entry_price + 1e-9))
 
 
 def _executable_signal(signal: TradeSignal, entry_limit_price: Optional[float]) -> TradeSignal:
@@ -2022,22 +2055,8 @@ def execute_signal(
                 )
                 return result
 
-            # 2. Side-consistent offset calculation
-            tick_size = 0.01 if exec_price >= 1.0 else 0.0001
-            precision = 2 if tick_size == 0.01 else 4
-            limit_price = round(exec_price, precision)
-
-            side_upper = signal.side.upper().strip()
-            if side_upper in ("BUY", "LONG"):
-                stop_distance = signal.entry_price - signal.stop_price
-                target_distance = signal.target_price - signal.entry_price
-                stop_price = round(limit_price - stop_distance, precision)
-                target_price = round(limit_price + target_distance, precision)
-            else:
-                stop_distance = signal.stop_price - signal.entry_price
-                target_distance = signal.entry_price - signal.target_price
-                stop_price = round(limit_price + stop_distance, precision)
-                target_price = round(limit_price - target_distance, precision)
+            # 2. Directional stop rounding; MR retains absolute stop and VWAP target.
+            limit_price, stop_price, target_price = _submission_prices(signal, exec_price)
 
             logger.info(
                 "[PRE-SUBMIT OFFSET ADJUST] %s: signal entry $%.2f -> live limit $%.4f | stop $%.4f -> $%.4f | target $%.4f -> $%.4f (unfavorable_chase=$%.4f)",
@@ -2060,7 +2079,7 @@ def execute_signal(
                 return result
 
             # Verify post-adjustment RR does not degrade below minimum
-            min_rr = getattr(config, "MIN_RISK_REWARD_RATIO", 1.5)
+            min_rr = getattr(config, "MIN_RR_RATIO", 1.5)
             if adj_rr < (min_rr - 1e-6):
                 released = idempotency_manager.release(
                     signal.symbol,
@@ -2083,6 +2102,7 @@ def execute_signal(
             final_geometry_reason = _validate_signal_prices(
                 submitted_candidate,
                 market_texture=market_texture,
+                quote={"bid": q_bid, "ask": q_ask},
             )
 
             if final_geometry_reason:
@@ -2106,6 +2126,38 @@ def execute_signal(
                     released,
                 )
                 return result
+
+    # Apply the same tick alignment/validation even if the optional quote block
+    # did not reprice the order. The broker must not be the first price quantizer.
+    limit_price, stop_price, target_price = _submission_prices(signal, limit_price)
+    boundary_candidate = replace(
+        executable_signal, entry_price=float(limit_price), stop_price=float(stop_price),
+        target_price=float(target_price), risk_per_share=abs(float(limit_price) - float(stop_price)),
+    )
+    boundary_quote = ({"bid": q_bid, "ask": q_ask}
+                      if locals().get("q_ask", 0) > locals().get("q_bid", 0) > 0 else quote)
+    boundary_reason = _validate_signal_prices(boundary_candidate, market_texture=market_texture, quote=boundary_quote)
+    if boundary_reason:
+        released = idempotency_manager.release(signal.symbol, side=signal.side,
+                                               reason=f"submission_boundary_veto:{boundary_reason}")
+        result["status"] = "VETOED" if released else "IDEMPOTENCY_RELEASE_FAILED"
+        result["reason"] = f"Submission boundary geometry invalid: {boundary_reason}"
+        return result
+
+    # Repricing/quantization occurs after sizing and risk checks. Only reduce quantity;
+    # never silently exceed either of the already-approved risk and notional budgets.
+    final_risk = abs(float(limit_price) - float(stop_price))
+    shares = _cap_submission_shares(
+        shares, risk_dollars, shares * executable_signal.entry_price,
+        final_risk, float(limit_price),
+    )
+    if shares < max(1, int(getattr(config, "MIN_SHARE_COUNT", 1))):
+        released = idempotency_manager.release(signal.symbol, side=signal.side, reason="final_size_below_minimum")
+        result["status"] = "VETOED" if released else "IDEMPOTENCY_RELEASE_FAILED"
+        result["reason"] = "Final geometry exceeds approved risk/notional budget at minimum size"
+        return result
+    result["shares"] = shares
+    risk_dollars = shares * final_risk
 
     # Phase B: Broker Submission (Deterministic single call)
     try:

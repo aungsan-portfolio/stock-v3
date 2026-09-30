@@ -551,9 +551,9 @@ SCANNER_REFRESH_MINUTES = 10
 
 # ── Noise Floor — ATR-Based Veto Calibration ────────
 NOISE_FLOOR_ATR_PERIOD       = 10    # ATR window (10 for responsiveness)
-NOISE_FLOOR_ATR_MULTIPLIER   = 1.00  # noise_floor = ATR * 1.00 (Calibrated from 0.75)
+NOISE_FLOOR_ATR_MULTIPLIER   = 0.75  # Canonical shared geometry ATR floor multiplier
 NOISE_FLOOR_ABS_MIN          = 0.08  # minimum floor $0.08
-NOISE_FLOOR_HARD_VETO_RATIO  = 0.75  # veto if stop < 80% of noise floor (Calibrated from 0.70)
+NOISE_FLOOR_HARD_VETO_RATIO  = 0.75  # Legacy Option B only; Option A enforces the full floor
 MAX_RISK_PER_TRADE_DOLLARS   = 50.0  # Max per-trade dollar risk cap (Calibrated to $50 for Phase 2 7-slot allocation)
 MAX_TARGET_RR_RATIO           = 5.0   # Target reachability ceiling (5.0x risk per share)
 MAX_TARGET_DAILY_ATR_MULTIPLE = 3.5   # Target ceiling multiple vs Daily ATR (if daily_atr present)

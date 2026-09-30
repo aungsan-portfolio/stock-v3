@@ -161,7 +161,7 @@ class ExecutionHealthGate:
         # 4. Feed Telemetry & Latency (DEGRADED / STALE)
         if feed_telemetry:
             metrics.update(feed_telemetry)
-            timeouts = feed_telemetry.get("consecutive_fetch_timeouts", 0) or feed_telemetry.get("batch_timeout_count", 0)
+            timeouts = feed_telemetry.get("consecutive_fetch_timeouts", 0)
             batch_dur = feed_telemetry.get("last_batch_duration_s", 0.0) or feed_telemetry.get("last_batch_duration_seconds", 0.0)
             stale_consecutive = feed_telemetry.get("stale_bar_consecutive")
             if stale_consecutive is None:

@@ -273,8 +273,8 @@ def _prepare_closed_bars(df):
                 last_ts_et = last_ts.astimezone(now.tzinfo)
             else:
                 last_ts_et = last_ts
-            # If the last bar started less than 4.5 minutes ago, it's currently forming -> remove it
-            if hasattr(last_ts_et, "hour") and (now - last_ts_et).total_seconds() < 270:
+            # A 5m bar must have a full 300 seconds before it is closed.
+            if hasattr(last_ts_et, "hour") and (now - last_ts_et).total_seconds() < 300:
                 return df.iloc[:-1]
         except Exception:
             return df.iloc[:-1]
@@ -514,17 +514,50 @@ def _should_bypass_lunch_chop(sig: TradeSignal, event_decision: Optional[object]
     return is_allowed
 
 
-def evaluate_symbol(symbol: str, bridge: object = None) -> List[TradeSignal]:
+def _evaluate_mean_reversion(symbol, df, market_texture, scorer, bridge=None):
+    """Route MR with real execution context without relaxing any acceptance gate."""
+    if market_texture != "SIDEWAYS" or not getattr(config, "STRATEGY_MEAN_REVERSION_ENABLED", True):
+        return None
+    from strategies.mean_reversion import MeanReversionStrategy
+    context = dict(getattr(df, "attrs", {}) or {})
+    # Daily ATR here must already be a dollar distance. Broker's daily ATR percent
+    # API is not substituted: its reference price and fallback provenance differ.
+    quote = context.get("quote")
+    get_quote = getattr(bridge, "get_quote", None) if bridge is not None else None
+    if callable(get_quote):
+        try:
+            fresh_quote = get_quote(symbol)
+            if fresh_quote is not None:
+                quote = fresh_quote
+        except Exception as exc:
+            logger.debug("[MEAN REVERSION] %s: upstream quote unavailable: %s", symbol, exc)
+    signal = MeanReversionStrategy().generate_signal(
+        symbol, df, market_texture=market_texture, quote=quote, metadata=context,
+    )
+    if signal is None or not signal.is_valid:
+        return None
+    signal.metadata["raw_confidence"] = signal.confidence
+    signal.confidence = scorer.calculate_risk_adjusted_confidence(signal)
+    if not signal.bar_timestamp and hasattr(df, "index") and len(df.index) > 0:
+        last_idx = df.index[-1]
+        signal.bar_timestamp = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
+    feed_id = context.get("feed_identity")
+    if not signal.decision_feed and feed_id:
+        signal.decision_feed = str(feed_id).lower().strip()
+    return signal
+
+
+def evaluate_symbol(symbol: str, bridge: object = None, market_texture: str = "TRENDING") -> List[TradeSignal]:
     """Evaluate one symbol through all strategies."""
     from strategies.intraday_data import fetch_intraday
     df = fetch_intraday(symbol, bridge=bridge)
-    if df.empty:
+    if df is None or df.empty:
         logger.warning("No data for %s", symbol)
         return []
-    return _evaluate_on_df(symbol, df)
+    return _evaluate_on_df(symbol, df, market_texture=market_texture, bridge=bridge)
 
 
-def _evaluate_on_df(symbol: str, df, market_texture: str = "TRENDING") -> List[TradeSignal]:
+def _evaluate_on_df(symbol: str, df, market_texture: str = "TRENDING", bridge: object = None) -> List[TradeSignal]:
     """Internal sync implementation for one symbol given its DataFrame."""
     if df is None or df.empty:
         return []
@@ -604,19 +637,8 @@ def _evaluate_on_df(symbol: str, df, market_texture: str = "TRENDING") -> List[T
     # Evaluate MeanReversionStrategy when in SIDEWAYS market texture
     if market_texture == "SIDEWAYS":
         try:
-            from strategies.mean_reversion import MeanReversionStrategy
-            mr_strat = MeanReversionStrategy()
-            mr_signal = mr_strat.generate_signal(symbol, df, market_texture=market_texture)
+            mr_signal = _evaluate_mean_reversion(symbol, df, market_texture, scorer, bridge=bridge)
             if mr_signal is not None:
-                mr_signal.metadata['raw_confidence'] = mr_signal.confidence
-                mr_signal.confidence = scorer.calculate_risk_adjusted_confidence(mr_signal)
-                if not mr_signal.bar_timestamp and hasattr(df, "index") and len(df.index) > 0:
-                    last_idx = df.index[-1]
-                    mr_signal.bar_timestamp = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
-                if not getattr(mr_signal, "decision_feed", None):
-                    feed_id = getattr(df, "attrs", {}).get("feed_identity")
-                    if feed_id:
-                        mr_signal.decision_feed = str(feed_id).lower().strip()
                 signals.append(mr_signal)
         except Exception as mr_err:
             logger.exception("MeanReversionStrategy failed for %s: %s", symbol, mr_err)
@@ -1011,10 +1033,10 @@ def evaluate_symbols_parallel(symbols: List[str], bridge: object = None, market_
     out = []
     if not parallel_enabled or len(symbol_data) < min_batch:
         for sym, df in symbol_data.items():
-            out.extend(_evaluate_on_df(sym, df, market_texture=market_texture))
+            out.extend(_evaluate_on_df(sym, df, market_texture=market_texture, bridge=bridge))
     else:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(_evaluate_on_df, sym, df, market_texture): sym for sym, df in symbol_data.items()}
+            futures = {pool.submit(_evaluate_on_df, sym, df, market_texture, bridge): sym for sym, df in symbol_data.items()}
             for fut in as_completed(futures):
                 sym = futures[fut]
                 try:
@@ -1023,7 +1045,7 @@ def evaluate_symbols_parallel(symbols: List[str], bridge: object = None, market_
                     logger.exception("Parallel evaluation failed for %s", sym)
                     fallback_serial = getattr(config, "DAYTRADE_PARALLEL_EVALUATION_FALLBACK_TO_SERIAL", True)
                     if fallback_serial:
-                        out.extend(_evaluate_on_df(sym, symbol_data[sym], market_texture=market_texture))
+                        out.extend(_evaluate_on_df(sym, symbol_data[sym], market_texture=market_texture, bridge=bridge))
                     else:
                         raise e
 
@@ -1656,7 +1678,12 @@ def evaluate_and_execute(
                 )
             allow_new_entries = False
             can_evaluate_signals = False
-            should_run_eval = False
+            # If degraded or stale, allow 5m bar evaluation to probe market feed and unlatch telemetry
+            # once fresh bars arrive, while strictly disabling order entry (fail-closed execution).
+            if should_evaluate_5m_bar and str(health_gate.status.value).lower() in ("degraded", "stale"):
+                should_run_eval = True
+            else:
+                should_run_eval = False
         else:
             logger.debug("[EXECUTION HEALTH GATE] %s", health_gate.summary)
     except Exception as h_err:

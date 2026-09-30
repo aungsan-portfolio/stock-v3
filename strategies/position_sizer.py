@@ -80,7 +80,11 @@ def validate_executable_geometry(
 
 
 def calculate_shares(signal: TradeSignal, equity: float) -> int:
-    if equity <= 0 or signal.entry_price <= 0:
+    if not math.isfinite(equity) or equity <= 0:
+        return 0
+    valid, reason = validate_executable_geometry(signal)
+    if not valid:
+        logger.warning("[SIZER REJECT] %s", reason)
         return 0
 
     tick_size = 0.01 if signal.entry_price >= 1.0 else 0.0001
@@ -95,15 +99,23 @@ def calculate_shares(signal: TradeSignal, equity: float) -> int:
         )
         return 0
 
-    if signal.risk_per_share <= 0:
+    if not (math.isfinite(signal.risk_per_share) and signal.risk_per_share > 0
+            and math.isclose(signal.risk_per_share, risk_per_share, rel_tol=1e-6, abs_tol=1e-6)):
+        logger.warning("[SIZER REJECT] %s inconsistent risk/share", signal.symbol)
         return 0
+
+    strat_cfg = getattr(config, "STRATEGY_SETTINGS", {}).get(signal.strategy)
+    risk_pct = (float(strat_cfg.get("max_risk_pct", 1.0)) if isinstance(strat_cfg, dict)
+                else float(getattr(strat_cfg, "max_risk_pct", 1.0)))
+    if not (math.isfinite(risk_pct) and risk_pct > 0):
+        return 0
+    risk_budget = equity * (risk_pct / 100.0)
 
     method = config.SIZING_METHOD
 
     if method == "atr_adjusted_risk":
-        import numpy as np
         atr = getattr(signal, "atr", None)
-        if atr is None or np.isnan(atr) or atr <= 0:
+        if atr is None or not math.isfinite(atr) or atr <= 0:
             logger.warning("ATR is missing, NaN, or <= 0 for %s. Skipping trade.", signal.symbol)
             return 0
 
@@ -113,18 +125,12 @@ def calculate_shares(signal: TradeSignal, equity: float) -> int:
             return 0
 
         multiplier = getattr(config, "ATR_SIZING_MULTIPLIER", getattr(config, "TRAILING_STOP_ATR_MULTIPLE", 1.5))
-        if multiplier <= 0:
-            logger.warning("Invalid ATR sizing multiplier %.2f, defaulting to 1.5", multiplier)
-            multiplier = 1.5
+        if not (math.isfinite(multiplier) and multiplier > 0):
+            logger.warning("Invalid ATR sizing multiplier %.2f; rejecting size", multiplier)
+            return 0
 
-        strat_cfg = getattr(config, "STRATEGY_SETTINGS", {}).get(signal.strategy)
-        risk_pct = strat_cfg.max_risk_pct if strat_cfg else 1.0
-        risk_budget = equity * (risk_pct / 100.0)
         raw = risk_budget / (atr * multiplier)
     elif method == "risk_based":
-        strat_cfg = getattr(config, "STRATEGY_SETTINGS", {}).get(signal.strategy)
-        risk_pct = strat_cfg.max_risk_pct if strat_cfg else 1.0
-        risk_budget = equity * (risk_pct / 100.0)
         raw = risk_budget / risk_per_share
     elif method == "fixed_shares":
         raw = config.FIXED_SHARE_COUNT
@@ -132,9 +138,6 @@ def calculate_shares(signal: TradeSignal, equity: float) -> int:
         raw = config.FIXED_DOLLAR_AMOUNT / signal.entry_price
     else:
         logger.warning("Unknown sizing method %s, using risk_based", method)
-        strat_cfg = getattr(config, "STRATEGY_SETTINGS", {}).get(signal.strategy)
-        risk_pct = strat_cfg.max_risk_pct if strat_cfg else 1.0
-        risk_budget = equity * (risk_pct / 100.0)
         raw = risk_budget / risk_per_share
 
     # Volatility Risk Parity Sizing (Cap per-trade dollar risk at MAX_RISK_PER_TRADE_DOLLARS)
@@ -148,11 +151,18 @@ def calculate_shares(signal: TradeSignal, equity: float) -> int:
     else:
         equity_cap_shares = (equity * config.MAX_POSITION_PCT_OF_EQUITY) / signal.entry_price
 
-    shares = int(min(raw, risk_parity_shares, dollar_cap_shares, equity_cap_shares))
+    strategy_risk_shares = risk_budget / risk_per_share
+    limits = (raw, risk_parity_shares, dollar_cap_shares, equity_cap_shares, strategy_risk_shares)
+    if not all(math.isfinite(value) and value >= 0 for value in limits):
+        logger.warning("[SIZER REJECT] %s non-finite or negative sizing limits", signal.symbol)
+        return 0
+    shares = int(min(limits))
     shares = max(shares, 0)
     min_shares = getattr(config, "MIN_SHARE_COUNT", 1)
     if shares > 0 and shares < min_shares:
-        shares = min_shares
+        logger.info("[SIZER REJECT] %s size %d below minimum %d; caps are not overridden",
+                    signal.symbol, shares, min_shares)
+        return 0
 
     if shares == 0:
         logger.info(

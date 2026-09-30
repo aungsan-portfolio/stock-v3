@@ -11,12 +11,16 @@ subject to 4 strict confirmation layers to eliminate false breakdown signals:
 """
 
 import logging
+import math
 from typing import Optional
 import pandas as pd
 import numpy as np
 
 import config
 from strategies.base import TradeSignal
+from strategies.execution_geometry import (
+    calculate_directional_stop_and_validate, floor_to_tick_float,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +34,8 @@ class MeanReversionStrategy:
     def __init__(self, cfg=None):
         self.cfg = cfg or config
 
-    def generate_signal(self, symbol: str, df: pd.DataFrame, market_texture: str = "SIDEWAYS") -> Optional[TradeSignal]:
+    def generate_signal(self, symbol: str, df: pd.DataFrame, market_texture: str = "SIDEWAYS",
+                        *, quote: Optional[dict] = None, metadata: Optional[dict] = None) -> Optional[TradeSignal]:
         """Evaluates DataFrame against 4-layer confirmation checks for Mean Reversion BUY signal.
         
         Returns TradeSignal if all confirmation layers pass, or None.
@@ -50,7 +55,7 @@ class MeanReversionStrategy:
             low = df["low"]
             volume = df["volume"]
 
-            if close <= 0:
+            if not math.isfinite(close) or close <= 0:
                 return None
 
             # Calculate 14-period ATR
@@ -59,7 +64,7 @@ class MeanReversionStrategy:
             low_cp = (low - df["close"].shift(1)).abs()
             tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
             atr = float(tr.tail(14).mean())
-            if atr <= 0:
+            if not math.isfinite(atr) or atr <= 0:
                 return None
 
             # Calculate VWAP
@@ -85,6 +90,9 @@ class MeanReversionStrategy:
             avg_vol = float(volume.tail(20).mean())
             last_vol = float(volume.iloc[-1])
             volume_ratio = last_vol / avg_vol if avg_vol > 0 else 1.0
+
+            if not all(math.isfinite(value) for value in (vwap, rsi, lower_bb, volume_ratio)):
+                return None
 
             # ── 4 CONFIRMATION LAYERS ─────────────────────────
             # Layer 1: VWAP Deviation
@@ -123,27 +131,55 @@ class MeanReversionStrategy:
                 )
                 return None
 
-            # Calculate Target & Stop Geometry
-            stop_price = close - (0.5 * atr)
-            target_price = vwap
-            risk_per_share = close - stop_price
-            reward_per_share = target_price - close
-            rr_ratio = reward_per_share / risk_per_share if risk_per_share > 0 else 0.0
+            # Preserve the four entry layers; harmonize only execution geometry.
+            context = dict(getattr(df, "attrs", {}) or {})
+            context.update(metadata or {})
+            quote = quote if quote is not None else context.get("quote")
+            spread_floor = 0.0
+            if quote is not None:
+                bid = float(quote.get("bid", 0.0) or quote.get("bid_price", 0.0) or 0.0)
+                ask = float(quote.get("ask", 0.0) or quote.get("ask_price", 0.0) or 0.0)
+                if not (math.isfinite(bid) and math.isfinite(ask) and ask >= bid > 0):
+                    logger.debug("[MEAN REVERSION] %s: Invalid supplied quote", symbol)
+                    return None
+                spread_floor = ask - bid
 
-            # Noise floor consistency check at signal generation layer
-            abs_min_noise = getattr(config, "NOISE_FLOOR_ABS_MIN", 0.08)
-            hard_veto_ratio = getattr(config, "NOISE_FLOOR_HARD_VETO_RATIO", 0.50)
-            min_allowable_stop = abs_min_noise * hard_veto_ratio
-            if risk_per_share < min_allowable_stop:
-                logger.debug(
-                    "[MEAN REVERSION] %s: Rejection Noise Floor (Stop distance $%.4f < Min allowable $%.4f)",
-                    symbol, risk_per_share, min_allowable_stop
-                )
+            # Use the emitted entry precision consistently; do not round ATR/risk independently.
+            entry_price = round(close, 4)
+            tick_size = 0.01 if entry_price >= 1.0 else 0.0001
+            geom = calculate_directional_stop_and_validate(
+                side="long", price=entry_price, raw_risk=0.50 * atr,
+                atr=atr, spread_floor=spread_floor, tick_size=tick_size,
+                precision=2 if tick_size == 0.01 else 4, cfg=self.cfg,
+            )
+            stop_price = geom.stop_price
+            # Conservative tick alignment: never move a long target above VWAP.
+            target_price = floor_to_tick_float(vwap, tick_size)
+            risk_per_share = entry_price - stop_price
+            reward_per_share = target_price - entry_price
+            rr_ratio = reward_per_share / risk_per_share
+            min_rr = float(getattr(self.cfg, "MIN_RR_RATIO", 1.50))
+            max_rr = float(getattr(self.cfg, "MAX_TARGET_RR_RATIO", 5.00))
+            if not (math.isfinite(min_rr) and math.isfinite(max_rr) and 0 < min_rr <= max_rr):
+                raise ValueError("Invalid R:R configuration")
+            if rr_ratio < (min_rr - 1e-6):
+                logger.debug("[MEAN REVERSION] %s: Insufficient R:R %.4f < %.4f", symbol, rr_ratio, min_rr)
+                return None
+            if rr_ratio > (max_rr + 1e-6):
+                logger.debug("[MEAN REVERSION] %s: Unreachable target R:R %.4f > %.4f", symbol, rr_ratio, max_rr)
                 return None
 
-            if rr_ratio < 1.2:
-                logger.debug("[MEAN REVERSION] %s: Rejection Geometry (RR %.2f < 1.2)", symbol, rr_ratio)
-                return None
+            daily_atr = context.get("daily_atr")
+            if daily_atr is not None:
+                daily_atr = float(daily_atr)
+                if not (math.isfinite(daily_atr) and daily_atr > 0):
+                    return None
+                max_reach = float(getattr(self.cfg, "MAX_TARGET_DAILY_ATR_MULTIPLE", 3.5))
+                if not (math.isfinite(max_reach) and max_reach > 0):
+                    return None
+                if reward_per_share > daily_atr * max_reach:
+                    logger.debug("[MEAN REVERSION] %s: Target exceeds daily ATR reachability", symbol)
+                    return None
 
             from strategies.constants import StrategyName
             signal = TradeSignal(
@@ -151,14 +187,20 @@ class MeanReversionStrategy:
                 strategy=StrategyName.MEAN_REVERSION,
                 side="BUY",
                 confidence=0.65,
-                entry_price=round(close, 4),
-                stop_price=round(stop_price, 4),
-                target_price=round(target_price, 4),
-                atr=round(atr, 4),
-                risk_per_share=round(risk_per_share, 4),
+                entry_price=entry_price,
+                stop_price=stop_price,
+                target_price=target_price,
+                atr=atr,
+                risk_per_share=risk_per_share,
                 reason=f"Mean Reversion 4-Layer Pass: Dev=${deviation:.2f} (>=1.2xATR), RSI={rsi:.1f}<=35, VolRatio={volume_ratio:.2f}<=2.0, Close<LowerBB",
                 metadata={
+                    **context,
+                    **({"quote": quote} if quote is not None else {}),
                     "timeframe": "5m",
+                    "target_anchor": "VWAP",
+                    "geometry_version": "MR_v0.3",
+                    "spread_floor": spread_floor,
+                    "minimum_stop_distance": geom.minimum_distance,
                     "rsi": rsi,
                     "volume_ratio": volume_ratio,
                     "vwap": vwap,
