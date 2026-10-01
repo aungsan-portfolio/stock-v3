@@ -14,7 +14,7 @@ import logging
 import math
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -190,6 +190,90 @@ def extract_benchmark_pct(data: Optional[Dict[str, Any]], symbol: str) -> Option
     elif isinstance(node, (int, float)):
         return float(node)
     return None
+
+
+def compute_vwap_breadth(
+    symbols: Optional[List[str]] = None,
+    bridge=None,
+    data: Optional[Dict[str, Any]] = None,
+    symbol_data: Optional[Dict[str, Any]] = None,
+) -> Tuple[float, str, Dict[str, Any]]:
+    """Compute market breadth as % of symbols trading above daily VWAP (Dual-Mode).
+
+    Dual-mode fallback:
+      - Primary: Watchlist VWAP breadth (evaluated symbols with valid intraday bars >= 5).
+      - Fallback: If valid count < 5, fall back to index breadth (SPY / QQQ / SOXX / IWM).
+    """
+    above_vwap = 0
+    valid_count = 0
+    evaluated_symbols = []
+
+    candidates = symbols or []
+    for sym in candidates:
+        df = None
+        if symbol_data and sym in symbol_data:
+            df = symbol_data[sym]
+        elif bridge is not None:
+            try:
+                from strategies.intraday_data import fetch_intraday
+                df = fetch_intraday(sym, bridge=bridge)
+            except Exception:
+                df = None
+
+        if df is not None and not df.empty and len(df) >= 2:
+            try:
+                from strategies.indicators import add_vwap
+                if "vwap" not in df.columns:
+                    df = add_vwap(df)
+                last_close = float(df["close"].iloc[-1])
+                last_vwap = float(df["vwap"].iloc[-1])
+                if math.isfinite(last_close) and math.isfinite(last_vwap) and last_vwap > 0:
+                    valid_count += 1
+                    is_above = last_close > last_vwap
+                    if is_above:
+                        above_vwap += 1
+                    evaluated_symbols.append((sym, is_above, last_close, last_vwap))
+            except Exception:
+                pass
+
+    if valid_count >= 5:
+        breadth_pct = round((above_vwap / valid_count) * 100.0, 2)
+        mode = "WATCHLIST_VWAP"
+        details = {
+            "mode": mode,
+            "evaluated": valid_count,
+            "above_vwap": above_vwap,
+            "breadth_pct": breadth_pct,
+            "symbols": [s[0] for s in evaluated_symbols],
+        }
+        return breadth_pct, mode, details
+
+    # Fallback to Index Breadth
+    dt = data or {}
+    benchmarks = ["SPY", "QQQ", "SOXX", "IWM"]
+    bench_valid = 0
+    bench_pos = 0
+    for b_sym in benchmarks:
+        pct = extract_benchmark_pct(dt, b_sym)
+        if pct is not None and math.isfinite(pct):
+            bench_valid += 1
+            if pct > 0:
+                bench_pos += 1
+
+    if bench_valid > 0:
+        breadth_pct = round((bench_pos / bench_valid) * 100.0, 2)
+    else:
+        breadth_pct = 50.0  # Neutral fallback
+
+    mode = "INDEX_FALLBACK"
+    details = {
+        "mode": mode,
+        "evaluated": bench_valid,
+        "positive_count": bench_pos,
+        "breadth_pct": breadth_pct,
+        "fallback_reason": f"Watchlist valid count {valid_count} < 5 minimum threshold",
+    }
+    return breadth_pct, mode, details
 
 
 def validate_regime_texture_combination(
@@ -574,6 +658,16 @@ def evaluate_market_regime(
     else:
         reasons.append("scanner_candidate_count_unavailable")
 
+    # 4. Market Breadth (Dual-Mode Watchlist VWAP Breadth / Index Fallback)
+    breadth_pct, breadth_mode, breadth_details = compute_vwap_breadth(
+        symbols=symbols,
+        bridge=bridge,
+        data=health_data,
+    )
+    data["market_breadth"] = breadth_pct
+    data["market_breadth_mode"] = breadth_mode
+    data["market_breadth_details"] = breadth_details
+
     score = sum(factor_scores.values())
 
     # Mode Determination
@@ -696,13 +790,18 @@ def evaluate_market_regime(
 class RegimeStateTracker:
     """
     Thread-safe hysteresis state tracker wrapping evaluate_market_regime().
-    Maintains recovery cool-down to prevent flapping between DATA_DEGRADED and normal modes.
+    Maintains recovery cool-down to prevent flapping between DATA_DEGRADED and normal modes,
+    and texture dwell hysteresis (N=3 consecutive bars) to prevent texture whipping.
     """
-    def __init__(self, recovery_bars: Optional[int] = None):
+    def __init__(self, recovery_bars: Optional[int] = None, texture_dwell_bars: Optional[int] = None):
         cfg_settings = getattr(config, "DATA_HEALTH_SETTINGS", {})
         self._recovery_bars = recovery_bars if recovery_bars is not None else int(cfg_settings.get("recovery_bars", 3))
+        self._texture_dwell_bars = texture_dwell_bars if texture_dwell_bars is not None else 3
         self._consecutive_healthy = 0
         self._latched_degraded = False
+        self._active_texture: Optional[str] = None
+        self._candidate_texture: Optional[str] = None
+        self._candidate_texture_count: int = 0
         self._lock = threading.RLock()
 
     @property
@@ -715,16 +814,37 @@ class RegimeStateTracker:
         with self._lock:
             return self._consecutive_healthy
 
+    @property
+    def active_texture(self) -> Optional[str]:
+        with self._lock:
+            return self._active_texture
+
+    @property
+    def candidate_texture(self) -> Optional[str]:
+        with self._lock:
+            return self._candidate_texture
+
+    @property
+    def candidate_texture_count(self) -> int:
+        with self._lock:
+            return self._candidate_texture_count
+
     def reset(self) -> None:
         with self._lock:
             self._consecutive_healthy = 0
             self._latched_degraded = False
+            self._active_texture = None
+            self._candidate_texture = None
+            self._candidate_texture_count = 0
 
     def update(self, raw_result: MarketRegimeResult) -> MarketRegimeResult:
         with self._lock:
             if raw_result.mode == MODE_DATA_DEGRADED:
                 self._consecutive_healthy = 0
                 self._latched_degraded = True
+                self._active_texture = None
+                self._candidate_texture = None
+                self._candidate_texture_count = 0
                 return raw_result
 
             if self._latched_degraded:
@@ -758,6 +878,58 @@ class RegimeStateTracker:
                     "[REGIME TRACKER] Data health restored after %d consecutive healthy bars; unlatching %s",
                     self._consecutive_healthy,
                     raw_result.mode,
+                )
+
+            # 2. Texture Dwell Hysteresis (N=3 consecutive bars required before flipping texture)
+            raw_texture = raw_result.market_texture
+            if self._active_texture is None:
+                self._active_texture = raw_texture
+                self._candidate_texture = raw_texture
+                self._candidate_texture_count = 1
+                confirmed_texture = raw_texture
+            elif raw_texture == self._active_texture:
+                self._candidate_texture = raw_texture
+                self._candidate_texture_count = 0
+                confirmed_texture = self._active_texture
+            else:
+                if raw_texture == self._candidate_texture:
+                    self._candidate_texture_count += 1
+                else:
+                    self._candidate_texture = raw_texture
+                    self._candidate_texture_count = 1
+
+                if self._candidate_texture_count >= self._texture_dwell_bars:
+                    logger.info(
+                        "[TEXTURE HYSTERESIS] Texture transition confirmed: %s -> %s after %d consecutive bars",
+                        self._active_texture,
+                        self._candidate_texture,
+                        self._candidate_texture_count,
+                    )
+                    self._active_texture = self._candidate_texture
+                    self._candidate_texture_count = 0
+                    confirmed_texture = self._active_texture
+                else:
+                    logger.debug(
+                        "[TEXTURE HYSTERESIS] Dwell window active (%d/%d bars for %s). Retaining confirmed texture: %s",
+                        self._candidate_texture_count,
+                        self._texture_dwell_bars,
+                        self._candidate_texture,
+                        self._active_texture,
+                    )
+                    confirmed_texture = self._active_texture
+
+            if confirmed_texture != raw_result.market_texture:
+                halt = raw_result.halt_new_entries
+                allow_long = raw_result.allow_new_longs
+                tex_cfg = getattr(config, "MARKET_REGIME_SETTINGS", {}).get(confirmed_texture, {})
+                if tex_cfg.get("halt_new_entries", False):
+                    halt = True
+                    allow_long = False
+                return replace(
+                    raw_result,
+                    market_texture=confirmed_texture,
+                    halt_new_entries=halt,
+                    allow_new_longs=allow_long,
                 )
 
             return raw_result
