@@ -424,13 +424,16 @@ def compute_effective_noise_floor(
 def validate_quote_health(
     quote: Optional[dict],
     now_ts: Optional[float] = None,
-    max_age_seconds: float = 5.0,
+    max_age_seconds: Optional[float] = None,
     max_spread_pct: float = 0.015,
     atr: Optional[float] = None,
 ) -> Tuple[bool, str, dict]:
     """Validates real-time bid/ask quote health and returns normalized spread metrics."""
     if not quote:
         return False, "QUOTE_MISSING", {}
+
+    if max_age_seconds is None:
+        max_age_seconds = float(getattr(config, "MAX_QUOTE_AGE_SECONDS", 10.0))
 
     try:
         bid = float(quote.get("bid", 0.0) or quote.get("bid_price", 0.0) or 0.0)
@@ -1483,14 +1486,78 @@ def execute_signal(
         logger.info("Skipped %s: %s", signal.symbol, result["reason"])
         return result
 
-    quote = signal_metadata.get("quote") or getattr(signal, "quote", None)
+    # ── Quote Freshness & Snapshot Concordance (Lane 2) ─────────────────────
+    quote_fetch_time = time.time()
+    get_quote_fn = getattr(bridge, "get_quote", None) if bridge is not None else None
+    quote = None
+    if callable(get_quote_fn):
+        try:
+            quote = get_quote_fn(signal.symbol)
+        except Exception as q_exc:
+            if not dry_run and (getattr(bridge, "is_connected", False) or getattr(bridge, "_connected", False)):
+                result["reason"] = f"QUOTE_REFETCH_FAILED: Exception during quote refetch for {signal.symbol}: {q_exc}"
+                logger.warning("[QUOTE REFETCH FAILED] Blocked %s: %s", signal.symbol, result["reason"])
+                return result
+            logger.debug("[QUOTE REFETCH] Non-blocking quote refetch error for %s: %s", signal.symbol, q_exc)
+
+    if quote is None:
+        quote = signal_metadata.get("quote") or getattr(signal, "quote", None)
+
+    if not dry_run and (getattr(bridge, "is_connected", False) or getattr(bridge, "_connected", False)) and not quote:
+        result["reason"] = f"QUOTE_REFETCH_FAILED: Realtime quote missing for {signal.symbol}"
+        logger.warning("[QUOTE REFETCH FAILED] Blocked %s: %s", signal.symbol, result["reason"])
+        return result
+
+    quote_metrics = {}
     if quote:
-        quote_ok, quote_err, quote_metrics = validate_quote_health(quote, atr=getattr(signal, "atr", None))
+        if isinstance(signal_metadata, dict):
+            signal_metadata["quote"] = quote
+        if isinstance(getattr(signal, "metadata", None), dict):
+            signal.metadata["quote"] = quote
+        if hasattr(signal, "quote"):
+            try:
+                signal.quote = quote
+            except Exception:
+                pass
+
+        max_quote_age = float(getattr(config, "MAX_QUOTE_AGE_SECONDS", 10.0))
+        quote_ok, quote_err, quote_metrics = validate_quote_health(
+            quote,
+            atr=getattr(signal, "atr", None),
+            max_age_seconds=max_quote_age,
+        )
         result["metadata"]["quote_metrics"] = quote_metrics
         if not quote_ok:
             result["reason"] = f"Quote health veto: {quote_err}"
             logger.warning("[QUOTE HEALTH VETO] Blocked %s: %s", signal.symbol, result["reason"])
             return result
+
+    # Diagnostic Timestamps (quote_fetch_time, signal_generation_time, veto_evaluation_time)
+    veto_evaluation_time = time.time()
+    sig_gen_time = None
+    if isinstance(signal_metadata.get("created_at"), (int, float)):
+        sig_gen_time = float(signal_metadata["created_at"])
+    elif hasattr(signal, "timestamp") and signal.timestamp:
+        try:
+            import pandas as pd
+            sig_gen_time = pd.Timestamp(signal.timestamp).timestamp()
+        except Exception:
+            sig_gen_time = None
+    if sig_gen_time is None:
+        sig_gen_time = quote_fetch_time
+
+    latency_ms = max(0.0, (veto_evaluation_time - sig_gen_time) * 1000.0)
+    q_age = quote_metrics.get("age_seconds", 0.0) if quote else 0.0
+
+    result["metadata"]["quote_fetch_time"] = quote_fetch_time
+    result["metadata"]["signal_generation_time"] = sig_gen_time
+    result["metadata"]["veto_evaluation_time"] = veto_evaluation_time
+    result["metadata"]["execution_latency_ms"] = latency_ms
+
+    logger.info(
+        "[QUOTE TIMESTAMPS] %s: signal_gen=%.4f quote_fetch=%.4f veto_eval=%.4f (latency=%.1fms, quote_age=%.2fs)",
+        signal.symbol, sig_gen_time, quote_fetch_time, veto_evaluation_time, latency_ms, q_age
+    )
 
     price_reason = _validate_signal_prices(signal, market_texture=market_texture, quote=quote)
     if price_reason:
@@ -1971,6 +2038,7 @@ def execute_signal(
                 bar_timestamp=getattr(executable_signal, "bar_timestamp", None) or getattr(signal, "bar_timestamp", None),
                 max_bar_age_seconds=getattr(config, "MAX_BAR_STALENESS_SECONDS", 300.0),
                 require_feed_concordance=getattr(config, "REQUIRE_FEED_CONCORDANCE", False),
+                quote=quote,
             )
         except Exception as quote_exc:
             idempotency_manager.release(

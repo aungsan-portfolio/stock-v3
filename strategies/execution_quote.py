@@ -114,6 +114,7 @@ def validate_execution_quote(
     bar_timestamp: Optional[Union[str, float, datetime, Any]] = None,
     max_bar_age_seconds: float = 300.0,
     require_feed_concordance: bool = False,
+    quote: Optional[Any] = None,
 ) -> QuoteValidationResult:
     """
     Validate that a fresh, real-time broker quote is available and within acceptable risk parameters.
@@ -149,20 +150,23 @@ def validate_execution_quote(
             reason="Invalid quote-validation configuration",
         )
 
-    get_quote_fn = getattr(bridge, "get_quote", None)
-    if not callable(get_quote_fn):
-        return QuoteValidationResult(
-            valid=False,
-            reason=f"Broker bridge does not implement get_quote() contract for {symbol}",
-        )
+    if quote is not None:
+        raw_quote = quote
+    else:
+        get_quote_fn = getattr(bridge, "get_quote", None)
+        if not callable(get_quote_fn):
+            return QuoteValidationResult(
+                valid=False,
+                reason=f"Broker bridge does not implement get_quote() contract for {symbol}",
+            )
 
-    try:
-        raw_quote = get_quote_fn(symbol)
-    except Exception as exc:
-        return QuoteValidationResult(
-            valid=False,
-            reason=f"Failed to fetch quote for {symbol}: {exc}",
-        )
+        try:
+            raw_quote = get_quote_fn(symbol)
+        except Exception as exc:
+            return QuoteValidationResult(
+                valid=False,
+                reason=f"Failed to fetch quote for {symbol}: {exc}",
+            )
 
     if not raw_quote:
         return QuoteValidationResult(
