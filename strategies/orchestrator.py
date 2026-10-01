@@ -1750,7 +1750,50 @@ def evaluate_and_execute(
         except Exception:
             pass
 
+    total_universe_candidates = len(watchlist) if watchlist else 0
+    raw_screened_setups = len(all_signals)
+
+    # ── Lane 5: Pre-Correlation / Pre-Sizing Texture Admission Filter ──
+    tex_cfg = getattr(config, "MARKET_REGIME_SETTINGS", {}).get(market_tex, {})
+    raw_allowed = tex_cfg.get("allowed_strategies", None)
+    allowed_strats = set(raw_allowed) if raw_allowed else None
+
+    texture_admitted_signals = []
+    for sig in all_signals:
+        is_inverse_exempt = _is_inverse_etf_signal(sig) and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
+        strat_key = getattr(sig.strategy, "value", getattr(sig.strategy, "name", str(sig.strategy)))
+        if is_inverse_exempt or allowed_strats is None or sig.strategy in allowed_strats or strat_key in allowed_strats:
+            texture_admitted_signals.append(sig)
+        else:
+            logger.info(
+                "[TEXTURE ADMISSION REJECT] Skipped %s: strategy %s not allowed in market texture '%s'",
+                sig.symbol, sig.strategy, market_tex
+            )
+            try:
+                from strategies.gate_ledger import log_gate_decision
+                from strategies.veto_reasons import VetoReason
+                log_gate_decision(
+                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sig.symbol}_{int(time.time())}",
+                    symbol=sig.symbol,
+                    bar=getattr(sig, "bar_timestamp", "") or "",
+                    strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                    stage="STAGE_REGIME",
+                    decision="REJECT",
+                    reason_code=VetoReason.REGIME_TEXTURE_FILTER,
+                    human_message=f"Strategy {sig.strategy} not allowed in market texture '{market_tex}'",
+                    terminal_decision=True,
+                    blocked_by="STAGE_REGIME",
+                    raw_conf=getattr(sig, "confidence", 0.0),
+                    final_conf=getattr(sig, "confidence", 0.0),
+                )
+            except Exception:
+                pass
+
+    texture_admitted_count = len(texture_admitted_signals)
+    all_signals = texture_admitted_signals
+
     all_signals = apply_portfolio_correlation(all_signals, cached_open_positions, bridge=bridge)
+    correlated_count = len(all_signals)
 
     # ── Signal Export Hook for ML Training ──
     if all_signals:
@@ -2271,6 +2314,7 @@ def evaluate_and_execute(
     if error_handler is None:
         error_handler = TradingErrorHandler(bridge=bridge)
 
+    execution_results = []
     logger.debug("[HOOK] before execute")
     for sig in all_signals:
         entry_allowed_for_sig = allow_new_entries or _inverse_etf_entry_allowed(regime_res, sig)
@@ -2355,6 +2399,7 @@ def evaluate_and_execute(
                 regime_result=regime_res,
                 entry_readiness=readiness,
             )
+            execution_results.append(result)
             if result["status"] in {"PLACED", "DRY_RUN"}:
                 error_handler.reset()
                 try:
@@ -2410,6 +2455,30 @@ def evaluate_and_execute(
             print(f"Error executing signal: {e}")
             if error_handler:
                 error_handler.record(e)
+
+    # ── Lane 5: Funnel Telemetry v2.1 (Dual Denominators) ──
+    placed_count = sum(1 for r in execution_results if r.get("status") in {"PLACED", "DRY_RUN"})
+    legacy_placed_pct_screened = (placed_count / raw_screened_setups * 100.0) if raw_screened_setups > 0 else 0.0
+    legacy_placed_pct_universe = (placed_count / total_universe_candidates * 100.0) if total_universe_candidates > 0 else 0.0
+    norm_placed_pct_admitted = (placed_count / texture_admitted_count * 100.0) if texture_admitted_count > 0 else 0.0
+    norm_corr_pct_admitted = (correlated_count / texture_admitted_count * 100.0) if texture_admitted_count > 0 else 0.0
+
+    logger.info(
+        "[FUNNEL TELEMETRY v2.1] raw_candidates_total=%d, universe_candidates=%d, screened_setups=%d, "
+        "texture_admitted=%d, correlated=%d, placed=%d | "
+        "legacy: placed/screened=%.1f%%, placed/universe=%.1f%% | "
+        "normalized: placed/admitted=%.1f%%, correlated/admitted=%.1f%%",
+        raw_screened_setups,
+        total_universe_candidates,
+        raw_screened_setups,
+        texture_admitted_count,
+        correlated_count,
+        placed_count,
+        legacy_placed_pct_screened,
+        legacy_placed_pct_universe,
+        norm_placed_pct_admitted,
+        norm_corr_pct_admitted,
+    )
     try:
         from strategies.order_manager import reap_expired_entry_orders
         reap_expired_entry_orders(
