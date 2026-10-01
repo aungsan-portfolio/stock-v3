@@ -1261,19 +1261,16 @@ def evaluate_and_execute(
             else:
                 cached_open_positions = []
             try:
-                equity = float(bridge.get_net_liquidation())
-            except Exception:
-                equity = float(getattr(config, "PDT_MIN_EQUITY", 25000.0))
-
-            try:
-                if hasattr(bridge, "account_daily_pnl"):
-                    broker_pnl = float(bridge.account_daily_pnl())
-                elif hasattr(bridge, "daily_pnl"):
-                    broker_pnl = float(bridge.daily_pnl())
-                else:
-                    broker_pnl = today_pnl()
-            except Exception:
+                from strategies.validation_lane import get_production_risk_equity
+                equity, broker_pnl = get_production_risk_equity(bridge, include_validation=False)
+            except Exception as eq_err:
+                logger.debug("get_production_risk_equity failed: %s", eq_err)
+                try:
+                    equity = float(bridge.get_net_liquidation())
+                except Exception:
+                    equity = float(getattr(config, "PDT_MIN_EQUITY", 25000.0))
                 broker_pnl = today_pnl()
+
             if hasattr(bridge, "sync_today_trades_to_journal"):
                 try:
                     bridge.sync_today_trades_to_journal()
@@ -1318,11 +1315,16 @@ def evaluate_and_execute(
         governing_limit = min(dollar_limit, pct_limit)
         anchor_eq = getattr(bridge, "_start_of_day_equity", equity)
 
+        from strategies.validation_lane import get_validation_daily_pnl
+        val_daily_pnl = get_validation_daily_pnl()
+
         logger.info(
             "[EVALUATION PROVENANCE] live_equity=%.2f start_of_day_anchor=%.2f formula=(live_equity - start_of_day_anchor) "
-            "calendar_day_pnl=%+.2f governing_limit=-%.2f budget_remaining=%.2f",
+            "calendar_day_pnl=%+.2f governing_limit=-%.2f budget_remaining=%.2f | "
+            "[VALIDATION ISOLATION] val_daily_pnl=%+.2f production_pnl=%+.2f production_equity=%.2f",
             float(equity), float(anchor_eq),
-            float(current_pnl), float(governing_limit), float(governing_limit + current_pnl)
+            float(current_pnl), float(governing_limit), float(governing_limit + current_pnl),
+            float(val_daily_pnl), float(current_pnl), float(equity)
         )
 
         try:

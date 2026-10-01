@@ -2573,17 +2573,29 @@ class AlpacaBridge:
         self._require_connection()
         return self._call_with_retry(lambda: self._client.get_clock())
 
-    def account_daily_pnl(self) -> float:
+    def account_daily_pnl(self, include_validation: bool = False) -> float:
         net_liq = self.get_net_liquidation()
         if getattr(self, "_start_of_day_equity", 0.0) <= 0.0:
             self.snapshot_start_of_day_equity()
         sod_eq = getattr(self, "_start_of_day_equity", net_liq)
         pnl = net_liq - sod_eq
+        if not include_validation:
+            try:
+                from strategies.validation_lane import get_validation_daily_pnl
+                val_pnl = get_validation_daily_pnl()
+                pnl = pnl - val_pnl
+            except Exception as e:
+                logger.debug("Could not isolate validation P&L: %s", e)
         logger.debug(
-            "[BASELINE PROVENANCE] net_liq=%.2f last_equity=%.2f formula=(net_liq - last_equity) calendar_day_pnl=%+.2f",
-            net_liq, sod_eq, pnl
+            "[BASELINE PROVENANCE] net_liq=%.2f last_equity=%.2f include_validation=%s calendar_day_pnl=%+.2f",
+            net_liq, sod_eq, include_validation, pnl
         )
         return pnl
+
+    def get_production_risk_equity(self, include_validation: bool = False) -> Tuple[float, float]:
+        from strategies.validation_lane import get_production_risk_equity
+        return get_production_risk_equity(self, include_validation=include_validation)
+
 
     def snapshot_start_of_day_equity(self) -> float:
         from strategies.session import now_eastern

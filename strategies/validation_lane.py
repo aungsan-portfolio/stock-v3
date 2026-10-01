@@ -98,6 +98,7 @@ class ValidationTradeRecord:
     hard_safety_pass: bool = False
     policy_rejected: bool = True
     validation_only: bool = True
+    quarantined_from_production_budget: bool = True
     status: str = "PENDING"  # PENDING, SUBMITTED, FILLED, CLOSED, VETOED
 
     def to_dict(self) -> Dict[str, Any]:
@@ -787,3 +788,86 @@ def evaluate_and_route_validation_candidate(
         signal.confidence, policy_stage
     )
     return result
+
+
+def get_validation_daily_pnl(
+    session_date: Optional[str] = None,
+    filepath: str = DEFAULT_VALIDATION_LEDGER_PATH,
+) -> float:
+    """Compute realized P&L from closed validation trades for a given session date (YYYY-MM-DD).
+    If session_date is None, uses today's Eastern date.
+    """
+    if session_date is None:
+        try:
+            from strategies.session import now_eastern
+            session_date = str(now_eastern().date())
+        except Exception:
+            session_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    records = dedupe_on_read(filepath)
+    val_pnl = 0.0
+    for rec in records:
+        ts = rec.get("timestamp", "")
+        rec_date = ts[:10] if ts else ""
+        if rec_date == session_date:
+            pnl_val = rec.get("realized_pnl")
+            if pnl_val is None:
+                pnl_val = rec.get("pnl")
+            if pnl_val is not None:
+                try:
+                    val_pnl += float(pnl_val)
+                except (ValueError, TypeError):
+                    pass
+    return round(val_pnl, 4)
+
+
+def get_production_risk_equity(bridge, include_validation: bool = False) -> Tuple[float, float]:
+    """Returns (governing_equity, current_production_pnl) strictly isolated from validation lane P&L.
+
+    If include_validation is False:
+        - governing_equity excludes validation loss/gain (adjusts broker net_liq by -validation_daily_pnl)
+        - current_production_pnl = raw_daily_pnl - validation_daily_pnl
+    """
+    import config
+    raw_equity = 0.0
+    if bridge is not None:
+        try:
+            if hasattr(bridge, "get_net_liquidation"):
+                raw_equity = float(bridge.get_net_liquidation())
+            else:
+                raw_equity = float(getattr(bridge, "equity", getattr(config, "PDT_MIN_EQUITY", 25000.0)))
+        except Exception:
+            raw_equity = float(getattr(config, "PDT_MIN_EQUITY", 25000.0))
+    else:
+        raw_equity = float(getattr(config, "PDT_MIN_EQUITY", 25000.0))
+
+    raw_pnl = 0.0
+    if bridge is not None:
+        try:
+            if hasattr(bridge, "account_daily_pnl"):
+                import inspect
+                sig = inspect.signature(bridge.account_daily_pnl)
+                if "include_validation" in sig.parameters:
+                    raw_pnl = float(bridge.account_daily_pnl(include_validation=True))
+                else:
+                    raw_pnl = float(bridge.account_daily_pnl())
+            elif hasattr(bridge, "daily_pnl"):
+                raw_pnl = float(bridge.daily_pnl())
+            else:
+                from strategies.trade_journal import today_pnl
+                raw_pnl = today_pnl()
+        except Exception:
+            from strategies.trade_journal import today_pnl
+            raw_pnl = today_pnl()
+    else:
+        from strategies.trade_journal import today_pnl
+        raw_pnl = today_pnl()
+
+    if include_validation:
+        return raw_equity, raw_pnl
+
+    val_pnl = get_validation_daily_pnl()
+    governing_equity = round(raw_equity - val_pnl, 2)
+    prod_pnl = round(raw_pnl - val_pnl, 2)
+    return governing_equity, prod_pnl
+
