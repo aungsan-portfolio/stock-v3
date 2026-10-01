@@ -1230,12 +1230,19 @@ class AlpacaBridge:
         stop_leg_id: Optional[str] = None,
         tp_leg_id: Optional[str] = None,
         client_order_id: Optional[str] = None,
+        strategy: Optional[str] = None,
     ) -> None:
         """Helper to record parent/stop/tp entries into in-memory dictionary."""
         pid = str(parent_id or "").strip()
         cid = str(client_order_id or "").strip() if client_order_id else None
         sid = str(stop_leg_id or "").strip() if stop_leg_id else None
         tid = str(tp_leg_id or "").strip() if tp_leg_id else None
+
+        strat = strategy
+        if not strat and cid:
+            parts = str(cid).split("_")
+            if len(parts) >= 2 and parts[0] == "dt":
+                strat = parts[1]
 
         if pid:
             self._order_role_registry[pid] = {
@@ -1244,6 +1251,7 @@ class AlpacaBridge:
                 "client_order_id": cid,
                 "stop_order_id": sid,
                 "tp_order_id": tid,
+                "strategy": strat,
             }
         if sid:
             self._order_role_registry[sid] = {
@@ -1252,6 +1260,7 @@ class AlpacaBridge:
                 "client_order_id": cid,
                 "stop_order_id": sid,
                 "tp_order_id": tid,
+                "strategy": strat,
             }
         if tid:
             self._order_role_registry[tid] = {
@@ -1260,6 +1269,7 @@ class AlpacaBridge:
                 "client_order_id": cid,
                 "stop_order_id": sid,
                 "tp_order_id": tid,
+                "strategy": strat,
             }
 
     def _save_order_role_registry(self) -> None:
@@ -1310,8 +1320,9 @@ class AlpacaBridge:
                             sid = meta.get("stop_order_id")
                             tid = meta.get("tp_order_id")
                             cid = meta.get("client_order_id")
+                            strat = rec.get("strategy")
                             if pid:
-                                self._apply_role_entry(pid, sid, tid, cid)
+                                self._apply_role_entry(pid, sid, tid, cid, strategy=strat)
                     except Exception:
                         continue
         except Exception:
@@ -1323,13 +1334,14 @@ class AlpacaBridge:
         stop_leg_id: Optional[str] = None,
         tp_leg_id: Optional[str] = None,
         client_order_id: Optional[str] = None,
+        strategy: Optional[str] = None,
     ) -> None:
         """Register order roles and parent/child linkage for deterministic telemetry."""
         lock = getattr(self, "_order_role_lock", None) or threading.Lock()
         with lock:
             if not hasattr(self, "_order_role_registry"):
                 self._order_role_registry = {}
-            self._apply_role_entry(parent_id, stop_leg_id, tp_leg_id, client_order_id)
+            self._apply_role_entry(parent_id, stop_leg_id, tp_leg_id, client_order_id, strategy=strategy)
             self._save_order_role_registry()
 
     def get_order_role_info(self, order_id: str) -> dict:
@@ -4676,11 +4688,14 @@ class AlpacaBridge:
                     parts = client_ref.split("_")
                     strat = parts[1] if len(parts) >= 2 and parts[0] == "dt" else "UNKNOWN"
 
+                    role_info = self.get_order_role_info(order_id_str)
+                    parent_oid = getattr(o, "parent_order_id", None) or role_info.get("parent_order_id")
+
                     from strategies.order_registry import get_registered_order
                     reg = get_registered_order(order_id_str)
-
                     order_type = "ENTRY"
                     signal_id = None
+
                     if reg:
                         expected_price = reg["expected_price"]
                         order_type = reg.get("order_type", "ENTRY")
@@ -4697,6 +4712,18 @@ class AlpacaBridge:
                             order_type = "TAKE_PROFIT" if side == "SELL" else "ENTRY"
                         else:
                             expected_price = float(incremental_price)
+
+                    if not strat or strat == "UNKNOWN":
+                        if role_info.get("strategy") and role_info["strategy"] != "UNKNOWN":
+                            strat = role_info["strategy"]
+                        elif parent_oid:
+                            parent_role = self.get_order_role_info(str(parent_oid))
+                            if parent_role.get("strategy") and parent_role["strategy"] != "UNKNOWN":
+                                strat = parent_role["strategy"]
+                            else:
+                                parent_reg = get_registered_order(str(parent_oid))
+                                if parent_reg and parent_reg.get("strategy") and parent_reg["strategy"] != "UNKNOWN":
+                                    strat = parent_reg["strategy"]
 
                     fill_price_float = float(incremental_price)
                     if expected_price > 0:

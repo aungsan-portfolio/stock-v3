@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 _consecutive_broker_failures = 0
 _last_evaluated_5m_bar_str: Optional[str] = None
 _skipped_bar_ids: set[str] = set()
+_engine_boot_ts: float = time.time()
+
 
 
 @dataclass(frozen=True)
@@ -1596,13 +1598,19 @@ def evaluate_and_execute(
             )
             should_evaluate_5m_bar = False
         elif _last_evaluated_5m_bar_str is None and bar_age > grace_seconds:
-            # Mid-bar startup sync: synchronize forward to avoid evaluating stale bars
+            # Mid-bar startup/buffer sync: synchronize forward to avoid evaluating stale bars
             _last_evaluated_5m_bar_str = completed_5m_bar_str
             if bar_age > pub_timeout:
                 _skipped_bar_ids.add(completed_5m_bar_str)
             next_boundary_ts = current_5m_bar_ts + timedelta(minutes=5)
+            boot_elapsed = time.time() - getattr(sys.modules[__name__], "_engine_boot_ts", time.time())
+            from strategies.session import is_past_opening_buffer
+            if boot_elapsed > 180.0 and is_past_opening_buffer(15):
+                sync_context = "Opening buffer cleared mid-bar"
+            else:
+                sync_context = "Engine booted mid-bar"
             logger.info(
-                f"[STARTUP CADENCE SYNC] Engine booted mid-bar (elapsed: {bar_age:.1f}s > grace: {grace_seconds:.1f}s "
+                f"[STARTUP CADENCE SYNC] {sync_context} (elapsed: {bar_age:.1f}s > grace: {grace_seconds:.1f}s "
                 f"since {current_5m_bar_ts.strftime('%H:%M:%S')} UTC close). "
                 f"Synchronizing to next 5m bar boundary at {next_boundary_ts.strftime('%H:%M:%S')} UTC. "
                 f"Skipping stale bar evaluation."

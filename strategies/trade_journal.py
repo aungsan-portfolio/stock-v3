@@ -6,7 +6,7 @@ import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Tuple, Set
 
 import config
 from strategies.session import is_market_day, now_eastern
@@ -60,11 +60,20 @@ class OrderFillState:
         self.logged_notional = Decimal("0")
         self.execution_ids = set()
 
-    def add_fill(self, qty: Decimal, price: Decimal, exec_id: Optional[str] = None):
+    def add_fill(self, qty: Decimal, price: Decimal, exec_id: Optional[str] = None) -> bool:
+        """
+        Add fill execution slice to cumulative state.
+        Returns True if fill was new and accumulated; False if duplicate execution_id was skipped.
+        """
+        if exec_id is not None:
+            exec_id_str = str(exec_id).strip()
+            if exec_id_str:
+                if exec_id_str in self.execution_ids:
+                    return False
+                self.execution_ids.add(exec_id_str)
         self.logged_qty += qty
         self.logged_notional += qty * price
-        if exec_id:
-            self.execution_ids.add(str(exec_id))
+        return True
 
 def load_journal_order_fill_state(records, account_id: Optional[str] = None, trading_date=None) -> Dict[Tuple[str, str, str, str, str], OrderFillState]:
     """
@@ -113,7 +122,12 @@ def load_journal_order_fill_state(records, account_id: Optional[str] = None, tra
         qty = Decimal(str(r.get("qty", "0")))
         price = Decimal(str(r.get("fill_price", "0.0")))
         exec_id = r.get("execution_id") or r.get("fill_id")
-        states[key].add_fill(qty, price, exec_id)
+        added = states[key].add_fill(qty, price, exec_id)
+        if not added:
+            logger.warning(
+                "[JOURNAL DEDUPLICATION] Duplicate execution %s for order %s skipped during fill state load",
+                exec_id, order_id
+            )
 
     return states
 
@@ -139,8 +153,31 @@ def log_trade(
     if cid.startswith("val_"):
         raise RuntimeError(f"HARD LANE GUARD: Validation order {cid} routed to production trade journal!")
 
-    p = float(entry_price or exit_price or 0.0)
-    price_tier = "5-10" if (5.0 <= p < 10.0) else (">10" if p >= 10.0 else "<5")
+    resolved_strategy = strategy
+    if not resolved_strategy or resolved_strategy == "UNKNOWN":
+        client_order_id = kwargs.get("client_order_id")
+        if client_order_id:
+            parts = str(client_order_id).split("_")
+            if len(parts) >= 2 and parts[0] == "dt":
+                resolved_strategy = parts[1]
+        if not resolved_strategy or resolved_strategy == "UNKNOWN":
+            try:
+                from strategies.order_registry import get_registered_order
+                for oid in (order_id, kwargs.get("broker_order_id")):
+                    if oid:
+                        reg = get_registered_order(str(oid))
+                        if reg and reg.get("strategy") and reg["strategy"] != "UNKNOWN":
+                            resolved_strategy = reg["strategy"]
+                            break
+                        if reg and reg.get("parent_order_id"):
+                            p_reg = get_registered_order(str(reg["parent_order_id"]))
+                            if p_reg and p_reg.get("strategy") and p_reg["strategy"] != "UNKNOWN":
+                                resolved_strategy = p_reg["strategy"]
+                                break
+            except Exception:
+                pass
+    if not resolved_strategy:
+        resolved_strategy = "UNKNOWN"
 
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -149,7 +186,7 @@ def log_trade(
         "signal_id": signal_id,
         "symbol": symbol,
         "side": side,
-        "strategy": strategy,
+        "strategy": resolved_strategy,
         "qty": qty,
         "entry_price": entry_price,
         "stop_price": stop_price,
@@ -212,6 +249,31 @@ def log_fill(
         is_synthetic = True
         requires_reconciliation = True
 
+    resolved_strategy = strategy
+    if not resolved_strategy or resolved_strategy == "UNKNOWN":
+        if client_order_id:
+            parts = str(client_order_id).split("_")
+            if len(parts) >= 2 and parts[0] == "dt":
+                resolved_strategy = parts[1]
+        if not resolved_strategy or resolved_strategy == "UNKNOWN":
+            try:
+                from strategies.order_registry import get_registered_order
+                for oid in (order_id, broker_order_id):
+                    if oid:
+                        reg = get_registered_order(str(oid))
+                        if reg and reg.get("strategy") and reg["strategy"] != "UNKNOWN":
+                            resolved_strategy = reg["strategy"]
+                            break
+                        if reg and reg.get("parent_order_id"):
+                            p_reg = get_registered_order(str(reg["parent_order_id"]))
+                            if p_reg and p_reg.get("strategy") and p_reg["strategy"] != "UNKNOWN":
+                                resolved_strategy = p_reg["strategy"]
+                                break
+            except Exception:
+                pass
+    if not resolved_strategy:
+        resolved_strategy = "UNKNOWN"
+
     record = {
         "timestamp": timestamp or now_utc_str,
         "journal_write_timestamp_utc": now_utc_str,
@@ -227,7 +289,7 @@ def log_fill(
         "signal_id": signal_id,
         "symbol": symbol,
         "side": side,
-        "strategy": strategy or "UNKNOWN",
+        "strategy": resolved_strategy,
         "qty": qty,
         "fill_price": fill_price,
         "expected_price": expected_price,
@@ -242,6 +304,26 @@ def log_fill(
     path = journal_file or config.DAYTRADE_TRADE_JOURNAL_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     with _journal_lock:
+        if path.exists() and primary_fill_id:
+            try:
+                with open(path, "r", encoding="utf-8") as fh_check:
+                    for line in fh_check:
+                        if not line.strip():
+                            continue
+                        if primary_fill_id in line:
+                            try:
+                                item = json.loads(line)
+                                if item.get("fill_id") == primary_fill_id or item.get("execution_id") == primary_fill_id:
+                                    logger.warning(
+                                        "[JOURNAL WRITE IDEMPOTENT GUARD] Execution %s already recorded in %s. Skipping duplicate write.",
+                                        primary_fill_id, path
+                                    )
+                                    return
+                            except Exception:
+                                pass
+            except Exception as read_err:
+                logger.warning("[JOURNAL WRITE GUARD READ ERROR] %s", read_err)
+
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, default=str) + "\n")
     if slippage is not None and fill_latency_ms is not None:
@@ -706,7 +788,7 @@ def auto_verify_first_trades(journal_file: Optional[Path] = None) -> bool:
                     seen_keys.add(key)
 
         _verified_first_trades = True
-        sample = records[0]
+        sample = next((r for r in reversed(records) if r.get("strategy") and r.get("strategy") != "UNKNOWN"), records[-1])
         msg = f"[PASS] [JOURNAL AUTO-VERIFIED PASS] Live Journal Integrity Checked: {len(records)} records verified cleanly (Events: {len(seen_keys)} | Strategy: '{sample.get('strategy')}' | Price Tier: '{sample.get('price_tier')}')."
         logger.info(msg)
         return True

@@ -67,11 +67,9 @@ if %errorlevel% equ 0 (
 )
 
 REM ---------------------------------------------------------
-REM 4. Lock File Tracking
+REM 4. Lock File Tracking (Managed atomically by Python engine)
 REM ---------------------------------------------------------
-set "LOCK_FILE=%~dp0data\daytrade_bot.lock"
 if not exist "%~dp0data" mkdir "%~dp0data"
-echo %DATE% %TIME% > "!LOCK_FILE!"
 
 REM ---------------------------------------------------------
 REM 5. Python Environment Selection
@@ -107,8 +105,7 @@ echo.
 "!PY_EXE!" -X utf8 main.py daytrade-bot --live-paper
 set "EXIT_CODE=%errorlevel%"
 
-REM Clean lock file on exit
-if exist "!LOCK_FILE!" del "!LOCK_FILE!"
+
 
 echo.
 echo =======================================================

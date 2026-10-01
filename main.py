@@ -2863,6 +2863,56 @@ def cmd_daytrade_status(args) -> int:
 
 
 def cmd_daytrade_bot(args) -> int:
+    # Runtime configuration validation (explicit execution startup only)
+    try:
+        config.validate_alpaca_runtime_config()
+    except ValueError as ve:
+        logger.critical("🚨 [CONFIG_VALIDATION_ERROR] Alpaca configuration invalid: %s", ve)
+        print(f"\n🚨 [CONFIG_VALIDATION_ERROR] Alpaca configuration invalid: {ve}\n")
+        return 1
+
+    from strategies.startup_security import (
+        acquire_atomic_process_lock,
+        release_atomic_process_lock,
+        ProcessLockMetadata,
+        StartupSafetyRejected,
+    )
+    from pathlib import Path
+    import os
+    import socket
+    from strategies.session import now_eastern
+
+    target_acct = str(getattr(config, "EXPECTED_PAPER_ACCOUNT_ID", None) or "PA3UODIC5JTA").strip().upper()
+    lock_path = Path("data") / f"daytrade_bot_{target_acct}.lock"
+    lock_fd = None
+    try:
+        lock_meta = ProcessLockMetadata(
+            pid=os.getpid(),
+            hostname=socket.gethostname(),
+            account=target_acct,
+            mode="daytrade",
+            branch="feature/batch-fetch-engine",
+            release_sha="2d07950",
+            started_at_utc=now_eastern().isoformat(),
+        )
+        lock_fd = acquire_atomic_process_lock(lock_path, lock_meta)
+    except StartupSafetyRejected as ssr:
+        logger.critical("🚨 [STARTUP_LOCK_COLLISION] Daytrade process exclusivity rejected: %s", ssr)
+        print(f"\n🚨 [STARTUP_LOCK_COLLISION] Daytrade process exclusivity rejected: {ssr}\n")
+        return 1
+    except Exception as lock_exc:
+        logger.critical("🚨 [STARTUP_LOCK_ERROR] Could not acquire daytrade process lock: %s", lock_exc)
+        print(f"\n🚨 [STARTUP_LOCK_ERROR] Could not acquire daytrade process lock: {lock_exc}\n")
+        return 1
+
+    try:
+        return _run_daytrade_bot_lifecycle(args)
+    finally:
+        if lock_fd is not None and lock_path is not None:
+            release_atomic_process_lock(lock_path, lock_fd)
+
+
+def _run_daytrade_bot_lifecycle(args) -> int:
     import time
     import threading
     import signal as sig_module
@@ -2870,14 +2920,6 @@ def cmd_daytrade_bot(args) -> int:
     from strategies.scanner.premarket_scanner import scan
     from strategies.orchestrator import evaluate_and_execute
     from strategies.session import is_market_open, session_status, now_eastern
-    
-    # Runtime configuration validation (explicit execution startup only)
-    try:
-        config.validate_alpaca_runtime_config()
-    except ValueError as ve:
-        logger.critical("🚨 [CONFIG_VALIDATION_ERROR] Alpaca configuration invalid: %s", ve)
-        print(f"\n🚨 [CONFIG_VALIDATION_ERROR] Alpaca configuration invalid: {ve}\n")
-        sys.exit(1)
 
     print(f"\n{'='*60}")
     print("  AUTOMATED DAY TRADING BOT STARTED")

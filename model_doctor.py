@@ -273,7 +273,7 @@ def _backup_existing_models() -> List[str]:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     MODEL_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     made: List[str] = []
-    for src in (config.ML_MODELS_FILE, config.LSTM_CKPT_FILE, SCALERS_FILE):
+    for src in (config.ML_MODELS_FILE, config.LSTM_CKPT_FILE, SCALERS_FILE, config.MODEL_METRICS_FILE):
         if src.exists():
             dst = MODEL_BACKUP_DIR / f"{src.name}.{stamp}.bak"
             shutil.copy2(src, dst)

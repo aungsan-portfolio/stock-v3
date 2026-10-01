@@ -18,6 +18,19 @@ from datetime import datetime
 # Default initial mock capital for drawdown calculations
 DEFAULT_CAPITAL = 10000.0
 
+# Binding Test Artifact & Historical Incident Quarantine Sets
+TEST_ARTIFACT_ORDER_IDS = {
+    "p_555",
+    "broker-parent-999",
+    "parent-ord-888",
+    "parent-12345",
+}
+
+QUARANTINED_COMMITS = {
+    "75d0234",
+    "2d07950",
+}
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate trade journal against Production Gates.")
@@ -54,6 +67,8 @@ def load_records(journal_path: Path, since: str | None = None) -> list:
         print(f"Error: Journal file not found at {journal_path}", file=sys.stderr)
         return []
     records = []
+    excluded_artifacts = 0
+    excluded_quarantines = 0
     with open(journal_path, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
@@ -64,9 +79,37 @@ def load_records(journal_path: Path, since: str | None = None) -> list:
                         ts = str(rec.get("timestamp", ""))[:10]
                         if ts and ts < since[:10]:
                             continue
+
+                    # 1. Filter out test artifact order IDs (Sep-30 binding requirement)
+                    order_id = str(rec.get("order_id", "") or "")
+                    client_id = str(rec.get("client_order_id", "") or "")
+                    parent_id = str(rec.get("parent_order_id", "") or "")
+                    matched_ids = {order_id, client_id, parent_id}
+                    if any(
+                        tid in matched_ids or any(tid in x for x in (order_id, client_id, parent_id))
+                        for tid in TEST_ARTIFACT_ORDER_IDS
+                    ):
+                        excluded_artifacts += 1
+                        continue
+
+                    # 2. Filter out quarantined historical commits and explicit quarantine flags
+                    git_commit = str(rec.get("git_commit", "") or rec.get("commit", "") or "")
+                    if (
+                        any(qc in git_commit for qc in QUARANTINED_COMMITS)
+                        or rec.get("quarantined_from_production_budget") is True
+                        or rec.get("quarantined") is True
+                    ):
+                        excluded_quarantines += 1
+                        continue
+
                     records.append(rec)
                 except json.JSONDecodeError:
                     continue
+    if excluded_artifacts > 0 or excluded_quarantines > 0:
+        print(
+            f"[AUDIT FILTER] Excluded {excluded_artifacts} test artifact records and "
+            f"{excluded_quarantines} quarantined records from gate evaluation."
+        )
     return records
 
 

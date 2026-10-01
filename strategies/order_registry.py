@@ -21,6 +21,7 @@ def register_order_expected_price(
     signal_id: Optional[str] = None,
     is_validation: bool = False,
     client_order_id: Optional[str] = None,
+    parent_order_id: Optional[str] = None,
 ) -> None:
     if not order_id:
         return
@@ -36,6 +37,7 @@ def register_order_expected_price(
             "signal_id": str(signal_id) if signal_id else None,
             "is_validation": bool(is_validation),
             "client_order_id": str(client_order_id) if client_order_id else None,
+            "parent_order_id": str(parent_order_id) if parent_order_id else None,
         }
 
 def get_registered_order(order_id: str) -> Optional[Dict[str, Any]]:

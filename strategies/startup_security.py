@@ -143,7 +143,7 @@ class ProcessLockMetadata:
 
 
 def is_pid_active(pid: int) -> bool:
-    """Check if process with given pid is actively running."""
+    """Check if process with given pid is actively running across Windows and POSIX."""
     if pid <= 0:
         return False
     try:
@@ -151,10 +151,29 @@ def is_pid_active(pid: int) -> bool:
         return psutil.pid_exists(pid)
     except ImportError:
         pass
+
+    import sys
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            kernel32 = ctypes.windll.kernel32
+            h_process = kernel32.OpenProcess(0x1000, False, pid)
+            if h_process:
+                exit_code = wintypes.DWORD()
+                kernel32.GetExitCodeProcess(h_process, ctypes.byref(exit_code))
+                kernel32.CloseHandle(h_process)
+                # STILL_ACTIVE = 259
+                return exit_code.value == 259
+            return False
+        except Exception:
+            pass
+
     try:
         os.kill(pid, 0)
         return True
-    except (OSError, ProcessLookupError, PermissionError):
+    except (OSError, ProcessLookupError, PermissionError, ValueError, SystemError):
         return False
 
 
@@ -179,11 +198,14 @@ def acquire_atomic_process_lock(
         except Exception:
             os.close(fd)
             if lock_file.exists():
-                lock_file.unlink()
+                try:
+                    lock_file.unlink()
+                except Exception:
+                    pass
             raise
         return fd
     except FileExistsError:
-        # Check if existing lock is stale
+        # Check if existing lock is stale or invalid
         existing_meta = None
         try:
             with open(lock_file, "r", encoding="utf-8") as f:
@@ -201,6 +223,13 @@ def acquire_atomic_process_lock(
                     raise StartupSafetyRejected(
                         f"STARTUP_LOCK_STALE_CLEANUP_FAILED: Could not remove stale lock for PID {existing_pid}: {clean_exc}"
                     )
+        elif existing_meta is None:
+            # Lock file exists but is corrupted or empty. Check if any active process holds it.
+            try:
+                lock_file.unlink()
+                return acquire_atomic_process_lock(lock_path, metadata)
+            except Exception:
+                pass
 
         raise StartupSafetyRejected(
             f"STARTUP_LOCK_COLLISION: Another engine instance is running with lock at {lock_file}"
