@@ -119,6 +119,179 @@ def log_validation_record(
             f.write(line)
 
 
+def build_fill_composite_key(
+    order_id: str,
+    side: str,
+    fill_price: float,
+    qty: float,
+    timestamp: Optional[str] = None,
+    execution_id: Optional[str] = None,
+) -> str:
+    """Build a deterministic composite deduplication key safe against partial fills."""
+    if execution_id and str(execution_id).strip():
+        return str(execution_id).strip()
+    ts = str(timestamp or "").strip()
+    return f"VAL_FILL:{order_id}:{side.upper().strip()}:{float(fill_price):.4f}:{float(qty):.4f}:{ts}"
+
+
+def load_seen_validation_order_ids(filepath: str = DEFAULT_VALIDATION_LEDGER_PATH) -> set:
+    """Build a set of all seen validation entry and exit order IDs on startup."""
+    seen = set()
+    if not os.path.exists(filepath):
+        return seen
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line_s = line.strip()
+                if not line_s:
+                    continue
+                try:
+                    d = json.loads(line_s)
+                    for k in ("entry_order_id", "exit_order_id", "order_id"):
+                        val = d.get(k)
+                        if val:
+                            seen.add(str(val).strip())
+                except Exception:
+                    continue
+    except Exception as e:
+        logger.error("[VALIDATION LEDGER ERROR] Failed to load seen order IDs: %s", e)
+    return seen
+
+
+def dedupe_on_read(filepath: str = DEFAULT_VALIDATION_LEDGER_PATH) -> list:
+    """
+    Returns a consolidated in-memory projection of validation trade records.
+    Deduplicates repeated entries, aggregates partial fills, and preserves historical records
+    without rewriting or mutating the underlying ledger file on disk.
+    """
+    if not os.path.exists(filepath):
+        return []
+
+    with _validation_lock:
+        raw_records = []
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                for line in f:
+                    line_s = line.strip()
+                    if line_s:
+                        try:
+                            raw_records.append(json.loads(line_s))
+                        except Exception:
+                            continue
+        except Exception as e:
+            logger.error("[VALIDATION LEDGER ERROR] dedupe_on_read failed on %s: %s", filepath, e)
+            return []
+
+        trades_by_id = {}
+        ordered_keys = []
+
+        for r in raw_records:
+            v_id = str(r.get("validation_id") or r.get("entry_order_id") or "").strip()
+            if not v_id:
+                v_id = f"synth_{r.get('symbol')}_{r.get('timestamp')}"
+
+            if v_id not in trades_by_id:
+                trades_by_id[v_id] = dict(r)
+                ordered_keys.append(v_id)
+            else:
+                existing = trades_by_id[v_id]
+                for field in (
+                    "entry_order_id", "entry_fill_price", "exit_order_id", "exit_fill_price",
+                    "realized_pnl", "pnl", "slippage_bps", "exit_reason", "status", "event_type",
+                    "entry_price", "exit_price"
+                ):
+                    if r.get(field) is not None:
+                        existing[field] = r[field]
+
+        return [trades_by_id[k] for k in ordered_keys]
+
+
+def load_validation_fill_states(
+    account_id: Optional[str] = None,
+    trading_date: Optional[Any] = None,
+    filepath: str = DEFAULT_VALIDATION_LEDGER_PATH,
+) -> dict:
+    """
+    Extracts OrderFillState objects for all validation orders from paper_validation_trades.jsonl.
+    Enables AlpacaBridge reconciliation to recognize already-logged validation orders
+    and avoid replaying fills on subsequent polls.
+    """
+    from decimal import Decimal
+    from strategies.trade_journal import OrderFillState
+    import pytz
+
+    states = {}
+    if not os.path.exists(filepath):
+        return states
+
+    target_date_str = str(trading_date) if trading_date is not None else None
+    target_acc_str = str(account_id) if account_id is not None else "PA3UODIC5JTA"
+
+    with _validation_lock:
+        records = []
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                for line in f:
+                    line_s = line.strip()
+                    if line_s:
+                        try:
+                            records.append(json.loads(line_s))
+                        except Exception:
+                            continue
+        except Exception as e:
+            logger.error("[VALIDATION LEDGER ERROR] Failed to load validation fill states from %s: %s", filepath, e)
+            return states
+
+        for rec in records:
+            sym = str(rec.get("symbol") or "").upper().strip()
+            side = str(rec.get("side") or "BUY").upper().strip()
+            ts_str = rec.get("timestamp") or ""
+            rec_date_str = None
+            if ts_str:
+                try:
+                    dt = datetime.fromisoformat(ts_str)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    et_tz = pytz.timezone("US/Eastern")
+                    rec_date_str = str(dt.astimezone(et_tz).date())
+                except Exception:
+                    rec_date_str = None
+
+            if target_date_str and rec_date_str and rec_date_str != target_date_str:
+                continue
+
+            scoped_acc = target_acc_str
+            date_key = rec_date_str or target_date_str or ""
+
+            # 1. Entry fill
+            entry_oid = str(rec.get("entry_order_id") or "").strip()
+            entry_px = rec.get("entry_fill_price") or rec.get("decision_price")
+            entry_status = str(rec.get("status") or "").upper().strip()
+            if entry_oid and entry_px is not None and entry_status in ("FILLED", "CLOSED"):
+                e_key = (scoped_acc, date_key, entry_oid, sym, side)
+                if e_key not in states:
+                    states[e_key] = OrderFillState(broker_order_id=entry_oid)
+                e_qty = Decimal(str(rec.get("qty", 1)))
+                e_px = Decimal(str(entry_px))
+                exec_id = str(rec.get("entry_execution_id") or f"VAL:ENTRY:{entry_oid}")
+                states[e_key].add_fill(e_qty, e_px, exec_id)
+
+            # 2. Exit fill
+            exit_oid = str(rec.get("exit_order_id") or "").strip()
+            exit_px = rec.get("exit_fill_price") or rec.get("exit_price")
+            if exit_oid and exit_px is not None and entry_status == "CLOSED":
+                exit_side = "SELL" if side in ("BUY", "LONG") else "BUY"
+                x_key = (scoped_acc, date_key, exit_oid, sym, exit_side)
+                if x_key not in states:
+                    states[x_key] = OrderFillState(broker_order_id=exit_oid)
+                x_qty = Decimal(str(rec.get("qty", 1)))
+                x_px = Decimal(str(exit_px))
+                exec_id = str(rec.get("exit_execution_id") or f"VAL:EXIT:{exit_oid}")
+                states[x_key].add_fill(x_qty, x_px, exec_id)
+
+    return states
+
+
 def record_validation_fill(
     order_id: str,
     fill_price: float,
@@ -128,6 +301,7 @@ def record_validation_fill(
     slippage: Optional[float] = None,
     client_order_id: Optional[str] = None,
     symbol: Optional[str] = None,
+    execution_id: Optional[str] = None,
     filepath: str = DEFAULT_VALIDATION_LEDGER_PATH,
 ) -> bool:
     """Record a broker entry fill on a validation trade record in paper_validation_trades.jsonl."""
@@ -154,12 +328,14 @@ def record_validation_fill(
         target_oid = str(order_id or "").strip()
         target_cid = str(client_order_id or "").strip()
         target_sym = str(symbol or "").upper().strip()
+        comp_key = build_fill_composite_key(target_oid, side, fill_price, qty, timestamp, execution_id)
 
         for rec in reversed(records):
             r_oid = str(rec.get("entry_order_id") or "").strip()
             r_cid = str(rec.get("validation_id") or "").strip()
             r_sym = str(rec.get("symbol") or "").upper().strip()
             r_status = str(rec.get("status") or "").upper().strip()
+            r_exec = str(rec.get("entry_execution_id") or "").strip()
 
             is_match = False
             if target_oid and (r_oid == target_oid or target_oid in r_oid):
@@ -169,10 +345,26 @@ def record_validation_fill(
             elif target_sym and r_sym == target_sym and r_status == "SUBMITTED":
                 is_match = True
 
+            # If already filled with exact same execution ID or composite key, idempotent no-op
+            if is_match and (r_exec == comp_key or (execution_id and r_exec == execution_id)):
+                return True
+
             if is_match and r_status != "CLOSED":
-                rec["entry_fill_price"] = float(fill_price)
-                rec["entry_price"] = float(fill_price)
+                # Handle partial fill aggregation if already partially filled
+                prev_qty = float(rec.get("qty", 0.0) or 0.0) if r_status == "FILLED" else 0.0
+                prev_px = float(rec.get("entry_fill_price", 0.0) or 0.0) if r_status == "FILLED" else 0.0
+                new_delta_qty = float(qty)
+                total_qty = prev_qty + new_delta_qty
+                if total_qty > 0 and prev_qty > 0:
+                    weighted_px = (prev_qty * prev_px + new_delta_qty * float(fill_price)) / total_qty
+                else:
+                    weighted_px = float(fill_price)
+
+                rec["entry_fill_price"] = float(round(weighted_px, 4))
+                rec["entry_price"] = float(round(weighted_px, 4))
+                rec["qty"] = total_qty
                 rec["event_type"] = "TRADE"
+                rec["entry_execution_id"] = comp_key
                 if slippage is not None:
                     rec["slippage_bps"] = round(float(slippage) * 10000.0, 2)
                 if target_oid and not rec.get("entry_order_id"):
@@ -180,8 +372,8 @@ def record_validation_fill(
                 rec["status"] = "FILLED"
                 updated = True
                 logger.info(
-                    "[VALIDATION FILL RECORDED] %s %s @ $%.2f (order_id=%s, slippage=%.4f)",
-                    rec.get("symbol"), rec.get("side"), fill_price, order_id, slippage or 0.0
+                    "[VALIDATION FILL RECORDED] %s %s @ $%.2f (order_id=%s, qty=%.2f, slippage=%.4f)",
+                    rec.get("symbol"), rec.get("side"), fill_price, order_id, total_qty, slippage or 0.0
                 )
                 break
 
@@ -209,6 +401,7 @@ def record_validation_exit(
     client_order_id: Optional[str] = None,
     symbol: Optional[str] = None,
     exit_reason: str = "STOP_OUT",
+    execution_id: Optional[str] = None,
     filepath: str = DEFAULT_VALIDATION_LEDGER_PATH,
 ) -> bool:
     """Record an exit fill on an open validation trade record in paper_validation_trades.jsonl."""
@@ -234,15 +427,24 @@ def record_validation_exit(
 
         target_oid = str(order_id or "").strip()
         target_sym = str(symbol or "").upper().strip()
+        comp_key = build_fill_composite_key(target_oid, side, exit_price, qty, timestamp, execution_id)
 
         for rec in reversed(records):
             r_sym = str(rec.get("symbol") or "").upper().strip()
             r_status = str(rec.get("status") or "").upper().strip()
+            r_exit_oid = str(rec.get("exit_order_id") or "").strip()
+            r_exit_exec = str(rec.get("exit_execution_id") or "").strip()
+
+            # If already closed with exact same exit execution ID, idempotent no-op
+            if target_sym and r_sym == target_sym and r_status == "CLOSED":
+                if (target_oid and r_exit_oid == target_oid) or (execution_id and r_exit_exec == execution_id):
+                    return True
 
             if target_sym and r_sym == target_sym and r_status in ("FILLED", "SUBMITTED"):
                 rec["exit_order_id"] = target_oid
                 rec["exit_fill_price"] = float(exit_price)
                 rec["exit_price"] = float(exit_price)
+                rec["exit_execution_id"] = comp_key
                 rec["status"] = "CLOSED"
                 rec["event_type"] = "TRADE_CLOSED"
                 rec["exit_reason"] = str(exit_reason)

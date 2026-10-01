@@ -3475,6 +3475,7 @@ class AlpacaBridge:
             if protect.get("repaired"):
                 positions = self.positions_plain()
                 working = self.working_orders_plain()
+                snapshot = reconciliation.build_snapshot(positions, working)
             verified_prot = list(protect.get("protected", []))
             if verified_prot:
                 snapshot["protected_longs"] = sorted(set(list(snapshot.get("protected_longs", [])) + verified_prot))
@@ -4538,6 +4539,12 @@ class AlpacaBridge:
                 states = load_journal_order_fill_state(
                     existing_records, account_id=acct_id, trading_date=today_date
                 )
+                try:
+                    from strategies.validation_lane import load_validation_fill_states
+                    val_states = load_validation_fill_states(account_id=acct_id, trading_date=today_date)
+                    states.update(val_states)
+                except Exception as val_e:
+                    logger.debug("Failed to load validation fill states into reconciler: %s", val_e)
 
                 for o in sorted(orders, key=lambda x: x.filled_at if x.filled_at else _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)):
                     if o.filled_at is None or not o.filled_qty or float(o.filled_qty) <= 0:
@@ -4741,6 +4748,7 @@ class AlpacaBridge:
                                     client_order_id=val_cid,
                                     symbol=o.symbol,
                                     exit_reason=order_type,
+                                    execution_id=synth_exec_id,
                                 )
                                 if not exit_recorded:
                                     record_validation_fill(
@@ -4752,6 +4760,7 @@ class AlpacaBridge:
                                         slippage=slippage,
                                         client_order_id=val_cid,
                                         symbol=o.symbol,
+                                        execution_id=synth_exec_id,
                                     )
                             else:
                                 record_validation_fill(
@@ -4763,6 +4772,7 @@ class AlpacaBridge:
                                     slippage=slippage,
                                     client_order_id=val_cid,
                                     symbol=o.symbol,
+                                    execution_id=synth_exec_id,
                                 )
                             logger.info(
                                 "[VALIDATION FILL ISOLATED] Symbol=%s Side=%s Qty=%s @ $%.2f routed exclusively to validation ledger",
