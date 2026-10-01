@@ -696,66 +696,103 @@ def _cap_submission_shares(shares, checked_risk_dollars, checked_notional, risk_
 
 
 def _executable_signal(signal: TradeSignal, entry_limit_price: Optional[float]) -> TradeSignal:
-    """Return a signal priced at the worst executable entry limit, with dynamic offset capping.
+    """Return a signal priced at the worst executable entry limit, with dynamic offset capping
+    and relative stop/target geometry realignment (D2-Geometry).
     
     Adheres to SEC Rule 612 (no sub-penny quotes for stocks >= $1.00).
     """
+    is_long = signal.side.upper().strip() in ("BUY", "LONG")
+    strategy_name = getattr(signal.strategy, "name", str(signal.strategy))
+    anchored = strategy_name == "MEAN_REVERSION" or (getattr(signal, "metadata", None) or {}).get("target_anchor") == "VWAP"
+    
+    orig_stop_dist = round(abs(signal.entry_price - signal.stop_price), 6)
+    orig_target_dist = round(abs(signal.target_price - signal.entry_price), 6)
+
     if entry_limit_price is not None:
         tick_size = 0.01 if entry_limit_price >= 1.0 else 0.0001
-        new_stop_dist = abs(entry_limit_price - signal.stop_price)
-        if new_stop_dist <= tick_size:
-            logger.warning(
-                "[GEOMETRY COLLAPSE VETO] %s live entry %.4f vs stop %.4f gives gap %.6f <= tick %.4f",
-                signal.symbol, entry_limit_price, signal.stop_price, new_stop_dist, tick_size,
+        precision = 2 if tick_size == 0.01 else 4
+        live_entry = round(float(entry_limit_price), precision)
+    else:
+        # 1. Determine tick size based on SEC Rule 612
+        tick_size = 0.01 if signal.entry_price >= 1.0 else 0.0001
+        precision = 2 if tick_size == 0.01 else 4
+        
+        # 2. Get default offset
+        offset = config.LIMIT_OFFSET_CENTS / 100.0
+        
+        # Guard against zero/negative distances
+        if orig_target_dist <= tick_size or orig_stop_dist <= tick_size:
+            logger.error(
+                f"Invalid signal geometry for {signal.symbol}: target_dist={orig_target_dist:.5f}, "
+                f"stop_dist={orig_stop_dist:.5f} is less than or equal to tick_size={tick_size:.5f}"
             )
-        return replace(
-            signal,
-            entry_price=entry_limit_price,
-            risk_per_share=new_stop_dist,
-        )
-    
-    # 1. Determine tick size based on SEC Rule 612
-    tick_size = 0.01 if signal.entry_price >= 1.0 else 0.0001
-    
-    # 2. Get default offset
-    offset = config.LIMIT_OFFSET_CENTS / 100.0
-    
-    # 3. Calculate target and stop distances
-    target_dist = round(abs(signal.target_price - signal.entry_price), 6)
-    stop_dist = round(abs(signal.entry_price - signal.stop_price), 6)
-    
-    # Guard against zero/negative distances
-    if target_dist <= tick_size or stop_dist <= tick_size:
-        logger.error(
-            f"Invalid signal geometry for {signal.symbol}: target_dist={target_dist:.5f}, "
-            f"stop_dist={stop_dist:.5f} is less than or equal to tick_size={tick_size:.5f}"
-        )
-        return signal
-    
-    # 4. Cap offset at 20% of the smaller distance
-    max_allowed_offset = min(target_dist, stop_dist) * 0.20
-    offset = min(offset, max_allowed_offset)
-    
-    # 5. Round offset to the appropriate tick size
-    offset = max(round(offset / tick_size) * tick_size, tick_size)
-    
-    # 6. Final safety check: ensure rounded offset does not cross target/stop
-    if offset >= target_dist or offset >= stop_dist:
-        offset = min(target_dist, stop_dist) * 0.40
+            return signal
+        
+        # 3. Cap offset at 20% of the smaller distance
+        max_allowed_offset = min(orig_target_dist, orig_stop_dist) * 0.20
+        offset = min(offset, max_allowed_offset)
+        
+        # 4. Round offset to the appropriate tick size
         offset = max(round(offset / tick_size) * tick_size, tick_size)
-        if offset >= min(target_dist, stop_dist):
-            offset = tick_size
-    
-    entry_limit_price = (
-        signal.entry_price + offset
-        if signal.side.upper() == "BUY"
-        else signal.entry_price - offset
-    )
-    
+        
+        # 5. Final safety check: ensure rounded offset does not cross target/stop
+        if offset >= orig_target_dist or offset >= orig_stop_dist:
+            offset = min(orig_target_dist, orig_stop_dist) * 0.40
+            offset = max(round(offset / tick_size) * tick_size, tick_size)
+            if offset >= min(orig_target_dist, orig_stop_dist):
+                offset = tick_size
+        
+        live_entry = round(
+            signal.entry_price + offset if is_long else signal.entry_price - offset,
+            precision,
+        )
+
+    # Recompute stop and target relative to live_entry (preserves R:R and dollar risk)
+    if anchored:
+        recomputed_stop = (
+            floor_to_tick_float(signal.stop_price, tick_size)
+            if is_long
+            else ceil_to_tick_float(signal.stop_price, tick_size)
+        )
+        recomputed_target = (
+            floor_to_tick_float(signal.target_price, tick_size)
+            if is_long
+            else ceil_to_tick_float(signal.target_price, tick_size)
+        )
+    else:
+        recomputed_stop = (
+            floor_to_tick_float(live_entry - orig_stop_dist, tick_size)
+            if is_long
+            else ceil_to_tick_float(live_entry + orig_stop_dist, tick_size)
+        )
+        recomputed_target = round(
+            live_entry + orig_target_dist if is_long else live_entry - orig_target_dist,
+            precision,
+        )
+
+    new_stop_dist = round(abs(live_entry - recomputed_stop), 6)
+    if new_stop_dist <= tick_size:
+        logger.warning(
+            "[GEOMETRY COLLAPSE VETO] %s live entry %.4f vs stop %.4f gives gap %.6f <= tick %.4f",
+            signal.symbol, live_entry, recomputed_stop, new_stop_dist, tick_size,
+        )
+
+    meta = dict(signal.metadata) if getattr(signal, "metadata", None) else {}
+    meta["orig_entry"] = signal.entry_price
+    meta["orig_stop"] = signal.stop_price
+    meta["orig_target"] = signal.target_price
+    meta["recomputed_entry"] = live_entry
+    meta["recomputed_stop"] = recomputed_stop
+    meta["recomputed_target"] = recomputed_target
+    meta["recomputed_stop_dist"] = new_stop_dist
+
     return replace(
         signal,
-        entry_price=entry_limit_price,
-        risk_per_share=abs(entry_limit_price - signal.stop_price),
+        entry_price=live_entry,
+        stop_price=recomputed_stop,
+        target_price=recomputed_target,
+        risk_per_share=new_stop_dist,
+        metadata=meta,
     )
 
 
