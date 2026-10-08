@@ -303,6 +303,16 @@ def validate_execution_quote(
                 reason=f"BAR_TIMESTAMP_IN_FUTURE: Decision bar timestamp for {symbol} is in the future",
                 quote=quote,
             )
+        if bar_duration_seconds is not None:
+            if not (math.isfinite(bar_duration_seconds) and bar_duration_seconds >= 0.0):
+                return QuoteValidationResult(
+                    valid=False,
+                    reason=(
+                        f"Invalid quote-validation configuration for {symbol}: "
+                        f"bar_duration_seconds={bar_duration_seconds}"
+                    ),
+                    quote=quote,
+                )
         if bar_duration_seconds > 0.0:
             bar_close_epoch = bar_epoch + bar_duration_seconds
             bar_close_age = now - bar_close_epoch
@@ -311,12 +321,21 @@ def validate_execution_quote(
                 if max_entry_bar_close_age_seconds is not None
                 else max_bar_age_seconds
             )
-            if bar_close_age < -future_tolerance_seconds:
+            if not (math.isfinite(bar_close_age) and math.isfinite(effective_limit) and effective_limit >= 0.0):
+                return QuoteValidationResult(
+                    valid=False,
+                    reason=(
+                        f"Invalid quote-validation configuration for {symbol}: "
+                        f"bar_close_age={bar_close_age}, effective_limit={effective_limit}"
+                    ),
+                    quote=quote,
+                )
+            if bar_close_age < 0.0:
                 return QuoteValidationResult(
                     valid=False,
                     reason=(
                         f"BAR_FORMING: Decision bar for {symbol} has not closed yet "
-                        f"(forming; closes in {abs(bar_close_age):.1f}s)"
+                        f"(forming; closes in {abs(bar_close_age):.3f}s)"
                     ),
                     quote=quote,
                 )

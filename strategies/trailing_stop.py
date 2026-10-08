@@ -67,6 +67,145 @@ _STOP_ORDER_TYPES = frozenset([
     "trailing_stop",
 ])
 
+_WORKING_STOP_STATUSES = frozenset([
+    "new",
+    "accepted",
+    "pending_new",
+    "accepted_for_bidding",
+    "held",
+    "calculated",
+    "partially_filled",
+    "open",
+])
+
+_TERMINAL_STOP_STATUSES = frozenset([
+    "rejected",
+    "canceled",
+    "cancelled",
+    "expired",
+    "failed",
+    "done_for_day",
+    "stopped",
+    "filled",
+])
+
+
+def _normalize_sdk_field(raw: Any) -> str:
+    """Safely extracts lowercase string representation from SDK Enum, string, or object."""
+    if raw is None:
+        return ""
+    if hasattr(raw, "value"):
+        return str(raw.value).lower().strip()
+    return str(raw).lower().strip()
+
+
+def _extract_order_field(order_obj: Any, *field_names: str) -> Any:
+    """Extract field from dict, object, or namespace."""
+    if order_obj is None:
+        return None
+    if isinstance(order_obj, dict):
+        for f in field_names:
+            if f in order_obj and order_obj[f] is not None:
+                return order_obj[f]
+        return None
+    for f in field_names:
+        if hasattr(order_obj, f):
+            v = getattr(order_obj, f, None)
+            if v is not None:
+                return v
+    return None
+
+
+def verify_broker_stop_order_evidence(
+    order_data: Any,
+    expected_order_id: str,
+    expected_symbol: str,
+    position_side: str,
+    expected_stop_price: float,
+    expected_qty: Optional[float] = None,
+) -> Tuple[bool, str]:
+    """
+    Validates that order_data satisfies strict broker evidence requirements:
+    1. Identity: order_id matches expected_order_id.
+    2. Symbol: matches expected_symbol.
+    3. Side: For BUY/LONG position -> stop order side must be SELL.
+             For SELL/SHORT position -> stop order side must be BUY.
+    4. Type: Must be in _STOP_ORDER_TYPES ('stop', 'stop_limit', 'trailing_stop').
+    5. Status: Must be in _WORKING_STOP_STATUSES and strictly not in _TERMINAL_STOP_STATUSES.
+    6. Qty: If expected_qty is provided and order has qty, must match.
+    7. Stop Price: Must match expected_stop_price within tolerance (0.01 + 1e-4).
+    """
+    if order_data is None:
+        return False, "EVIDENCE_MISSING: Order data is None"
+
+    # 1. Identity check
+    order_id = _extract_order_field(order_data, "id", "order_id")
+    if not order_id:
+        return False, "EVIDENCE_ID_MISSING: Order data lacks id"
+    if str(order_id) != str(expected_order_id):
+        return False, f"EVIDENCE_ID_MISMATCH: Order id {order_id} != expected {expected_order_id}"
+
+    # 2. Status normalization and check
+    raw_status = _extract_order_field(order_data, "status")
+    if raw_status is None:
+        return False, "EVIDENCE_STATUS_MISSING: Order status is None"
+    status_str = _normalize_sdk_field(raw_status)
+    if status_str in _TERMINAL_STOP_STATUSES:
+        return False, f"EVIDENCE_STATUS_TERMINAL: Status {status_str} is terminal/rejected"
+    if status_str and status_str not in _WORKING_STOP_STATUSES:
+        return False, f"EVIDENCE_STATUS_NON_WORKING: Status {status_str} is not a valid working protection state"
+
+    # 3. Symbol check
+    raw_symbol = _extract_order_field(order_data, "symbol")
+    if raw_symbol is not None:
+        if str(raw_symbol).upper().strip() != expected_symbol.upper().strip():
+            return False, f"EVIDENCE_SYMBOL_MISMATCH: Symbol {raw_symbol} != expected {expected_symbol}"
+    else:
+        return False, "EVIDENCE_SYMBOL_MISSING: Order symbol is missing"
+
+    # 4. Side check
+    expected_stop_side = "sell" if position_side.upper() in ("BUY", "LONG") else "buy"
+    raw_side = _extract_order_field(order_data, "side")
+    if raw_side is not None:
+        side_str = _normalize_sdk_field(raw_side)
+        if side_str != expected_stop_side:
+            return False, f"EVIDENCE_SIDE_MISMATCH: Stop order side {side_str} != expected {expected_stop_side} for {position_side} position"
+    else:
+        return False, "EVIDENCE_SIDE_MISSING: Order side is missing"
+
+    # 5. Order Type check
+    raw_type = _extract_order_field(order_data, "type", "order_type")
+    if raw_type is not None:
+        type_str = _normalize_sdk_field(raw_type)
+        if type_str not in _STOP_ORDER_TYPES:
+            return False, f"EVIDENCE_TYPE_INVALID: Order type {type_str} not in {_STOP_ORDER_TYPES}"
+    else:
+        return False, "EVIDENCE_TYPE_MISSING: Order type is missing"
+
+    # 6. Quantity check
+    if expected_qty is not None:
+        raw_qty = _extract_order_field(order_data, "qty", "quantity")
+        if raw_qty is not None:
+            try:
+                if abs(float(raw_qty) - float(expected_qty)) > 1e-4:
+                    return False, f"EVIDENCE_QTY_MISMATCH: Order qty {raw_qty} != expected {expected_qty}"
+            except (ValueError, TypeError):
+                return False, f"EVIDENCE_QTY_INVALID: Could not parse order qty {raw_qty}"
+
+    # 7. Stop Price check
+    raw_stop_price = _extract_order_field(order_data, "stop_price", "stopPrice")
+    if raw_stop_price is None:
+        return False, "EVIDENCE_STOP_PRICE_MISSING: Order lacks stop_price"
+    try:
+        stop_price_f = float(raw_stop_price)
+        if abs(stop_price_f - expected_stop_price) > (0.01 + 1e-4):
+            return False, f"EVIDENCE_STOP_PRICE_MISMATCH: Broker stop {stop_price_f:.4f} != expected {expected_stop_price:.4f}"
+    except (ValueError, TypeError):
+        return False, f"EVIDENCE_STOP_PRICE_INVALID: Could not parse stop price {raw_stop_price}"
+
+    return True, "EVIDENCE_VERIFIED"
+
+
 
 def _normalize_strategy_name(raw) -> str:
     """Safely extract string strategy name from enum, string, or object."""
@@ -496,6 +635,7 @@ class DynamicTrailingStopManager:
         tp_order_id: Optional[str] = None,
         side: str = "BUY",
         return_details: bool = False,
+        expected_qty: Optional[float] = None,
     ) -> Union[float, GeometryRebuildResult]:
         """
         Validate bracket order stop geometry against actual fill price.
@@ -654,56 +794,75 @@ class DynamicTrailingStopManager:
                             except Exception:
                                 req = {"stop_price": new_stop_price}
                             res = replace_fn(stop_order_id, req)
-                            new_id = getattr(res, "id", None) or getattr(res, "order_id", None)
+                            new_id = _extract_order_field(res, "id", "order_id")
                             if not res or not new_id:
                                 replace_stop_succeeded = False
                                 logger.warning(
                                     f"[POST-FILL GEOMETRY REBUILD] Broker replace returned invalid/empty response: {res}"
                                 )
                             else:
-                                res_status = str(getattr(res, "status", getattr(getattr(res, "status", None), "value", "")) or "").lower()
-                                if res_status in ("rejected", "canceled", "cancelled", "expired", "failed"):
-                                    replace_stop_succeeded = False
-                                    logger.warning(
-                                        f"[POST-FILL GEOMETRY REBUILD] Replaced order {new_id} immediately terminal/rejected: status={res_status}"
-                                    )
+                                # Primary: Validate broker evidence directly on replacement response
+                                is_valid, reason = verify_broker_stop_order_evidence(
+                                    res,
+                                    expected_order_id=str(new_id),
+                                    expected_symbol=symbol,
+                                    position_side=side,
+                                    expected_stop_price=new_stop_price,
+                                    expected_qty=expected_qty,
+                                )
+                                if is_valid:
+                                    replace_stop_succeeded = True
+                                    effective_stop_order_id = str(new_id)
                                 else:
-                                    # Price confirmation check
-                                    ret_stop = getattr(res, "stop_price", getattr(res, "stopPrice", None))
-                                    if ret_stop is not None:
+                                    # If terminal/rejected, fail immediately without querying snapshot
+                                    res_status = _normalize_sdk_field(_extract_order_field(res, "status"))
+                                    if res_status in _TERMINAL_STOP_STATUSES:
+                                        replace_stop_succeeded = False
+                                        logger.warning(
+                                            f"[POST-FILL GEOMETRY REBUILD] Replaced order {new_id} terminal/rejected: {reason}"
+                                        )
+                                    # Fallback: Query authoritative broker snapshot if res lacked fields
+                                    elif bridge and (
+                                        hasattr(bridge, "get_order_snapshot")
+                                        or hasattr(bridge, "get_order_by_id")
+                                        or hasattr(getattr(bridge, "_client", None), "get_order_by_id")
+                                    ):
                                         try:
-                                            ret_stop_f = float(ret_stop)
-                                            if abs(ret_stop_f - new_stop_price) <= 0.01 + 1e-4:
-                                                replace_stop_succeeded = True
-                                                effective_stop_order_id = str(new_id)
-                                            else:
-                                                replace_stop_succeeded = False
-                                                logger.warning(
-                                                    f"[POST-FILL GEOMETRY REBUILD] Stop price mismatch: broker returned ${ret_stop_f:.4f} != requested ${new_stop_price:.4f}"
-                                                )
-                                        except (TypeError, ValueError):
-                                            replace_stop_succeeded = False
-                                    elif hasattr(bridge, "get_order_snapshot") or hasattr(bridge, "get_order_by_id"):
-                                        try:
-                                            snap_fn = getattr(bridge, "get_order_snapshot", None) or getattr(bridge, "get_order_by_id", None)
+                                            snap_fn = (
+                                                getattr(bridge, "get_order_snapshot", None)
+                                                or getattr(bridge, "get_order_by_id", None)
+                                                or getattr(bridge._client, "get_order_by_id", None)
+                                            )
                                             snap = snap_fn(new_id)
-                                            snap_stop = snap.get("stop_price") if isinstance(snap, dict) else getattr(snap, "stop_price", None)
-                                            if snap_stop is not None and abs(float(snap_stop) - new_stop_price) <= 0.01 + 1e-4:
+                                            snap_valid, snap_reason = verify_broker_stop_order_evidence(
+                                                snap,
+                                                expected_order_id=str(new_id),
+                                                expected_symbol=symbol,
+                                                position_side=side,
+                                                expected_stop_price=new_stop_price,
+                                                expected_qty=expected_qty,
+                                            )
+                                            if snap_valid:
                                                 replace_stop_succeeded = True
                                                 effective_stop_order_id = str(new_id)
+                                                logger.info(
+                                                    f"[POST-FILL GEOMETRY REBUILD] Broker snapshot verified for {new_id}: {snap_reason}"
+                                                )
                                             else:
                                                 replace_stop_succeeded = False
                                                 logger.warning(
-                                                    f"[POST-FILL GEOMETRY REBUILD] Snapshot verification failed for {new_id}: stop={snap_stop} vs expected {new_stop_price}"
+                                                    f"[POST-FILL GEOMETRY REBUILD] Broker snapshot failed verification for {new_id}: {snap_reason}"
                                                 )
                                         except Exception as snap_err:
                                             replace_stop_succeeded = False
                                             logger.warning(
-                                                f"[POST-FILL GEOMETRY REBUILD] Could not verify snapshot for replaced order {new_id}: {snap_err}"
+                                                f"[POST-FILL GEOMETRY REBUILD] Could not query snapshot for replaced order {new_id}: {snap_err}"
                                             )
                                     else:
-                                        replace_stop_succeeded = True
-                                        effective_stop_order_id = str(new_id)
+                                        replace_stop_succeeded = False
+                                        logger.warning(
+                                            f"[POST-FILL GEOMETRY REBUILD] Insufficient broker evidence for replaced order {new_id}: {reason}"
+                                        )
 
                             if replace_stop_succeeded:
                                 logger.info(f"[POST-FILL GEOMETRY REBUILD] Replaced & confirmed broker stop order {stop_order_id} -> {effective_stop_order_id} at new stop price ${new_stop_price:.{decimals}f}")

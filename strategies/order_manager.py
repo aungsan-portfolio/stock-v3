@@ -2059,19 +2059,40 @@ def execute_signal(
     target_price = signal.target_price
 
     # Phase 0: Trailing State Persistence Health Gate
-    # Fail-closed: Never submit new entry orders when trailing stop state cannot be persisted to disk
+    # Strict Fail-closed: Block new entries if trailing stop manager is missing,
+    # attribute missing, read exception occurs, persistence unhealthy, or state unknown.
     if not dry_run and is_connected:
         try:
-            import strategies.trailing_stop as ts_mod
-            ts_mgr = getattr(ts_mod, "trailing_stop_manager", None)
-            if ts_mgr is not None and hasattr(ts_mgr, "persistence_healthy") and not ts_mgr.persistence_healthy:
+            from strategies.trailing_stop import get_trailing_manager
+            ts_mgr = get_trailing_manager()
+            if ts_mgr is None:
+                idempotency_manager.release(signal.symbol, side=signal.side, reason="trailing_manager_missing")
+                result["status"] = "VETOED"
+                result["reason"] = "Trailing Stop Persistence Gate: Manager instance missing (fail-closed)"
+                logger.warning("[PERSISTENCE HEALTH VETO] %s: Trailing stop manager missing, blocking new entry.", signal.symbol)
+                return result
+
+            if not hasattr(ts_mgr, "persistence_healthy"):
+                idempotency_manager.release(signal.symbol, side=signal.side, reason="trailing_persistence_attr_missing")
+                result["status"] = "VETOED"
+                result["reason"] = "Trailing Stop Persistence Gate: persistence_healthy attribute missing (fail-closed)"
+                logger.warning("[PERSISTENCE HEALTH VETO] %s: persistence_healthy attribute missing, blocking new entry.", signal.symbol)
+                return result
+
+            is_healthy = getattr(ts_mgr, "persistence_healthy", None)
+            if is_healthy is not True:
+                last_err = getattr(ts_mgr, "last_persistence_error", "STATE_UNHEALTHY_OR_UNKNOWN")
                 idempotency_manager.release(signal.symbol, side=signal.side, reason="trailing_persistence_unhealthy")
                 result["status"] = "VETOED"
-                result["reason"] = f"Trailing Stop Persistence Unhealthy: {getattr(ts_mgr, 'last_persistence_error', 'STATE_UNHEALTHY')} (new entries blocked)"
-                logger.warning("[PERSISTENCE HEALTH VETO] %s: Trailing stop state persistence is unhealthy, blocking new entry.", signal.symbol)
+                result["reason"] = f"Trailing Stop Persistence Unhealthy: {last_err} (new entries blocked)"
+                logger.warning("[PERSISTENCE HEALTH VETO] %s: Trailing stop state persistence is %s (%s), blocking new entry.", signal.symbol, is_healthy, last_err)
                 return result
         except Exception as persist_chk_err:
-            logger.debug("Trailing persistence health gate check skipped: %s", persist_chk_err)
+            idempotency_manager.release(signal.symbol, side=signal.side, reason="trailing_persistence_check_exception")
+            result["status"] = "VETOED"
+            result["reason"] = f"Trailing Stop Persistence Gate Exception: {persist_chk_err} (fail-closed)"
+            logger.warning("[PERSISTENCE HEALTH VETO] %s: Trailing stop health check raised exception %s, blocking new entry.", signal.symbol, persist_chk_err)
+            return result
 
     # Phase A: Quote Validation Gate
     require_realtime = getattr(config, "REQUIRE_REALTIME_DATA_FOR_ORDERS", True)
