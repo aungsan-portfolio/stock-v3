@@ -731,6 +731,10 @@ VALIDATION_LANE_ENABLED = os.getenv("VALIDATION_LANE_ENABLED", "True").lower() i
 VALIDATION_LANE_SHARES = int(os.getenv("VALIDATION_LANE_SHARES", "1"))
 VALIDATION_LANE_LEDGER_PATH = DATA_DIR / "paper_validation_trades.jsonl"
 
+# ── Paper Strategy Experiment Lane (Fail-Closed Paper Only) ──────
+PAPER_EXPERIMENT_LANE_ENABLED: bool = os.getenv("PAPER_EXPERIMENT_LANE_ENABLED", "True").lower() in ("true", "1", "yes")
+PAPER_EXPERIMENT_CELLS: tuple = ("CANDLESTICK_SIDEWAYS", "CANDLESTICK_TRANSITIONING")
+
 # ── Breakeven Stop Lock ──────────────────────────────
 BREAKEVEN_LOCK_ENABLED          = True
 BREAKEVEN_LOCK_THRESHOLD_ATR    = 1.0   # Lock at +1.0x ATR unrealized profit

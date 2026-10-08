@@ -55,6 +55,35 @@ class AccountModeViolation(RuntimeError):
     pass
 
 
+class ReleaseGateViolation(RuntimeError):
+    """Raised when order submission is attempted without explicit machine-enforced Principal Release."""
+    definitely_rejected: bool = True
+
+
+
+@dataclass
+class ValidationReleaseToken:
+    """
+    Single-Use Principal Release Token for Controlled Paper Validation.
+    Authorizes exactly one validation lifecycle (Entry -> Stop -> Replace -> Exit).
+    Token is consumed at entry submission admission to prevent duplicate or subsequent orders.
+    """
+    release_id: str
+    account_id: str = "PA3UODIC5JTA"
+    paper_only: bool = True
+    max_qty: int = 1
+    max_new_positions: int = 1
+    max_lifecycles: int = 1
+    expires_at: Optional[_dt.datetime] = None
+    consumed: bool = False
+    consumed_at: Optional[_dt.datetime] = None
+    authorized_symbol: Optional[str] = None
+    authorized_qty: int = 1
+    authorized_parent_order_id: Optional[str] = None
+    authorized_client_order_id: Optional[str] = None
+    submission_outcome: str = "PENDING"
+
+
 class PersistedRiskStateInvalidError(RuntimeError):
     """Raised when persisted risk state file exists but is corrupted, unreadable, or malformed."""
     pass
@@ -490,13 +519,25 @@ class MutationCounters:
         self.mutation_passed_through += 1
         if kind == "submit_order":
             self.submit_order_passed_through += 1
-        elif kind == "replace_order":
+        elif kind in ("replace_order", "modify_stop_order"):
             self.replace_order_passed_through += 1
         elif kind == "cancel_order":
             self.cancel_order_passed_through += 1
         elif kind == "close_position":
             self.close_position_passed_through += 1
         return False
+
+    def get(self, kind: str) -> int:
+        if kind in ("replace_order", "modify_stop_order"):
+            return self.replace_order_passed_through
+        if kind == "submit_order":
+            return self.submit_order_passed_through
+        if kind == "cancel_order":
+            return self.cancel_order_passed_through
+        if kind == "close_position":
+            return self.close_position_passed_through
+        d = self.to_dict()
+        return d.get(kind, getattr(self, kind, 0))
 
     def to_dict(self) -> dict:
         return {
@@ -1025,6 +1066,8 @@ class AlpacaBridge:
         self._load_order_role_registry()
         self._account_id: str = "default"
         self._risk_state_dir: Optional[str] = None
+        self.principal_release_granted: bool = False
+        self.validation_release_token: Optional[ValidationReleaseToken] = None
 
     @property
     def account_id(self) -> str:
@@ -1039,6 +1082,10 @@ class AlpacaBridge:
         if self._client is not None:
             return bool(getattr(self._client, "_paper", True))
         return True
+
+    @property
+    def is_paper_account(self) -> bool:
+        return self.is_paper
 
     @property
     def account_mode(self) -> str:
@@ -1145,6 +1192,217 @@ class AlpacaBridge:
                 )
 
         return True
+
+    def is_validation_release_authorized(self) -> bool:
+        """Check if controlled paper validation release is authorized without mutating state."""
+        token = getattr(self, "validation_release_token", None)
+        if token is not None and not token.consumed:
+            if token.expires_at is not None:
+                now_utc = _dt.datetime.now(_dt.timezone.utc)
+                exp = token.expires_at if token.expires_at.tzinfo else token.expires_at.replace(tzinfo=_dt.timezone.utc)
+                if now_utc > exp:
+                    return False
+            return True
+        release_env = os.environ.get("PRINCIPAL_RELEASE_GRANTED", "false").strip().lower() in ("1", "true", "yes")
+        release_attr = getattr(self, "principal_release_granted", False)
+        return bool(release_env or release_attr)
+
+    def is_daytrade_paper_execution_authorized(self) -> bool:
+        """Check if normal Daytrade Paper execution is explicitly authorized."""
+        dt_paper_env = os.environ.get("DAYTRADE_PAPER_EXECUTION_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+        dt_paper_attr = getattr(self, "daytrade_paper_execution_enabled", False)
+        return bool(dt_paper_env or dt_paper_attr)
+
+    def assert_machine_release_gate(
+        self,
+        is_validation: bool = False,
+        qty: int = 1,
+        is_entry: bool = True,
+        symbol: Optional[str] = None,
+        client_order_id: Optional[str] = None,
+        parent_order_id: Optional[str] = None,
+    ) -> None:
+        """
+        Machine-Enforced Release Gate (A-Prime Rule & Segregated Paper Authorization).
+        Enforces fail-closed invariants before ANY broker API write is attempted:
+          1. Paper Mode Enforcement (rejects live endpoints or non-paper account).
+          2. Authorized Lane Enforcement (strictly PA3UODIC5JTA for Daytrade / Validation; PA3R71I7JFDZ for Swing).
+          3. Zero Open Safety Blockers (entry gate must not be halted for new entries).
+          4. Segregated Release Architecture:
+             - Protective Actions (is_entry=False): Admitted for risk-reduction; does NOT depend on entry token expiry.
+             - Validation Lane (is_validation=True, is_entry=True): Single-use 1-share ValidationReleaseToken.
+             - Normal Daytrade Paper (is_validation=False, is_entry=True): Explicit Daytrade Paper authorization, normal sizing.
+        """
+        # 1. Non-paper fail-closed
+        self.assert_account_mode_safety()
+
+        # 2. Authorized Account Lane Verification
+        if is_validation:
+            if str(self.account_id).strip().upper() != "PA3UODIC5JTA":
+                raise ReleaseGateViolation(
+                    f"RELEASE_GATE_VIOLATION: Controlled paper validation is strictly restricted to account 'PA3UODIC5JTA'. "
+                    f"Observed account '{self.account_id}'. Account 'PA3R71I7JFDZ' (Swing) is prohibited from validation release."
+                )
+        else:
+            expected_lane = "PA3UODIC5JTA" if self.mode == "daytrade" else "PA3R71I7JFDZ"
+            if str(self.account_id).strip().upper() != expected_lane:
+                raise ReleaseGateViolation(
+                    f"RELEASE_GATE_VIOLATION: Wrong account lane '{self.account_id}'. Expected authorized '{expected_lane}'."
+                )
+
+        # 3. Zero Open Safety Blockers (Circuit breaker / Entry gate)
+        gate = getattr(self, "entry_gate", None)
+        if gate and getattr(gate, "halted", False):
+            if is_entry:
+                raise ReleaseGateViolation(
+                    f"RELEASE_GATE_VIOLATION: Safety breaker is halted ({getattr(gate, 'halt_reason', 'halted')})."
+                )
+
+        # 4. PROTECTIVE ACTIONS (is_entry=False)
+        # CRITICAL SAFETY INVARIANT: Must NOT depend on entry token, 1-share cap, or entry token expiry.
+        if not is_entry:
+            if int(qty) <= 0:
+                raise ReleaseGateViolation(
+                    f"RELEASE_GATE_VIOLATION: Protective action quantity must be positive. Requested: {qty}"
+                )
+            if not symbol or not str(symbol).strip():
+                raise ReleaseGateViolation(
+                    "RELEASE_GATE_VIOLATION: Protective action requires a valid symbol."
+                )
+
+            # Validation descendant orders bind to authorized validation lifecycle lineage
+            if is_validation:
+                token: Optional[ValidationReleaseToken] = getattr(self, "validation_release_token", None)
+                if token and token.consumed:
+                    req_sym = str(symbol).strip().upper()
+                    if token.authorized_symbol and req_sym != token.authorized_symbol:
+                        raise ReleaseGateViolation(
+                            f"RELEASE_GATE_VIOLATION: Unrelated descendant action on symbol '{req_sym}'. "
+                            f"Authorized lifecycle is strictly bound to '{token.authorized_symbol}'."
+                        )
+                    if int(qty) > token.authorized_qty:
+                        raise ReleaseGateViolation(
+                            f"RELEASE_GATE_VIOLATION: Descendant quantity {qty} exceeds authorized lifecycle quantity {token.authorized_qty}."
+                        )
+            else:
+                # Normal Daytrade protective stop: ensure quantity does not increase exposure
+                pos = getattr(self, "positions", {}).get(str(symbol).strip().upper())
+                if pos is not None:
+                    pos_qty = abs(getattr(pos, "qty", 0.0))
+                    if pos_qty > 0 and int(qty) > int(pos_qty):
+                        raise ReleaseGateViolation(
+                            f"RELEASE_GATE_VIOLATION: Protective stop quantity {qty} exceeds open position exposure {pos_qty}."
+                        )
+
+            logger.info(
+                "[RELEASE GATE] Admitted risk-reducing protective action (is_validation=%s, symbol=%s, qty=%d, client_order_id=%s)",
+                is_validation, symbol, qty, client_order_id
+            )
+            return
+
+        # 5. VALIDATION LANE ENTRY (is_validation=True, is_entry=True)
+        if is_validation:
+            token: Optional[ValidationReleaseToken] = getattr(self, "validation_release_token", None)
+            release_env = os.environ.get("PRINCIPAL_RELEASE_GRANTED", "false").strip().lower() in ("1", "true", "yes")
+            release_attr = getattr(self, "principal_release_granted", False)
+
+            if token is None:
+                if release_env or release_attr:
+                    token = ValidationReleaseToken(
+                        release_id=f"token-{int(time.time())}",
+                        account_id=str(self.account_id).strip().upper(),
+                        paper_only=True,
+                        max_qty=1,
+                        max_new_positions=1,
+                        max_lifecycles=1,
+                        consumed=False,
+                    )
+                    self.validation_release_token = token
+                else:
+                    raise ReleaseGateViolation(
+                        "RELEASE_GATE_VIOLATION: Explicit Principal Release Authorization is absent. Broker writes strictly blocked (FAIL-CLOSED)."
+                    )
+
+            if token.paper_only and not getattr(getattr(self, "_client", None), "_paper", False):
+                raise ReleaseGateViolation("RELEASE_GATE_VIOLATION: Validation token restricted to paper trading only.")
+
+            if token.account_id and str(self.account_id).strip().upper() != str(token.account_id).strip().upper():
+                raise ReleaseGateViolation(
+                    f"RELEASE_GATE_VIOLATION: Token account mismatch: authorized for '{token.account_id}', active is '{self.account_id}'."
+                )
+
+            if token.expires_at is not None:
+                now_utc = _dt.datetime.now(_dt.timezone.utc)
+                exp = token.expires_at if token.expires_at.tzinfo else token.expires_at.replace(tzinfo=_dt.timezone.utc)
+                if now_utc > exp:
+                    raise ReleaseGateViolation(
+                        f"RELEASE_GATE_VIOLATION: Validation release token '{token.release_id}' expired at {token.expires_at}."
+                    )
+
+            if int(qty) > token.max_qty:
+                raise ReleaseGateViolation(
+                    f"RELEASE_GATE_VIOLATION: Controlled paper validation permits maximum {token.max_qty} share. Requested: {qty}"
+                )
+
+            if token.consumed:
+                raise ReleaseGateViolation(
+                    f"RELEASE_GATE_VIOLATION: Single-use validation token '{token.release_id}' was already consumed at {token.consumed_at}. "
+                    "Second independent entry submission denied (max 1 lifecycle)."
+                )
+            token.consumed = True
+            token.consumed_at = _dt.datetime.now(_dt.timezone.utc)
+            if symbol:
+                token.authorized_symbol = str(symbol).strip().upper()
+            token.authorized_qty = int(qty)
+            if client_order_id:
+                token.authorized_client_order_id = str(client_order_id)
+            logger.info(
+                "[RELEASE GATE] Single-use validation token '%s' CONSUMED upon entry admission (symbol=%s, client_order_id=%s, qty=%d)",
+                token.release_id, symbol, client_order_id, qty
+            )
+            return
+
+        # 6. NORMAL DAYTRADE PAPER ENTRY (is_validation=False, is_entry=True)
+        if self.mode == "daytrade":
+            if not self.is_daytrade_paper_execution_authorized():
+                raise ReleaseGateViolation(
+                    "RELEASE_GATE_VIOLATION: Daytrade Paper execution authorization is absent (DAYTRADE_PAPER_EXECUTION_ENABLED is disabled). "
+                    "Broker writes strictly blocked (FAIL-CLOSED)."
+                )
+
+            logger.info(
+                "[RELEASE GATE] Admitted normal Daytrade Paper entry under authorized lane '%s' (symbol=%s, qty=%d, client_order_id=%s)",
+                self.account_id, symbol, qty, client_order_id
+            )
+            return
+
+    def reconcile_validation_token_outcome(self) -> Optional[str]:
+        """
+        Reconcile an UNKNOWN entry submission outcome against broker truth.
+        Queries broker orders for client_order_id.
+        If found: binds authorized_parent_order_id to broker order ID and sets outcome='RECONCILED'.
+        If not found: marks outcome='NOT_FOUND' and remains release-locked.
+        """
+        token = getattr(self, "validation_release_token", None)
+        if not token or token.submission_outcome != "UNKNOWN":
+            return None
+        cid = token.authorized_client_order_id
+        if not cid:
+            return None
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            orders = self._client.get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, limit=50))
+            for ord_obj in orders:
+                if getattr(ord_obj, "client_order_id", "") == cid:
+                    token.authorized_parent_order_id = str(ord_obj.id)
+                    token.submission_outcome = "RECONCILED"
+                    logger.info("[RECONCILIATION] Reconciled unknown submission: bound broker order %s to token %s", ord_obj.id, token.release_id)
+                    return str(ord_obj.id)
+        except Exception as exc:
+            logger.warning("[RECONCILIATION] Broker query failed during token reconciliation: %s", exc)
+        token.submission_outcome = "NOT_FOUND"
+        return None
 
     def _assert_paper_stream_endpoint(self, stream: Any) -> None:
         """
@@ -1955,6 +2213,13 @@ class AlpacaBridge:
             self._trade_stream_reconnect_thread = thread
             thread.start()
 
+    def _cleanup_failed_probe_stream(self) -> None:
+        """Private helper: cleans up failed probe stream references while preserving reconnect supervisor."""
+        try:
+            self._stop_trade_stream(cancel_reconnect=False)
+        except Exception as stop_exc:
+            logger.debug("[TRADE STREAM] Failed probe cleanup exception: %s", stop_exc)
+
     def _trade_stream_reconnect_loop(self) -> None:
         max_attempts = int(self._c("TRADE_STREAM_RECONNECT_MAX_ATTEMPTS", 8))
         base_delay = float(self._c("TRADE_STREAM_RECONNECT_BASE_DELAY_SECONDS", 2.0))
@@ -1962,6 +2227,7 @@ class AlpacaBridge:
         jitter_ratio = float(self._c("TRADE_STREAM_RECONNECT_JITTER_RATIO", 0.20))
 
         try:
+            # ── Tier 1: Fast Backoff Loop (Attempts 1 to max_attempts) ──
             for attempt in range(1, max_attempts + 1):
                 if (
                     self._trade_stream_reconnect_cancel.is_set()
@@ -2002,21 +2268,102 @@ class AlpacaBridge:
                     return
                 except AccountModeViolation as amv:
                     logger.critical("🚨 [ACCOUNT_MODE_VIOLATION] Trade stream reconnect aborted: %s", amv)
+                    self._cleanup_failed_probe_stream()
                     self._mark_trade_stream_unavailable(f"Account mode violation: {amv}")
                     raise
                 except Exception as exc:
+                    self._cleanup_failed_probe_stream()
                     self._mark_trade_stream_unavailable(
                         f"Reconnect attempt {attempt}/{max_attempts} failed: {exc}"
                     )
 
+            # ── Fast Retries Exhausted -> Transition to DEGRADED ──
             self._mark_trade_stream_unavailable(
-                f"Reconnect exhausted after {max_attempts} attempts; operator action required"
+                f"Fast reconnect exhausted after {max_attempts} attempts; entering long-tail recovery probe"
             )
             self._transition_stream_state(
                 expected={StreamState.RECONNECTING},
                 new_state=StreamState.DEGRADED,
-                reason="Reconnect attempts exhausted",
+                reason="Fast reconnect exhausted; long-tail probe active",
             )
+
+            # ── Tier 2: Slow Autonomous Long-Tail Probe Loop ──
+            probe_interval = float(self._c("TRADE_STREAM_LONG_TAIL_PROBE_INTERVAL_SECONDS", 300.0))
+            probe_num = 0
+
+            while (
+                not self._trade_stream_reconnect_cancel.is_set()
+                and self._is_reconnect_allowed()
+                and self.stream_state == StreamState.DEGRADED
+            ):
+                probe_num += 1
+                logger.info(
+                    "[TRADE STREAM] Long-tail recovery probe %d scheduled in %.1fs (state=DEGRADED, entries=HALTED)",
+                    probe_num,
+                    probe_interval,
+                )
+                if self._trade_stream_reconnect_cancel.wait(max(0.1, probe_interval)):
+                    return
+
+                # Secondary pre-probe state check
+                if (
+                    self._trade_stream_reconnect_cancel.is_set()
+                    or not self._is_reconnect_allowed()
+                    or self.stream_state != StreamState.DEGRADED
+                ):
+                    return
+
+                with self._trade_stream_lock:
+                    credentials = self._trade_stream_credentials
+                if not credentials:
+                    self._mark_trade_stream_unavailable("Long-tail probe credentials unavailable")
+                    return
+
+                try:
+                    logger.info("[TRADE STREAM] Executing long-tail recovery probe %d...", probe_num)
+                    self._start_trade_stream(*credentials)
+
+                    # Secondary post-start invariant check: must be AUTHENTICATED_UNRECONCILED
+                    if self.stream_state != StreamState.AUTHENTICATED_UNRECONCILED:
+                        logger.error(
+                            "[TRADE STREAM] Invariant violation: expected AUTHENTICATED_UNRECONCILED after start, observed %s",
+                            self.stream_state,
+                        )
+                        self._cleanup_failed_probe_stream()
+                        continue
+
+                    logger.info("[TRADE STREAM] Long-tail probe %d authenticated; executing broker reconciliation handshake", probe_num)
+                    recon_ok = self._run_post_reconnect_reconciliation()
+
+                    # Tri-state outcome handling:
+                    if recon_ok:
+                        # 1. CLEAN -> HEALTHY (Recovery Complete, ONLY stream-owned halts cleared)
+                        logger.info(
+                            "[TRADE STREAM] Long-tail probe %d: broker reconciliation clean; stream fully restored to HEALTHY",
+                            probe_num,
+                        )
+                        return
+                    else:
+                        # 2. DIRTY / DESYNC -> LATCHED_DESYNC (Autonomous retry prohibited; operator action required)
+                        logger.critical(
+                            "[TRADE STREAM] Long-tail probe %d: broker reconciliation dirty/desync; stream latched in LATCHED_DESYNC; operator intervention required",
+                            probe_num,
+                        )
+                        return
+
+                except AccountModeViolation as amv:
+                    logger.critical("🚨 [ACCOUNT_MODE_VIOLATION] Long-tail probe aborted: %s", amv)
+                    self._cleanup_failed_probe_stream()
+                    self._mark_trade_stream_unavailable(f"Account mode violation: {amv}")
+                    raise
+                except Exception as probe_err:
+                    # 3. RETRYABLE_ERROR -> Remain in DEGRADED (fail-closed); clean up stream; wait for next cycle
+                    self._cleanup_failed_probe_stream()
+                    logger.warning(
+                        "[TRADE STREAM] Long-tail probe %d failed (%s); remaining in DEGRADED (fail-closed)",
+                        probe_num,
+                        probe_err,
+                    )
         finally:
             with self._trade_stream_lock:
                 if self._trade_stream_reconnect_thread is threading.current_thread():
@@ -2108,7 +2455,7 @@ class AlpacaBridge:
                         # Amendment 1: recovery_required remains True until broker reconciliation completes clean
                         self._trade_stream_recovery_required = True
                 self._transition_stream_state(
-                    expected={StreamState.DISCONNECTED, StreamState.RECONNECTING, StreamState.AUTHENTICATED_UNRECONCILED, StreamState.STOPPED},
+                    expected={StreamState.DISCONNECTED, StreamState.RECONNECTING, StreamState.AUTHENTICATED_UNRECONCILED, StreamState.STOPPED, StreamState.DEGRADED},
                     new_state=StreamState.AUTHENTICATED_UNRECONCILED,
                     reason="Authenticated paper trade-update stream is ready",
                 )
@@ -4189,8 +4536,31 @@ class AlpacaBridge:
                 "reason": "DRY_RUN_MUTATION_BLOCKED",
             }
 
-        order = self._client.submit_order(LimitOrderRequest(**request_kwargs))
-        parent_id = str(order.id)
+        is_val = bool(str(client_order_id or "").startswith("val_"))
+        self.assert_machine_release_gate(
+            is_validation=is_val,
+            qty=qty,
+            is_entry=True,
+            symbol=symbol,
+            client_order_id=client_order_id,
+        )
+        try:
+            order = self._client.submit_order(LimitOrderRequest(**request_kwargs))
+            parent_id = str(order.id)
+            rel_token = getattr(self, "validation_release_token", None)
+            if rel_token:
+                rel_token.authorized_parent_order_id = parent_id
+                rel_token.submission_outcome = "SUBMITTED"
+        except Exception as submit_exc:
+            rel_token = getattr(self, "validation_release_token", None)
+            if rel_token:
+                rel_token.submission_outcome = "UNKNOWN"
+            logger.error(
+                "[RELEASE GATE] Entry submission encountered unknown outcome (%s) for %s. "
+                "Token remains CONSUMED. NO RETRY PERMITTED. Broker truth reconciliation required.",
+                submit_exc, client_order_id
+            )
+            raise
         order_ids = [parent_id]
         stop_leg_id = None
         tp_leg_id = None
@@ -4321,6 +4691,7 @@ class AlpacaBridge:
         if getattr(self, "dry_run", False):
             logger.info("[DRY-RUN MUTATION BLOCKED] place_stop_order for %s %s qty=%d @ stop=%.2f", symbol, side, qty, stop_price)
             return {"order_id": f"dry_stop_{symbol}"}
+        self.assert_machine_release_gate(is_validation=False, qty=qty, is_entry=False, symbol=symbol)
         from alpaca.trading.requests import StopOrderRequest
         order = self._client.submit_order(StopOrderRequest(
             symbol=symbol.upper().strip(),
@@ -4335,6 +4706,7 @@ class AlpacaBridge:
         self.assert_account_mode_safety()
         self._require_connection()
         if getattr(self, "dry_run", False):
+            self.mutation_counters.record("modify_stop_order", True)
             logger.info("[DRY-RUN MUTATION BLOCKED] modify_stop_order %s -> stop=%.2f", order_id, new_stop)
             return f"dry_{order_id}"
         if symbol:
@@ -4354,16 +4726,96 @@ class AlpacaBridge:
             except Exception as q_exc:
                 logger.debug(f"[MODIFY STOP P3] Quote check skipped for {symbol}: {q_exc}")
 
+        pred_id = str(order_id).strip()
+        role_info = self.get_order_role_info(pred_id)
+        from strategies.order_registry import get_registered_order, register_order_expected_price
+        pred_reg = get_registered_order(pred_id) or {}
+
+        parent_id = role_info.get("parent_order_id") or pred_reg.get("parent_order_id")
+        client_oid = role_info.get("client_order_id") or pred_reg.get("client_order_id")
+        strat = role_info.get("strategy") or pred_reg.get("strategy")
+        tp_id = role_info.get("tp_order_id")
+        is_val = bool(
+            pred_reg.get("is_validation")
+            or (client_oid and str(client_oid).startswith("val_"))
+        )
+
+        from alpaca.trading.requests import ReplaceOrderRequest
+        req = ReplaceOrderRequest(stop_price=_round_price(new_stop))
+        new_order = None
         try:
-            from alpaca.trading.requests import ReplaceOrderRequest
-            req = ReplaceOrderRequest(stop_price=_round_price(new_stop))
-            new_order = self._client.replace_order_by_id(order_id, req)
-            new_id = str(getattr(new_order, "id", order_id))
-            logger.info(f"[MODIFY STOP P3] Replaced stop order {order_id} -> new order ID {new_id} at stop price ${_round_price(new_stop):.2f} (Atomic PATCH)")
-            return new_id
+            new_order = self._client.replace_order_by_id(pred_id, req)
         except Exception as exc:
-            logger.error(f"[MODIFY STOP P3] Failed to modify stop order {order_id}: {exc}")
-            return None
+            exc_msg = str(exc)
+            exc_lower = exc_msg.lower()
+            if any(k in exc_lower for k in ("422", "not cancelable", "cannot be replaced", "already filled")):
+                logger.warning("[MODIFY STOP RACE] Order %s unreplaceable/terminal (%s)", pred_id, exc_msg)
+                return None
+            # Unknown outcome reconciliation: verify broker truth if replacement succeeded remotely
+            logger.warning("[MODIFY STOP UNKNOWN OUTCOME] Checking broker truth for %s after error: %s", pred_id, exc_msg)
+            try:
+                pred_truth = self.get_order_truth(pred_id)
+                if pred_truth and pred_truth.raw:
+                    replaced_by = getattr(pred_truth.raw, "replaced_by", None)
+                    if replaced_by:
+                        new_order = self._client.get_order_by_id(str(replaced_by))
+            except Exception as recon_exc:
+                logger.error("[MODIFY STOP RECONCILIATION ERROR] Could not reconcile %s: %s", pred_id, recon_exc)
+
+            if new_order is None:
+                logger.error("[MODIFY STOP FAILED] Failed to modify stop order %s: %s", pred_id, exc)
+                return None
+
+        new_id = str(getattr(new_order, "id", pred_id))
+        self.mutation_counters.record("modify_stop_order", False)
+
+        # Atomic Lineage & Role Propagation
+        lock = getattr(self, "_order_role_lock", None) or threading.Lock()
+        with lock:
+            if not hasattr(self, "_order_role_registry"):
+                self._order_role_registry = {}
+                self._load_order_role_registry()
+
+            self._order_role_registry[new_id] = {
+                "role": "STOP_LOSS",
+                "parent_order_id": parent_id,
+                "client_order_id": client_oid,
+                "stop_order_id": new_id,
+                "tp_order_id": tp_id,
+                "strategy": strat,
+                "predecessor_order_id": pred_id,
+                "replacement_status": "REPLACED",
+            }
+            if parent_id and parent_id in self._order_role_registry:
+                self._order_role_registry[parent_id]["stop_order_id"] = new_id
+
+            if pred_id in self._order_role_registry:
+                self._order_role_registry[pred_id]["replaced_by_order_id"] = new_id
+                self._order_role_registry[pred_id]["replacement_status"] = "SUPERSEDED"
+
+            self._save_order_role_registry()
+
+        sym = symbol or pred_reg.get("symbol") or getattr(new_order, "symbol", "")
+        register_order_expected_price(
+            order_id=new_id,
+            expected_price=new_stop,
+            side="SELL",
+            order_type="STOP_LOSS",
+            symbol=str(sym).upper() if sym else "",
+            strategy=strat,
+            is_validation=is_val,
+            client_order_id=client_oid,
+            parent_order_id=parent_id,
+        )
+
+        logger.info(
+            "[MODIFY STOP SUCCESS] Replaced stop order %s -> %s (val=%s, parent=%s) at stop price $%.2f",
+            pred_id, new_id, is_val, parent_id, _round_price(new_stop)
+        )
+        return new_id
+
+    # Canonical alias
+    modify_stop_order_price = modify_stop_order
 
     def get_current_stop(self, symbol: str) -> Optional[float]:
         """
@@ -4519,6 +4971,8 @@ class AlpacaBridge:
             raise ValueError(f"Protective stop qty {qty} is below min shares {min_shares}")
         if getattr(self, "dry_run", False):
             return f"dry_protective_stop_{symbol}"
+        is_val = bool(str(client_order_id or "").startswith("val_"))
+        self.assert_machine_release_gate(is_validation=is_val, qty=int(qty), is_entry=False, symbol=symbol, client_order_id=client_order_id)
         from alpaca.trading.requests import StopOrderRequest
         req_kwargs = {
             "symbol": symbol.upper().strip(),
@@ -4537,7 +4991,7 @@ class AlpacaBridge:
         )
         return new_id
 
-    def sync_today_trades_to_journal(self) -> int:
+    def sync_today_trades_to_journal(self, orders: Optional[list] = None) -> int:
         if not self._connected or not self._client:
             return 0
         try:
@@ -4554,8 +5008,9 @@ class AlpacaBridge:
             today_date = now_eastern().date()
             acct_id = str(getattr(self, "account_id", "") or "ALPACA")
 
-            req = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=500)
-            orders = self._client.get_orders(req)
+            if orders is None:
+                req = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=500)
+                orders = self._client.get_orders(req)
             synced_count = 0
 
             with get_journal_lock():
@@ -4769,6 +5224,14 @@ class AlpacaBridge:
                     if not is_val_order and role_info.get("parent_order_id"):
                         parent_info = self.get_order_role_info(role_info["parent_order_id"])
                         if str(parent_info.get("client_order_id") or "").startswith("val_"):
+                            is_val_order = True
+                    if not is_val_order and role_info.get("predecessor_order_id"):
+                        pred_info = self.get_order_role_info(role_info["predecessor_order_id"])
+                        if str(pred_info.get("client_order_id") or "").startswith("val_"):
+                            is_val_order = True
+                    if not is_val_order and getattr(o, "replaces", None):
+                        pred_info = self.get_order_role_info(str(o.replaces))
+                        if str(pred_info.get("client_order_id") or "").startswith("val_"):
                             is_val_order = True
 
                     if is_val_order:

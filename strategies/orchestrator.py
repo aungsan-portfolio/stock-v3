@@ -133,6 +133,89 @@ def _inverse_etf_entry_allowed(regime_res, sig: TradeSignal) -> bool:
     return False
 
 
+def _normalize_strategy_key(strategy: Any) -> str:
+    if strategy is None:
+        return ""
+    if hasattr(strategy, "value"):
+        return str(strategy.value).upper().strip()
+    if hasattr(strategy, "name"):
+        return str(strategy.name).upper().strip()
+    return str(strategy).upper().strip()
+
+
+def _strategy_allowed_in_texture(strategy: Any, allowed_strats: Optional[Any]) -> bool:
+    if allowed_strats is None:
+        return True
+    strat_key = _normalize_strategy_key(strategy)
+    for allowed in allowed_strats:
+        if strategy == allowed or strat_key == _normalize_strategy_key(allowed):
+            return True
+    return False
+
+
+def is_strategy_admitted_for_texture(
+    strategy: Any,
+    market_texture: str,
+    bridge: Optional[Any] = None,
+    signal: Optional[TradeSignal] = None,
+) -> Tuple[bool, bool, Optional[str]]:
+    """
+    Evaluates whether a strategy is admitted under the current market texture.
+    Supports fail-closed experimental paper routing for specific research cells
+    (e.g., CANDLESTICK in SIDEWAYS or TRANSITIONING).
+
+    Returns:
+        (is_admitted: bool, is_paper_experiment: bool, cell_tag: Optional[str])
+    """
+    market_tex = str(market_texture or "TRENDING").upper().strip()
+    tex_cfg = getattr(config, "MARKET_REGIME_SETTINGS", {}).get(market_tex, {})
+    raw_allowed = tex_cfg.get("allowed_strategies", None)
+
+    is_inverse_exempt = False
+    if signal is not None:
+        is_inverse_exempt = _is_inverse_etf_signal(signal) and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
+
+    if is_inverse_exempt or _strategy_allowed_in_texture(strategy, raw_allowed):
+        return True, False, None
+
+    # Check Paper Strategy Experiment Lane (Strict fail-closed)
+    strat_key = _normalize_strategy_key(strategy)
+    cell_tag = f"{strat_key}_{market_tex}"
+    allowed_cells = set(getattr(config, "PAPER_EXPERIMENT_CELLS", ("CANDLESTICK_SIDEWAYS", "CANDLESTICK_TRANSITIONING")))
+
+    if cell_tag not in allowed_cells:
+        return False, False, None
+
+    is_experiment_flag_on = getattr(config, "PAPER_EXPERIMENT_LANE_ENABLED", False) is True
+    if not is_experiment_flag_on:
+        return False, False, None
+
+    # Explicit verified paper account guard
+    is_paper_broker = False
+    if bridge is not None:
+        is_paper_attr = getattr(bridge, "is_paper", None)
+        is_paper_account_attr = getattr(bridge, "is_paper_account", None)
+        endpoint = str(getattr(bridge, "endpoint", "") or getattr(bridge, "_endpoint", "")).lower()
+
+        if is_paper_attr is True or is_paper_account_attr is True or "paper-api" in endpoint:
+            acct_mode = str(getattr(bridge, "account_mode", "")).upper()
+            if acct_mode != "LIVE":
+                is_paper_broker = True
+
+    if not is_paper_broker:
+        return False, False, None
+
+    # Admitted as Paper Experiment: tag signal metadata if provided
+    if signal is not None:
+        if getattr(signal, "metadata", None) is None:
+            signal.metadata = {}
+        signal.metadata["lane"] = "PAPER_EXPERIMENT"
+        signal.metadata["paper_experiment"] = True
+        signal.metadata["paper_experiment_cell"] = cell_tag
+
+    return True, True, cell_tag
+
+
 SIGNAL_FEATURE_COLUMNS = [
     "timestamp",
     "timestamp_et",
@@ -263,10 +346,10 @@ def export_candidate_signals(
 
 def _prepare_closed_bars(df):
     """Ensure only fully closed bars are evaluated.
-    If the last bar in df is still actively forming (<5m old), remove it.
+    If the last bar in df is still actively forming (<5m old or in future), remove it.
     If the last bar is already a completed closed bar, preserve it.
     """
-    if df is not None and not df.empty and len(df) > 1:
+    if df is not None and not df.empty and len(df) >= 1:
         try:
             from strategies.session import now_eastern
             now = now_eastern()
@@ -1764,15 +1847,39 @@ def evaluate_and_execute(
     raw_screened_setups = len(all_signals)
 
     # ── Lane 5: Pre-Correlation / Pre-Sizing Texture Admission Filter ──
-    tex_cfg = getattr(config, "MARKET_REGIME_SETTINGS", {}).get(market_tex, {})
-    raw_allowed = tex_cfg.get("allowed_strategies", None)
-    allowed_strats = set(raw_allowed) if raw_allowed else None
-
     texture_admitted_signals = []
     for sig in all_signals:
-        is_inverse_exempt = _is_inverse_etf_signal(sig) and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
-        strat_key = getattr(sig.strategy, "value", getattr(sig.strategy, "name", str(sig.strategy)))
-        if is_inverse_exempt or allowed_strats is None or sig.strategy in allowed_strats or strat_key in allowed_strats:
+        admitted, is_experiment, cell_tag = is_strategy_admitted_for_texture(
+            strategy=sig.strategy,
+            market_texture=market_tex,
+            bridge=bridge,
+            signal=sig,
+        )
+        if admitted:
+            if is_experiment:
+                logger.info(
+                    "[PAPER EXPERIMENT ADMISSION] %s (%s) admitted for paper research cell '%s' in texture '%s'",
+                    sig.symbol, sig.strategy, cell_tag, market_tex
+                )
+                try:
+                    from strategies.gate_ledger import log_gate_decision
+                    log_gate_decision(
+                        evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sig.symbol}_{int(time.time())}",
+                        symbol=sig.symbol,
+                        bar=getattr(sig, "bar_timestamp", "") or "",
+                        strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                        stage="STAGE_REGIME",
+                        decision="PAPER_EXPERIMENT_ADMIT",
+                        reason_code="TEXTURE_RESTRICTION_OVERRIDDEN_FOR_PAPER_EXPERIMENT",
+                        human_message=f"Paper experiment admission for cell {cell_tag}",
+                        terminal_decision=False,
+                        blocked_by=None,
+                        raw_conf=getattr(sig, "confidence", 0.0),
+                        final_conf=getattr(sig, "confidence", 0.0),
+                        metadata={"paper_experiment_cell": cell_tag, "lane": "PAPER_EXPERIMENT"},
+                    )
+                except Exception:
+                    pass
             texture_admitted_signals.append(sig)
         else:
             logger.info(
@@ -1914,16 +2021,13 @@ def evaluate_and_execute(
             continue
 
         # Regime-aware strategy filtering
-        tex_cfg = getattr(config, "MARKET_REGIME_SETTINGS", {}).get(market_tex, {})
-        raw_allowed = tex_cfg.get("allowed_strategies", None)
-        allowed_strats = raw_allowed if raw_allowed else None
-        is_inverse_exempt = _is_inverse_etf_signal(sig) and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
-        if is_inverse_exempt:
-            logger.info(
-                "[INVERSE ETF EXEMPT] Strategy texture filter bypassed for %s (%s in '%s' texture)",
-                sig.symbol, sig.strategy, market_tex
-            )
-        elif allowed_strats is not None and sig.strategy not in allowed_strats:
+        admitted, is_experiment, cell_tag = is_strategy_admitted_for_texture(
+            strategy=sig.strategy,
+            market_texture=market_tex,
+            bridge=bridge,
+            signal=sig,
+        )
+        if not admitted:
             logger.info("Skipped %s: strategy %s not allowed in market texture '%s'", sig.symbol, sig.strategy, market_tex)
             try:
                 from strategies.gate_ledger import log_gate_decision
