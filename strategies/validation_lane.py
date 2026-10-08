@@ -610,6 +610,8 @@ def evaluate_and_route_validation_candidate(
             bar_timestamp=bar_ts,
             max_bar_age_seconds=getattr(config, "MAX_BAR_STALENESS_SECONDS", 300.0),
             require_feed_concordance=True,  # STRICT CONCORDANCE MANDATORY
+            bar_duration_seconds=float(getattr(signal, "bar_duration_seconds", getattr(config, "ENTRY_BAR_DURATION_SECONDS", 300.0))),
+            max_entry_bar_close_age_seconds=float(getattr(config, "ENTRY_BAR_CLOSE_GRACE_SECONDS", 60.0)),
         )
     except Exception as exc:
         result["reason"] = f"Execution quote safety check crashed: {exc}"
@@ -713,6 +715,27 @@ def evaluate_and_route_validation_candidate(
     }
 
     if not dry_run:
+        # Pre-check: Verify validation release authorization locally before attempting broker submission
+        can_release = True
+        if hasattr(bridge, "is_validation_release_authorized"):
+            can_release = bool(bridge.is_validation_release_authorized())
+        elif hasattr(bridge, "assert_machine_release_gate"):
+            token = getattr(bridge, "validation_release_token", None)
+            release_env = os.environ.get("PRINCIPAL_RELEASE_GRANTED", "false").strip().lower() in ("1", "true", "yes")
+            release_attr = getattr(bridge, "principal_release_granted", False)
+            can_release = bool((token is not None and not token.consumed) or release_env or release_attr)
+
+        if not can_release:
+            logger.info(
+                "[VALIDATION LANE SKIP] Release authorization unavailable for %s (principal release absent). Skipping broker submission.",
+                signal.symbol,
+            )
+            result["status"] = "VALIDATION_RELEASE_BLOCKED"
+            result["reason"] = "Validation release authorization unavailable (pre-check skip)"
+            record.status = "PRE_CHECK_SKIPPED"
+            log_validation_record(record, filepath=filepath)
+            return result
+
         place_fn = getattr(bridge, "place_bracket_order", None) or getattr(bridge, "place_order", None)
         if place_fn is not None:
             try:

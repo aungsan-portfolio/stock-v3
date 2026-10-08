@@ -406,6 +406,8 @@ ALPACA_CHUNK_TIMEOUT_SECONDS: float = float(os.environ.get("ALPACA_CHUNK_TIMEOUT
 ALPACA_SUBSCRIPTION_TIER: str = os.environ.get("ALPACA_SUBSCRIPTION_TIER", "free").lower().strip()
 REQUIRE_FEED_CONCORDANCE: bool = os.environ.get("REQUIRE_FEED_CONCORDANCE", "false").lower().strip() in ("true", "1", "yes")
 MAX_BAR_STALENESS_SECONDS: float = float(os.environ.get("MAX_BAR_STALENESS_SECONDS", 300.0))
+ENTRY_BAR_DURATION_SECONDS: float = float(os.environ.get("ENTRY_BAR_DURATION_SECONDS", 300.0))
+ENTRY_BAR_CLOSE_GRACE_SECONDS: float = float(os.environ.get("ENTRY_BAR_CLOSE_GRACE_SECONDS", 60.0))
 
 # WebSocket keepalive & connection management
 ALPACA_WS_PING_INTERVAL_SECONDS: int = int(os.environ.get("ALPACA_WS_PING_INTERVAL_SECONDS", 20))

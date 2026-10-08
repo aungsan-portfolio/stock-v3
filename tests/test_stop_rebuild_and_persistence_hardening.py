@@ -1,0 +1,323 @@
+"""
+tests/test_stop_rebuild_and_persistence_hardening.py
+
+Unit tests verifying critical P0 execution safety and bar-freshness invariants:
+1. Zero False Confirmation: When broker stop replacement fails, confirmed_broker_stop_price
+   is None, stop_reconciliation_required is True, and the old stop order id is retained.
+2. Verified Confirmation: When broker stop replacement succeeds, confirmed_broker_stop_price
+   is updated, stop_reconciliation_required is False, and the new order id is recorded.
+3. Fail-Closed Persistence: Disk write failures set persistence_healthy = False, flag all
+   active positions for reconciliation, and raise TrailingStatePersistenceError if requested.
+4. Safe Corrupted/Empty State Load: Empty or corrupted trailing state files do not crash the engine
+   and explicitly mark persistence_healthy = False.
+5. Bar-Close Freshness Semantics: 5m closed bars are evaluated against bar close time rather than
+   bar start time, preventing false staleness rejections for freshly closed bars.
+6. Post-Init Integrity: TrailingStopState.__post_init__ preserves confirmed_broker_stop_price = None
+   whenever stop_reconciliation_required is True.
+"""
+import json
+import os
+import sys
+import tempfile
+import time
+import unittest
+from unittest.mock import MagicMock, patch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import config
+from strategies.base import TradeSignal, StrategyName
+from strategies.execution_quote import validate_execution_quote
+from strategies.trailing_stop import (
+    DynamicTrailingStopManager,
+    GeometryRebuildResult,
+    TrailingStopState,
+    TrailingStatePersistenceError,
+)
+
+
+class TestStopRebuildAndPersistenceHardening(unittest.TestCase):
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.state_file = os.path.join(self.temp_dir.name, "trailing_state.json")
+        self.patcher = patch("strategies.trailing_stop.STATE_FILE", self.state_file)
+        self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
+        self.temp_dir.cleanup()
+
+    def test_replace_fails_no_false_confirmation(self):
+        """
+        When fill causes geometry invalidation (e.g. fill=100.0, initial_stop=100.01 for LONG)
+        and broker replace call fails, confirmed_broker_stop_price must remain None,
+        stop_reconciliation_required must be True, and order_id must NOT be falsely marked replaced.
+        """
+        manager = DynamicTrailingStopManager()
+        mock_bridge = MagicMock()
+        # Mock broker replace call failing (e.g. 500 error or network disconnect)
+        mock_bridge.replace_order_by_id.side_effect = RuntimeError("Broker connection dropped during replace")
+
+        # 1. Test validate_and_rebuild_geometry direct call with return_details=True
+        res = manager.validate_and_rebuild_geometry(
+            symbol="AAPL",
+            signal_price=100.00,
+            fill_price=100.00,
+            initial_stop=100.01,  # Inverted stop for BUY! Must be rebuilt.
+            target_price=100.50,
+            bridge=mock_bridge,
+            stop_order_id="stop_order_orig_123",
+            tp_order_id="tp_order_orig_456",
+            side="BUY",
+            return_details=True,
+        )
+
+        self.assertIsInstance(res, GeometryRebuildResult)
+        self.assertTrue(res.rebuild_performed)
+        self.assertFalse(res.rebuild_succeeded)
+        self.assertIsNone(res.confirmed_broker_stop_price, "Must NOT claim confirmed stop on broker when replace failed")
+        self.assertTrue(res.stop_reconciliation_required, "Must require reconciliation when replace failed")
+        self.assertEqual(res.stop_order_id, "stop_order_orig_123", "Must retain original order ID on failure")
+        self.assertLess(res.stop_price, 100.00, "Calculated safe stop should be below fill")
+
+        # 2. Test initialize_position end-to-end with failed replace
+        sig = TradeSignal(
+            symbol="AAPL",
+            strategy=StrategyName.MOMENTUM_SCALP,
+            side="BUY",
+            confidence=0.85,
+            entry_price=100.00,
+            stop_price=100.01,  # Inverted
+            target_price=100.50,
+            atr=0.10,
+            risk_per_share=0.04,
+            signal_id="sig_test_001",
+            reason="Test inverted stop",
+        )
+
+        state = manager.initialize_position(
+            signal=sig,
+            fill_price=100.00,
+            bridge=mock_bridge,
+            stop_order_id="stop_order_orig_123",
+            tp_order_id="tp_order_orig_456",
+            qty=100,
+        )
+
+        self.assertIsNone(state.confirmed_broker_stop_price)
+        self.assertTrue(state.stop_reconciliation_required)
+        self.assertTrue(state.remediation_in_progress)
+        self.assertEqual(state.order_id, "stop_order_orig_123")
+
+    def test_replace_succeeds_confirmed(self):
+        """
+        When broker stop replace succeeds, confirmed_broker_stop_price is updated to the
+        new stop price, stop_reconciliation_required is False, and the new order id is stored.
+        """
+        manager = DynamicTrailingStopManager()
+        mock_bridge = MagicMock()
+        mock_replace_res = MagicMock()
+        mock_replace_res.id = "new_replaced_stop_789"
+        mock_bridge.replace_order_by_id.return_value = mock_replace_res
+
+        sig = TradeSignal(
+            symbol="MSFT",
+            strategy=StrategyName.MOMENTUM_SCALP,
+            side="BUY",
+            confidence=0.85,
+            entry_price=200.00,
+            stop_price=200.05,  # Inverted stop for BUY
+            target_price=202.00,
+            atr=0.20,
+            risk_per_share=0.08,
+            signal_id="sig_test_002",
+            reason="Test rebuild success",
+        )
+
+        state = manager.initialize_position(
+            signal=sig,
+            fill_price=200.00,
+            bridge=mock_bridge,
+            stop_order_id="stop_orig_111",
+            tp_order_id="tp_orig_222",
+            qty=50,
+        )
+
+        self.assertIsNotNone(state.confirmed_broker_stop_price)
+        self.assertEqual(state.confirmed_broker_stop_price, state.stop_price)
+        self.assertFalse(state.stop_reconciliation_required)
+        self.assertFalse(state.remediation_in_progress)
+        self.assertEqual(state.order_id, "new_replaced_stop_789")
+
+    def test_save_fails_no_false_persistent_state(self):
+        """
+        Atomic save failure must set persistence_healthy = False, mark all active positions
+        as stop_reconciliation_required = True, and raise TrailingStatePersistenceError if requested.
+        """
+        manager = DynamicTrailingStopManager()
+        sig = TradeSignal(
+            symbol="NVDA",
+            strategy=StrategyName.MOMENTUM_SCALP,
+            side="BUY",
+            confidence=0.85,
+            entry_price=100.00,
+            stop_price=99.50,
+            target_price=101.50,
+            atr=0.20,
+            risk_per_share=0.50,
+            signal_id="sig_test_003",
+            reason="Test persistence failure",
+        )
+        state = manager.initialize_position(
+            signal=sig,
+            fill_price=100.00,
+            bridge=None,
+            qty=10,
+        )
+        self.assertTrue(manager.persistence_healthy)
+        self.assertFalse(state.stop_reconciliation_required)
+
+        # Simulate atomic rename/replace failure (e.g. disk write/permission error)
+        with patch("os.replace", side_effect=OSError("Disk write I/O error")):
+            save_ok = manager._save_state(raise_on_error=False)
+            self.assertFalse(save_ok)
+            self.assertFalse(manager.persistence_healthy)
+            self.assertIn("Disk write I/O error", manager.last_persistence_error)
+            self.assertEqual(manager.consecutive_persistence_failures, 1)
+            # All active positions must now require reconciliation
+            self.assertTrue(manager.states["NVDA"].stop_reconciliation_required)
+
+            # With raise_on_error=True, it must raise TrailingStatePersistenceError
+            with self.assertRaises(TrailingStatePersistenceError):
+                manager._save_state(raise_on_error=True)
+
+    def test_restart_uncertain_trailing_state_reconciliation(self):
+        """
+        Restart with corrupted or empty state file must flag persistence_healthy = False
+        and record the error without crashing.
+        """
+        # Create empty file
+        with open(self.state_file, "w") as f:
+            pass
+
+        manager_empty = DynamicTrailingStopManager()
+        self.assertFalse(manager_empty.persistence_healthy)
+        self.assertEqual(manager_empty.last_persistence_error, "STATE_FILE_EMPTY")
+
+        # Create corrupted JSON file
+        with open(self.state_file, "w") as f:
+            f.write("{invalid_json: true,")
+
+        manager_corrupt = DynamicTrailingStopManager()
+        self.assertFalse(manager_corrupt.persistence_healthy)
+        self.assertIn("LOAD_FAILED", manager_corrupt.last_persistence_error)
+
+    def test_bar_close_freshness_semantics(self):
+        """
+        Validates bar-close freshness vs bar-start freshness semantics:
+        A 5m bar that completed 30 seconds ago has a start age of 330s.
+        With bar_duration_seconds=300.0 and max_entry_bar_close_age_seconds=60.0:
+        - Bar with start age = 330s (close age = 30s) must PASS.
+        - Bar with start age = 380s (close age = 80s) must FAIL with BAR_STALE.
+        - Bar with start age = 100s (close age = -200s, i.e. future/unclosed) must FAIL with BAR_TIMESTAMP_IN_FUTURE.
+        """
+        now = time.time()
+        mock_bridge = MagicMock()
+        mock_bridge.get_quote.return_value = {
+            "symbol": "SPY",
+            "bid": 500.00,
+            "ask": 500.05,
+            "last": 500.02,
+            "timestamp": now - 1.0,
+            "source": "alpaca",
+            "is_realtime": True,
+            "feed_identity": "iex",
+        }
+
+        # Case 1: Freshly closed 5m bar (30 seconds after close)
+        bar_start_330s_ago = now - 330.0
+        res_fresh = validate_execution_quote(
+            bridge=mock_bridge,
+            symbol="SPY",
+            side="BUY",
+            decision_price=500.00,
+            decision_feed="iex",
+            bar_timestamp=bar_start_330s_ago,
+            max_bar_age_seconds=300.0,
+            bar_duration_seconds=300.0,
+            max_entry_bar_close_age_seconds=60.0,
+        )
+        self.assertTrue(res_fresh.valid, f"Freshly closed bar should pass: {res_fresh.reason}")
+
+        # Case 2: Stale closed 5m bar (80 seconds after close > 60s limit)
+        bar_start_380s_ago = now - 380.0
+        res_stale = validate_execution_quote(
+            bridge=mock_bridge,
+            symbol="SPY",
+            side="BUY",
+            decision_price=500.00,
+            decision_feed="iex",
+            bar_timestamp=bar_start_380s_ago,
+            max_bar_age_seconds=300.0,
+            bar_duration_seconds=300.0,
+            max_entry_bar_close_age_seconds=60.0,
+        )
+        self.assertFalse(res_stale.valid)
+        self.assertIn("BAR_STALE", res_stale.reason)
+        self.assertIn("close_age=80.0s > limit=60.0s", res_stale.reason)
+
+        # Case 3: Future bar (timestamp in future)
+        bar_in_future = now + 60.0
+        res_future = validate_execution_quote(
+            bridge=mock_bridge,
+            symbol="SPY",
+            side="BUY",
+            decision_price=500.00,
+            decision_feed="iex",
+            bar_timestamp=bar_in_future,
+            max_bar_age_seconds=300.0,
+            bar_duration_seconds=300.0,
+            max_entry_bar_close_age_seconds=60.0,
+        )
+        self.assertFalse(res_future.valid)
+        self.assertIn("BAR_TIMESTAMP_IN_FUTURE", res_future.reason)
+
+    def test_trailing_stop_state_post_init_preserves_unconfirmed(self):
+        """
+        Directly constructing TrailingStopState with stop_reconciliation_required=True
+        and confirmed_broker_stop_price=None must NOT overwrite confirmed_broker_stop_price.
+        """
+        state = TrailingStopState(
+            symbol="AMD",
+            side="BUY",
+            entry_price=150.00,
+            peak_price=150.00,
+            atr=1.50,
+            stop_price=148.00,
+            trail_multiple=1.5,
+            last_updated=time.time(),
+            confirmed_broker_stop_price=None,
+            stop_reconciliation_required=True,
+        )
+        self.assertIsNone(state.confirmed_broker_stop_price)
+        self.assertTrue(state.stop_reconciliation_required)
+
+        # But when stop_reconciliation_required is False, confirmed defaults to stop_price
+        state_confirmed = TrailingStopState(
+            symbol="AMD",
+            side="BUY",
+            entry_price=150.00,
+            peak_price=150.00,
+            atr=1.50,
+            stop_price=148.00,
+            trail_multiple=1.5,
+            last_updated=time.time(),
+            confirmed_broker_stop_price=None,
+            stop_reconciliation_required=False,
+        )
+        self.assertEqual(state_confirmed.confirmed_broker_stop_price, 148.00)
+
+
+if __name__ == "__main__":
+    unittest.main()

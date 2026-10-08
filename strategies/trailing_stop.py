@@ -10,7 +10,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, asdict
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import config
 from strategies.base import TradeSignal
@@ -26,6 +26,23 @@ MAX_REMEDIATION_STRIKES: int = 2
 POST_FILL_NOISE_FLOOR_BPS: float = 0.0005     # 5 bps (0.05%) price scale floor
 POST_FILL_MIN_ABSOLUTE_BUFFER: float = 0.05    # $0.05 absolute minimum tick buffer
 POST_FILL_REBUILD_BUFFER_MULT: float = 1.15    # Pre-existing 15% safety buffer
+
+
+class TrailingStatePersistenceError(RuntimeError):
+    """Raised when trailing stop state cannot be persisted to disk."""
+    pass
+
+
+@dataclass
+class GeometryRebuildResult:
+    """Outcome of post-fill bracket geometry validation and child order rebuild."""
+    stop_price: float
+    desired_stop_price: float
+    confirmed_broker_stop_price: Optional[float]
+    stop_order_id: Optional[str]
+    stop_reconciliation_required: bool
+    rebuild_performed: bool
+    rebuild_succeeded: bool
 
 
 def compute_canonical_post_fill_distances(
@@ -116,7 +133,7 @@ class TrailingStopState:
     def __post_init__(self):
         if self.desired_stop_price is None:
             self.desired_stop_price = float(self.stop_price)
-        if self.confirmed_broker_stop_price is None:
+        if self.confirmed_broker_stop_price is None and not self.stop_reconciliation_required:
             self.confirmed_broker_stop_price = float(self.stop_price)
 
 
@@ -261,6 +278,10 @@ def _extract_order_info(o: object) -> dict:
 class DynamicTrailingStopManager:
     def __init__(self):
         self._lock = threading.RLock()
+        self.persistence_healthy: bool = True
+        self.last_persistence_error: Optional[str] = None
+        self.last_persistence_error_time: float = 0.0
+        self.consecutive_persistence_failures: int = 0
         with self._lock:
             self.states: Dict[str, TrailingStopState] = {}
             self._load_state()
@@ -271,6 +292,8 @@ class DynamicTrailingStopManager:
         try:
             if os.path.getsize(STATE_FILE) == 0:
                 logger.warning(f"Trailing stop state file {STATE_FILE} is empty. Initializing empty state.")
+                self.persistence_healthy = False
+                self.last_persistence_error = "STATE_FILE_EMPTY"
                 return
             with open(STATE_FILE, "r") as f:
                 data = json.load(f)
@@ -282,11 +305,14 @@ class DynamicTrailingStopManager:
                             state_dict.setdefault("confirmed_broker_stop_price", state_dict.get("stop_price"))
                             state_dict.setdefault("stop_reconciliation_required", False)
                             self.states[sym] = TrailingStopState(**state_dict)
+            self.persistence_healthy = True
             logger.info(f"Loaded {len(self.states)} active trailing stops.")
         except (json.JSONDecodeError, OSError) as e:
+            self.persistence_healthy = False
+            self.last_persistence_error = f"LOAD_FAILED: {e}"
             logger.error(f"Failed to load trailing stop state: {e}")
 
-    def _save_state(self) -> None:
+    def _save_state(self, raise_on_error: bool = False) -> bool:
         import threading
         tmp_file = f"{STATE_FILE}.tmp.{os.getpid()}.{threading.get_ident()}"
         try:
@@ -301,10 +327,23 @@ class DynamicTrailingStopManager:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_file, STATE_FILE)
-        except Exception:
-            logger.exception(
-                "Failed to save trailing stop state atomically: %s",
+            self.persistence_healthy = True
+            self.consecutive_persistence_failures = 0
+            return True
+        except Exception as exc:
+            self.persistence_healthy = False
+            self.last_persistence_error = str(exc)
+            self.last_persistence_error_time = time.time()
+            self.consecutive_persistence_failures += 1
+            # Mark all active position protection statuses as requiring reconciliation
+            for s in self.states.values():
+                s.stop_reconciliation_required = True
+            logger.error(
+                "[PERSISTENCE HEALTH FAILED] Failed to save trailing stop state atomically to %s: %s "
+                "(consecutive_failures=%d, all active positions flagged for reconciliation)",
                 STATE_FILE,
+                exc,
+                self.consecutive_persistence_failures,
             )
             try:
                 if os.path.exists(tmp_file):
@@ -315,6 +354,11 @@ class DynamicTrailingStopManager:
                     tmp_file,
                     exc_info=True,
                 )
+            if raise_on_error:
+                raise TrailingStatePersistenceError(
+                    f"Failed to save trailing stop state atomically to {STATE_FILE}: {exc}"
+                ) from exc
+            return False
 
     def soft_reset(self, symbol: str) -> None:
         """Deactivate state — preserves telemetry/audit trail."""
@@ -396,7 +440,7 @@ class DynamicTrailingStopManager:
             target_price = getattr(signal, "target_price", None)
 
             # Validate and rebuild bracket geometry if actual fill price inverted stop price
-            initial_stop = self.validate_and_rebuild_geometry(
+            rebuild_res = self.validate_and_rebuild_geometry(
                 symbol=signal.symbol,
                 signal_price=signal_price,
                 fill_price=fill_price,
@@ -406,6 +450,7 @@ class DynamicTrailingStopManager:
                 stop_order_id=stop_order_id,
                 tp_order_id=tp_order_id,
                 side=signal.side,
+                return_details=True,
             )
 
             state = TrailingStopState(
@@ -414,14 +459,17 @@ class DynamicTrailingStopManager:
                 entry_price=fill_price,
                 peak_price=fill_price,
                 atr=atr,
-                stop_price=initial_stop,
-                desired_stop_price=initial_stop,
-                confirmed_broker_stop_price=initial_stop,
-                stop_reconciliation_required=False,
+                stop_price=rebuild_res.stop_price,
+                desired_stop_price=rebuild_res.desired_stop_price,
+                confirmed_broker_stop_price=rebuild_res.confirmed_broker_stop_price,
+                stop_reconciliation_required=rebuild_res.stop_reconciliation_required,
+                remediation_in_progress=rebuild_res.stop_reconciliation_required,
+                last_remediation_time=time.time() if rebuild_res.stop_reconciliation_required else 0.0,
+                remediation_attempts=1 if rebuild_res.stop_reconciliation_required else 0,
                 target_price=target_price,
                 trail_multiple=mult,
                 last_updated=time.time(),
-                order_id=stop_order_id,
+                order_id=rebuild_res.stop_order_id,
                 qty=qty,
                 strategy=_normalize_strategy_name(getattr(signal, "strategy", None)) if _normalize_strategy_name(getattr(signal, "strategy", None)) != "UNKNOWN" else ("DAYTRADE_SCALP" if getattr(signal, "signal_id", None) else "UNKNOWN"),
                 signal_id=getattr(signal, "signal_id", None),
@@ -430,7 +478,10 @@ class DynamicTrailingStopManager:
             )
             self.states[signal.symbol] = state
             self._save_state()
-            logger.info(f"Initialized Trailing Stop for {signal.symbol}: Entry ${fill_price:.2f}, Stop ${initial_stop:.2f}")
+            logger.info(
+                f"Initialized Trailing Stop for {signal.symbol}: Entry ${fill_price:.2f}, Stop ${rebuild_res.stop_price:.2f} "
+                f"(confirmed_broker={rebuild_res.confirmed_broker_stop_price}, recon_req={rebuild_res.stop_reconciliation_required}, order_id={rebuild_res.stop_order_id})"
+            )
             return state
 
     def validate_and_rebuild_geometry(
@@ -444,7 +495,8 @@ class DynamicTrailingStopManager:
         stop_order_id: Optional[str] = None,
         tp_order_id: Optional[str] = None,
         side: str = "BUY",
-    ) -> float:
+        return_details: bool = False,
+    ) -> Union[float, GeometryRebuildResult]:
         """
         Validate bracket order stop geometry against actual fill price.
         Ensure for LONG position: stop_price < actual_avg_fill < target_price.
@@ -492,9 +544,29 @@ class DynamicTrailingStopManager:
                 f"[POST-FILL GEOMETRY DEGRADED] {symbol} ({side.upper()}): Post-fill actual R:R ({actual_rr:.2f}) "
                 f"fell below required minimum ({min_rr:.2f}). Preserving valid protective stop at ${initial_stop:.{decimals}f}."
             )
+            if return_details:
+                return GeometryRebuildResult(
+                    stop_price=initial_stop,
+                    desired_stop_price=initial_stop,
+                    confirmed_broker_stop_price=initial_stop,
+                    stop_order_id=stop_order_id,
+                    stop_reconciliation_required=False,
+                    rebuild_performed=False,
+                    rebuild_succeeded=True,
+                )
             return initial_stop
 
         if action == "ACCEPTED":
+            if return_details:
+                return GeometryRebuildResult(
+                    stop_price=initial_stop,
+                    desired_stop_price=initial_stop,
+                    confirmed_broker_stop_price=initial_stop,
+                    stop_order_id=stop_order_id,
+                    stop_reconciliation_required=False,
+                    rebuild_performed=False,
+                    rebuild_succeeded=True,
+                )
             return initial_stop
 
         if not composite_valid:
@@ -551,10 +623,22 @@ class DynamicTrailingStopManager:
                         logger.error(
                             f"[GEOMETRY FAIL-SAFE] Failed to close {symbol}: {close_err}"
                         )
+                if return_details:
+                    return GeometryRebuildResult(
+                        stop_price=new_stop_price,
+                        desired_stop_price=new_stop_price,
+                        confirmed_broker_stop_price=None,
+                        stop_order_id=stop_order_id,
+                        stop_reconciliation_required=True,
+                        rebuild_performed=True,
+                        rebuild_succeeded=False,
+                    )
                 return new_stop_price  # best-effort return
             else:
                 logger.info(f"[POST-FILL GEOMETRY REBUILD SUCCESS] {symbol} ({side.upper()}): Re-validation valid=True for new stop ${new_stop_price:.{decimals}f}")
 
+            replace_stop_succeeded = False
+            effective_stop_order_id = stop_order_id
             if bridge:
                 replace_fn = getattr(bridge, "replace_order_by_id", None)
                 if not replace_fn and hasattr(bridge, "_client") and hasattr(bridge._client, "replace_order_by_id"):
@@ -570,9 +654,11 @@ class DynamicTrailingStopManager:
                             except Exception:
                                 req = {"stop_price": new_stop_price}
                             res = replace_fn(stop_order_id, req)
-                            new_id = getattr(res, "id", stop_order_id)
-                            logger.info(f"[POST-FILL GEOMETRY REBUILD] Replaced broker stop order {stop_order_id} -> {new_id} at new stop price ${new_stop_price:.{decimals}f}")
+                            effective_stop_order_id = getattr(res, "id", None) or getattr(res, "order_id", None) or stop_order_id
+                            replace_stop_succeeded = True
+                            logger.info(f"[POST-FILL GEOMETRY REBUILD] Replaced broker stop order {stop_order_id} -> {effective_stop_order_id} at new stop price ${new_stop_price:.{decimals}f}")
                         except Exception as replace_err:
+                            replace_stop_succeeded = False
                             logger.warning(f"[POST-FILL GEOMETRY REBUILD] Could not replace broker stop order {stop_order_id}: {replace_err}")
 
                     # 2. Replace Take Profit Order if tp_order_id is provided and new_target_price is set
@@ -588,8 +674,41 @@ class DynamicTrailingStopManager:
                         except Exception as tp_err:
                             logger.warning(f"[POST-FILL GEOMETRY REBUILD] Could not replace broker TP order {tp_order_id}: {tp_err}")
 
+            if bridge and stop_order_id:
+                confirmed_broker_stop = new_stop_price if replace_stop_succeeded else None
+                recon_required = not replace_stop_succeeded
+                rebuild_ok = replace_stop_succeeded
+            elif stop_order_id and not bridge:
+                confirmed_broker_stop = None
+                recon_required = True
+                rebuild_ok = False
+            else:
+                confirmed_broker_stop = new_stop_price
+                recon_required = False
+                rebuild_ok = True
+
+            if return_details:
+                return GeometryRebuildResult(
+                    stop_price=new_stop_price,
+                    desired_stop_price=new_stop_price,
+                    confirmed_broker_stop_price=confirmed_broker_stop,
+                    stop_order_id=effective_stop_order_id,
+                    stop_reconciliation_required=recon_required,
+                    rebuild_performed=True,
+                    rebuild_succeeded=rebuild_ok,
+                )
             return new_stop_price
 
+        if return_details:
+            return GeometryRebuildResult(
+                stop_price=initial_stop,
+                desired_stop_price=initial_stop,
+                confirmed_broker_stop_price=initial_stop,
+                stop_order_id=stop_order_id,
+                stop_reconciliation_required=False,
+                rebuild_performed=False,
+                rebuild_succeeded=True,
+            )
         return initial_stop
 
     def ensure_initialized(

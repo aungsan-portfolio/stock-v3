@@ -2076,6 +2076,8 @@ def execute_signal(
                 max_bar_age_seconds=getattr(config, "MAX_BAR_STALENESS_SECONDS", 300.0),
                 require_feed_concordance=getattr(config, "REQUIRE_FEED_CONCORDANCE", False),
                 quote=quote,
+                bar_duration_seconds=float(getattr(executable_signal, "bar_duration_seconds", getattr(signal, "bar_duration_seconds", getattr(config, "ENTRY_BAR_DURATION_SECONDS", 300.0)))),
+                max_entry_bar_close_age_seconds=float(getattr(config, "ENTRY_BAR_CLOSE_GRACE_SECONDS", 60.0)),
             )
         except Exception as quote_exc:
             idempotency_manager.release(
