@@ -654,9 +654,61 @@ class DynamicTrailingStopManager:
                             except Exception:
                                 req = {"stop_price": new_stop_price}
                             res = replace_fn(stop_order_id, req)
-                            effective_stop_order_id = getattr(res, "id", None) or getattr(res, "order_id", None) or stop_order_id
-                            replace_stop_succeeded = True
-                            logger.info(f"[POST-FILL GEOMETRY REBUILD] Replaced broker stop order {stop_order_id} -> {effective_stop_order_id} at new stop price ${new_stop_price:.{decimals}f}")
+                            new_id = getattr(res, "id", None) or getattr(res, "order_id", None)
+                            if not res or not new_id:
+                                replace_stop_succeeded = False
+                                logger.warning(
+                                    f"[POST-FILL GEOMETRY REBUILD] Broker replace returned invalid/empty response: {res}"
+                                )
+                            else:
+                                res_status = str(getattr(res, "status", getattr(getattr(res, "status", None), "value", "")) or "").lower()
+                                if res_status in ("rejected", "canceled", "cancelled", "expired", "failed"):
+                                    replace_stop_succeeded = False
+                                    logger.warning(
+                                        f"[POST-FILL GEOMETRY REBUILD] Replaced order {new_id} immediately terminal/rejected: status={res_status}"
+                                    )
+                                else:
+                                    # Price confirmation check
+                                    ret_stop = getattr(res, "stop_price", getattr(res, "stopPrice", None))
+                                    if ret_stop is not None:
+                                        try:
+                                            ret_stop_f = float(ret_stop)
+                                            if abs(ret_stop_f - new_stop_price) <= 0.01 + 1e-4:
+                                                replace_stop_succeeded = True
+                                                effective_stop_order_id = str(new_id)
+                                            else:
+                                                replace_stop_succeeded = False
+                                                logger.warning(
+                                                    f"[POST-FILL GEOMETRY REBUILD] Stop price mismatch: broker returned ${ret_stop_f:.4f} != requested ${new_stop_price:.4f}"
+                                                )
+                                        except (TypeError, ValueError):
+                                            replace_stop_succeeded = False
+                                    elif hasattr(bridge, "get_order_snapshot") or hasattr(bridge, "get_order_by_id"):
+                                        try:
+                                            snap_fn = getattr(bridge, "get_order_snapshot", None) or getattr(bridge, "get_order_by_id", None)
+                                            snap = snap_fn(new_id)
+                                            snap_stop = snap.get("stop_price") if isinstance(snap, dict) else getattr(snap, "stop_price", None)
+                                            if snap_stop is not None and abs(float(snap_stop) - new_stop_price) <= 0.01 + 1e-4:
+                                                replace_stop_succeeded = True
+                                                effective_stop_order_id = str(new_id)
+                                            else:
+                                                replace_stop_succeeded = False
+                                                logger.warning(
+                                                    f"[POST-FILL GEOMETRY REBUILD] Snapshot verification failed for {new_id}: stop={snap_stop} vs expected {new_stop_price}"
+                                                )
+                                        except Exception as snap_err:
+                                            replace_stop_succeeded = False
+                                            logger.warning(
+                                                f"[POST-FILL GEOMETRY REBUILD] Could not verify snapshot for replaced order {new_id}: {snap_err}"
+                                            )
+                                    else:
+                                        replace_stop_succeeded = True
+                                        effective_stop_order_id = str(new_id)
+
+                            if replace_stop_succeeded:
+                                logger.info(f"[POST-FILL GEOMETRY REBUILD] Replaced & confirmed broker stop order {stop_order_id} -> {effective_stop_order_id} at new stop price ${new_stop_price:.{decimals}f}")
+                            else:
+                                logger.warning(f"[POST-FILL GEOMETRY REBUILD] Replacement unconfirmed for stop order {stop_order_id} (new_id={new_id})")
                         except Exception as replace_err:
                             replace_stop_succeeded = False
                             logger.warning(f"[POST-FILL GEOMETRY REBUILD] Could not replace broker stop order {stop_order_id}: {replace_err}")
@@ -1891,6 +1943,7 @@ class DynamicTrailingStopManager:
             self._save_state()
 
 manager = DynamicTrailingStopManager()
+trailing_stop_manager = manager
 
 
 def get_trailing_manager() -> DynamicTrailingStopManager:

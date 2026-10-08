@@ -734,7 +734,7 @@ VALIDATION_LANE_SHARES = int(os.getenv("VALIDATION_LANE_SHARES", "1"))
 VALIDATION_LANE_LEDGER_PATH = DATA_DIR / "paper_validation_trades.jsonl"
 
 # ── Paper Strategy Experiment Lane (Fail-Closed Paper Only) ──────
-PAPER_EXPERIMENT_LANE_ENABLED: bool = os.getenv("PAPER_EXPERIMENT_LANE_ENABLED", "True").lower() in ("true", "1", "yes")
+PAPER_EXPERIMENT_LANE_ENABLED: bool = os.getenv("PAPER_EXPERIMENT_LANE_ENABLED", "False").lower() in ("true", "1", "yes")
 PAPER_EXPERIMENT_CELLS: tuple = ("CANDLESTICK_SIDEWAYS", "CANDLESTICK_TRANSITIONING")
 
 # ── Breakeven Stop Lock ──────────────────────────────

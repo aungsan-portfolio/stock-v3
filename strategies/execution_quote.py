@@ -311,22 +311,21 @@ def validate_execution_quote(
                 if max_entry_bar_close_age_seconds is not None
                 else max_bar_age_seconds
             )
-            if bar_age >= bar_duration_seconds:
-                if bar_close_age > effective_limit:
-                    return QuoteValidationResult(
-                        valid=False,
-                        reason=(
-                            f"BAR_STALE: Decision bar for {symbol} is stale "
-                            f"(close_age={bar_close_age:.1f}s > limit={effective_limit:.1f}s)"
-                        ),
-                        quote=quote,
-                    )
-            elif bar_age > max_bar_age_seconds:
+            if bar_close_age < -future_tolerance_seconds:
+                return QuoteValidationResult(
+                    valid=False,
+                    reason=(
+                        f"BAR_FORMING: Decision bar for {symbol} has not closed yet "
+                        f"(forming; closes in {abs(bar_close_age):.1f}s)"
+                    ),
+                    quote=quote,
+                )
+            if bar_close_age > effective_limit:
                 return QuoteValidationResult(
                     valid=False,
                     reason=(
                         f"BAR_STALE: Decision bar for {symbol} is stale "
-                        f"(age={bar_age:.1f}s > limit={max_bar_age_seconds:.1f}s)"
+                        f"(close_age={bar_close_age:.1f}s > limit={effective_limit:.1f}s)"
                     ),
                     quote=quote,
                 )

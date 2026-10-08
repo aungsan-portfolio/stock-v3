@@ -2058,6 +2058,21 @@ def execute_signal(
     stop_price = signal.stop_price
     target_price = signal.target_price
 
+    # Phase 0: Trailing State Persistence Health Gate
+    # Fail-closed: Never submit new entry orders when trailing stop state cannot be persisted to disk
+    if not dry_run and is_connected:
+        try:
+            import strategies.trailing_stop as ts_mod
+            ts_mgr = getattr(ts_mod, "trailing_stop_manager", None)
+            if ts_mgr is not None and hasattr(ts_mgr, "persistence_healthy") and not ts_mgr.persistence_healthy:
+                idempotency_manager.release(signal.symbol, side=signal.side, reason="trailing_persistence_unhealthy")
+                result["status"] = "VETOED"
+                result["reason"] = f"Trailing Stop Persistence Unhealthy: {getattr(ts_mgr, 'last_persistence_error', 'STATE_UNHEALTHY')} (new entries blocked)"
+                logger.warning("[PERSISTENCE HEALTH VETO] %s: Trailing stop state persistence is unhealthy, blocking new entry.", signal.symbol)
+                return result
+        except Exception as persist_chk_err:
+            logger.debug("Trailing persistence health gate check skipped: %s", persist_chk_err)
+
     # Phase A: Quote Validation Gate
     require_realtime = getattr(config, "REQUIRE_REALTIME_DATA_FOR_ORDERS", True)
     if not dry_run and require_realtime and is_connected:

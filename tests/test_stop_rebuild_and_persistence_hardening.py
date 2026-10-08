@@ -119,6 +119,8 @@ class TestStopRebuildAndPersistenceHardening(unittest.TestCase):
         mock_bridge = MagicMock()
         mock_replace_res = MagicMock()
         mock_replace_res.id = "new_replaced_stop_789"
+        mock_replace_res.stop_price = 199.89
+        mock_replace_res.status = "new"
         mock_bridge.replace_order_by_id.return_value = mock_replace_res
 
         sig = TradeSignal(
@@ -318,6 +320,266 @@ class TestStopRebuildAndPersistenceHardening(unittest.TestCase):
         )
         self.assertEqual(state_confirmed.confirmed_broker_stop_price, 148.00)
 
+    def test_forming_candle_rejected_and_non_finite_inputs(self):
+        """
+        Closed-bar invariant tests:
+        1. Candle started 30s ago on a 5m bar (forming) -> strictly REJECTED (BAR_FORMING).
+        2. Candle closed 30s ago (start age = 330s) -> PASSED.
+        3. Candle closed 61s ago (start age = 361s) -> strictly REJECTED (BAR_STALE).
+        4. Non-finite / negative duration or grace limit -> REJECTED.
+        """
+        now = time.time()
+        mock_bridge = MagicMock()
+        mock_bridge.get_quote.return_value = {
+            "symbol": "QQQ",
+            "bid": 400.00,
+            "ask": 400.05,
+            "last": 400.02,
+            "timestamp": now - 1.0,
+            "source": "alpaca",
+            "is_realtime": True,
+            "feed_identity": "iex",
+        }
+
+        # 1. Forming candle: started 30s ago on a 5m candle
+        res_forming = validate_execution_quote(
+            bridge=mock_bridge,
+            symbol="QQQ",
+            side="BUY",
+            decision_price=400.00,
+            bar_timestamp=now - 30.0,
+            bar_duration_seconds=300.0,
+            max_entry_bar_close_age_seconds=60.0,
+        )
+        self.assertFalse(res_forming.valid)
+        self.assertIn("BAR_FORMING", res_forming.reason)
+
+        # 2. Closed 30s ago: started 330s ago on 5m candle
+        res_closed_fresh = validate_execution_quote(
+            bridge=mock_bridge,
+            symbol="QQQ",
+            side="BUY",
+            decision_price=400.00,
+            bar_timestamp=now - 330.0,
+            bar_duration_seconds=300.0,
+            max_entry_bar_close_age_seconds=60.0,
+        )
+        self.assertTrue(res_closed_fresh.valid)
+
+        # 3. Closed 61s ago: started 361s ago on 5m candle
+        res_closed_stale = validate_execution_quote(
+            bridge=mock_bridge,
+            symbol="QQQ",
+            side="BUY",
+            decision_price=400.00,
+            bar_timestamp=now - 361.0,
+            bar_duration_seconds=300.0,
+            max_entry_bar_close_age_seconds=60.0,
+        )
+        self.assertFalse(res_closed_stale.valid)
+        self.assertIn("BAR_STALE", res_closed_stale.reason)
+
+        # 4. Non-finite / negative parameters
+        res_nan_dur = validate_execution_quote(
+            bridge=mock_bridge,
+            symbol="QQQ",
+            decision_price=400.00,
+            bar_timestamp=now - 330.0,
+            bar_duration_seconds=float("nan"),
+        )
+        self.assertFalse(res_nan_dur.valid)
+        self.assertIn("Invalid quote-validation configuration", res_nan_dur.reason)
+
+        res_neg_dur = validate_execution_quote(
+            bridge=mock_bridge,
+            symbol="QQQ",
+            decision_price=400.00,
+            bar_timestamp=now - 330.0,
+            bar_duration_seconds=-10.0,
+        )
+        self.assertFalse(res_neg_dur.valid)
+        self.assertIn("Invalid quote-validation configuration", res_neg_dur.reason)
+
+    def test_stop_replace_none_response_no_false_confirmation(self):
+        """replace_fn returning None must NOT result in confirmed_broker_stop_price."""
+        manager = DynamicTrailingStopManager()
+        mock_bridge = MagicMock()
+        mock_bridge.replace_order_by_id.return_value = None  # None return without exception
+
+        res = manager.validate_and_rebuild_geometry(
+            symbol="INTC",
+            signal_price=30.00,
+            fill_price=30.00,
+            initial_stop=30.01,  # Inverted
+            target_price=30.50,
+            bridge=mock_bridge,
+            stop_order_id="stop_111",
+            side="BUY",
+            return_details=True,
+        )
+        self.assertIsNone(res.confirmed_broker_stop_price)
+        self.assertTrue(res.stop_reconciliation_required)
+        self.assertFalse(res.rebuild_succeeded)
+        self.assertEqual(res.stop_order_id, "stop_111")
+
+    def test_stop_replace_missing_id_no_false_confirmation(self):
+        """replace_fn returning object without id must NOT result in confirmed_broker_stop_price."""
+        import types
+        manager = DynamicTrailingStopManager()
+        mock_bridge = MagicMock()
+        mock_bridge.replace_order_by_id.return_value = types.SimpleNamespace()  # No id or order_id
+
+        res = manager.validate_and_rebuild_geometry(
+            symbol="INTC",
+            signal_price=30.00,
+            fill_price=30.00,
+            initial_stop=30.01,
+            target_price=30.50,
+            bridge=mock_bridge,
+            stop_order_id="stop_222",
+            side="BUY",
+            return_details=True,
+        )
+        self.assertIsNone(res.confirmed_broker_stop_price)
+        self.assertTrue(res.stop_reconciliation_required)
+        self.assertFalse(res.rebuild_succeeded)
+
+    def test_stop_replace_terminal_status_no_false_confirmation(self):
+        """replace_fn returning rejected order must NOT result in confirmed_broker_stop_price."""
+        import types
+        manager = DynamicTrailingStopManager()
+        mock_bridge = MagicMock()
+        mock_bridge.replace_order_by_id.return_value = types.SimpleNamespace(id="r_rej", status="rejected")
+
+        res = manager.validate_and_rebuild_geometry(
+            symbol="INTC",
+            signal_price=30.00,
+            fill_price=30.00,
+            initial_stop=30.01,
+            target_price=30.50,
+            bridge=mock_bridge,
+            stop_order_id="stop_333",
+            side="BUY",
+            return_details=True,
+        )
+        self.assertIsNone(res.confirmed_broker_stop_price)
+        self.assertTrue(res.stop_reconciliation_required)
+        self.assertFalse(res.rebuild_succeeded)
+
+    def test_stop_replace_price_mismatch_no_false_confirmation(self):
+        """replace_fn returning stop_price that doesn't match new stop must NOT confirm."""
+        import types
+        manager = DynamicTrailingStopManager()
+        mock_bridge = MagicMock()
+        mock_bridge.replace_order_by_id.return_value = types.SimpleNamespace(id="r_wrong_price", status="new", stop_price=25.00)
+
+        res = manager.validate_and_rebuild_geometry(
+            symbol="INTC",
+            signal_price=30.00,
+            fill_price=30.00,
+            initial_stop=30.01,
+            target_price=30.50,
+            bridge=mock_bridge,
+            stop_order_id="stop_444",
+            side="BUY",
+            return_details=True,
+        )
+        self.assertIsNone(res.confirmed_broker_stop_price)
+        self.assertTrue(res.stop_reconciliation_required)
+        self.assertFalse(res.rebuild_succeeded)
+
+    def test_stop_replace_snapshot_query_fails_no_false_confirmation(self):
+        """When snapshot query fails during confirmation, stop must NOT be marked confirmed."""
+        import types
+        manager = DynamicTrailingStopManager()
+        mock_bridge = MagicMock()
+        mock_bridge.replace_order_by_id.return_value = types.SimpleNamespace(id="r_snap_fail", status="new")
+        mock_bridge.get_order_snapshot.side_effect = RuntimeError("Broker gateway timeout")
+
+        res = manager.validate_and_rebuild_geometry(
+            symbol="INTC",
+            signal_price=30.00,
+            fill_price=30.00,
+            initial_stop=30.01,
+            target_price=30.50,
+            bridge=mock_bridge,
+            stop_order_id="stop_555",
+            side="BUY",
+            return_details=True,
+        )
+        self.assertIsNone(res.confirmed_broker_stop_price)
+        self.assertTrue(res.stop_reconciliation_required)
+        self.assertFalse(res.rebuild_succeeded)
+
+    def test_persistence_unhealthy_blocks_new_entry_gate(self):
+        """When trailing stop manager persistence is unhealthy, execute_signal must veto new entries."""
+        from strategies.order_manager import execute_signal
+        from strategies.base import EntryReadiness
+        from datetime import datetime, timezone
+        import strategies.trailing_stop as ts_mod
+
+        now = time.time()
+        mock_bridge = MagicMock()
+        mock_bridge.is_connected = True
+        mock_bridge.open_position_count.return_value = 0
+        mock_bridge.list_positions.return_value = []
+        mock_bridge.has_position.return_value = False
+        mock_bridge.has_working_order.return_value = False
+        mock_bridge.get_quote.return_value = {
+            "symbol": "SPY",
+            "bid": 500.00,
+            "ask": 500.05,
+            "last": 500.02,
+            "timestamp": now - 1.0,
+            "source": "alpaca",
+            "is_realtime": True,
+            "feed_identity": "iex",
+        }
+
+        signal = TradeSignal(
+            symbol="SPY",
+            strategy=StrategyName.MOMENTUM_SCALP,
+            side="BUY",
+            confidence=0.85,
+            entry_price=500.00,
+            stop_price=498.00,
+            target_price=504.00,
+            atr=1.00,
+            risk_per_share=2.00,
+            reason="Persistence gate test",
+            bar_timestamp=datetime.fromtimestamp(now - 330.0, tz=timezone.utc).isoformat(),
+            decision_feed="iex",
+        )
+        readiness = EntryReadiness(
+            entry_allowed=True,
+            suppression_reason=None,
+            cycle_id="cycle_persist",
+            bar_ts=datetime.fromtimestamp(now - 330.0, tz=timezone.utc).isoformat(),
+            created_at=now,
+            expires_at=now + 300.0,
+        )
+
+        orig_healthy = ts_mod.trailing_stop_manager.persistence_healthy
+        try:
+            ts_mod.trailing_stop_manager.persistence_healthy = False
+            ts_mod.trailing_stop_manager.last_persistence_error = "DISK_CORRUPTED"
+
+            with patch("config.SPY_TREND_GUARD_ENABLED", False), \
+                 patch("strategies.intraday_risk.get_recent_symbol_loss_time", return_value=None):
+                res = execute_signal(
+                    signal=signal,
+                    bridge=mock_bridge,
+                    equity=100000.0,
+                    current_pnl=0.0,
+                    dry_run=False,
+                    entry_readiness=readiness,
+                )
+                self.assertEqual(res.get("status"), "VETOED")
+                self.assertIn("Trailing Stop Persistence Unhealthy", res.get("reason", ""))
+        finally:
+            ts_mod.trailing_stop_manager.persistence_healthy = orig_healthy
+
 
 if __name__ == "__main__":
     unittest.main()
+

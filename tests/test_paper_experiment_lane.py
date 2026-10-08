@@ -52,6 +52,12 @@ class MockPaperBridge:
         }
 
 
+@pytest.fixture(autouse=True)
+def enable_paper_experiment_lane(monkeypatch):
+    """Enable PAPER_EXPERIMENT_LANE_ENABLED by default for this test suite."""
+    monkeypatch.setattr(config, "PAPER_EXPERIMENT_LANE_ENABLED", True)
+
+
 class MockLiveBridge:
     """Mock bridge representing a Live money sub-account."""
     def __init__(self):
