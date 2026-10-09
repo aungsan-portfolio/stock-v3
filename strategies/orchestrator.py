@@ -2314,7 +2314,6 @@ def evaluate_and_execute(
             except Exception:
                 pass
             continue
-        seen_symbols.add(sym)
 
         rsi_max = getattr(config, "RSI_MAX_BUY_ENTRY", 70.0)
         rsi_min = getattr(config, "RSI_MIN_SHORT_ENTRY", 30.0)
@@ -2410,6 +2409,7 @@ def evaluate_and_execute(
                 pass
             continue
 
+        seen_symbols.add(sym)
         deduped_signals.append(sig)
     all_signals = deduped_signals
 
