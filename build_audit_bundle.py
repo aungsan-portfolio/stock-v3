@@ -32,6 +32,9 @@ SENSITIVE_PATTERNS = [
 ]
 
 SOURCE_FILES = [
+    "alpaca_bridge.py",
+    "main.py",
+    "run_daytrade_paper.bat",
     "strategies/execution_quote.py",
     "strategies/trailing_stop.py",
     "strategies/order_manager.py",
@@ -62,15 +65,18 @@ SOURCE_FILES = [
 ]
 
 TEST_FILES = [
+    "tests/test_session_exit_and_regime_baseline_hardening.py",
     "tests/test_stop_rebuild_and_persistence_hardening.py",
-    "tests/test_paper_experiment_lane.py",
-    "tests/test_feed_provenance_contract.py",
-    "tests/test_geometry_hard_guards.py",
-    "tests/test_trailing_stop_p1_5.py",
-    "tests/test_lifecycle_halt_integration.py",
-    "tests/test_order_manager_idempotency.py",
-    "tests/test_execution_quote.py",
+    "tests/test_validation_lane.py",
     "tests/test_candidate_selection_coordination.py",
+    "tests/test_price_tier_semantics.py",
+    "tests/test_replacement_lineage.py",
+    "tests/test_machine_release_gate.py",
+    "tests/test_long_tail_recovery_supervisor.py",
+    "tests/test_vwap_confidence_calibration.py",
+    "tests/test_deterministic_telemetry_join.py",
+    "tests/test_soxx_fail_closed_regression.py",
+    "tests/test_candlestick_strategy.py",
 ]
 
 
@@ -203,53 +209,52 @@ def main():
 ## Overview
 This bundle provides full source files, test suites, and raw verification artifacts for commit `{head_sha}` on branch `feature/p0-hardening-and-paper-experiment`.
 
-## Strategy Coordination & P0 Hardening Closures
-1. **Fix 1: Candidate Claim Order & Symbol Suppression** (`strategies/orchestrator.py`):
-   - `seen_symbols.add(sym)` moved from line 2317 (before candidate checks) to line 2412 (immediately before `deduped_signals.append(sig)`).
-   - Prevents rejected high-priority candidates (e.g. failing RSI, inverse-ETF, or geometry) from claiming the symbol and causing valid alternative candidates to be skipped as `DUPLICATE_ORDER`.
-   - Verified across all 7 probe cases and pre-submit non-fallback semantics in `test_candidate_selection_coordination.py`.
+## Forensic Defect Closures & Engine Hardening
+1. **Defect 1: Stop Verification Evidence Mismatch Closure** (`alpaca_bridge.py`):
+   - Enriched `AlpacaBridge.get_order_snapshot(order_id)` to extract and return full canonical fields: `id`, `client_order_id`, `status`, `symbol`, `side`, `order_type`, `type`, `qty`, `filled_qty`, `stop_price`, `limit_price`, `filled_avg_price`, and `replaced_by`.
+   - Resolves `EVIDENCE_SYMBOL_MISSING` in `verify_broker_stop_order_evidence()` and guarantees full concordance between `entry_lifecycle.py` and `trailing_stop.py`.
 
-2. **Criterion 1 Remediations: Stop Evidence Remaining Capacity & Protection Call-Sites** (`strategies/trailing_stop.py`):
-   - Reject overfilled order evidence where `filled_qty > qty` (`EVIDENCE_FILLED_EXCEEDS_QTY`).
-   - Non-mock `raw_filled_qty` that is NaN, negative, or non-numeric fails closed (`EVIDENCE_FILLED_QTY_INVALID`).
-   - In `validate_and_rebuild_geometry`, unchanged geometry (`ACCEPTED`, `POST_FILL_RR_DEGRADED`) enforces `require_qty=True`. If `expected_qty` is invalid or missing, verification fails closed (`confirmed_broker_stop_price = None`, `rebuild_succeeded = False`).
-   - Price matching tolerance heuristic clarifies that half-tick bounding (`min(max(tick_size / 2.0, float(cfg_tol)), tick_size) + 1e-6`) is a rounding tolerance buffer rather than broker-quantized subpenny execution proof.
+2. **Defect 2: Authoritative Exit Reconciliation & Phantom STOP_OUT Prevention** (`strategies/trailing_stop.py`):
+   - In `ensure_initialized`: When a stop order returns `canceled` or `expired` from broker, queries fresh position first. If flat (`pos_qty <= 0`), cleanly marks state inactive without erroneously setting `order_id = None` for remediation loop.
+   - In `handle_naked_position`: When position quantity becomes 0, checks `tp_order_id` snapshot first to detect take-profit fills (`TAKE_PROFIT`), then stop order snapshots (`STOP_OUT`), and checks broker closed orders for authoritative execution fill details.
+   - If broker fill reconciliation is still in-flight, defers closing via `FLAT_PENDING_EXIT_RECONCILIATION` instead of fabricating phantom stop-outs at local stop price.
 
-3. **Criterion 2 Remediations: Final-Submit Boundary Persistence Health Gate** (`strategies/order_manager.py`):
-   - Strict Fail-Closed Check: Placed immediately before `_place_bracket_order_once` submission adapter.
-   - Re-verifies canonical `get_trailing_manager()`. If manager is missing, missing `persistence_healthy` attr, `persistence_healthy is not True`, or throws on check:
-     - Order is vetoed (`status: "VETOED"` citing Final Submit boundary).
-     - `_place_bracket_order_once` is never invoked, fake broker `submit_order` call count remains 0.
-     - Pre-submit idempotency reservation is cleanly released from reservations store.
-     - Non-entry lifecycle operations (exits, stop modifications, reconciliation) remain unblocked.
+3. **Defect 3: Calendar-Aware Regime Previous Close Invariant** (`strategies/regime_engine.py`):
+   - Implemented `_extract_prev_session_close(bars_list, today_date)` which parses bar timestamps into US/Eastern calendar dates and selects the latest bar where `bar_date < today_date`.
+   - Completely eliminates benchmark returns jumping across session boundaries due to partial vs complete daily bars.
+   - Preserves complete `[REGIME BASELINE]` provenance telemetry in logs.
 
-4. **Criterion 3 Remediations: Candle-Based Entry Missing-Bar Guard** (`strategies/order_manager.py`, `strategies/validation_lane.py`):
-   - Upstream entry readiness already rejects missing signal bar as `[ENTRY READINESS BAR INVALID]`.
-   - Defense-in-depth: Phase A Execution Quote Gate strictly rejects candle-based entry signals (`ORB`, `VWAP_BOUNCE`, `GAP_AND_GO`, `MOMENTUM_SCALP`, `CANDLESTICK`, `MEAN_REVERSION`) when `bar_timestamp` is None or empty as `BAR_TIMESTAMP_MISSING`.
-   - Validation lane also strictly vetoes candle entry signals with missing `bar_timestamp` (`BAR_TIMESTAMP_MISSING`).
-   - Generic quote validation, exit orders, and non-candle quote checks remain completely unblocked without `bar_timestamp`.
+4. **Defense-in-Depth & Test Isolation Invariants**:
+   - `tests/test_validation_lane.py`: Hardened `test_negative_latency_veto` against premature quote staleness.
+   - `tests/test_stop_rebuild_and_persistence_hardening.py`: Isolated idempotency state per test execution.
+   - Added new regression suite `tests/test_session_exit_and_regime_baseline_hardening.py` covering all 3 defect areas.
 
-## Verification Summary (108 / 108 PASS)
+## Verification Summary (140 / 140 PASS)
 - **Suite Breakdown**:
+  - Session exit & regime baseline hardening: **7**
   - Stop rebuild & persistence hardening: **38**
-  - Candidate selection coordination: **8** (all 7 probe cases + pre-submit fallback safety)
-  - Paper experiment lane: **10**
-  - Feed provenance contract: **16**
-  - Geometry hard guards: **13**
-  - Trailing stop P1.5: **16**
-  - Lifecycle halt integration: **7**
-  - **TOTAL: 108 passed (100% Zero Regressions)**
+  - Validation lane: **14**
+  - Candidate selection coordination: **15**
+  - Price tier semantics: **1**
+  - Replacement lineage: **6**
+  - Machine release gate: **20**
+  - Long-tail recovery supervisor: **5**
+  - VWAP confidence calibration: **2**
+  - Deterministic telemetry join: **6**
+  - SOXX fail-closed regression: **18**
+  - Candlestick pattern strategy: **8**
+  - **TOTAL: 140 passed (100% Zero Regressions)**
 - **JUnit XML**: `evidence/pytest_junit_report.xml`
 
 ## Bundle Contents
-- `source/`: Full source of all strategy modules including generators, sizers, correlation, scoring, and veto reasons.
-- `tests/`: 9 complete test suites covering persistence, stop rebuild, candidate coordination, tick quantization, candle boundaries, idempotency, and halt integration.
+- `source/`: Full source of core engine files (`alpaca_bridge.py`, `main.py`, `run_daytrade_paper.bat`, `strategies/`, `config.py`).
+- `tests/`: 12 comprehensive test suites covering all execution safety, persistence, stop rebuild, regime invariant, and coordination gates.
 - `evidence/`:
   - `git_rev_parse_head.txt`: Git HEAD SHA (`{head_sha}`)
   - `git_status_short.txt`: Git workspace status
   - `git_commit_diff_{short_sha}.patch`: Exact commit patch for `{short_sha}`
   - `git_diff_cumulative_since_3ef1bab.patch`: Cumulative patch since `3ef1bab`
-  - `pytest_junit_report.xml`: Machine-readable test execution report (100 testcases)
+  - `pytest_junit_report.xml`: Machine-readable test execution report (140 testcases)
   - `effective_safety_settings.json`: Active safety policy parameters
   - `runtime_config_evidence.json`: Runtime provenance and promotion gates
 
