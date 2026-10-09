@@ -159,6 +159,9 @@ def check_session_suppression(
         return False, ""
 
 
+is_symbol_suppressed = check_session_suppression
+
+
 def record_hard_veto_skip(
     symbol: str,
     reason: Union[str, Any],

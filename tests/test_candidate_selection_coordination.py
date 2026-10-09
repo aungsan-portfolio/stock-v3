@@ -468,6 +468,259 @@ class TestCandidateSelectionCoordination(unittest.TestCase):
             self.assertNotIn(("AAPL", "BUY"), idempotency_manager.reservations)
             self.assertNotIn(("MSFT", "BUY"), idempotency_manager.reservations)
 
+    # ── Same-Symbol Cooldown Fallback Tests (Acceptance Criteria) ──────────
+
+    def test_same_symbol_leader_in_cooldown_follower_selected(self):
+        """
+        Acceptance Criteria (Item 1 & 3):
+        - Same symbol AAPL: Candidate A is in cooldown on (AAPL, GAP_AND_GO, BUY).
+        - Candidate B (AAPL, CANDLESTICK, BUY) is valid and unsuppressed.
+        - Canonical select_viable_cycle_candidates checks cooldown BEFORE symbol claim.
+        - A does NOT claim the symbol; B claims the symbol and is returned as the winner.
+        """
+        now = time.time()
+        # Put Candidate A into cooldown
+        om._setup_suppressed_until[("AAPL", "GAP_AND_GO", "BUY")] = now + 2700.0
+        om._setup_cooldown_counts[("AAPL", "GAP_AND_GO", "BUY")] = 1
+
+        sig_a = _make_candidate(
+            symbol="AAPL",
+            strategy=StrategyName.GAP_AND_GO,
+            side="BUY",
+            confidence=0.85,
+            rsi=50.0,
+            signal_id="A",
+        )
+        sig_b = _make_candidate(
+            symbol="AAPL",
+            strategy=StrategyName.CANDLESTICK,
+            side="BUY",
+            confidence=0.80,
+            rsi=50.0,
+            signal_id="B",
+        )
+
+        selected = select_viable_cycle_candidates([sig_a, sig_b])
+        self.assertEqual(len(selected), 1, "Expected exactly 1 candidate selected for AAPL")
+        self.assertEqual(selected[0].signal_id, "B", "Follower B should be selected when A is in cooldown")
+        self.assertEqual(selected[0].strategy, StrategyName.CANDLESTICK)
+
+    def test_production_orchestrator_same_symbol_cooldown_follower_executed(self):
+        """
+        Acceptance Criteria (Item 2 & 3 - Production Flow Verification):
+        - End-to-end execution of evaluate_and_execute() with same-symbol candidates:
+          Candidate A: AAPL, GAP_AND_GO, BUY (confidence 0.85) -> in cooldown
+          Candidate B: AAPL, CANDLESTICK, BUY (confidence 0.80) -> valid
+        - Main evaluate_and_execute() invokes canonical select_viable_cycle_candidates().
+        - Candidate A is skipped prior to symbol claim due to cooldown.
+        - Candidate B is selected as the viable cycle candidate.
+        - execute_signal() is invoked for Candidate B (CANDLESTICK) and NOT Candidate A.
+        - Broker receives order for Candidate B.
+        """
+        from datetime import datetime, timezone
+        from strategies.orchestrator import EvaluationResult
+        import strategies.orchestrator as orch
+
+        now = time.time()
+        completed_bar_ts = datetime.fromtimestamp(now - 330.0, tz=timezone.utc).isoformat()
+
+        # 1. Put Candidate A (AAPL, GAP_AND_GO, BUY) into active cooldown
+        om._setup_suppressed_until[("AAPL", "GAP_AND_GO", "BUY")] = now + 2700.0
+        om._setup_cooldown_counts[("AAPL", "GAP_AND_GO", "BUY")] = 1
+
+        sig_a = _make_candidate(
+            symbol="AAPL",
+            strategy=StrategyName.GAP_AND_GO,
+            side="BUY",
+            entry_price=150.0,
+            stop_price=148.0,
+            target_price=154.0,
+            risk_per_share=2.0,
+            confidence=0.85,
+            rsi=50.0,
+            signal_id="sig_a_gap",
+        )
+        sig_a.bar_timestamp = completed_bar_ts
+        sig_b = _make_candidate(
+            symbol="AAPL",
+            strategy=StrategyName.CANDLESTICK,
+            side="BUY",
+            entry_price=150.0,
+            stop_price=148.0,
+            target_price=154.0,
+            risk_per_share=2.0,
+            confidence=0.80,
+            rsi=50.0,
+            signal_id="sig_b_candle",
+        )
+        sig_b.bar_timestamp = completed_bar_ts
+
+        mock_eval_result = EvaluationResult(
+            entry_signals=(sig_a, sig_b),
+            entry_allowed=True,
+            suppression_reason=None,
+            coverage=1.0,
+            required_coverage=0.95,
+            received_symbols=("AAPL",),
+            missing_symbols=(),
+        )
+
+        executed_signals = []
+
+        def mock_execute_signal(signal, **kwargs):
+            executed_signals.append(signal)
+            return {"status": "PLACED", "order_id": "ord_b_123", "stop_order_id": "stp_b_123", "tp_order_id": "tp_b_123"}
+
+        mock_bridge = MagicMock()
+        mock_bridge.is_connected = True
+        mock_bridge.is_paper = True
+        mock_bridge.account_mode = "PAPER"
+        mock_bridge.get_positions.return_value = []
+        mock_bridge.open_position_count.return_value = 0
+        mock_bridge.has_position.return_value = False
+        mock_bridge.has_working_order.return_value = False
+
+        orch._last_evaluated_5m_bar_str = "PREV_TEST_BAR"
+
+        from strategies.regime_engine import MarketRegimeResult, TEXTURE_TRENDING
+        mock_regime = MarketRegimeResult(
+            mode="RISK_ON",
+            score=3,
+            allow_new_longs=True,
+            allow_new_shorts=True,
+            requires_opening_buffer=False,
+            position_scale=1.0,
+            confidence_boost=0.0,
+            market_texture=TEXTURE_TRENDING,
+            halt_new_entries=False,
+        )
+
+        with patch.object(orch, "evaluate_symbols_parallel", return_value=mock_eval_result), \
+             patch.object(orch, "execute_signal", side_effect=mock_execute_signal), \
+             patch.object(orch, "apply_portfolio_correlation", side_effect=lambda sigs, *a, **k: sigs), \
+             patch.object(orch, "today_pnl", return_value=0.0), \
+             patch.object(orch, "day_trades_in_last_5_days", return_value=0), \
+             patch("strategies.regime_engine.evaluate_market_regime", return_value=mock_regime), \
+             patch.object(orch._regime_state_tracker, "update", return_value=mock_regime), \
+             patch.object(config, "DAYTRADE_BAR_PUBLICATION_TIMEOUT_S", 3600.0), \
+             patch.object(config, "LUNCH_CHOP_FILTER_ENABLED", False), \
+             patch.object(config, "SPY_TREND_GUARD_ENABLED", False), \
+             patch("strategies.execution_health.get_execution_health", return_value=types.SimpleNamespace(allows_new_entries=True, summary="OK", status=types.SimpleNamespace(value="healthy"), bar_age_seconds=10.0, broker_latency_ms=10.0)), \
+             patch("strategies.session.is_past_opening_buffer", return_value=True), \
+             patch("strategies.order_manager.pre_trade_check", return_value=None), \
+             patch("strategies.order_manager._min_confidence_for", return_value=0.50):
+
+            orch.evaluate_and_execute(["AAPL"], bridge=mock_bridge, live_paper=False)
+
+        # Candidate B must be the one executed
+        self.assertEqual(len(executed_signals), 1, "Expected exactly 1 execution for AAPL")
+        self.assertEqual(executed_signals[0].signal_id, "sig_b_candle")
+        self.assertEqual(executed_signals[0].strategy, StrategyName.CANDLESTICK)
+
+    def test_uncertain_submission_does_not_trigger_unsafe_same_symbol_fallback(self):
+        """
+        Acceptance Criteria (Item 3 - Uncertain Submission Non-Bypass):
+        - When winner Candidate A is selected and submitted, but encounters an uncertain
+          result (e.g. SUBMITTED_RECONCILIATION_REQUIRED), the engine does NOT fall back
+          to execute alternative Candidate B on the same symbol in that cycle.
+        """
+        from datetime import datetime, timezone
+        from strategies.orchestrator import EvaluationResult
+        import strategies.orchestrator as orch
+
+        now = time.time()
+        completed_bar_ts = datetime.fromtimestamp(now - 330.0, tz=timezone.utc).isoformat()
+
+        # Both Candidate A and B are valid, Candidate A has higher confidence
+        sig_a = _make_candidate(
+            symbol="AAPL",
+            strategy=StrategyName.GAP_AND_GO,
+            side="BUY",
+            entry_price=150.0,
+            stop_price=148.0,
+            target_price=154.0,
+            risk_per_share=2.0,
+            confidence=0.85,
+            rsi=50.0,
+            signal_id="sig_a_gap",
+        )
+        sig_a.bar_timestamp = completed_bar_ts
+        sig_b = _make_candidate(
+            symbol="AAPL",
+            strategy=StrategyName.CANDLESTICK,
+            side="BUY",
+            entry_price=150.0,
+            stop_price=148.0,
+            target_price=154.0,
+            risk_per_share=2.0,
+            confidence=0.80,
+            rsi=50.0,
+            signal_id="sig_b_candle",
+        )
+        sig_b.bar_timestamp = completed_bar_ts
+
+        mock_eval_result = EvaluationResult(
+            entry_signals=(sig_a, sig_b),
+            entry_allowed=True,
+            suppression_reason=None,
+            coverage=1.0,
+            required_coverage=0.95,
+            received_symbols=("AAPL",),
+            missing_symbols=(),
+        )
+
+        executed_signals = []
+
+        def mock_execute_uncertain(signal, **kwargs):
+            executed_signals.append(signal)
+            # Uncertain / reconciliation required result
+            return {"status": "SUBMITTED_RECONCILIATION_REQUIRED", "order_id": "ord_a_uncertain"}
+
+        mock_bridge = MagicMock()
+        mock_bridge.is_connected = True
+        mock_bridge.is_paper = True
+        mock_bridge.account_mode = "PAPER"
+        mock_bridge.get_positions.return_value = []
+        mock_bridge.open_position_count.return_value = 0
+        mock_bridge.has_position.return_value = False
+        mock_bridge.has_working_order.return_value = False
+
+        orch._last_evaluated_5m_bar_str = "PREV_TEST_BAR"
+
+        from strategies.regime_engine import MarketRegimeResult, TEXTURE_TRENDING
+        mock_regime = MarketRegimeResult(
+            mode="RISK_ON",
+            score=3,
+            allow_new_longs=True,
+            allow_new_shorts=True,
+            requires_opening_buffer=False,
+            position_scale=1.0,
+            confidence_boost=0.0,
+            market_texture=TEXTURE_TRENDING,
+            halt_new_entries=False,
+        )
+
+        with patch.object(orch, "evaluate_symbols_parallel", return_value=mock_eval_result), \
+             patch.object(orch, "execute_signal", side_effect=mock_execute_uncertain), \
+             patch.object(orch, "apply_portfolio_correlation", side_effect=lambda sigs, *a, **k: sigs), \
+             patch.object(orch, "today_pnl", return_value=0.0), \
+             patch.object(orch, "day_trades_in_last_5_days", return_value=0), \
+             patch("strategies.regime_engine.evaluate_market_regime", return_value=mock_regime), \
+             patch.object(orch._regime_state_tracker, "update", return_value=mock_regime), \
+             patch.object(config, "DAYTRADE_BAR_PUBLICATION_TIMEOUT_S", 3600.0), \
+             patch.object(config, "LUNCH_CHOP_FILTER_ENABLED", False), \
+             patch.object(config, "SPY_TREND_GUARD_ENABLED", False), \
+             patch("strategies.execution_health.get_execution_health", return_value=types.SimpleNamespace(allows_new_entries=True, summary="OK", status=types.SimpleNamespace(value="healthy"), bar_age_seconds=10.0, broker_latency_ms=10.0)), \
+             patch("strategies.session.is_past_opening_buffer", return_value=True), \
+             patch("strategies.order_manager.pre_trade_check", return_value=None), \
+             patch("strategies.order_manager._min_confidence_for", return_value=0.50):
+
+            orch.evaluate_and_execute(["AAPL"], bridge=mock_bridge, live_paper=False)
+
+        # Only Candidate A was executed; no unsafe fallback to Candidate B
+        self.assertEqual(len(executed_signals), 1)
+        self.assertEqual(executed_signals[0].signal_id, "sig_a_gap")
+
 
 if __name__ == "__main__":
     unittest.main()
