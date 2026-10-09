@@ -277,8 +277,12 @@ def verify_broker_stop_order_evidence(
     elif raw_filled_qty is not None:
         if type(raw_filled_qty).__name__ not in ("MagicMock", "Mock"):
             valid_filled, f_qty = _is_finite_non_negative(raw_filled_qty)
-            if valid_filled and f_qty is not None:
-                filled_qty_f = f_qty
+            if not valid_filled:
+                return False, f"EVIDENCE_FILLED_QTY_INVALID: Filled qty {raw_filled_qty} is not finite or < 0"
+            filled_qty_f = f_qty
+
+    if filled_qty_f > order_qty_f:
+        return False, f"EVIDENCE_FILLED_EXCEEDS_QTY: Filled qty {filled_qty_f:.4f} > order qty {order_qty_f:.4f}"
 
     remaining_qty = order_qty_f - filled_qty_f
     if remaining_qty <= 0.0:
@@ -794,7 +798,7 @@ class DynamicTrailingStopManager:
                             expected_stop_price=initial_stop,
                             expected_qty=expected_qty,
                             fill_price=fill_price,
-                            require_qty=True if expected_qty is not None else False,
+                            require_qty=True,
                         )
                         if snap_valid:
                             broker_confirmed = True

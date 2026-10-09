@@ -1456,6 +1456,275 @@ class TestStopRebuildAndPersistenceHardening(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("EXACT_PROTECTION_INVALID_STOP_PRICE", reason)
 
+    def test_filled_qty_exceeds_order_qty_rejected(self):
+        """Criterion 1: filled_qty > order qty must fail closed with EVIDENCE_FILLED_EXCEEDS_QTY."""
+        order = {
+            "id": "s1",
+            "symbol": "AAPL",
+            "side": "sell",
+            "type": "stop",
+            "status": "partially_filled",
+            "qty": 10.0,
+            "filled_qty": 11.0,
+            "stop_price": 99.0,
+        }
+        kw = dict(
+            expected_order_id="s1",
+            expected_symbol="AAPL",
+            position_side="BUY",
+            expected_stop_price=99.0,
+            expected_qty=10.0,
+        )
+        valid, reason = verify_broker_stop_order_evidence(order, **kw)
+        self.assertFalse(valid)
+        self.assertIn("EVIDENCE_FILLED_EXCEEDS_QTY", reason)
+
+    def test_malformed_raw_filled_qty_fails_closed(self):
+        """Criterion 1: Non-mock raw_filled_qty that is negative, NaN, or non-numeric must fail closed."""
+        import math
+        kw = dict(
+            expected_order_id="s1",
+            expected_symbol="AAPL",
+            position_side="BUY",
+            expected_stop_price=99.0,
+            expected_qty=10.0,
+        )
+        for bad_filled in [-1.0, math.nan, "bad_num"]:
+            order = {
+                "id": "s1",
+                "symbol": "AAPL",
+                "side": "sell",
+                "type": "stop",
+                "status": "new",
+                "qty": 10.0,
+                "filled_qty": bad_filled,
+                "stop_price": 99.0,
+            }
+            valid, reason = verify_broker_stop_order_evidence(order, **kw)
+            self.assertFalse(valid)
+            self.assertIn("EVIDENCE_FILLED_QTY_INVALID", reason)
+
+    def test_final_submit_boundary_persistence_race_veto(self):
+        """
+        Criterion 2: Pre-flight persistence check passes, but right before broker submission,
+        persistence becomes unhealthy. Must veto entry, release reservation, and NEVER call broker submit.
+        """
+        from strategies.order_manager import execute_signal
+        from strategies.base import EntryReadiness
+        from strategies.order_idempotency import idempotency_manager
+        from datetime import datetime, timezone
+        import types
+
+        now = time.time()
+        mock_bridge = MagicMock()
+        mock_bridge.is_connected = True
+        mock_bridge.open_position_count.return_value = 0
+        mock_bridge.list_positions.return_value = []
+        mock_bridge.has_position.return_value = False
+        mock_bridge.has_working_order.return_value = False
+        mock_bridge.get_quote.return_value = {
+            "symbol": "SPY",
+            "bid": 500.00,
+            "ask": 500.05,
+            "last": 500.02,
+            "timestamp": now - 1.0,
+            "source": "alpaca",
+            "is_realtime": True,
+            "feed_identity": "iex",
+        }
+
+        signal = TradeSignal(
+            symbol="SPY",
+            strategy=StrategyName.VWAP_BOUNCE,
+            side="BUY",
+            confidence=0.85,
+            entry_price=500.00,
+            stop_price=498.00,
+            target_price=504.00,
+            atr=1.00,
+            risk_per_share=2.00,
+            reason="Final submit persistence test",
+            bar_timestamp=datetime.fromtimestamp(now - 330.0, tz=timezone.utc).isoformat(),
+            decision_feed="iex",
+        )
+        readiness = EntryReadiness(
+            entry_allowed=True,
+            suppression_reason=None,
+            cycle_id="cycle_persist_final_submit",
+            bar_ts=datetime.fromtimestamp(now - 330.0, tz=timezone.utc).isoformat(),
+            created_at=now,
+            expires_at=now + 300.0,
+        )
+
+        # Dynamic manager mock: healthy on first call (Phase 0), degraded on second call (Phase C Final Submit)
+        class DynamicManager:
+            def __init__(self, mode="unhealthy"):
+                self.calls = 0
+                self.mode = mode
+                self.persistence_healthy = True
+                self.last_persistence_error = None
+
+            def __call__(self):
+                self.calls += 1
+                if self.calls == 1:
+                    # Phase 0 pre-flight passes
+                    return types.SimpleNamespace(persistence_healthy=True, last_persistence_error=None)
+                else:
+                    # Phase C final submit degrades
+                    if self.mode == "unhealthy":
+                        return types.SimpleNamespace(persistence_healthy=False, last_persistence_error="FINAL_SUBMIT_DISK_CORRUPT")
+                    elif self.mode == "missing_mgr":
+                        return None
+                    elif self.mode == "missing_attr":
+                        return types.SimpleNamespace()
+                    elif self.mode == "exception":
+                        return type("ExcManager", (), {
+                            "persistence_healthy": property(lambda self: (_ for _ in ()).throw(RuntimeError("I/O error during final check")))
+                        })()
+                    return types.SimpleNamespace(persistence_healthy=None, last_persistence_error="UNKNOWN")
+
+        for degrade_mode in ["unhealthy", "missing_mgr", "missing_attr", "exception"]:
+            idempotency_manager.clear()
+            dyn_mgr = DynamicManager(mode=degrade_mode)
+
+            with patch("strategies.trailing_stop.get_trailing_manager", side_effect=dyn_mgr), \
+                 patch("strategies.order_manager._place_bracket_order_once") as mock_place, \
+                 patch("config.SPY_TREND_GUARD_ENABLED", False), \
+                 patch("config.VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED", False), \
+                 patch("strategies.intraday_risk.get_recent_symbol_loss_time", return_value=None):
+
+                res = execute_signal(
+                    signal=signal,
+                    bridge=mock_bridge,
+                    equity=100000.0,
+                    current_pnl=0.0,
+                    dry_run=False,
+                    entry_readiness=readiness,
+                    regime_result=types.SimpleNamespace(mode="NORMAL", position_scale=1.0),
+                )
+
+                self.assertEqual(res.get("status"), "VETOED", f"Mode {degrade_mode} should be VETOED")
+                self.assertIn("Final Submit", res.get("reason", ""), f"Mode {degrade_mode} reason should cite Final Submit")
+                mock_place.assert_not_called()
+                mock_bridge.submit_order.assert_not_called()
+                if hasattr(mock_bridge, "_client"):
+                    mock_bridge._client.submit_order.assert_not_called()
+
+                # Reservation must be cleanly released from pre-submit state
+                self.assertNotIn(("SPY", "BUY"), idempotency_manager.reservations)
+
+    def test_candle_entry_missing_bar_timestamp_rejected(self):
+        """
+        Criterion 3: Candle-based entry signals missing bar_timestamp must fail closed.
+        - When entry readiness is active: Upstream readiness gate rejects as REJECTED (ENTRY_READINESS_BAR_INVALID).
+        - When entry readiness is bypassed: Phase A quote gate vetoes as VETOED (BAR_TIMESTAMP_MISSING).
+        - Validation lane also catches missing bar as BAR_TIMESTAMP_MISSING.
+        - Generic quote validation remains unblocked without bar_timestamp.
+        """
+        from strategies.order_manager import execute_signal
+        from strategies.validation_lane import evaluate_and_route_validation_candidate
+        from strategies.execution_quote import validate_execution_quote
+        from strategies.base import EntryReadiness
+        from datetime import datetime, timezone
+        import types
+
+        now = time.time()
+        mock_bridge = MagicMock()
+        mock_bridge.is_connected = True
+        mock_bridge.open_position_count.return_value = 0
+        mock_bridge.list_positions.return_value = []
+        mock_bridge.has_position.return_value = False
+        mock_bridge.has_working_order.return_value = False
+        mock_bridge.get_quote.return_value = {
+            "symbol": "AAPL",
+            "bid": 150.00,
+            "ask": 150.05,
+            "last": 150.02,
+            "timestamp": now - 1.0,
+            "source": "alpaca",
+            "is_realtime": True,
+            "feed_identity": "iex",
+        }
+
+        sig_no_bar = TradeSignal(
+            symbol="AAPL",
+            strategy=StrategyName.ORB,
+            side="BUY",
+            confidence=0.85,
+            entry_price=150.00,
+            stop_price=148.00,
+            target_price=154.00,
+            atr=1.00,
+            risk_per_share=2.00,
+            reason="Missing bar test",
+            bar_timestamp=None,
+            decision_feed="iex",
+        )
+        readiness = EntryReadiness(
+            entry_allowed=True,
+            suppression_reason=None,
+            cycle_id="cycle_bar_test",
+            bar_ts="2026-10-09T00:00:00Z",
+            created_at=now,
+            expires_at=now + 300.0,
+        )
+
+        with patch("strategies.trailing_stop.get_trailing_manager", return_value=types.SimpleNamespace(persistence_healthy=True)), \
+             patch("strategies.order_manager._place_bracket_order_once") as mock_place, \
+             patch("config.SPY_TREND_GUARD_ENABLED", False), \
+             patch("strategies.intraday_risk.get_recent_symbol_loss_time", return_value=None):
+
+            # 1a. Default mode (Readiness active): Upstream readiness gate blocks missing signal bar
+            res_readiness = execute_signal(
+                signal=sig_no_bar,
+                bridge=mock_bridge,
+                equity=100000.0,
+                current_pnl=0.0,
+                dry_run=False,
+                entry_readiness=readiness,
+                regime_result=types.SimpleNamespace(mode="NORMAL", position_scale=1.0),
+            )
+            self.assertEqual(res_readiness.get("status"), "REJECTED")
+            self.assertIn("ENTRY_READINESS_BAR_INVALID", res_readiness.get("reason", ""))
+            mock_place.assert_not_called()
+
+            # 1b. Defense-in-depth (Readiness bypassed): Quote gate blocks missing candle bar
+            with patch("config.DAYTRADE_REQUIRE_ENTRY_READINESS", False):
+                res_quote_gate = execute_signal(
+                    signal=sig_no_bar,
+                    bridge=mock_bridge,
+                    equity=100000.0,
+                    current_pnl=0.0,
+                    dry_run=False,
+                    entry_readiness=None,
+                    regime_result=types.SimpleNamespace(mode="NORMAL", position_scale=1.0),
+                )
+                self.assertEqual(res_quote_gate.get("status"), "VETOED")
+                self.assertIn("BAR_TIMESTAMP_MISSING", res_quote_gate.get("reason", ""))
+                mock_place.assert_not_called()
+
+        # 2. Validation lane with missing bar_timestamp for candle entry
+        with patch("config.VALIDATION_LANE_ENABLED", True):
+            val_res = evaluate_and_route_validation_candidate(
+                signal=sig_no_bar,
+                bridge=mock_bridge,
+                policy_stage="STAGE_REGIME",
+                policy_reason_code="REGIME_TEXTURE_FILTER",
+                policy_reason_msg="Sideways rejected",
+                dry_run=True,
+            )
+            self.assertEqual(val_res.get("status"), "VETOED")
+            self.assertIn("BAR_TIMESTAMP_MISSING", val_res.get("reason", ""))
+
+        # 3. Generic quote validation without bar_timestamp succeeds normally
+        quote_res = validate_execution_quote(
+            bridge=mock_bridge,
+            symbol="AAPL",
+            decision_price=150.00,
+            bar_timestamp=None,  # generic non-candle validation
+        )
+        self.assertTrue(quote_res.valid, "Generic quote validation must NOT require bar_timestamp")
+
 
 if __name__ == "__main__":
     unittest.main()

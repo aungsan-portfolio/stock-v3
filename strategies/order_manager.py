@@ -2101,6 +2101,25 @@ def execute_signal(
             from strategies.execution_quote import validate_execution_quote
             bar_ts = getattr(executable_signal, "bar_timestamp", None) or getattr(signal, "bar_timestamp", None)
             bar_dur_raw = getattr(executable_signal, "bar_duration_seconds", getattr(signal, "bar_duration_seconds", getattr(config, "ENTRY_BAR_DURATION_SECONDS", 300.0)))
+
+            # Defense-in-depth: Candle-based entry signals strictly require bar_timestamp
+            strat_obj = getattr(signal, "strategy", None)
+            strat_key = getattr(strat_obj, "name", getattr(strat_obj, "value", str(strat_obj or ""))).upper()
+            is_candle_strategy = strat_key in {
+                "ORB", "VWAP_BOUNCE", "GAP_AND_GO", "MOMENTUM_SCALP", "CANDLESTICK", "MEAN_REVERSION"
+            }
+            order_intent_raw = getattr(signal, "order_intent", getattr(OrderIntent, "ENTRY", "ENTRY"))
+            order_intent_str = getattr(order_intent_raw, "value", str(order_intent_raw)).upper()
+            is_candle_entry = is_candle_strategy and (order_intent_str == "ENTRY")
+
+            if is_candle_entry:
+                if bar_ts is None or str(bar_ts).strip() == "":
+                    idempotency_manager.release(signal.symbol, side=signal.side, reason="entry_bar_timestamp_missing")
+                    result["status"] = "VETOED"
+                    result["reason"] = "Execution Quote Gate failed closed: BAR_TIMESTAMP_MISSING (candle-based entry signal missing bar_timestamp)"
+                    logger.warning("[EXECUTION QUOTE VETO] %s: Candle entry signal missing bar_timestamp.", signal.symbol)
+                    return result
+
             if bar_ts is not None:
                 if bar_dur_raw is None:
                     idempotency_manager.release(signal.symbol, side=signal.side, reason="bar_duration_missing")
@@ -2345,6 +2364,89 @@ def execute_signal(
             )
         except Exception as audit_snap_exc:
             logger.debug("[ORDER AUDIT] Failed to record submission snapshot: %s", audit_snap_exc)
+
+        # Phase C: Final-Submit Boundary Persistence Health Gate
+        # Strict Fail-Closed: Immediately before delegating to the broker submission adapter,
+        # re-verify the canonical trailing stop manager's persistence health.
+        if not dry_run and is_connected:
+            try:
+                from strategies.trailing_stop import get_trailing_manager
+                final_ts_mgr = get_trailing_manager()
+                if final_ts_mgr is None:
+                    idempotency_manager.release(
+                        signal.symbol,
+                        side=signal.side,
+                        reason="final_submit_trailing_manager_missing",
+                    )
+                    result["status"] = "VETOED"
+                    result["reason"] = (
+                        "Trailing Stop Persistence Gate (Final Submit): "
+                        "Manager instance missing (fail-closed)"
+                    )
+                    logger.warning(
+                        "[PERSISTENCE HEALTH FINAL SUBMIT VETO] %s: Trailing stop manager missing immediately before submit.",
+                        signal.symbol,
+                    )
+                    return result
+
+                if not hasattr(final_ts_mgr, "persistence_healthy"):
+                    idempotency_manager.release(
+                        signal.symbol,
+                        side=signal.side,
+                        reason="final_submit_persistence_attr_missing",
+                    )
+                    result["status"] = "VETOED"
+                    result["reason"] = (
+                        "Trailing Stop Persistence Gate (Final Submit): "
+                        "persistence_healthy attribute missing (fail-closed)"
+                    )
+                    logger.warning(
+                        "[PERSISTENCE HEALTH FINAL SUBMIT VETO] %s: persistence_healthy attribute missing immediately before submit.",
+                        signal.symbol,
+                    )
+                    return result
+
+                final_healthy = getattr(final_ts_mgr, "persistence_healthy", None)
+                if final_healthy is not True:
+                    last_err = getattr(
+                        final_ts_mgr,
+                        "last_persistence_error",
+                        "STATE_UNHEALTHY_OR_UNKNOWN",
+                    )
+                    idempotency_manager.release(
+                        signal.symbol,
+                        side=signal.side,
+                        reason="final_submit_persistence_unhealthy",
+                    )
+                    result["status"] = "VETOED"
+                    result["reason"] = (
+                        f"Trailing Stop Persistence Unhealthy (Final Submit): "
+                        f"{last_err} (new entries blocked)"
+                    )
+                    logger.warning(
+                        "[PERSISTENCE HEALTH FINAL SUBMIT VETO] %s: Trailing stop state persistence is %s (%s) immediately before submit.",
+                        signal.symbol,
+                        final_healthy,
+                        last_err,
+                    )
+                    return result
+            except Exception as final_persist_err:
+                idempotency_manager.release(
+                    signal.symbol,
+                    side=signal.side,
+                    reason="final_submit_persistence_check_exception",
+                )
+                result["status"] = "VETOED"
+                result["reason"] = (
+                    f"Trailing Stop Persistence Gate (Final Submit) Exception: "
+                    f"{final_persist_err} (fail-closed)"
+                )
+                logger.warning(
+                    "[PERSISTENCE HEALTH FINAL SUBMIT VETO] %s: Trailing stop health check raised exception %s immediately before submit.",
+                    signal.symbol,
+                    final_persist_err,
+                )
+                return result
 
         order = _place_bracket_order_once(
             bridge,

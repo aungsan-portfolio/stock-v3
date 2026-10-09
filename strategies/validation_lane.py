@@ -596,6 +596,21 @@ def evaluate_and_route_validation_candidate(
     now = time.time()
     decision_feed = getattr(signal, "decision_feed", None) or "iex"
     bar_ts = getattr(signal, "bar_timestamp", None)
+    strat_obj = getattr(signal, "strategy", None)
+    strat_key = getattr(strat_obj, "name", getattr(strat_obj, "value", str(strat_obj or ""))).upper()
+    is_candle_strategy = strat_key in {
+        "ORB", "VWAP_BOUNCE", "GAP_AND_GO", "MOMENTUM_SCALP", "CANDLESTICK", "MEAN_REVERSION"
+    }
+    order_intent_raw = getattr(signal, "order_intent", "ENTRY")
+    order_intent_str = getattr(order_intent_raw, "value", str(order_intent_raw)).upper()
+    is_candle_entry = is_candle_strategy and (order_intent_str == "ENTRY")
+
+    if is_candle_entry:
+        if bar_ts is None or str(bar_ts).strip() == "":
+            result["reason"] = "Hard Safety Quote Gate: BAR_TIMESTAMP_MISSING (candle-based entry signal missing bar_timestamp)"
+            logger.warning("[VALIDATION HARD SAFETY VETO] %s: Candle entry signal missing bar_timestamp.", signal.symbol)
+            return result
+
     if bar_ts is not None:
         bar_dur_raw = getattr(signal, "bar_duration_seconds", getattr(config, "ENTRY_BAR_DURATION_SECONDS", 300.0))
         if bar_dur_raw is None:
