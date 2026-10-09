@@ -44,6 +44,11 @@ class VetoReason(str, Enum):
     IDEMPOTENCY_HELD = "IDEMPOTENCY_HELD"
     STRATEGY_DISABLED = "STRATEGY_DISABLED"
 
+    # Market Texture & Strategy Coordination
+    TEXTURE_NOT_ALLOWED = "TEXTURE_NOT_ALLOWED"
+    NO_SUPPORTED_STRATEGY = "NO_SUPPORTED_STRATEGY"
+    CANDIDATE_SUPERSEDED = "CANDIDATE_SUPERSEDED"
+
 
 # Hard-veto codes that legitimately trigger symbol-level skip suppression
 # Strictly excludes generic indicator/data logging containing 'atr'

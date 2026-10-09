@@ -79,6 +79,19 @@ _session_cooldown_counts = defaultdict(int)
 _session_permanently_suppressed = set()
 _seen_veto_fingerprints = {}
 
+# Setup-scoped suppression state (keyed by (symbol, strategy, side))
+_setup_skip_counts = defaultdict(int)
+_setup_suppressed_until = {}
+_setup_cooldown_counts = defaultdict(int)
+_setup_permanently_suppressed = set()
+
+
+def _normalize_setup_key(symbol: str, strategy: Optional[Any] = None, side: Optional[str] = None) -> Tuple[str, str, str]:
+    sym = symbol.upper().strip()
+    strat_str = getattr(strategy, "name", getattr(strategy, "value", str(strategy or "*"))).upper().strip()
+    side_str = str(side or "*").upper().strip()
+    return (sym, strat_str, side_str)
+
 
 def _get_skip_limit() -> int:
     return getattr(config, "HARD_VETO_SKIP_LIMIT", 5)
@@ -92,38 +105,71 @@ def _get_max_cooldown_cycles() -> int:
     return int(getattr(config, "MAX_DAILY_COOLDOWN_CYCLES", 3))
 
 
-def check_session_suppression(symbol: str) -> Tuple[bool, str]:
-    """Checks if a symbol is actively suppressed or in cooldown."""
+def check_session_suppression(
+    symbol: str,
+    strategy: Optional[Any] = None,
+    side: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Checks if a symbol or specific setup (symbol, strategy, side) is actively suppressed or in cooldown.
+    Tier 1: Global / whole-symbol hazards & suppression.
+    Tier 2: Candidate-specific setup suppression (prevents cross-strategy contamination).
+    """
     if not getattr(config, "SKIP_SUPPRESSOR_ENABLED", True):
         return False, ""
     sym = symbol.upper().strip()
+    now = time.time()
 
     with _session_state_lock:
-        # 1. Check permanent full-day suppression (exceeded max cooldown cycles)
+        # Tier 1: Check permanent full-day symbol suppression (exceeded max cooldown cycles)
         if sym in _session_permanently_suppressed:
             max_cycles = _get_max_cooldown_cycles()
             return True, f"[SESSION SUPPRESSED] {sym}: permanently suppressed this session (exceeded {max_cycles} cooldown cycles)"
 
-        # 2. Check dynamic cooldown window
+        # Tier 1: Check dynamic symbol cooldown window
         if sym in _session_suppressed_until:
-            now = time.time()
             until = _session_suppressed_until[sym]
             if now < until:
                 remaining_min = (until - now) / 60.0
                 cycle = _session_cooldown_counts[sym]
                 return True, f"[SESSION SUPPRESSED] {sym}: cooldown active ({remaining_min:.1f}m remaining, Cycle #{cycle})"
             else:
-                # Cooldown expired! Restore symbol to active evaluation
                 cycle = _session_cooldown_counts[sym]
                 logger.info("[COOLDOWN EXPIRE] %s: Cooldown period ended (Cycle #%d). Symbol restored to active evaluation.", sym, cycle)
                 del _session_suppressed_until[sym]
-                return False, ""
+
+        # Tier 2: Check Setup-Scoped Suppression (symbol, strategy, side)
+        if strategy is not None:
+            setup_key = _normalize_setup_key(sym, strategy, side)
+            strat_label = f"{setup_key[1]}:{setup_key[2]}"
+            if setup_key in _setup_permanently_suppressed:
+                max_cycles = _get_max_cooldown_cycles()
+                return True, f"[SESSION SUPPRESSED] {sym} [{strat_label}]: permanently suppressed this session (exceeded {max_cycles} cooldown cycles)"
+
+            if setup_key in _setup_suppressed_until:
+                until = _setup_suppressed_until[setup_key]
+                if now < until:
+                    remaining_min = (until - now) / 60.0
+                    cycle = _setup_cooldown_counts[setup_key]
+                    return True, f"[SESSION SUPPRESSED] {sym} [{strat_label}]: cooldown active ({remaining_min:.1f}m remaining, Cycle #{cycle})"
+                else:
+                    cycle = _setup_cooldown_counts[setup_key]
+                    logger.info("[COOLDOWN EXPIRE] %s [%s]: Cooldown period ended (Cycle #%d). Setup restored to active evaluation.", sym, strat_label, cycle)
+                    del _setup_suppressed_until[setup_key]
 
         return False, ""
 
 
-def record_hard_veto_skip(symbol: str, reason: Union[str, Any], bar_timestamp: str = ""):
-    """Increments skip counter when noise floor / tight stop hard vetoes occur, deduplicated per bar fingerprint."""
+def record_hard_veto_skip(
+    symbol: str,
+    reason: Union[str, Any],
+    bar_timestamp: str = "",
+    strategy: Optional[Any] = None,
+    side: Optional[str] = None,
+):
+    """Increments skip counter when noise floor / tight stop hard vetoes occur, deduplicated per bar fingerprint.
+    When strategy and side are provided, scopes cooldown to (symbol, strategy, side) so one strategy's
+    rejection does not contaminate other viable strategies on the same symbol.
+    """
     from strategies.veto_reasons import VetoReason, HARD_VETO_CODES
 
     sym = symbol.upper().strip()
@@ -156,57 +202,103 @@ def record_hard_veto_skip(symbol: str, reason: Union[str, Any], bar_timestamp: s
         return
 
     with _session_state_lock:
-        # Deduplicate repeat logs for identical geometry within 3600 seconds (session-level) across identical veto reasons
-        fingerprint = f"{sym}:{bar_timestamp}:{reason_str.strip()[:80]}"
         now = time.time()
-        last_seen = _seen_veto_fingerprints.get(fingerprint, 0)
+        # Candidate-specific setup suppression when strategy identity is provided
+        if strategy is not None:
+            setup_key = _normalize_setup_key(sym, strategy, side)
+            strat_label = f"{setup_key[1]}:{setup_key[2]}"
+            fingerprint = f"{setup_key[0]}:{strat_label}:{bar_timestamp}:{reason_str.strip()[:80]}"
+            last_seen = _seen_veto_fingerprints.get(fingerprint, 0)
 
-        if now - last_seen < 3600:
+            if now - last_seen < 3600:
+                count = _setup_skip_counts[setup_key]
+                logger.debug("[SKIP COUNTER REPEAT] %s [%s]: Repeat hard veto skip #%d (deduplicated) — reason: %s", sym, strat_label, count, reason)
+                return
+
+            _seen_veto_fingerprints[fingerprint] = now
+            _setup_skip_counts[setup_key] += 1
+            count = _setup_skip_counts[setup_key]
+            limit = _get_skip_limit()
+            logger.info("[SKIP COUNTER] %s [%s]: Hard veto skip #%d/%d — reason: %s", sym, strat_label, count, limit, reason)
+
+            if count >= limit:
+                max_cycles = _get_max_cooldown_cycles()
+                current_cycles = _setup_cooldown_counts[setup_key]
+
+                if current_cycles >= max_cycles:
+                    _setup_permanently_suppressed.add(setup_key)
+                    _setup_skip_counts[setup_key] = 0
+                    logger.warning(
+                        "🚨 [SESSION SUPPRESS PERMANENT] %s [%s]: Suppressed for remainder of session after reaching max cooldown cycles (%d/%d).",
+                        sym, strat_label, current_cycles, max_cycles,
+                    )
+                else:
+                    cooldown_sec = _get_cooldown_seconds()
+                    cooldown_until = now + cooldown_sec
+                    _setup_suppressed_until[setup_key] = cooldown_until
+                    _setup_cooldown_counts[setup_key] += 1
+                    _setup_skip_counts[setup_key] = 0
+                    cooldown_min = cooldown_sec / 60.0
+                    resume_str = time.strftime("%H:%M:%S", time.localtime(cooldown_until))
+                    logger.warning(
+                        "⏳ [COOLDOWN START] %s [%s]: Suppressed for %.1fm cooldown (Cycle #%d/%d) after %d hard vetoes. Active again at %s.",
+                        sym, strat_label, cooldown_min, _setup_cooldown_counts[setup_key], max_cycles, count, resume_str,
+                    )
+        else:
+            # Fallback / Global symbol-level suppression (when no strategy identity is provided)
+            fingerprint = f"{sym}:{bar_timestamp}:{reason_str.strip()[:80]}"
+            last_seen = _seen_veto_fingerprints.get(fingerprint, 0)
+
+            if now - last_seen < 3600:
+                count = _session_skip_counts[sym]
+                logger.debug("[SKIP COUNTER REPEAT] %s: Repeat hard veto skip #%d (deduplicated) — reason: %s", sym, count, reason)
+                return
+
+            _seen_veto_fingerprints[fingerprint] = now
+            _session_skip_counts[sym] += 1
             count = _session_skip_counts[sym]
-            logger.debug("[SKIP COUNTER REPEAT] %s: Repeat hard veto skip #%d (deduplicated) — reason: %s", sym, count, reason)
-            return
+            limit = _get_skip_limit()
+            logger.info("[SKIP COUNTER] %s: Hard veto skip #%d/%d — reason: %s", sym, count, limit, reason)
 
-        _seen_veto_fingerprints[fingerprint] = now
-        _session_skip_counts[sym] += 1
-        count = _session_skip_counts[sym]
-        limit = _get_skip_limit()
-        logger.info("[SKIP COUNTER] %s: Hard veto skip #%d/%d — reason: %s", sym, count, limit, reason)
+            if count >= limit:
+                max_cycles = _get_max_cooldown_cycles()
+                current_cycles = _session_cooldown_counts[sym]
 
-        if count >= limit:
-            max_cycles = _get_max_cooldown_cycles()
-            current_cycles = _session_cooldown_counts[sym]
-
-            # Safeguard #1: Cooldown Cycle Cap (Max 3 cycles before full-day permanent suppression)
-            if current_cycles >= max_cycles:
-                _session_permanently_suppressed.add(sym)
-                _session_skip_counts[sym] = 0
-                logger.warning(
-                    "🚨 [SESSION SUPPRESS PERMANENT] %s: Suppressed for remainder of session after reaching max cooldown cycles (%d/%d).",
-                    sym, current_cycles, max_cycles,
-                )
-            else:
-                cooldown_sec = _get_cooldown_seconds()
-                cooldown_until = now + cooldown_sec
-                _session_suppressed_until[sym] = cooldown_until
-                _session_cooldown_counts[sym] += 1
-                _session_skip_counts[sym] = 0  # Counter reset for fresh post-cooldown budget
-                cooldown_min = cooldown_sec / 60.0
-                resume_str = time.strftime("%H:%M:%S", time.localtime(cooldown_until))
-                logger.warning(
-                    "⏳ [COOLDOWN START] %s: Suppressed for %.1fm cooldown (Cycle #%d/%d) after %d hard vetoes. Active again at %s.",
-                    sym, cooldown_min, _session_cooldown_counts[sym], max_cycles, count, resume_str,
-                )
+                if current_cycles >= max_cycles:
+                    _session_permanently_suppressed.add(sym)
+                    _session_skip_counts[sym] = 0
+                    logger.warning(
+                        "🚨 [SESSION SUPPRESS PERMANENT] %s: Suppressed for remainder of session after reaching max cooldown cycles (%d/%d).",
+                        sym, current_cycles, max_cycles,
+                    )
+                else:
+                    cooldown_sec = _get_cooldown_seconds()
+                    cooldown_until = now + cooldown_sec
+                    _session_suppressed_until[sym] = cooldown_until
+                    _session_cooldown_counts[sym] += 1
+                    _session_skip_counts[sym] = 0  # Counter reset for fresh post-cooldown budget
+                    cooldown_min = cooldown_sec / 60.0
+                    resume_str = time.strftime("%H:%M:%S", time.localtime(cooldown_until))
+                    logger.warning(
+                        "⏳ [COOLDOWN START] %s: Suppressed for %.1fm cooldown (Cycle #%d/%d) after %d hard vetoes. Active again at %s.",
+                        sym, cooldown_min, _session_cooldown_counts[sym], max_cycles, count, resume_str,
+                    )
 
 
 def reset_session_skip_state():
     """Resets session skip state for new trading sessions."""
     global _session_skip_counts, _session_suppressed_until, _session_cooldown_counts, _session_permanently_suppressed, _seen_veto_fingerprints
+    global _setup_skip_counts, _setup_suppressed_until, _setup_cooldown_counts, _setup_permanently_suppressed
     with _session_state_lock:
         _session_skip_counts = defaultdict(int)
         _session_suppressed_until = {}
         _session_cooldown_counts = defaultdict(int)
         _session_permanently_suppressed = set()
         _seen_veto_fingerprints = {}
+        _setup_skip_counts = defaultdict(int)
+        _setup_suppressed_until = {}
+        _setup_cooldown_counts = defaultdict(int)
+        _setup_permanently_suppressed = set()
     logger.info("[ORDER MANAGER] Session skip state reset.")
 
 
@@ -1497,7 +1589,11 @@ def execute_signal(
             logger.critical("[PAPER ACCOUNT GATE] %s", paper_reason)
             return result
 
-    suppressed, supp_reason = check_session_suppression(signal.symbol)
+    suppressed, supp_reason = check_session_suppression(
+        signal.symbol,
+        strategy=getattr(signal, "strategy", None),
+        side=getattr(signal, "side", None),
+    )
     if suppressed:
         result["reason"] = supp_reason
         logger.info("Skipped %s: %s", signal.symbol, supp_reason)
@@ -1599,7 +1695,13 @@ def execute_signal(
     price_reason = _validate_signal_prices(signal, market_texture=market_texture, quote=quote)
     if price_reason:
         result["reason"] = price_reason
-        record_hard_veto_skip(signal.symbol, price_reason, getattr(signal, "bar_timestamp", "") or "")
+        record_hard_veto_skip(
+            signal.symbol,
+            price_reason,
+            getattr(signal, "bar_timestamp", "") or "",
+            strategy=getattr(signal, "strategy", None),
+            side=getattr(signal, "side", None),
+        )
         logger.info("Skipped %s: %s", signal.symbol, price_reason)
         return result
 
@@ -1607,7 +1709,13 @@ def execute_signal(
     executable_price_reason = _validate_signal_prices(executable_signal, market_texture=market_texture, quote=quote)
     if executable_price_reason:
         result["reason"] = f"Invalid executable limit: {executable_price_reason}"
-        record_hard_veto_skip(signal.symbol, executable_price_reason, getattr(signal, "bar_timestamp", "") or "")
+        record_hard_veto_skip(
+            signal.symbol,
+            executable_price_reason,
+            getattr(signal, "bar_timestamp", "") or "",
+            strategy=getattr(signal, "strategy", None),
+            side=getattr(signal, "side", None),
+        )
         logger.info("Skipped %s: %s", signal.symbol, result["reason"])
         return result
 

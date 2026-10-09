@@ -212,7 +212,7 @@ MARKET_REGIME_SETTINGS = {
         "confidence_min": 0.60,
         "tp_atr_mult": 1.5,
         "halt_new_entries": False,
-        "allowed_strategies": ["MEAN_REVERSION", "VWAP_BOUNCE", "ORB_BREAKOUT"]
+        "allowed_strategies": ["MEAN_REVERSION", "VWAP_BOUNCE", "ORB"]
     }
 }
 

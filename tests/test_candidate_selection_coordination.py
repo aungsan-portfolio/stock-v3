@@ -1,27 +1,27 @@
 """
 tests/test_candidate_selection_coordination.py
 
-Tests candidate selection, deduplication, and strategy coordination in orchestrator.py:
-- Fix 1 Verification: Moving seen_symbols.add(sym) after candidate checks ensures
-  a candidate failing RSI, inverse-ETF, or geometry does not claim the symbol and
-  suppress a viable alternative candidate.
-- Acceptance Scenarios:
-  1. Leader BUY RSI overbought (80), follower BUY RSI (50) -> follower selected
-  2. Leader geometry fails, follower valid -> follower selected
-  3. Both valid same symbol -> leader selected, follower rejected as duplicate (one winner)
-  4. Different symbols both valid -> both retained
-  5. Both invalid geometry -> none retained
-  6. Same RSI opposite sides (SELL RSI=20 fails, BUY RSI=20 passes) -> BUY selected
-  7. Short RSI fails (SELL RSI=20), follower valid (SELL RSI=50) -> follower selected
-  8. Pre-submit veto does not automatically fallback to superseded candidate
+Tests candidate selection, deduplication, and strategy coordination:
+1. Fix 1 Verification (Production Function): Direct testing of canonical
+   `strategies.orchestrator.select_viable_cycle_candidates` across all 7 probe scenarios.
+2. Final-Submit Boundary & Non-Fallback Integration: Validates that when a selected
+   candidate passes pre-flight but fails the final-submit boundary gate, it is vetoed
+   without broker submission, releases reservation, and does NOT trigger an automatic
+   retry loop over rejected candidates.
+3. Setup-Scoped Suppression Cooldown: Validates that 5 noise-floor vetoes on Strategy A
+   trigger a setup-scoped cooldown (symbol, strategy, side) while leaving Strategy B
+   on the same symbol completely unsuppressed.
 """
 
 import unittest
 from unittest.mock import MagicMock, patch
+import time
 import types
 
 from strategies.base import TradeSignal
 from strategies.constants import StrategyName
+from strategies.orchestrator import select_viable_cycle_candidates
+import strategies.order_manager as om
 import config
 
 
@@ -60,48 +60,20 @@ def _make_candidate(
 
 class TestCandidateSelectionCoordination(unittest.TestCase):
 
-    def _run_selection_segment(self, signals):
-        """
-        Executes the candidate selection loop extracted from orchestrator.py:2295-2415
-        with active config and live geometry validation.
-        """
-        from strategies.orchestrator import _extract_signal_rsi, _is_inverse_etf_signal
-        from strategies.position_sizer import validate_executable_geometry
+    def setUp(self):
+        om.reset_session_skip_state()
 
-        seen_symbols = set()
-        deduped_signals = []
+    def tearDown(self):
+        om.reset_session_skip_state()
 
-        for sig in signals:
-            sym = sig.symbol.upper().strip()
-
-            if sym in seen_symbols:
-                continue
-
-            rsi_max = getattr(config, "RSI_MAX_BUY_ENTRY", 70.0)
-            rsi_min = getattr(config, "RSI_MIN_SHORT_ENTRY", 30.0)
-            sig_rsi = _extract_signal_rsi(sig)
-            if sig.side.upper() in ("BUY", "LONG") and sig_rsi >= rsi_max:
-                continue
-            if sig.side.upper() in ("SELL", "SHORT") and sig_rsi <= rsi_min:
-                continue
-            if _is_inverse_etf_signal(sig) and sig.side.upper() in ("SELL", "SHORT"):
-                continue
-
-            geom_ok, geom_msg = validate_executable_geometry(sig)
-            if not geom_ok:
-                continue
-
-            seen_symbols.add(sym)
-            deduped_signals.append(sig)
-
-        return deduped_signals
+    # ── Canonical Orchestrator Candidate Selection Tests ──────────────────
 
     def test_leader_rsi_overbought_follower_selected(self):
         """Case 1: Leader BUY fails RSI (80 >= 70), follower BUY passes (50) -> Follower selected."""
         sig_a = _make_candidate(symbol="AAPL", side="BUY", rsi=80.0, signal_id="A")
         sig_b = _make_candidate(symbol="AAPL", side="BUY", rsi=50.0, signal_id="B")
 
-        selected = self._run_selection_segment([sig_a, sig_b])
+        selected = select_viable_cycle_candidates([sig_a, sig_b])
         self.assertEqual(len(selected), 1)
         self.assertEqual(selected[0].signal_id, "B")
 
@@ -110,7 +82,7 @@ class TestCandidateSelectionCoordination(unittest.TestCase):
         sig_a = _make_candidate(symbol="AAPL", side="BUY", entry_price=150.0, stop_price=151.0, signal_id="A")
         sig_b = _make_candidate(symbol="AAPL", side="BUY", entry_price=150.0, stop_price=148.0, signal_id="B")
 
-        selected = self._run_selection_segment([sig_a, sig_b])
+        selected = select_viable_cycle_candidates([sig_a, sig_b])
         self.assertEqual(len(selected), 1)
         self.assertEqual(selected[0].signal_id, "B")
 
@@ -119,7 +91,7 @@ class TestCandidateSelectionCoordination(unittest.TestCase):
         sig_a = _make_candidate(symbol="AAPL", side="BUY", rsi=50.0, signal_id="A")
         sig_b = _make_candidate(symbol="AAPL", side="BUY", rsi=52.0, signal_id="B")
 
-        selected = self._run_selection_segment([sig_a, sig_b])
+        selected = select_viable_cycle_candidates([sig_a, sig_b])
         self.assertEqual(len(selected), 1)
         self.assertEqual(selected[0].signal_id, "A")
 
@@ -128,7 +100,7 @@ class TestCandidateSelectionCoordination(unittest.TestCase):
         sig_a = _make_candidate(symbol="AAPL", side="BUY", rsi=50.0, signal_id="A")
         sig_b = _make_candidate(symbol="MSFT", side="BUY", rsi=52.0, signal_id="B")
 
-        selected = self._run_selection_segment([sig_a, sig_b])
+        selected = select_viable_cycle_candidates([sig_a, sig_b])
         self.assertEqual(len(selected), 2)
         self.assertEqual({s.signal_id for s in selected}, {"A", "B"})
 
@@ -137,7 +109,7 @@ class TestCandidateSelectionCoordination(unittest.TestCase):
         sig_a = _make_candidate(symbol="AAPL", side="BUY", entry_price=150.0, stop_price=151.0, signal_id="A")
         sig_b = _make_candidate(symbol="AAPL", side="BUY", entry_price=150.0, stop_price=152.0, signal_id="B")
 
-        selected = self._run_selection_segment([sig_a, sig_b])
+        selected = select_viable_cycle_candidates([sig_a, sig_b])
         self.assertEqual(len(selected), 0)
 
     def test_same_rsi_opposite_sides_leader_invalid(self):
@@ -145,7 +117,7 @@ class TestCandidateSelectionCoordination(unittest.TestCase):
         sig_a = _make_candidate(symbol="AAPL", side="SELL", entry_price=150.0, stop_price=152.0, target_price=146.0, rsi=20.0, signal_id="A")
         sig_b = _make_candidate(symbol="AAPL", side="BUY", entry_price=150.0, stop_price=148.0, target_price=154.0, rsi=20.0, signal_id="B")
 
-        selected = self._run_selection_segment([sig_a, sig_b])
+        selected = select_viable_cycle_candidates([sig_a, sig_b])
         self.assertEqual(len(selected), 1)
         self.assertEqual(selected[0].signal_id, "B")
 
@@ -154,18 +126,39 @@ class TestCandidateSelectionCoordination(unittest.TestCase):
         sig_a = _make_candidate(symbol="AAPL", side="SELL", entry_price=150.0, stop_price=152.0, target_price=146.0, rsi=20.0, signal_id="A")
         sig_b = _make_candidate(symbol="AAPL", side="SELL", entry_price=150.0, stop_price=152.0, target_price=146.0, rsi=50.0, signal_id="B")
 
-        selected = self._run_selection_segment([sig_a, sig_b])
+        selected = select_viable_cycle_candidates([sig_a, sig_b])
         self.assertEqual(len(selected), 1)
         self.assertEqual(selected[0].signal_id, "B")
 
-    def test_pre_submit_veto_does_not_loop_fallback(self):
+    # ── Final-Submit Boundary & Non-Fallback Integration ───────────────────
+
+    def test_final_boundary_veto_and_no_fallback_loop(self):
         """
-        Acceptance Criteria: Once a candidate is selected and fails pre-submit veto in execute_signal,
-        the system does NOT automatically fall back to loop through rejected candidates.
+        Tests the true final submit boundary:
+        - Call 1 (Pre-flight Phase 0): Manager is healthy (persistence_healthy=True).
+        - Call 2 (Final submit boundary Phase C): Manager degrades (persistence_healthy=False).
+        - execute_signal vetoes at the final submit boundary without broker call.
+        - Pre-submit reservation is cleanly released.
+        - The execution terminates fail-closed; no automatic loop retry over superseded candidates.
         """
-        from strategies.order_manager import execute_signal
+        from strategies.order_manager import execute_signal, idempotency_manager
         from strategies.base import EntryReadiness
-        import time
+
+        call_count = [0]
+
+        def get_manager_two_phase():
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # Pre-flight Phase 0 passes
+                return types.SimpleNamespace(persistence_healthy=True, last_persistence_error=None)
+            else:
+                # Final-submit Phase C degrades
+                return types.SimpleNamespace(persistence_healthy=False, last_persistence_error="FINAL_SUBMIT_DEGRADED")
+
+        from datetime import datetime, timezone
+
+        now = time.time()
+        completed_bar_ts = datetime.fromtimestamp(now - 330.0, tz=timezone.utc).isoformat()
 
         mock_bridge = MagicMock()
         mock_bridge.is_connected = True
@@ -178,28 +171,28 @@ class TestCandidateSelectionCoordination(unittest.TestCase):
             "bid": 150.00,
             "ask": 150.05,
             "last": 150.02,
-            "timestamp": time.time() - 1.0,
+            "timestamp": now - 1.0,
             "source": "alpaca",
             "is_realtime": True,
             "feed_identity": "iex",
         }
 
-        # Candidate selected: sig_b
         sig_b = _make_candidate(symbol="AAPL", side="BUY", rsi=50.0, signal_id="B")
+        sig_b.bar_timestamp = completed_bar_ts
         readiness = EntryReadiness(
             entry_allowed=True,
             suppression_reason=None,
-            cycle_id="cycle_fb_test",
-            bar_ts="2026-10-09T14:00:00Z",
-            created_at=time.time(),
-            expires_at=time.time() + 300.0,
+            cycle_id="cycle_two_phase_test",
+            bar_ts=completed_bar_ts,
+            created_at=now,
+            expires_at=now + 300.0,
         )
 
-        with patch("strategies.order_manager._place_bracket_order_once") as mock_place, \
+        with patch("strategies.trailing_stop.get_trailing_manager", side_effect=get_manager_two_phase), \
+             patch("strategies.order_manager._place_bracket_order_once") as mock_place, \
              patch("config.SPY_TREND_GUARD_ENABLED", False), \
-             patch("strategies.trailing_stop.get_trailing_manager", return_value=types.SimpleNamespace(persistence_healthy=False, last_persistence_error="HEALTH_TEST")):
+             patch("strategies.intraday_risk.get_recent_symbol_loss_time", return_value=None):
 
-            # Candidate B is vetoed at final submit persistence gate
             res = execute_signal(
                 signal=sig_b,
                 bridge=mock_bridge,
@@ -209,9 +202,70 @@ class TestCandidateSelectionCoordination(unittest.TestCase):
                 entry_readiness=readiness,
                 regime_result=types.SimpleNamespace(mode="NORMAL", position_scale=1.0),
             )
+
+            # Verification of final-submit boundary trigger
             self.assertEqual(res["status"], "VETOED")
+            self.assertIn("Final Submit", res["reason"])
+            self.assertIn("FINAL_SUBMIT_DEGRADED", res["reason"])
+
+            # Broker submission must NEVER be reached
             mock_place.assert_not_called()
-            # The execution pipeline terminates cleanly for AAPL; no retry loop occurs
+            mock_bridge.submit_order.assert_not_called()
+
+            # Pre-submit idempotency reservation must be cleanly released
+            self.assertNotIn(("AAPL", "BUY"), idempotency_manager.reservations)
+
+    # ── Setup-Scoped Cooldown vs Cross-Strategy Suppression ────────────────
+
+    def test_setup_scoped_cooldown_does_not_block_other_strategies(self):
+        """
+        Tests the Two-Tier Suppression Architecture:
+        - Strategy A (CANDLESTICK, BUY) triggers 5 noise-floor skips on AAPL.
+        - Strategy A (CANDLESTICK, BUY) is placed in 45m cooldown.
+        - Strategy B (MEAN_REVERSION, BUY) on AAPL is NOT suppressed.
+        - Strategy A (CANDLESTICK, SELL) on AAPL is NOT suppressed.
+        - Whole-symbol hazard correctly suppresses ALL strategies on AAPL.
+        """
+        sym = "AAPL"
+        reason = "Noise floor critically tight: stop 0.05 < 0.10"
+
+        # Record 5 setup skips for CANDLESTICK BUY on AAPL
+        for i in range(5):
+            om.record_hard_veto_skip(
+                sym,
+                reason,
+                bar_timestamp=f"bar_{i}",
+                strategy=StrategyName.CANDLESTICK,
+                side="BUY",
+            )
+
+        # 1. Strategy A (CANDLESTICK, BUY) must be suppressed in cooldown
+        suppressed_a, msg_a = om.check_session_suppression(
+            sym, strategy=StrategyName.CANDLESTICK, side="BUY"
+        )
+        self.assertTrue(suppressed_a)
+        self.assertIn("[SESSION SUPPRESSED] AAPL [CANDLESTICK:BUY]: cooldown active", msg_a)
+
+        # 2. Strategy B (MEAN_REVERSION, BUY) on AAPL must NOT be suppressed
+        suppressed_b, msg_b = om.check_session_suppression(
+            sym, strategy=StrategyName.MEAN_REVERSION, side="BUY"
+        )
+        self.assertFalse(suppressed_b, f"Strategy B should be unsuppressed, got: {msg_b}")
+        self.assertEqual(msg_b, "")
+
+        # 3. Strategy A (CANDLESTICK, SELL) on AAPL must NOT be suppressed
+        suppressed_a_sell, msg_a_sell = om.check_session_suppression(
+            sym, strategy=StrategyName.CANDLESTICK, side="SELL"
+        )
+        self.assertFalse(suppressed_a_sell, f"Opposite side should be unsuppressed, got: {msg_a_sell}")
+
+        # 4. Global / whole-symbol hazard must suppress all strategies on the symbol
+        om._session_permanently_suppressed.add(sym)
+        suppressed_b_global, msg_b_global = om.check_session_suppression(
+            sym, strategy=StrategyName.MEAN_REVERSION, side="BUY"
+        )
+        self.assertTrue(suppressed_b_global)
+        self.assertIn("permanently suppressed this session", msg_b_global)
 
 
 if __name__ == "__main__":

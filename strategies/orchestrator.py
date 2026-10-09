@@ -632,6 +632,142 @@ def _evaluate_mean_reversion(symbol, df, market_texture, scorer, bridge=None):
     return signal
 
 
+def select_viable_cycle_candidates(signals: List[TradeSignal]) -> List[TradeSignal]:
+    """Candidate Selection & Deduplication Gate (Canonical Production Implementation):
+    Evaluates candidate signals against RSI filters, inverse-ETF short restrictions,
+    and executable geometry. Only when a candidate passes all checks does it claim
+    the symbol (seen_symbols.add(sym)) and get retained in deduped_signals.
+    """
+    from strategies.position_sizer import validate_executable_geometry
+    seen_symbols = set()
+    deduped_signals = []
+
+    for sig in signals:
+        sym = sig.symbol.upper().strip()
+
+        if sym in seen_symbols:
+            logger.info("[SIGNAL DISPOSITION] Skipped %s: duplicate signal in this cycle (superseded by previous candidate)", sym)
+            try:
+                from strategies.gate_ledger import log_gate_decision
+                from strategies.veto_reasons import VetoReason
+                log_gate_decision(
+                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                    symbol=sig.symbol,
+                    bar=getattr(sig, "bar_timestamp", "") or "",
+                    strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                    stage="STAGE_PENDING_ORDER",
+                    decision="REJECT",
+                    reason_code=VetoReason.DUPLICATE_ORDER,
+                    human_message="Duplicate signal in cycle superseded by higher priority candidate",
+                    terminal_decision=True,
+                    blocked_by="STAGE_PENDING_ORDER",
+                    raw_conf=getattr(sig, "confidence", 0.0),
+                    final_conf=getattr(sig, "confidence", 0.0),
+                )
+            except Exception:
+                pass
+            continue
+
+        rsi_max = getattr(config, "RSI_MAX_BUY_ENTRY", 70.0)
+        rsi_min = getattr(config, "RSI_MIN_SHORT_ENTRY", 30.0)
+        sig_rsi = _extract_signal_rsi(sig)
+        if sig.side.upper() in ("BUY", "LONG") and sig_rsi >= rsi_max:
+            logger.info("Skipped %s: RSI %.1f >= %.1f (Overbought BUY entry filter)", sig.symbol, sig_rsi, rsi_max)
+            try:
+                from strategies.gate_ledger import log_gate_decision
+                from strategies.veto_reasons import VetoReason
+                log_gate_decision(
+                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                    symbol=sig.symbol,
+                    bar=getattr(sig, "bar_timestamp", "") or "",
+                    strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                    stage="STAGE_RSI_FILTER",
+                    decision="REJECT",
+                    reason_code=VetoReason.RSI_OVERBOUGHT,
+                    human_message=f"RSI {sig_rsi:.1f} >= {rsi_max:.1f} (Overbought)",
+                    terminal_decision=True,
+                    blocked_by="STAGE_RSI_FILTER",
+                    raw_conf=getattr(sig, "confidence", 0.0),
+                    final_conf=getattr(sig, "confidence", 0.0),
+                )
+            except Exception:
+                pass
+            continue
+        if sig.side.upper() in ("SELL", "SHORT") and sig_rsi <= rsi_min:
+            logger.info("Skipped %s: RSI %.1f <= %.1f (Oversold SHORT entry filter)", sig.symbol, sig_rsi, rsi_min)
+            try:
+                from strategies.gate_ledger import log_gate_decision
+                from strategies.veto_reasons import VetoReason
+                log_gate_decision(
+                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                    symbol=sig.symbol,
+                    bar=getattr(sig, "bar_timestamp", "") or "",
+                    strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                    stage="STAGE_RSI_FILTER",
+                    decision="REJECT",
+                    reason_code=VetoReason.RSI_OVERSOLD,
+                    human_message=f"RSI {sig_rsi:.1f} <= {rsi_min:.1f} (Oversold)",
+                    terminal_decision=True,
+                    blocked_by="STAGE_RSI_FILTER",
+                    raw_conf=getattr(sig, "confidence", 0.0),
+                    final_conf=getattr(sig, "confidence", 0.0),
+                )
+            except Exception:
+                pass
+            continue
+        if _is_inverse_etf_signal(sig) and sig.side.upper() in ("SELL", "SHORT"):
+            logger.info("Skipped %s: Inverse ETFs cannot be sold short (Long-only hedge)", sig.symbol)
+            try:
+                from strategies.gate_ledger import log_gate_decision
+                from strategies.veto_reasons import VetoReason
+                log_gate_decision(
+                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                    symbol=sig.symbol,
+                    bar=getattr(sig, "bar_timestamp", "") or "",
+                    strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                    stage="STAGE_GEOMETRY",
+                    decision="REJECT",
+                    reason_code=VetoReason.INVALID_GEOMETRY,
+                    human_message="Inverse ETFs cannot be sold short",
+                    terminal_decision=True,
+                    blocked_by="STAGE_GEOMETRY",
+                    raw_conf=getattr(sig, "confidence", 0.0),
+                    final_conf=getattr(sig, "confidence", 0.0),
+                )
+            except Exception:
+                pass
+            continue
+
+        geom_ok, geom_msg = validate_executable_geometry(sig)
+        if not geom_ok:
+            logger.info("[PRE-EXECUTION GEOMETRY VETO] %s: %s", sig.symbol, geom_msg)
+            try:
+                from strategies.gate_ledger import log_gate_decision
+                from strategies.veto_reasons import VetoReason
+                log_gate_decision(
+                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                    symbol=sig.symbol,
+                    bar=getattr(sig, "bar_timestamp", "") or "",
+                    strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                    stage="STAGE_GEOMETRY",
+                    decision="REJECT",
+                    reason_code=VetoReason.INVALID_GEOMETRY,
+                    human_message=geom_msg,
+                    terminal_decision=True,
+                    blocked_by="STAGE_GEOMETRY",
+                    raw_conf=getattr(sig, "confidence", 0.0),
+                    final_conf=getattr(sig, "confidence", 0.0),
+                )
+            except Exception:
+                pass
+            continue
+
+        seen_symbols.add(sym)
+        deduped_signals.append(sig)
+
+    return deduped_signals
+
+
 def evaluate_symbol(symbol: str, bridge: object = None, market_texture: str = "TRENDING") -> List[TradeSignal]:
     """Evaluate one symbol through all strategies."""
     from strategies.intraday_data import fetch_intraday
@@ -2039,7 +2175,7 @@ def evaluate_and_execute(
                     strategy=getattr(sig.strategy, "name", str(sig.strategy)),
                     stage="STAGE_REGIME",
                     decision="REJECT",
-                    reason_code=VetoReason.REGIME_RISK_OFF,
+                    reason_code=VetoReason.TEXTURE_NOT_ALLOWED,
                     human_message=f"Strategy {sig.strategy} not allowed in market texture '{market_tex}'",
                     terminal_decision=True,
                     blocked_by="STAGE_REGIME",

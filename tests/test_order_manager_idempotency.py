@@ -49,7 +49,11 @@ def clean_om_state(monkeypatch, tmp_path):
     idempotency_manager.clear()
 
 
-def _make_signal(symbol="AAPL", side="BUY", entry=100.0, stop=98.0, target=106.0, confidence=0.85, atr=1.0):
+def _make_signal(symbol="AAPL", side="BUY", entry=100.0, stop=98.0, target=106.0, confidence=0.85, atr=1.0, bar_timestamp=None):
+    from datetime import datetime, timezone
+    import time
+    if bar_timestamp is None:
+        bar_timestamp = datetime.fromtimestamp(time.time() - 310.0, tz=timezone.utc).isoformat()
     risk = abs(entry - stop)
     return TradeSignal(
         symbol=symbol,
@@ -62,6 +66,7 @@ def _make_signal(symbol="AAPL", side="BUY", entry=100.0, stop=98.0, target=106.0
         atr=atr,
         risk_per_share=risk,
         reason="idempotency_test_signal",
+        bar_timestamp=bar_timestamp,
     )
 
 
