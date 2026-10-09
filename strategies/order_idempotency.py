@@ -473,6 +473,18 @@ class EntryIdempotencyStore:
         """Alias for complete for entry_lifecycle compatibility."""
         self.complete(parent_order_id, status)
 
+    def has_reservation(self, symbol: str, side: str = "BUY") -> bool:
+        """Check if an active reservation exists for symbol and side."""
+        sym = symbol.upper().strip()
+        s_side = side.upper().strip()
+        key = f"{sym}_{s_side}"
+        with self._lock:
+            return key in self.reservations
+
+    def is_reserved(self, symbol: str, side: str = "BUY") -> bool:
+        """Alias for has_reservation for test and inspection parity."""
+        return self.has_reservation(symbol, side=side)
+
     def clear(self) -> None:
         """Reset in-memory and persisted reservation store (for tests and administrative maintenance)."""
         with self._lock:

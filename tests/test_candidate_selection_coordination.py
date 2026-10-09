@@ -22,6 +22,7 @@ from strategies.base import TradeSignal
 from strategies.constants import StrategyName
 from strategies.orchestrator import select_viable_cycle_candidates
 import strategies.order_manager as om
+from strategies.order_idempotency import idempotency_manager
 import config
 
 
@@ -221,7 +222,8 @@ class TestCandidateSelectionCoordination(unittest.TestCase):
             mock_bridge.submit_order.assert_not_called()
 
             # Pre-submit idempotency reservation must be cleanly released
-            self.assertNotIn(("AAPL", "BUY"), idempotency_manager.reservations)
+            self.assertNotIn("AAPL_BUY", idempotency_manager.reservations)
+            self.assertFalse(idempotency_manager.has_reservation("AAPL", "BUY"))
 
     # ── Setup-Scoped Cooldown vs Cross-Strategy Suppression ────────────────
 
@@ -364,7 +366,8 @@ class TestCandidateSelectionCoordination(unittest.TestCase):
             )
             self.assertIn(res_a["status"], ("VETOED", "REJECTED"))
             self.assertIn("spread", res_a["reason"].lower(), f"Expected spread veto reason, got: {res_a['reason']}")
-            self.assertNotIn(("AAPL", "BUY"), idempotency_manager.reservations)
+            self.assertNotIn("AAPL_BUY", idempotency_manager.reservations)
+            self.assertFalse(idempotency_manager.has_reservation("AAPL", "BUY"))
 
             # 2. Cycle proceeds to evaluate Candidate B (valid alternative)
             res_b = execute_signal(
@@ -465,8 +468,10 @@ class TestCandidateSelectionCoordination(unittest.TestCase):
             # ZERO broker orders placed across both candidates
             mock_place.assert_not_called()
             mock_bridge.submit_order.assert_not_called()
-            self.assertNotIn(("AAPL", "BUY"), idempotency_manager.reservations)
-            self.assertNotIn(("MSFT", "BUY"), idempotency_manager.reservations)
+            self.assertNotIn("AAPL_BUY", idempotency_manager.reservations)
+            self.assertNotIn("MSFT_BUY", idempotency_manager.reservations)
+            self.assertFalse(idempotency_manager.has_reservation("AAPL", "BUY"))
+            self.assertFalse(idempotency_manager.has_reservation("MSFT", "BUY"))
 
     # ── Same-Symbol Cooldown Fallback Tests (Acceptance Criteria) ──────────
 
@@ -507,15 +512,14 @@ class TestCandidateSelectionCoordination(unittest.TestCase):
 
     def test_production_orchestrator_same_symbol_cooldown_follower_executed(self):
         """
-        Acceptance Criteria (Item 2 & 3 - Production Flow Verification):
-        - End-to-end execution of evaluate_and_execute() with same-symbol candidates:
-          Candidate A: AAPL, GAP_AND_GO, BUY (confidence 0.85) -> in cooldown
-          Candidate B: AAPL, CANDLESTICK, BUY (confidence 0.80) -> valid
-        - Main evaluate_and_execute() invokes canonical select_viable_cycle_candidates().
-        - Candidate A is skipped prior to symbol claim due to cooldown.
-        - Candidate B is selected as the viable cycle candidate.
-        - execute_signal() is invoked for Candidate B (CANDLESTICK) and NOT Candidate A.
-        - Broker receives order for Candidate B.
+        Acceptance Criteria (Item 2 & 3 - Production Flow Routing Verification):
+        - Routing-level verification: evaluates that main flow evaluate_and_execute() invokes
+          canonical select_viable_cycle_candidates(), skips Candidate A (cooldown) prior to claim,
+          and routes Candidate B (CANDLESTICK) to execute_signal().
+        - Confirms orchestrator routing without mutating broker state.
+        - Note: execute_signal() is mocked here to specifically test orchestrator routing logic;
+          full execution through real order_manager, reservations, and broker submission
+          is tested in test_production_integration_same_symbol_cooldown_real_execution_with_mocked_broker.
         """
         from datetime import datetime, timezone
         from strategies.orchestrator import EvaluationResult
@@ -617,19 +621,189 @@ class TestCandidateSelectionCoordination(unittest.TestCase):
         self.assertEqual(executed_signals[0].signal_id, "sig_b_candle")
         self.assertEqual(executed_signals[0].strategy, StrategyName.CANDLESTICK)
 
-    def test_uncertain_submission_does_not_trigger_unsafe_same_symbol_fallback(self):
+    def test_production_integration_same_symbol_cooldown_real_execution_with_mocked_broker(self):
         """
-        Acceptance Criteria (Item 3 - Uncertain Submission Non-Bypass):
-        - When winner Candidate A is selected and submitted, but encounters an uncertain
-          result (e.g. SUBMITTED_RECONCILIATION_REQUIRED), the engine does NOT fall back
-          to execute alternative Candidate B on the same symbol in that cycle.
+        Acceptance Criteria (Item 2 & 3 - Real Execution Integration with Mocked Broker Adapter):
+        - Full execution pipeline integration: execute_signal() is NOT mocked.
+        - Evaluates candidate selection coordination under active cooldown on (AAPL, GAP_AND_GO, BUY).
+        - Candidate A (GAP_AND_GO) is skipped BEFORE symbol claim due to active cooldown.
+        - Candidate B (CANDLESTICK) claims AAPL and proceeds to real execute_signal().
+        - Real execute_signal() creates real durable reservation 'AAPL_BUY', validates sizing/quotes,
+          invokes mock_bridge.place_bracket_order(), and binds the parent order ID to the reservation.
+        - Asserts that:
+          1. mock_bridge.place_bracket_order is called exactly ONCE.
+          2. The client_order_id indicates Candidate B (CANDLESTICK, not GAP_AND_GO).
+          3. idempotency_manager.has_reservation('AAPL', 'BUY') is True with status ACKNOWLEDGED.
+          4. Candidate A was never submitted or reserved.
         """
-        from datetime import datetime, timezone
+        from datetime import datetime, timezone, timedelta
         from strategies.orchestrator import EvaluationResult
         import strategies.orchestrator as orch
+        from strategies.order_idempotency import STATUS_ACKNOWLEDGED
+        from strategies.execution_quote import QuoteValidationResult, BrokerQuote
+        from strategies.trailing_stop import get_trailing_manager
 
         now = time.time()
-        completed_bar_ts = datetime.fromtimestamp(now - 330.0, tz=timezone.utc).isoformat()
+        now_utc = datetime.now(timezone.utc)
+        cur_5m = now_utc.replace(second=0, microsecond=0)
+        cur_5m = cur_5m.replace(minute=(cur_5m.minute // 5) * 5)
+        completed_bar_ts = (cur_5m - timedelta(minutes=5)).isoformat()
+
+        # 1. Put Candidate A (AAPL, GAP_AND_GO, BUY) into active cooldown
+        om._setup_suppressed_until[("AAPL", "GAP_AND_GO", "BUY")] = now + 2700.0
+        om._setup_cooldown_counts[("AAPL", "GAP_AND_GO", "BUY")] = 1
+
+        sig_a = _make_candidate(
+            symbol="AAPL",
+            strategy=StrategyName.GAP_AND_GO,
+            side="BUY",
+            entry_price=150.0,
+            stop_price=148.0,
+            target_price=154.0,
+            risk_per_share=2.0,
+            confidence=0.85,
+            rsi=50.0,
+            signal_id="sig_a_gap",
+        )
+        sig_a.bar_timestamp = completed_bar_ts
+        sig_b = _make_candidate(
+            symbol="AAPL",
+            strategy=StrategyName.CANDLESTICK,
+            side="BUY",
+            entry_price=150.0,
+            stop_price=148.0,
+            target_price=154.0,
+            risk_per_share=2.0,
+            confidence=0.80,
+            rsi=50.0,
+            signal_id="sig_b_candle",
+        )
+        sig_b.bar_timestamp = completed_bar_ts
+
+        mock_eval_result = EvaluationResult(
+            entry_signals=(sig_a, sig_b),
+            entry_allowed=True,
+            suppression_reason=None,
+            coverage=1.0,
+            required_coverage=0.95,
+            received_symbols=("AAPL",),
+            missing_symbols=(),
+        )
+
+        mock_bridge = MagicMock()
+        mock_bridge.is_connected = True
+        mock_bridge.is_paper = True
+        mock_bridge.account_mode = "PAPER"
+        mock_bridge.get_positions.return_value = []
+        mock_bridge.open_position_count.return_value = 0
+        mock_bridge.has_position.return_value = False
+        mock_bridge.has_working_order.return_value = False
+        mock_bridge.get_production_risk_equity.return_value = 100000.0
+        mock_bridge.get_net_liquidation.return_value = 100000.0
+        mock_bridge.get_account.return_value = types.SimpleNamespace(equity=100000.0, cash=100000.0)
+        mock_bridge.place_bracket_order.return_value = {
+            "order_id": "ord_b_parent",
+            "stop_order_id": "ord_b_stop",
+            "tp_order_id": "ord_b_tp",
+            "order_ids": ["ord_b_parent", "ord_b_stop", "ord_b_tp"],
+            "status": "Submitted",
+        }
+
+        mock_quote = QuoteValidationResult(
+            valid=True,
+            reason="OK",
+            quote=BrokerQuote(
+                symbol="AAPL",
+                bid=150.0,
+                ask=150.05,
+                last=150.02,
+                timestamp=datetime.now(timezone.utc),
+                source="broker",
+                is_realtime=True,
+                feed_identity="iex",
+            ),
+        )
+
+        ts_mgr = get_trailing_manager()
+        ts_mgr.persistence_healthy = True
+
+        orch._last_evaluated_5m_bar_str = "PREV_TEST_BAR"
+
+        from strategies.regime_engine import MarketRegimeResult, TEXTURE_TRENDING
+        mock_regime = MarketRegimeResult(
+            mode="RISK_ON",
+            score=3,
+            allow_new_longs=True,
+            allow_new_shorts=True,
+            requires_opening_buffer=False,
+            position_scale=1.0,
+            confidence_boost=0.0,
+            market_texture=TEXTURE_TRENDING,
+            halt_new_entries=False,
+        )
+
+        with patch.object(orch, "evaluate_symbols_parallel", return_value=mock_eval_result), \
+             patch.object(orch, "apply_portfolio_correlation", side_effect=lambda sigs, *a, **k: sigs), \
+             patch.object(orch, "today_pnl", return_value=0.0), \
+             patch.object(orch, "day_trades_in_last_5_days", return_value=0), \
+             patch("strategies.regime_engine.evaluate_market_regime", return_value=mock_regime), \
+             patch.object(orch._regime_state_tracker, "update", return_value=mock_regime), \
+             patch.object(config, "DAYTRADE_BAR_PUBLICATION_TIMEOUT_S", 3600.0), \
+             patch.object(config, "LUNCH_CHOP_FILTER_ENABLED", False), \
+             patch.object(config, "SPY_TREND_GUARD_ENABLED", False), \
+             patch("strategies.execution_health.get_execution_health", return_value=types.SimpleNamespace(allows_new_entries=True, summary="OK", status=types.SimpleNamespace(value="healthy"), bar_age_seconds=10.0, broker_latency_ms=10.0)), \
+             patch("strategies.session.is_past_opening_buffer", return_value=True), \
+             patch("strategies.session.now_eastern", return_value=datetime(2026, 10, 9, 10, 0, 0)), \
+             patch("strategies.order_manager.pre_trade_check", return_value=None), \
+             patch("strategies.order_manager._min_confidence_for", return_value=0.50), \
+             patch("strategies.execution_quote.validate_execution_quote", return_value=mock_quote):
+
+            orch.evaluate_and_execute(["AAPL"], bridge=mock_bridge, live_paper=True)
+
+        # 1. Exactly 1 broker order submission occurred
+        self.assertEqual(mock_bridge.place_bracket_order.call_count, 1)
+
+        # 2. Verify submission parameters correspond to Candidate B (CANDLESTICK)
+        call_kwargs = mock_bridge.place_bracket_order.call_args[1] if mock_bridge.place_bracket_order.call_args[1] else mock_bridge.place_bracket_order.call_args.kwargs
+        self.assertEqual(call_kwargs["symbol"], "AAPL")
+        self.assertEqual(call_kwargs["side"], "BUY")
+        self.assertIn("cand", call_kwargs["client_order_id"], "Submitted order must belong to CANDLESTICK strategy")
+        self.assertNotIn("gap", call_kwargs["client_order_id"], "GAP_AND_GO must not be submitted")
+
+        # 3. Real idempotency reservation inspection: AAPL_BUY is reserved and ACKNOWLEDGED to ord_b_parent
+        self.assertTrue(idempotency_manager.has_reservation("AAPL", "BUY"))
+        reservation = idempotency_manager.reservations.get("AAPL_BUY")
+        self.assertIsNotNone(reservation)
+        self.assertEqual(reservation.status, STATUS_ACKNOWLEDGED)
+        self.assertEqual(reservation.parent_order_id, "ord_b_parent")
+
+    def test_uncertain_submission_does_not_trigger_unsafe_same_symbol_fallback(self):
+        """
+        Acceptance Criteria (Item 3 - Uncertain Submission Non-Bypass & Real Idempotency Lock Retention):
+        - Full execution pipeline integration: execute_signal() runs for real.
+        - When winner Candidate A (GAP_AND_GO, higher confidence) is submitted, but the broker
+          returns an uncertain result (missing child stop leg, triggering SUBMITTED_RECONCILIATION_REQUIRED),
+          the durable idempotency reservation 'AAPL_BUY' is retained (not released).
+        - Asserts that:
+          1. mock_bridge.place_bracket_order was called for Candidate A.
+          2. The durable reservation 'AAPL_BUY' is retained (has_reservation('AAPL', 'BUY') is True).
+          3. Reservation is bound to parent 'ord_a_parent'.
+          4. Any immediate fallback or subsequent attempt to reserve 'AAPL_BUY' for Candidate B
+             is strictly blocked by the active reservation lock.
+          5. Candidate B was NEVER submitted to the broker.
+        """
+        from datetime import datetime, timezone, timedelta
+        from strategies.orchestrator import EvaluationResult
+        import strategies.orchestrator as orch
+        from strategies.order_idempotency import STATUS_ACKNOWLEDGED
+        from strategies.execution_quote import QuoteValidationResult, BrokerQuote
+        from strategies.trailing_stop import get_trailing_manager
+
+        now = time.time()
+        now_utc = datetime.now(timezone.utc)
+        cur_5m = now_utc.replace(second=0, microsecond=0)
+        cur_5m = cur_5m.replace(minute=(cur_5m.minute // 5) * 5)
+        completed_bar_ts = (cur_5m - timedelta(minutes=5)).isoformat()
 
         # Both Candidate A and B are valid, Candidate A has higher confidence
         sig_a = _make_candidate(
@@ -669,13 +843,6 @@ class TestCandidateSelectionCoordination(unittest.TestCase):
             missing_symbols=(),
         )
 
-        executed_signals = []
-
-        def mock_execute_uncertain(signal, **kwargs):
-            executed_signals.append(signal)
-            # Uncertain / reconciliation required result
-            return {"status": "SUBMITTED_RECONCILIATION_REQUIRED", "order_id": "ord_a_uncertain"}
-
         mock_bridge = MagicMock()
         mock_bridge.is_connected = True
         mock_bridge.is_paper = True
@@ -684,6 +851,36 @@ class TestCandidateSelectionCoordination(unittest.TestCase):
         mock_bridge.open_position_count.return_value = 0
         mock_bridge.has_position.return_value = False
         mock_bridge.has_working_order.return_value = False
+        mock_bridge.get_production_risk_equity.return_value = 100000.0
+        mock_bridge.get_net_liquidation.return_value = 100000.0
+        mock_bridge.get_account.return_value = types.SimpleNamespace(equity=100000.0, cash=100000.0)
+
+        # Broker returns parent order without named stop child leg -> triggers SUBMITTED_RECONCILIATION_REQUIRED
+        mock_bridge.place_bracket_order.return_value = {
+            "order_id": "ord_a_parent",
+            "stop_order_id": None,
+            "tp_order_id": "ord_a_tp",
+            "order_ids": ["ord_a_parent"],
+            "status": "Submitted",
+        }
+
+        mock_quote = QuoteValidationResult(
+            valid=True,
+            reason="OK",
+            quote=BrokerQuote(
+                symbol="AAPL",
+                bid=150.0,
+                ask=150.05,
+                last=150.02,
+                timestamp=datetime.now(timezone.utc),
+                source="broker",
+                is_realtime=True,
+                feed_identity="iex",
+            ),
+        )
+
+        ts_mgr = get_trailing_manager()
+        ts_mgr.persistence_healthy = True
 
         orch._last_evaluated_5m_bar_str = "PREV_TEST_BAR"
 
@@ -701,7 +898,6 @@ class TestCandidateSelectionCoordination(unittest.TestCase):
         )
 
         with patch.object(orch, "evaluate_symbols_parallel", return_value=mock_eval_result), \
-             patch.object(orch, "execute_signal", side_effect=mock_execute_uncertain), \
              patch.object(orch, "apply_portfolio_correlation", side_effect=lambda sigs, *a, **k: sigs), \
              patch.object(orch, "today_pnl", return_value=0.0), \
              patch.object(orch, "day_trades_in_last_5_days", return_value=0), \
@@ -712,15 +908,31 @@ class TestCandidateSelectionCoordination(unittest.TestCase):
              patch.object(config, "SPY_TREND_GUARD_ENABLED", False), \
              patch("strategies.execution_health.get_execution_health", return_value=types.SimpleNamespace(allows_new_entries=True, summary="OK", status=types.SimpleNamespace(value="healthy"), bar_age_seconds=10.0, broker_latency_ms=10.0)), \
              patch("strategies.session.is_past_opening_buffer", return_value=True), \
+             patch("strategies.session.now_eastern", return_value=datetime(2026, 10, 9, 10, 0, 0)), \
              patch("strategies.order_manager.pre_trade_check", return_value=None), \
-             patch("strategies.order_manager._min_confidence_for", return_value=0.50):
+             patch("strategies.order_manager._min_confidence_for", return_value=0.50), \
+             patch("strategies.execution_quote.validate_execution_quote", return_value=mock_quote):
 
-            orch.evaluate_and_execute(["AAPL"], bridge=mock_bridge, live_paper=False)
+            orch.evaluate_and_execute(["AAPL"], bridge=mock_bridge, live_paper=True)
 
-        # Only Candidate A was executed; no unsafe fallback to Candidate B
-        self.assertEqual(len(executed_signals), 1)
-        self.assertEqual(executed_signals[0].signal_id, "sig_a_gap")
+        # 1. Broker place_bracket_order was called exactly once (for Candidate A)
+        self.assertEqual(mock_bridge.place_bracket_order.call_count, 1)
+        call_kwargs = mock_bridge.place_bracket_order.call_args[1] if mock_bridge.place_bracket_order.call_args[1] else mock_bridge.place_bracket_order.call_args.kwargs
+        self.assertIn("gap", call_kwargs["client_order_id"], "Submitted order must belong to Candidate A (GAP_AND_GO)")
+
+        # 2. Durable idempotency reservation 'AAPL_BUY' is retained (fail-closed, not released)
+        self.assertTrue(idempotency_manager.has_reservation("AAPL", "BUY"))
+        reservation = idempotency_manager.reservations.get("AAPL_BUY")
+        self.assertIsNotNone(reservation)
+        self.assertEqual(reservation.status, STATUS_ACKNOWLEDGED)
+        self.assertEqual(reservation.parent_order_id, "ord_a_parent")
+
+        # 3. Any fallback attempt on Candidate B is blocked by the active reservation
+        can_reserve, block_reason = idempotency_manager.reserve("AAPL", side="BUY")
+        self.assertFalse(can_reserve, "Candidate B fallback must be blocked by retained reservation")
+        self.assertEqual(block_reason, "ACTIVE_ACKNOWLEDGED_RESERVATION")
 
 
 if __name__ == "__main__":
     unittest.main()
+
