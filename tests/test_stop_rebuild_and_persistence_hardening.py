@@ -40,12 +40,21 @@ from strategies.trailing_stop import (
 class TestStopRebuildAndPersistenceHardening(unittest.TestCase):
 
     def setUp(self):
+        from pathlib import Path
+        from strategies.order_idempotency import idempotency_manager
         self.temp_dir = tempfile.TemporaryDirectory()
         self.state_file = os.path.join(self.temp_dir.name, "trailing_state.json")
+        self.idemp_file = os.path.join(self.temp_dir.name, "order_idempotency_state.json")
         self.patcher = patch("strategies.trailing_stop.STATE_FILE", self.state_file)
+        self.idemp_patcher = patch("strategies.order_idempotency.IDEMPOTENCY_FILE", Path(self.idemp_file))
         self.patcher.start()
+        self.idemp_patcher.start()
+        idempotency_manager.clear()
 
     def tearDown(self):
+        from strategies.order_idempotency import idempotency_manager
+        idempotency_manager.clear()
+        self.idemp_patcher.stop()
         self.patcher.stop()
         self.temp_dir.cleanup()
 
