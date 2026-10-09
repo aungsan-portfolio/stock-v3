@@ -216,6 +216,70 @@ def is_strategy_admitted_for_texture(
     return True, True, cell_tag
 
 
+def is_strategy_globally_enabled(strategy: Any) -> bool:
+    """Check strategy global enablement configuration (Loss containment)."""
+    strat_key = getattr(strategy, "name", getattr(strategy, "value", str(strategy or ""))).upper().replace("STRATEGYNAME.", "").strip()
+    if strat_key in ("MOMENTUM_SCALP", "STRATEGY_MOMENTUM_SCALP"):
+        return bool(getattr(config, "MOMENTUM_SCALP_ENABLED", getattr(config, "STRATEGY_MOMENTUM_SCALP_ENABLED", True)))
+    elif strat_key in ("VWAP_BOUNCE", "STRATEGY_VWAP_BOUNCE"):
+        return bool(getattr(config, "VWAP_BOUNCE_ENABLED", getattr(config, "STRATEGY_VWAP_BOUNCE_ENABLED", True)))
+    elif strat_key in ("ORB", "STRATEGY_ORB"):
+        return bool(getattr(config, "STRATEGY_ORB_ENABLED", False))
+    elif strat_key in ("GAP_AND_GO", "STRATEGY_GAP_AND_GO"):
+        return bool(getattr(config, "STRATEGY_GAP_AND_GO_ENABLED", True))
+    elif strat_key in ("CANDLESTICK", "STRATEGY_CANDLESTICK"):
+        return bool(getattr(config, "STRATEGY_CANDLESTICK_ENABLED", True))
+    elif strat_key in ("MEAN_REVERSION", "STRATEGY_MEAN_REVERSION"):
+        return bool(getattr(config, "STRATEGY_MEAN_REVERSION_ENABLED", True))
+    return True
+
+
+def get_strategy_reachability_matrix(market_texture: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Constructs the Strategy x Texture Reachability Matrix for all defined strategies,
+    reporting enabled status, generator texture support, admission eligibility,
+    and effective reachability diagnostic status.
+    """
+    textures = [market_texture.upper().strip()] if market_texture else ["TRENDING", "SIDEWAYS", "TRANSITIONING", "VOLATILE"]
+    strategies = [
+        StrategyName.ORB,
+        StrategyName.VWAP_BOUNCE,
+        StrategyName.GAP_AND_GO,
+        StrategyName.MOMENTUM_SCALP,
+        StrategyName.CANDLESTICK,
+        StrategyName.MEAN_REVERSION,
+    ]
+    matrix = []
+    for strat in strategies:
+        strat_key = strat.name if hasattr(strat, "name") else str(strat)
+        enabled = is_strategy_globally_enabled(strat)
+        for tex in textures:
+            admitted, is_exp, _ = is_strategy_admitted_for_texture(strat, tex)
+            gen_supported = True
+            if strat == StrategyName.MEAN_REVERSION and tex != "SIDEWAYS":
+                gen_supported = False
+            
+            if not enabled:
+                status = "BLOCKED_CONFIG_DISABLED"
+            elif not admitted:
+                status = "BLOCKED_TEXTURE_ADMISSION"
+            elif not gen_supported:
+                status = "BLOCKED_GENERATOR_MISMATCH"
+            else:
+                status = "REACHABLE"
+
+            matrix.append({
+                "strategy": strat_key,
+                "texture": tex,
+                "enabled": enabled,
+                "admitted": admitted,
+                "is_experiment": is_exp,
+                "generator_supported": gen_supported,
+                "status": status,
+            })
+    return matrix
+
+
 SIGNAL_FEATURE_COLUMNS = [
     "timestamp",
     "timestamp_et",
@@ -2118,20 +2182,7 @@ def evaluate_and_execute(
         sym = sig.symbol.upper().strip()
 
         # Check strategy global enablement gate (Loss containment)
-        strat_key = getattr(sig.strategy, "name", str(sig.strategy)).upper().replace("STRATEGYNAME.", "").strip()
-        is_strat_enabled = True
-        if strat_key in ("MOMENTUM_SCALP", "STRATEGY_MOMENTUM_SCALP"):
-            is_strat_enabled = getattr(config, "MOMENTUM_SCALP_ENABLED", getattr(config, "STRATEGY_MOMENTUM_SCALP_ENABLED", True))
-        elif strat_key in ("VWAP_BOUNCE", "STRATEGY_VWAP_BOUNCE"):
-            is_strat_enabled = getattr(config, "VWAP_BOUNCE_ENABLED", getattr(config, "STRATEGY_VWAP_BOUNCE_ENABLED", True))
-        elif strat_key in ("ORB", "STRATEGY_ORB"):
-            is_strat_enabled = getattr(config, "STRATEGY_ORB_ENABLED", False)
-        elif strat_key in ("GAP_AND_GO", "STRATEGY_GAP_AND_GO"):
-            is_strat_enabled = getattr(config, "STRATEGY_GAP_AND_GO_ENABLED", True)
-        elif strat_key in ("CANDLESTICK", "STRATEGY_CANDLESTICK"):
-            is_strat_enabled = getattr(config, "STRATEGY_CANDLESTICK_ENABLED", True)
-        elif strat_key in ("MEAN_REVERSION", "STRATEGY_MEAN_REVERSION"):
-            is_strat_enabled = getattr(config, "STRATEGY_MEAN_REVERSION_ENABLED", True)
+        is_strat_enabled = is_strategy_globally_enabled(sig.strategy)
 
         if not is_strat_enabled:
             logger.info("Skipped %s: strategy %s is disabled by configuration (governance loss containment)", sig.symbol, sig.strategy)
