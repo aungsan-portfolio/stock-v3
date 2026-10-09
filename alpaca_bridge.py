@@ -4596,19 +4596,73 @@ class AlpacaBridge:
             "status": "Submitted"
         }
 
-    def get_order_snapshot(self, order_id: str) -> dict:
+    def get_order_snapshot(self, order_id: str) -> Optional[dict]:
         try:
-            order = self._client.get_order_by_id(order_id)
-            status = order.status.value if hasattr(order.status, "value") else str(order.status)
-            qty = float(order.qty) if getattr(order, "qty", None) is not None else 0.0
-            filled_qty = float(getattr(order, "filled_qty", 0.0) or 0.0)
-            replaced_by = getattr(order, "replaced_by", None)
+            clean_id = str(order_id).strip()
+            order = self._client.get_order_by_id(clean_id)
+            if not order:
+                return None
+
+            def _get_val(obj, *keys):
+                for k in keys:
+                    if isinstance(obj, dict):
+                        if k in obj and obj[k] is not None:
+                            return obj[k]
+                    elif hasattr(obj, k):
+                        v = getattr(obj, k, None)
+                        if v is not None:
+                            return v
+                return None
+
+            status_raw = _get_val(order, "status")
+            status = status_raw.value if hasattr(status_raw, "value") else str(status_raw or "")
+
+            sym = str(_get_val(order, "symbol") or "").upper().strip()
+
+            side_raw = _get_val(order, "side")
+            side_str = (side_raw.value if hasattr(side_raw, "value") else str(side_raw or "")).lower().strip()
+
+            type_raw = _get_val(order, "order_type", "type")
+            type_str = (type_raw.value if hasattr(type_raw, "value") else str(type_raw or "")).lower().strip()
+
+            qty_val = _get_val(order, "qty")
+            qty = float(qty_val) if qty_val is not None else 0.0
+
+            fq_val = _get_val(order, "filled_qty")
+            filled_qty = float(fq_val or 0.0)
+
+            sp_val = _get_val(order, "stop_price", "stopPrice")
+            stop_price = float(sp_val) if sp_val is not None else None
+
+            lp_val = _get_val(order, "limit_price", "limitPrice")
+            limit_price = float(lp_val) if lp_val is not None else None
+
+            avg_px_val = _get_val(order, "filled_avg_price", "filledAvgPrice")
+            avg_px = float(avg_px_val) if avg_px_val is not None else None
+
+            rep_val = _get_val(order, "replaced_by")
+            replaced_by = str(rep_val) if rep_val else None
+
+            cid_val = _get_val(order, "client_order_id")
+            cid = str(cid_val or "")
+
+            oid_val = _get_val(order, "id")
+            oid = str(oid_val or clean_id)
+
             return {
-                "id": str(order.id),
+                "id": oid,
+                "client_order_id": cid,
                 "status": status,
+                "symbol": sym,
+                "side": side_str,
+                "order_type": type_str,
+                "type": type_str,
                 "qty": qty,
                 "filled_qty": filled_qty,
-                "replaced_by": str(replaced_by) if replaced_by else None,
+                "stop_price": stop_price,
+                "limit_price": limit_price,
+                "filled_avg_price": avg_px,
+                "replaced_by": replaced_by,
             }
         except Exception as exc:
             logger.error("get_order_snapshot failed for %s: %s", order_id, exc)

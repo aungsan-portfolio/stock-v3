@@ -90,7 +90,9 @@ def test_provider_specific_fetch_does_not_recurse(monkeypatch):
         yf_called.append(True)
         return pd.DataFrame()
 
-    with patch("strategies.intraday_data.fetch_intraday_yfinance", side_effect=fake_yf):
+    with patch("strategies.intraday_data.fetch_intraday_yfinance", side_effect=fake_yf), \
+         patch("strategies.intraday_data._sdk_get_stock_bars_soft_bounded", return_value=MagicMock(df=pd.DataFrame())), \
+         patch("strategies.intraday_data._read_cache", return_value=None):
         # Alpaca returns empty, must not invoke yfinance
         df = fetch_intraday_alpaca("AAPL", feed="iex")
         assert df.empty

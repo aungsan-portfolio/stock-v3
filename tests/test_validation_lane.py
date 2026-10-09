@@ -93,7 +93,7 @@ def _make_signal(
     reason: str = "test signal",
 ) -> TradeSignal:
     now_utc = datetime.now(timezone.utc)
-    bar_ts = bar_timestamp or (now_utc - timedelta(seconds=60)).isoformat()
+    bar_ts = bar_timestamp or (now_utc - timedelta(seconds=330)).isoformat()
     risk = abs(entry_price - stop_price)
     return TradeSignal(
         symbol=symbol,
@@ -272,12 +272,14 @@ def test_excessive_price_deviation_veto(tmp_path):
     assert len(bridge.placed_orders) == 0
 
 
-def test_negative_latency_veto(tmp_path):
+def test_negative_latency_veto(tmp_path, monkeypatch):
     """Quote timestamp older than bar timestamp by > 2.0s is vetoed."""
+    import config
+    monkeypatch.setattr(config, "MAX_QUOTE_AGE_SECONDS", 600.0)
     ledger_path = str(tmp_path / "val_trades.jsonl")
     now = time.time()
-    quote_ts = now - 6.0
-    bar_str = datetime.fromtimestamp(now - 1.0, timezone.utc).isoformat()
+    quote_ts = now - 336.0
+    bar_str = datetime.fromtimestamp(now - 330.0, timezone.utc).isoformat()
     bridge = MockValidationBridge(_make_quote(timestamp=quote_ts, feed="sip"))
     sig = _make_signal(bar_timestamp=bar_str, decision_feed="sip")
 
@@ -488,5 +490,44 @@ def test_validation_lane_strictly_blocks_real_money_account(tmp_path):
     assert "real-money" in res["reason"]
     assert len(bridge.placed_orders) == 0
     assert not os.path.exists(ledger_path)
+
+
+def test_validation_lane_skips_broker_write_when_release_absent(tmp_path):
+    """Validation lane must perform pre-check and skip broker write attempt when release is unavailable."""
+    ledger_path = str(tmp_path / "paper_val.jsonl")
+
+    class MockGateBridgeWithReleaseCheck:
+        def __init__(self):
+            self.calls = []
+            self.is_paper = True
+
+        def get_quote(self, symbol, feed=None):
+            return _make_quote(symbol=symbol, feed="sip")
+
+        def is_validation_release_authorized(self):
+            return False
+
+        def place_bracket_order(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"status": "placed"}
+
+    bridge = MockGateBridgeWithReleaseCheck()
+    sig = _make_signal(symbol="NFLX", decision_feed="sip", confidence=0.585)
+
+    res = evaluate_and_route_validation_candidate(
+        signal=sig,
+        bridge=bridge,
+        policy_stage="STAGE_CONFIDENCE",
+        policy_reason_code="CONFIDENCE_BELOW_FLOOR",
+        policy_reason_msg="Confidence 0.585 < 0.600",
+        dry_run=False,
+        filepath=ledger_path,
+    )
+
+    assert res["status"] == "VALIDATION_RELEASE_BLOCKED"
+    assert "pre-check skip" in res["reason"]
+    assert len(bridge.calls) == 0
+    assert os.path.exists(ledger_path)
+
 
 

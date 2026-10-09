@@ -213,8 +213,16 @@ class TestWebSocketResilience:
 
     def test_no_credentials_appear_in_failure_logs(self, bridge):
         bridge._trade_stream_credentials = ("SECRET_API_KEY_12345", "VERY_SECRET_SECRET_KEY_67890")
+        call_count = [0]
+
+        def fake_wait(delay):
+            call_count[0] += 1
+            if call_count[0] >= 8:
+                bridge._trade_stream_reconnect_cancel.set()
+            return False
+
         with patch.object(bridge, "_start_trade_stream", side_effect=RuntimeError("Connection refused")), \
-             patch.object(bridge._trade_stream_reconnect_cancel, "wait", return_value=False), \
+             patch.object(bridge._trade_stream_reconnect_cancel, "wait", side_effect=fake_wait), \
              patch("alpaca_bridge.logger.warning") as mock_warn, \
              patch("alpaca_bridge.logger.error") as mock_err:
 

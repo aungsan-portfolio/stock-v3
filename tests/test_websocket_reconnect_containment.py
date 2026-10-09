@@ -85,6 +85,8 @@ class TestWebSocketReconnectContainment:
 
         def fake_wait(delay):
             recorded_delays.append(delay)
+            if len(recorded_delays) >= 6:
+                bridge._trade_stream_reconnect_cancel.set()
             # Return False so wait completes without cancellation
             return False
 

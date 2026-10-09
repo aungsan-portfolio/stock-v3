@@ -94,7 +94,7 @@ def _is_hammer(o, h, l, c) -> bool:
         return False
     lower_shadow = min(o, c) - l
     upper_shadow = h - max(o, c)
-    return lower_shadow >= 2.0 * body and upper_shadow <= 0.1 * candle_range and body > 0
+    return lower_shadow >= 2.0 * body and upper_shadow <= 0.15 * candle_range and body > 0
 
 
 def _is_shooting_star(o, h, l, c) -> bool:
@@ -104,15 +104,18 @@ def _is_shooting_star(o, h, l, c) -> bool:
         return False
     upper_shadow = h - max(o, c)
     lower_shadow = min(o, c) - l
-    return upper_shadow >= 2.0 * body and lower_shadow <= 0.1 * candle_range and body > 0
+    return upper_shadow >= 2.0 * body and lower_shadow <= 0.15 * candle_range and body > 0
 
 
 def _is_bullish_engulfing(o1, c1, o2, c2) -> bool:
-    return c1 < o1 and c2 > o2 and o2 < c1 and c2 > o1
+    # On intraday 5m continuous bars, open[2] commonly equals close[1] (no overnight gap).
+    # Require body engulfing with tolerance for equal-open bars.
+    return c1 < o1 and c2 > o2 and o2 <= (c1 + 1e-4) and c2 >= o1 and (c2 - o2) >= abs(c1 - o1) * 0.9
 
 
 def _is_bearish_engulfing(o1, c1, o2, c2) -> bool:
-    return c1 > o1 and c2 < o2 and o2 > c1 and c2 < o1
+    # Symmetrical intraday continuous bar engulfing
+    return c1 > o1 and c2 < o2 and o2 >= (c1 - 1e-4) and c2 <= o1 and (o2 - c2) >= abs(c1 - o1) * 0.9
 
 
 def _is_morning_star(o1, c1, o2, c2, o3, c3) -> bool:
@@ -265,8 +268,16 @@ class CandlestickPatternStrategy(BaseStrategy):
         self.min_patterns = min_patterns
 
     @staticmethod
-    def _confidence(pattern_count: int, rsi: float, close: float, sma20: float, side: str) -> float:
-        """Score = pattern_base + rsi_bonus + trend_bonus, capped at 1.0."""
+    def _confidence(
+        pattern_count: int,
+        rsi: float,
+        close: float,
+        sma20: float,
+        side: str,
+        volume: float = 0.0,
+        volume_ma: float = 0.0,
+    ) -> float:
+        """Score = pattern_base + rsi_bonus + trend_bonus + vol_bonus, capped at 1.0."""
         base = min(0.60, pattern_count * 0.20)
 
         rsi_bonus = 0.0
@@ -289,7 +300,14 @@ class CandlestickPatternStrategy(BaseStrategy):
             elif side == "SELL" and close < sma20:
                 trend_bonus = 0.20
 
-        return min(1.0, base + rsi_bonus + trend_bonus)
+        vol_bonus = 0.0
+        if volume > 0 and volume_ma > 0:
+            if volume >= 1.5 * volume_ma:
+                vol_bonus = 0.10
+            elif volume >= 1.0 * volume_ma:
+                vol_bonus = 0.05
+
+        return min(1.0, base + rsi_bonus + trend_bonus + vol_bonus)
 
     def _build_signal(
         self,
@@ -300,6 +318,8 @@ class CandlestickPatternStrategy(BaseStrategy):
         sma20: float,
         side: str,
         patterns: list,
+        volume: float = 0.0,
+        volume_ma: float = 0.0,
     ) -> Optional[TradeSignal]:
         """Build and validate a TradeSignal from a detected pattern row."""
         entry = float(row["Close"])
@@ -318,6 +338,8 @@ class CandlestickPatternStrategy(BaseStrategy):
             close=entry,
             sma20=sma20,
             side=side,
+            volume=volume,
+            volume_ma=volume_ma,
         )
         if confidence < self.min_confidence:
             return None
@@ -343,7 +365,7 @@ class CandlestickPatternStrategy(BaseStrategy):
             risk_per_share=stop_dist,
             reason=f"{side} signal - patterns: {pattern_str}",
             pattern_name=pattern_str,
-            metadata={"patterns": patterns, "rsi": rsi, "sma20": sma20},
+            metadata={"patterns": patterns, "rsi": rsi, "sma20": sma20, "volume": volume, "volume_ma": volume_ma},
             bar_timestamp=bar_ts,
         )
         if not sig.is_valid:
@@ -399,11 +421,24 @@ class CandlestickPatternStrategy(BaseStrategy):
         last_pos = len(df) - 1
         fired_patterns = _patterns_at_index(opens, highs, lows, closes, last_pos)
 
+        # Volume confluence indicators
+        volume = float(row.get("Volume", row.get("volume", 0.0)) or 0.0)
+        if "volume_ma" in df.columns:
+            volume_ma = float(df["volume_ma"].loc[last_idx] or 0.0)
+        elif "Volume" in df.columns and len(df) >= 20:
+            volume_ma = float(df["Volume"].tail(20).mean() or 0.0)
+        elif "volume" in df.columns and len(df) >= 20:
+            volume_ma = float(df["volume"].tail(20).mean() or 0.0)
+        else:
+            volume_ma = 0.0
+
         bullish_patterns = [p for p in fired_patterns if p in BULLISH_PATTERNS]
         bearish_patterns = [p for p in fired_patterns if p in BEARISH_PATTERNS]
 
         if len(bullish_patterns) >= self.min_patterns and len(bullish_patterns) >= len(bearish_patterns):
-            return self._build_signal(symbol, row, atr, rsi, sma20, "BUY", bullish_patterns)
+            return self._build_signal(
+                symbol, row, atr, rsi, sma20, "BUY", bullish_patterns, volume=volume, volume_ma=volume_ma
+            )
         
         allow_short = getattr(config, "ALLOW_SHORT", False)
         inverse_etfs = getattr(config, "INVERSE_ETF_SYMBOLS", set())
@@ -411,7 +446,9 @@ class CandlestickPatternStrategy(BaseStrategy):
             allow_short = False
 
         if allow_short and len(bearish_patterns) >= self.min_patterns:
-            return self._build_signal(symbol, row, atr, rsi, sma20, "SELL", bearish_patterns)
+            return self._build_signal(
+                symbol, row, atr, rsi, sma20, "SELL", bearish_patterns, volume=volume, volume_ma=volume_ma
+            )
 
         return None
 

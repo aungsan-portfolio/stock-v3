@@ -179,6 +179,10 @@ def log_trade(
     if not resolved_strategy:
         resolved_strategy = "UNKNOWN"
 
+    resolved_price_tier = kwargs.pop("price_tier", None)
+    if not resolved_price_tier and entry_price and entry_price > 0:
+        resolved_price_tier = "5-10" if (5.0 <= entry_price < 10.0) else (">10" if entry_price >= 10.0 else "<5")
+
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "event_type": event_type,
@@ -194,7 +198,7 @@ def log_trade(
         "exit_price": exit_price,
         "exit_reason": exit_reason,
         "pnl": pnl,
-        "price_tier": price_tier,
+        "price_tier": resolved_price_tier,
         "notes": notes,
         **kwargs,
     }

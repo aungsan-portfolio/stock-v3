@@ -360,12 +360,17 @@ class TrailingStopState:
     confirmed_broker_stop_price: Optional[float] = None
     stop_reconciliation_required: bool = False
     is_validation: bool = False
+    last_stop_order_id: Optional[str] = None
+    tp_order_id: Optional[str] = None
+    reconciliation_status: Optional[str] = None
 
     def __post_init__(self):
         if self.desired_stop_price is None:
             self.desired_stop_price = float(self.stop_price)
         if self.confirmed_broker_stop_price is None and not self.stop_reconciliation_required:
             self.confirmed_broker_stop_price = float(self.stop_price)
+        if self.order_id and not self.last_stop_order_id:
+            self.last_stop_order_id = str(self.order_id)
 
 
 MAX_HOLD_MINUTES = 25.0
@@ -535,6 +540,9 @@ class DynamicTrailingStopManager:
                             state_dict.setdefault("desired_stop_price", state_dict.get("stop_price"))
                             state_dict.setdefault("confirmed_broker_stop_price", state_dict.get("stop_price"))
                             state_dict.setdefault("stop_reconciliation_required", False)
+                            state_dict.setdefault("last_stop_order_id", state_dict.get("order_id"))
+                            state_dict.setdefault("tp_order_id", None)
+                            state_dict.setdefault("reconciliation_status", None)
                             self.states[sym] = TrailingStopState(**state_dict)
             self.persistence_healthy = True
             logger.info(f"Loaded {len(self.states)} active trailing stops.")
@@ -633,6 +641,8 @@ class DynamicTrailingStopManager:
                 existing.qty = cumulative_qty
                 if stop_order_id:
                     existing.order_id = stop_order_id
+                if tp_order_id:
+                    existing.tp_order_id = tp_order_id
                 existing.last_updated = time.time()
                 self._save_state()
                 logger.info(f"Updated Trailing Stop for {symbol}: fill=${average_fill_price:.4f}, cumulative_qty={cumulative_qty:.4f}")
@@ -702,6 +712,7 @@ class DynamicTrailingStopManager:
                 trail_multiple=mult,
                 last_updated=time.time(),
                 order_id=rebuild_res.stop_order_id,
+                tp_order_id=tp_order_id,
                 qty=qty,
                 strategy=_normalize_strategy_name(getattr(signal, "strategy", None)) if _normalize_strategy_name(getattr(signal, "strategy", None)) != "UNKNOWN" else ("DAYTRADE_SCALP" if getattr(signal, "signal_id", None) else "UNKNOWN"),
                 signal_id=getattr(signal, "signal_id", None),
@@ -1099,8 +1110,29 @@ class DynamicTrailingStopManager:
                                     logger.info(f"[RECONCILE] {state.symbol}: Stop order {state.order_id} partially filled, remaining pos={pos_qty}")
                                     state.qty = pos_qty
                             elif d_status in ("cancelled", "canceled", "expired", "rejected"):
-                                logger.warning(f"[RECONCILE P0] {state.symbol}: Stop order {state.order_id} status='{d_status}'. Clearing order ID for remediation.")
-                                state.order_id = None
+                                pos_qty = 0.0
+                                if bridge and hasattr(bridge, "get_position"):
+                                    try:
+                                        pos_qty = float(bridge.get_position(state.symbol) or 0.0)
+                                    except Exception:
+                                        pos_qty = 0.0
+                                elif bridge and hasattr(bridge, "get_positions"):
+                                    try:
+                                        for p in (bridge.get_positions() or []):
+                                            p_sym = getattr(p, "symbol", "") or (p.get("symbol") if isinstance(p, dict) else "")
+                                            if p_sym.upper() == state.symbol.upper():
+                                                pos_qty = float(getattr(p, "qty", 0.0) or (p.get("qty", 0.0) if isinstance(p, dict) else 0.0))
+                                    except Exception:
+                                        pos_qty = 0.0
+                                if pos_qty <= 0:
+                                    logger.info(f"[RECONCILE P0] {state.symbol}: Stop order {state.order_id} status='{d_status}' and position flat. Marking inactive cleanly.")
+                                    state.active = False
+                                    state.order_id = None
+                                    self._save_state()
+                                    return state
+                                else:
+                                    logger.warning(f"[RECONCILE P0] {state.symbol}: Stop order {state.order_id} status='{d_status}' with remaining pos={pos_qty}. Clearing order ID for remediation.")
+                                    state.order_id = None
                         else:
                             # Direct lookup unavailable or not found:
                             # Check if a matching stop exists in all_open_orders
@@ -1655,12 +1687,79 @@ class DynamicTrailingStopManager:
                 fresh_qty = float(position_qty)
 
             if fresh_qty == 0.0:
-                logger.info(f"Fresh position query for {symbol} returned 0. Marking trailing stop inactive (stopped out).")
-                # Log stopped out exit to trade journal
-                exit_price = state.stop_price
+                logger.info(f"Fresh position query for {symbol} returned 0. Determining exit cause and reconciling.")
+                exit_price = None
+                exit_reason = None
+                notes = None
+
+                # 1. Attempt to reconcile from broker order snapshots
+                tp_id = getattr(state, "tp_order_id", None)
+                stop_id = getattr(state, "order_id", None) or getattr(state, "last_stop_order_id", None)
+
+                # Check TP order first
+                if tp_id and bridge and hasattr(bridge, "get_order_snapshot"):
+                    try:
+                        tp_snap = bridge.get_order_snapshot(str(tp_id))
+                        if tp_snap and str(tp_snap.get("status", "")).lower() == "filled":
+                            exit_reason = "TAKE_PROFIT"
+                            exit_price = float(tp_snap.get("filled_avg_price") or tp_snap.get("limit_price") or state.target_price)
+                            notes = f"Take profit fill confirmed via snapshot (order={tp_id})"
+                    except Exception as tp_err:
+                        logger.debug("Failed to query TP snapshot for %s: %s", tp_id, tp_err)
+
+                # Check Stop order next if TP was not filled
+                if not exit_reason and stop_id and bridge and hasattr(bridge, "get_order_snapshot"):
+                    try:
+                        stop_snap = bridge.get_order_snapshot(str(stop_id))
+                        if stop_snap and str(stop_snap.get("status", "")).lower() == "filled":
+                            exit_reason = "STOP_OUT"
+                            exit_price = float(stop_snap.get("filled_avg_price") or state.stop_price)
+                            notes = f"Stop-out fill confirmed via snapshot (order={stop_id})"
+                    except Exception as st_err:
+                        logger.debug("Failed to query stop snapshot for %s: %s", stop_id, st_err)
+
+                # 2. Check recent closed orders if bridge client is available
+                if not exit_reason and bridge and hasattr(bridge, "_client") and hasattr(bridge._client, "get_orders"):
+                    try:
+                        from alpaca.trading.requests import GetOrdersRequest
+                        from alpaca.trading.enums import QueryOrderStatus
+                        req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[symbol.upper().strip()], limit=5)
+                        closed_orders = bridge._client.get_orders(req)
+                        for co in closed_orders:
+                            co_type = str(getattr(co, "order_type", getattr(co, "type", "")) or "").lower()
+                            co_status = str(getattr(co, "status", "")).lower()
+                            if "fill" in co_status:
+                                co_avg = float(getattr(co, "filled_avg_price", 0.0) or 0.0)
+                                if "limit" in co_type:
+                                    exit_reason = "TAKE_PROFIT"
+                                    exit_price = co_avg or float(getattr(co, "limit_price", 0.0) or 0.0) or state.target_price
+                                    notes = f"Take profit fill confirmed via closed order {getattr(co, 'id', '')}"
+                                    break
+                                elif "stop" in co_type:
+                                    exit_reason = "STOP_OUT"
+                                    exit_price = co_avg or float(getattr(co, "stop_price", 0.0) or 0.0) or state.stop_price
+                                    notes = f"Stop fill confirmed via closed order {getattr(co, 'id', '')}"
+                                    break
+                    except Exception as co_err:
+                        logger.debug("Failed to query closed orders for %s: %s", symbol, co_err)
+
+                # 3. If fill details are not yet available, defer journal closing
+                if not exit_reason or exit_price is None or exit_price <= 0:
+                    logger.info(
+                        f"Fresh position query for {symbol} returned 0, but broker exit fill is pending. "
+                        f"Marking FLAT_PENDING_EXIT_RECONCILIATION without phantom stop-out."
+                    )
+                    state.reconciliation_status = "FLAT_PENDING_EXIT_RECONCILIATION"
+                    state.active = False
+                    state.remediation_in_progress = False
+                    state.order_id = None
+                    self._save_state()
+                    return
+
+                # 4. Fill details confirmed — log authoritative exit
                 qty_closed = getattr(state, "qty", 0.0) or abs(position_qty)
                 pnl_val = (exit_price - state.entry_price) * qty_closed if state.side == "BUY" else (state.entry_price - exit_price) * qty_closed
-                
+
                 try:
                     if getattr(state, "is_validation", False):
                         try:
@@ -1671,7 +1770,7 @@ class DynamicTrailingStopManager:
                                 qty=float(qty_closed),
                                 side="SELL" if state.side == "BUY" else "BUY",
                                 symbol=symbol,
-                                exit_reason="STOP_OUT",
+                                exit_reason=exit_reason,
                             )
                         except Exception as val_e:
                             logger.error("Failed to record validation exit: %s", val_e)
@@ -1686,15 +1785,16 @@ class DynamicTrailingStopManager:
                             stop_price=state.stop_price,
                             target_price=getattr(state, "target_price", None) or exit_price,
                             exit_price=exit_price,
-                            exit_reason="STOP_OUT",
+                            exit_reason=exit_reason,
                             pnl=pnl_val,
-                            notes="Stopped out exit",
+                            notes=notes or f"Authoritative {exit_reason} exit",
                             event_type="TRADE_CLOSED",
                             signal_id=getattr(state, "signal_id", None)
                         )
                 except Exception as e_log:
-                    logger.error("Failed to log stopped out exit to journal: %s", e_log)
-                
+                    logger.error("Failed to log exit to journal: %s", e_log)
+
+                state.reconciliation_status = f"RECONCILED_{exit_reason}"
                 state.active = False
                 state.remediation_in_progress = False
                 state.order_id = None

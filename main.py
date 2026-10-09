@@ -2974,7 +2974,14 @@ def _run_daytrade_bot_lifecycle(args) -> int:
         elif pf_report.decision == PreflightDecision.GO_WITH_ENTRY_HOLD:
             print(f"🟡 PRE-FLIGHT AUDIT: GO_WITH_ENTRY_HOLD — {pf_report.hold_reason}. Trading engine active; entries held until bar close.")
         else:
-            print("🟢 PRE-FLIGHT AUDIT: GO — Trading operations and entries fully approved.")
+            is_dt_paper_authorized = (
+                hasattr(bridge, "is_daytrade_paper_execution_authorized")
+                and bridge.is_daytrade_paper_execution_authorized()
+            )
+            if is_dt_paper_authorized:
+                print("🟢 PRE-FLIGHT AUDIT: GO — System operational health verified & Daytrade Paper entries fully approved.")
+            else:
+                print("🟡 PRE-FLIGHT AUDIT: GO — System operational health verified; Paper order submission gate is STANDBY (DAYTRADE_PAPER_EXECUTION_ENABLED=false).")
 
         # ── Strict Startup Lifecycle Sequencing (Amendment 6) ──
         print("\n" + "="*60)

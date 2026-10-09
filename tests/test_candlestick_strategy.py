@@ -190,7 +190,70 @@ class TestCandlestickSignalGeneration:
         strat = CandlestickPatternStrategy(min_confidence=0.40)
         sig = strat.generate_signal(df, symbol="TEST")
         # Bullish engulfing detected
-        if sig is not None:
-            assert sig.side == "BUY"
-            assert sig.symbol == "TEST"
-            assert sig.confidence >= 0.40
+        assert sig is not None
+        assert sig.side == "BUY"
+        assert sig.symbol == "TEST"
+        assert sig.confidence >= 0.40
+
+    def test_one_pattern_with_volume_confluence_passes_gate(self):
+        """1-pattern BUY in uptrend with volume confluence (volume > volume_ma):
+        base = 0.20
+        trend_bonus = 0.20
+        rsi_bonus = 0.20
+        vol_bonus = 0.05
+        raw_confidence = 0.65
+        vol_adj = 0.9960
+        risk_adjusted_confidence = 0.65 * 0.9960 = 0.6474 >= 0.6000 (UNLOCKED).
+        """
+        raw_conf = CandlestickPatternStrategy._confidence(
+            pattern_count=1,
+            rsi=62.0,
+            close=450.0,
+            sma20=445.0,
+            side="BUY",
+            volume=12000.0,
+            volume_ma=10000.0,
+        )
+        assert raw_conf == pytest.approx(0.65, abs=1e-4)
+
+        sig = TradeSignal(
+            symbol="SPY",
+            strategy=CandlestickPatternStrategy.name,
+            side="BUY",
+            confidence=raw_conf,
+            entry_price=450.0,
+            stop_price=448.0,
+            target_price=454.0,
+            atr=0.45,
+            risk_per_share=2.0,
+            reason="Test volume confluence signal",
+        )
+        scorer = RiskAdjustedSignalScorer()
+        adjusted_conf = scorer.calculate_risk_adjusted_confidence(sig)
+        assert adjusted_conf == pytest.approx(0.6474, abs=1e-3)
+        gate = get_confidence_gate("RISK_ON", "BUY")
+        assert adjusted_conf >= gate
+
+    def test_continuous_equal_open_intraday_engulfing(self):
+        """Intraday 5m continuous bars where bar 2 opens at bar 1 close (no gap)."""
+        n = 30
+        closes = [100.0 - i * 0.2 for i in range(28)] + [94.0, 95.5]
+        # Previous close 94.0 == current open 94.0 (exact continuous bar open)
+        opens = [100.0 - i * 0.2 for i in range(28)] + [94.5, 94.0]
+        highs = [max(o, c) + 0.3 for o, c in zip(opens, closes)]
+        lows = [min(o, c) - 0.3 for o, c in zip(opens, closes)]
+        volumes = [15000.0] * n
+
+        df = pd.DataFrame({
+            "Open": opens,
+            "High": highs,
+            "Low": lows,
+            "Close": closes,
+            "Volume": volumes,
+        }, index=pd.date_range("2026-09-25 09:30:00", periods=n, freq="5min"))
+
+        strat = CandlestickPatternStrategy(min_confidence=0.40)
+        sig = strat.generate_signal(df, symbol="CONTINUOUS_TEST")
+        assert sig is not None
+        assert sig.side == "BUY"
+        assert "BULLISH_ENGULFING" in sig.pattern_name

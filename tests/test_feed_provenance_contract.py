@@ -558,14 +558,14 @@ def test_order_manager_fail_closed_on_feed_dislocation():
         atr=0.20,
         risk_per_share=0.16,
         reason="Momentum test",
-        bar_timestamp=datetime.fromtimestamp(now - 60.0, tz=timezone.utc).isoformat(),
+        bar_timestamp=datetime.fromtimestamp(now - 330.0, tz=timezone.utc).isoformat(),
         decision_feed="sip",
     )
     readiness = EntryReadiness(
         entry_allowed=True,
         suppression_reason=None,
         cycle_id="cycle_001",
-        bar_ts=datetime.fromtimestamp(now - 60.0, tz=timezone.utc).isoformat(),
+        bar_ts=datetime.fromtimestamp(now - 330.0, tz=timezone.utc).isoformat(),
         created_at=now,
         expires_at=now + 300.0,
     )

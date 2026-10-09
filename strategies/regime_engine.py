@@ -434,6 +434,87 @@ class MarketRegimeResult:
         )
 
 
+def _extract_prev_session_close(
+    bars_list: list,
+    today_date=None,
+) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """
+    Extract the previous completed trading session's close price from daily bars.
+    Calendar-aware: selects the most recent bar strictly prior to today's trading session (bar_date < today_date).
+    Returns: (prev_close, quote_ts, bar_date_str)
+    """
+    if not bars_list:
+        return None, None, None
+
+    if today_date is None:
+        try:
+            from strategies.session import now_eastern
+            today_date = now_eastern().date()
+        except Exception:
+            today_date = datetime.now(timezone.utc).date()
+
+    import pytz
+    et_tz = pytz.timezone("US/Eastern")
+
+    completed_bars = []
+    latest_bar_ts = None
+
+    for b in bars_list:
+        raw_ts = getattr(b, "timestamp", None) or getattr(b, "date", None)
+        if raw_ts is None and isinstance(b, dict):
+            raw_ts = b.get("timestamp") or b.get("date")
+
+        b_dt = None
+        if isinstance(raw_ts, datetime):
+            b_dt = raw_ts if raw_ts.tzinfo else raw_ts.replace(tzinfo=timezone.utc)
+        elif isinstance(raw_ts, str):
+            try:
+                b_dt = datetime.fromisoformat(raw_ts)
+                if b_dt.tzinfo is None:
+                    b_dt = b_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                b_dt = None
+        elif isinstance(raw_ts, (int, float)):
+            b_dt = datetime.fromtimestamp(float(raw_ts), tz=timezone.utc)
+
+        if b_dt is not None:
+            latest_bar_ts = b_dt.timestamp()
+            b_eastern_date = b_dt.astimezone(et_tz).date()
+            if b_eastern_date < today_date:
+                completed_bars.append((b_eastern_date, b_dt, b))
+
+    if completed_bars:
+        # Sort by date ascending to get the latest completed session
+        completed_bars.sort(key=lambda x: x[1])
+        latest_date, latest_dt, latest_bar = completed_bars[-1]
+        close_val = getattr(latest_bar, "close", None)
+        if close_val is None and isinstance(latest_bar, dict):
+            close_val = latest_bar.get("close")
+        if close_val is not None:
+            try:
+                c_float = float(close_val)
+                if c_float > 0 and math.isfinite(c_float):
+                    return c_float, latest_bar_ts or latest_dt.timestamp(), latest_date.isoformat()
+            except (ValueError, TypeError):
+                pass
+
+    # Safe fallback if timestamps could not be separated by calendar (e.g. synthetic test mocks):
+    # if len >= 2 use [-2], if len == 1 use [-1]
+    if len(bars_list) >= 2:
+        fb_bar = bars_list[-2]
+    else:
+        fb_bar = bars_list[-1]
+    fb_close = getattr(fb_bar, "close", None) if not isinstance(fb_bar, dict) else fb_bar.get("close")
+    try:
+        c_float = float(fb_close)
+        if c_float > 0 and math.isfinite(c_float):
+            return c_float, latest_bar_ts, "unparsed_index_fallback"
+    except (ValueError, TypeError):
+        pass
+
+    return None, None, None
+
+
 def _get_premarket_pct_change(symbol: str, bridge=None) -> Tuple[Optional[float], str, Optional[float]]:
     """Helper to fetch pre-market or current daily % change and quote epoch for a benchmark symbol.
     Returns (pct_change, data_source_str, quote_epoch_ts).
@@ -461,17 +542,15 @@ def _get_premarket_pct_change(symbol: str, bridge=None) -> Tuple[Optional[float]
                 price = bridge.get_price(symbol, allow_historical=True)
                 if price > 0:
                     prev_close = None
+                    baseline_source = "alpaca_quote_vs_prev_close"
+                    session_date_str = None
                     if hasattr(bridge, "fetch_historical_data"):
                         try:
                             bars = bridge.fetch_historical_data(symbol)
-                            if bars and len(bars) >= 2:
-                                prev_close = float(getattr(bars[-2], "close", 0.0) or (bars[-2]["close"] if isinstance(bars[-2], dict) else 0.0))
-                                bar_ts = getattr(bars[-1], "timestamp", None) or getattr(bars[-1], "date", None)
-                                if bar_ts and quote_ts is None:
-                                    if isinstance(bar_ts, (int, float)):
-                                        quote_ts = float(bar_ts)
-                                    elif isinstance(bar_ts, datetime):
-                                        quote_ts = bar_ts.timestamp()
+                            if bars:
+                                prev_close, bar_epoch, session_date_str = _extract_prev_session_close(bars)
+                                if bar_epoch and quote_ts is None:
+                                    quote_ts = bar_epoch
                         except Exception:
                             pass
 
@@ -491,15 +570,20 @@ def _get_premarket_pct_change(symbol: str, bridge=None) -> Tuple[Optional[float]
                             )
                             bars = bridge._data_client.get_stock_bars(req)
                             symbol_bars = bars.get(symbol, []) if bars else []
-                            if len(symbol_bars) >= 2:
-                                prev_close = float(symbol_bars[-2].close)
-                                quote_ts = quote_ts or symbol_bars[-1].timestamp.timestamp()
+                            if symbol_bars:
+                                prev_close, bar_epoch, session_date_str = _extract_prev_session_close(symbol_bars)
+                                if bar_epoch and quote_ts is None:
+                                    quote_ts = bar_epoch
                         except Exception:
                             pass
 
                     if prev_close and prev_close > 0:
                         pct = ((price - prev_close) / prev_close) * 100.0
-                        return round(pct, 2), "alpaca_quote_vs_prev_close", quote_ts or now_epoch
+                        logger.info(
+                            "[REGIME BASELINE] %s: prev_close=%.2f (session=%s), price=%.2f, change=%.2f%% (src=%s)",
+                            symbol, prev_close, session_date_str or "historical", price, pct, baseline_source,
+                        )
+                        return round(pct, 2), baseline_source, quote_ts or now_epoch
         except Exception as exc:
             logger.debug("Failed fetching premarket pct via bridge for %s: %s", symbol, exc)
 

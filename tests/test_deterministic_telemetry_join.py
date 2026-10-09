@@ -54,35 +54,39 @@ def test_placed_result_contains_all_deterministic_ids():
         "status": "Submitted",
     }
 
-    with patch("strategies.order_manager.pre_trade_check", return_value=None):
-        with patch("strategies.order_manager.validate_geometry", return_value=(True, "", 2.0, 4.0, 2.0)):
-            with patch("strategies.execution_quote.validate_execution_quote") as mock_vq:
-                mock_vq.return_value = MagicMock(valid=True, quote=MagicMock(ask=150.00, bid=149.95, last=150.00, timestamp=datetime.now(timezone.utc)))
-                with patch("config.BRACKET_ORDER_ENABLED", True), patch("config.SPY_TREND_GUARD_ENABLED", False):
-                    import time
-                    from strategies.base import EntryReadiness
-                    readiness = EntryReadiness(
-                        entry_allowed=True,
-                        suppression_reason=None,
-                        cycle_id="cycle_01",
-                        bar_ts="2026-09-21T13:30:00Z",
-                        created_at=time.time(),
-                        expires_at=time.time() + 300.0,
-                    )
-                    res = execute_signal(
-                        signal=sig,
-                        bridge=bridge,
-                        equity=100000.0,
-                        current_pnl=0.0,
-                        dry_run=False,
-                        entry_readiness=readiness,
-                    )
+    try:
+        with patch("strategies.order_manager.pre_trade_check", return_value=None):
+            with patch("strategies.order_manager.validate_geometry", return_value=(True, "", 2.0, 4.0, 2.0)):
+                with patch("strategies.execution_quote.validate_execution_quote") as mock_vq:
+                    mock_vq.return_value = MagicMock(valid=True, quote=MagicMock(ask=150.00, bid=149.95, last=150.00, timestamp=datetime.now(timezone.utc)))
+                    with patch("config.BRACKET_ORDER_ENABLED", True), patch("config.SPY_TREND_GUARD_ENABLED", False):
+                        import time
+                        from strategies.base import EntryReadiness
+                        readiness = EntryReadiness(
+                            entry_allowed=True,
+                            suppression_reason=None,
+                            cycle_id="cycle_01",
+                            bar_ts="2026-09-21T13:30:00Z",
+                            created_at=time.time(),
+                            expires_at=time.time() + 300.0,
+                        )
+                        res = execute_signal(
+                            signal=sig,
+                            bridge=bridge,
+                            equity=100000.0,
+                            current_pnl=0.0,
+                            dry_run=False,
+                            entry_readiness=readiness,
+                        )
 
-    assert res["status"] == "PLACED", f"res was: {res}"
-    assert res["parent_order_id"] == "parent-12345"
-    assert "se3-aapl-b-orb" in res["client_order_id"].lower()
-    assert res["stop_order_id"] == "stop-67890"
-    assert res["tp_order_id"] == "tp-99999"
+        assert res["status"] == "PLACED", f"res was: {res}"
+        assert res["parent_order_id"] == "parent-12345"
+        assert "se3-aapl-b-orb" in res["client_order_id"].lower()
+        assert res["stop_order_id"] == "stop-67890"
+        assert res["tp_order_id"] == "tp-99999"
+    finally:
+        from strategies.entry_lifecycle import entry_lifecycle
+        entry_lifecycle.finalize_entry("parent-12345", reason="test_cleanup")
 
 
 def test_gate_ledger_metadata_contains_deterministic_ids(tmp_path):

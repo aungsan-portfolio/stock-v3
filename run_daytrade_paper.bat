@@ -33,6 +33,9 @@ if exist .env (
 REM Ensure D2 Mean Reversion Shadow Experiment is active (ratified shadow lane)
 if not defined EXPERIMENTAL_MR_SHADOW_ENABLED set "EXPERIMENTAL_MR_SHADOW_ENABLED=true"
 
+REM Explicit Daytrade Paper Execution Authorization (paper-only execution gate)
+set "DAYTRADE_PAPER_EXECUTION_ENABLED=true"
+
 REM ---------------------------------------------------------
 REM 3. Validation and Fail-Fast Guards
 REM ---------------------------------------------------------
@@ -98,6 +101,7 @@ echo   Account Key: !MASKED_KEY!
 echo   Endpoint:    !APCA_API_BASE_URL!
 echo   Python:      !PY_EXE!
 echo   Shadow Exp:  MR_SHADOW=!EXPERIMENTAL_MR_SHADOW_ENABLED!
+echo   Paper Exec:  AUTHORIZED=!DAYTRADE_PAPER_EXECUTION_ENABLED!
 echo   Session Log: !SESSION_LOG!
 echo =======================================================
 echo.

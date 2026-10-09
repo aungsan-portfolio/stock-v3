@@ -199,13 +199,31 @@ class VWAPBounceStrategy(BaseStrategy):
                     raw_risk, stop_geom.minimum_distance, spread_floor, tick_size,
                     actual_risk, actual_reward, actual_rr,
                 )
-                confidence = 0.5
-                if rsi < config.VWAP_RSI_OVERSOLD:
+                confidence = 0.50
+                # RSI Pullback & Momentum Calibration (healthy bounce zone vs deep oversold)
+                if rsi < getattr(config, "VWAP_RSI_OVERSOLD", 35.0):
                     confidence += 0.15
+                elif 40.0 <= rsi <= 60.0:
+                    confidence += 0.10
+                elif rsi < 40.0:
+                    confidence += 0.10
+
                 if price > vwap:
                     confidence += 0.10
-                if vol_ma > 0 and volume > vol_ma:
-                    confidence += 0.10
+
+                # Graduated volume participation
+                if vol_ma > 0:
+                    if volume >= 1.2 * vol_ma:
+                        confidence += 0.10
+                    elif volume >= 0.85 * vol_ma:
+                        confidence += 0.05
+
+                # Structural quality bonus
+                if actual_rr >= 2.0:
+                    confidence += 0.05
+                if held_above:
+                    confidence += 0.05
+
                 confidence = min(confidence, 1.0)
 
                 return TradeSignal(
@@ -332,13 +350,31 @@ class VWAPBounceStrategy(BaseStrategy):
                     raw_risk, stop_geom.minimum_distance, spread_floor, tick_size,
                     actual_risk, actual_reward, actual_rr,
                 )
-                confidence = 0.5
-                if rsi > config.VWAP_RSI_OVERBOUGHT:
+                confidence = 0.50
+                # Symmetrical RSI Rejection Calibration
+                if rsi > getattr(config, "VWAP_RSI_OVERBOUGHT", 65.0):
                     confidence += 0.15
+                elif 40.0 <= rsi <= 60.0:
+                    confidence += 0.10
+                elif rsi > 60.0:
+                    confidence += 0.10
+
                 if price < vwap:
                     confidence += 0.10
-                if vol_ma > 0 and volume > vol_ma:
-                    confidence += 0.10
+
+                # Graduated volume participation
+                if vol_ma > 0:
+                    if volume >= 1.2 * vol_ma:
+                        confidence += 0.10
+                    elif volume >= 0.85 * vol_ma:
+                        confidence += 0.05
+
+                # Structural quality bonus
+                if actual_rr >= 2.0:
+                    confidence += 0.05
+                if held_below:
+                    confidence += 0.05
+
                 confidence = min(confidence, 1.0)
 
                 return TradeSignal(
