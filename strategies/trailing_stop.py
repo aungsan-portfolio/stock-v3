@@ -7,10 +7,11 @@ Never loosens a stop. Updates orders directly when live.
 import json
 import logging
 import os
+import math
 import threading
 import time
 from dataclasses import dataclass, asdict
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union, Any
 
 import config
 from strategies.base import TradeSignal
@@ -123,6 +124,7 @@ def verify_broker_stop_order_evidence(
     position_side: str,
     expected_stop_price: float,
     expected_qty: Optional[float] = None,
+    fill_price: Optional[float] = None,
 ) -> Tuple[bool, str]:
     """
     Validates that order_data satisfies strict broker evidence requirements:
@@ -132,8 +134,9 @@ def verify_broker_stop_order_evidence(
              For SELL/SHORT position -> stop order side must be BUY.
     4. Type: Must be in _STOP_ORDER_TYPES ('stop', 'stop_limit', 'trailing_stop').
     5. Status: Must be in _WORKING_STOP_STATUSES and strictly not in _TERMINAL_STOP_STATUSES.
-    6. Qty: If expected_qty is provided and order has qty, must match.
-    7. Stop Price: Must match expected_stop_price within tolerance (0.01 + 1e-4).
+               Empty status is strictly rejected.
+    6. Qty: If expected_qty is provided, order qty must be present, finite, > 0, and match expected_qty.
+    7. Stop Price: Must match expected_stop_price within instrument tick-size tolerance.
     """
     if order_data is None:
         return False, "EVIDENCE_MISSING: Order data is None"
@@ -150,9 +153,11 @@ def verify_broker_stop_order_evidence(
     if raw_status is None:
         return False, "EVIDENCE_STATUS_MISSING: Order status is None"
     status_str = _normalize_sdk_field(raw_status)
+    if not status_str:
+        return False, "EVIDENCE_STATUS_MISSING: Order status is empty"
     if status_str in _TERMINAL_STOP_STATUSES:
         return False, f"EVIDENCE_STATUS_TERMINAL: Status {status_str} is terminal/rejected"
-    if status_str and status_str not in _WORKING_STOP_STATUSES:
+    if status_str not in _WORKING_STOP_STATUSES:
         return False, f"EVIDENCE_STATUS_NON_WORKING: Status {status_str} is not a valid working protection state"
 
     # 3. Symbol check
@@ -183,23 +188,48 @@ def verify_broker_stop_order_evidence(
         return False, "EVIDENCE_TYPE_MISSING: Order type is missing"
 
     # 6. Quantity check
+    raw_qty = _extract_order_field(order_data, "qty", "quantity")
     if expected_qty is not None:
-        raw_qty = _extract_order_field(order_data, "qty", "quantity")
-        if raw_qty is not None:
-            try:
-                if abs(float(raw_qty) - float(expected_qty)) > 1e-4:
-                    return False, f"EVIDENCE_QTY_MISMATCH: Order qty {raw_qty} != expected {expected_qty}"
-            except (ValueError, TypeError):
-                return False, f"EVIDENCE_QTY_INVALID: Could not parse order qty {raw_qty}"
+        if raw_qty is None:
+            return False, "EVIDENCE_QTY_MISSING: Order qty is missing"
+        try:
+            qty_f = float(raw_qty)
+            if not math.isfinite(qty_f) or qty_f <= 0.0:
+                return False, f"EVIDENCE_QTY_INVALID: Order qty {raw_qty} is not finite or <= 0"
+            if abs(qty_f - float(expected_qty)) > 1e-4:
+                return False, f"EVIDENCE_QTY_MISMATCH: Order qty {qty_f} != expected {expected_qty}"
+        except (ValueError, TypeError):
+            return False, f"EVIDENCE_QTY_INVALID: Could not parse order qty {raw_qty}"
+    elif raw_qty is not None:
+        try:
+            qty_f = float(raw_qty)
+            if not math.isfinite(qty_f) or qty_f <= 0.0:
+                return False, f"EVIDENCE_QTY_INVALID: Order qty {raw_qty} is not finite or <= 0"
+        except (ValueError, TypeError):
+            return False, f"EVIDENCE_QTY_INVALID: Could not parse order qty {raw_qty}"
 
-    # 7. Stop Price check
+    # 7. Stop Price check (Dynamic Instrument Tick Size & Quantization Contract)
     raw_stop_price = _extract_order_field(order_data, "stop_price", "stopPrice")
     if raw_stop_price is None:
         return False, "EVIDENCE_STOP_PRICE_MISSING: Order lacks stop_price"
     try:
         stop_price_f = float(raw_stop_price)
-        if abs(stop_price_f - expected_stop_price) > (0.01 + 1e-4):
-            return False, f"EVIDENCE_STOP_PRICE_MISMATCH: Broker stop {stop_price_f:.4f} != expected {expected_stop_price:.4f}"
+        if not math.isfinite(stop_price_f) or stop_price_f <= 0.0:
+            return False, f"EVIDENCE_STOP_PRICE_INVALID: Stop price {raw_stop_price} is not finite or <= 0"
+
+        ref_price = max(expected_stop_price, fill_price) if (fill_price is not None and math.isfinite(fill_price)) else expected_stop_price
+        tick_size = 0.01 if ref_price >= 1.0 else 0.0001
+        cfg_tol = getattr(config, "TRAILING_STOP_RECONCILE_TOLERANCE", None)
+        tolerance = (
+            max(tick_size / 2.0, float(cfg_tol)) + 1e-6
+            if (cfg_tol is not None and math.isfinite(float(cfg_tol)))
+            else (tick_size / 2.0 + 1e-6)
+        )
+        if abs(stop_price_f - expected_stop_price) > tolerance:
+            return False, (
+                f"EVIDENCE_STOP_PRICE_MISMATCH: Broker stop {stop_price_f:.4f} != "
+                f"expected {expected_stop_price:.4f} (tolerance {tolerance:.6f}, tick_size {tick_size:.4f})"
+            )
     except (ValueError, TypeError):
         return False, f"EVIDENCE_STOP_PRICE_INVALID: Could not parse stop price {raw_stop_price}"
 
@@ -590,6 +620,7 @@ class DynamicTrailingStopManager:
                 tp_order_id=tp_order_id,
                 side=signal.side,
                 return_details=True,
+                expected_qty=qty if (qty is not None and qty > 0) else None,
             )
 
             state = TrailingStopState(
@@ -809,6 +840,7 @@ class DynamicTrailingStopManager:
                                     position_side=side,
                                     expected_stop_price=new_stop_price,
                                     expected_qty=expected_qty,
+                                    fill_price=fill_price,
                                 )
                                 if is_valid:
                                     replace_stop_succeeded = True
@@ -841,6 +873,7 @@ class DynamicTrailingStopManager:
                                                 position_side=side,
                                                 expected_stop_price=new_stop_price,
                                                 expected_qty=expected_qty,
+                                                fill_price=fill_price,
                                             )
                                             if snap_valid:
                                                 replace_stop_succeeded = True

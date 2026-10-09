@@ -596,6 +596,24 @@ def evaluate_and_route_validation_candidate(
     now = time.time()
     decision_feed = getattr(signal, "decision_feed", None) or "iex"
     bar_ts = getattr(signal, "bar_timestamp", None)
+    if bar_ts is not None:
+        bar_dur_raw = getattr(signal, "bar_duration_seconds", getattr(config, "ENTRY_BAR_DURATION_SECONDS", 300.0))
+        if bar_dur_raw is None:
+            result["reason"] = "Hard Safety Quote Gate: BAR_DURATION_INVALID (bar_duration_seconds missing)"
+            logger.warning("[VALIDATION HARD SAFETY VETO] %s: bar_duration_seconds missing", signal.symbol)
+            return result
+        try:
+            bar_dur_f = float(bar_dur_raw)
+            if not math.isfinite(bar_dur_f) or bar_dur_f <= 0.0:
+                result["reason"] = f"Hard Safety Quote Gate: BAR_DURATION_INVALID (bar_duration_seconds={bar_dur_raw} must be > 0)"
+                logger.warning("[VALIDATION HARD SAFETY VETO] %s: bar_duration_seconds=%s must be > 0", signal.symbol, bar_dur_raw)
+                return result
+        except (TypeError, ValueError):
+            result["reason"] = f"Hard Safety Quote Gate: BAR_DURATION_INVALID (could not parse {bar_dur_raw})"
+            logger.warning("[VALIDATION HARD SAFETY VETO] %s: could not parse bar_duration_seconds=%s", signal.symbol, bar_dur_raw)
+            return result
+    else:
+        bar_dur_f = None
 
     try:
         quote_res = validate_execution_quote(
@@ -610,7 +628,7 @@ def evaluate_and_route_validation_candidate(
             bar_timestamp=bar_ts,
             max_bar_age_seconds=getattr(config, "MAX_BAR_STALENESS_SECONDS", 300.0),
             require_feed_concordance=True,  # STRICT CONCORDANCE MANDATORY
-            bar_duration_seconds=float(getattr(signal, "bar_duration_seconds", getattr(config, "ENTRY_BAR_DURATION_SECONDS", 300.0))),
+            bar_duration_seconds=bar_dur_f,
             max_entry_bar_close_age_seconds=float(getattr(config, "ENTRY_BAR_CLOSE_GRACE_SECONDS", 60.0)),
         )
     except Exception as exc:

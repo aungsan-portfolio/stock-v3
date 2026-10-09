@@ -115,7 +115,7 @@ def validate_execution_quote(
     max_bar_age_seconds: float = 300.0,
     require_feed_concordance: bool = False,
     quote: Optional[Any] = None,
-    bar_duration_seconds: float = 0.0,
+    bar_duration_seconds: Optional[float] = None,
     max_entry_bar_close_age_seconds: Optional[float] = None,
 ) -> QuoteValidationResult:
     """
@@ -128,7 +128,8 @@ def validate_execution_quote(
         max_deviation_pct = float(max_deviation_pct)
         max_age_seconds = float(max_age_seconds)
         max_bar_age_seconds = float(max_bar_age_seconds)
-        bar_duration_seconds = float(bar_duration_seconds)
+        if bar_duration_seconds is not None:
+            bar_duration_seconds = float(bar_duration_seconds)
         if max_entry_bar_close_age_seconds is not None:
             max_entry_bar_close_age_seconds = float(max_entry_bar_close_age_seconds)
         decision_price = float(decision_price)
@@ -143,14 +144,14 @@ def validate_execution_quote(
         or not math.isfinite(max_deviation_pct)
         or not math.isfinite(max_age_seconds)
         or not math.isfinite(max_bar_age_seconds)
-        or not math.isfinite(bar_duration_seconds)
+        or (bar_duration_seconds is not None and not math.isfinite(bar_duration_seconds))
         or (max_entry_bar_close_age_seconds is not None and not math.isfinite(max_entry_bar_close_age_seconds))
         or not math.isfinite(decision_price)
         or max_spread_pct < 0
         or max_deviation_pct < 0
         or max_age_seconds <= 0
         or max_bar_age_seconds <= 0
-        or bar_duration_seconds < 0
+        or (bar_duration_seconds is not None and bar_duration_seconds <= 0.0)
         or (max_entry_bar_close_age_seconds is not None and max_entry_bar_close_age_seconds <= 0)
         or decision_price < 0
     ):
@@ -304,7 +305,7 @@ def validate_execution_quote(
                 quote=quote,
             )
         if bar_duration_seconds is not None:
-            if not (math.isfinite(bar_duration_seconds) and bar_duration_seconds >= 0.0):
+            if not (math.isfinite(bar_duration_seconds) and bar_duration_seconds > 0.0):
                 return QuoteValidationResult(
                     valid=False,
                     reason=(
@@ -313,7 +314,6 @@ def validate_execution_quote(
                     ),
                     quote=quote,
                 )
-        if bar_duration_seconds > 0.0:
             bar_close_epoch = bar_epoch + bar_duration_seconds
             bar_close_age = now - bar_close_epoch
             effective_limit = (

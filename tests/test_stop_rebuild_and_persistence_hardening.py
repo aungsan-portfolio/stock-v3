@@ -33,6 +33,7 @@ from strategies.trailing_stop import (
     GeometryRebuildResult,
     TrailingStopState,
     TrailingStatePersistenceError,
+    verify_broker_stop_order_evidence,
 )
 
 
@@ -957,6 +958,289 @@ class TestStopRebuildAndPersistenceHardening(unittest.TestCase):
         self.assertFalse(res.stop_reconciliation_required)
         self.assertTrue(res.rebuild_succeeded)
         self.assertEqual(res.stop_order_id, "r_snap_ok")
+
+    def test_stop_evidence_empty_status_rejected(self):
+        """Broker order with empty string status or None status must fail-closed."""
+        order_empty = {
+            "id": "ord_status_empty",
+            "symbol": "AAPL",
+            "side": "sell",
+            "type": "stop",
+            "status": "",
+            "stop_price": 149.00,
+        }
+        valid, reason = verify_broker_stop_order_evidence(
+            order_empty,
+            expected_order_id="ord_status_empty",
+            expected_symbol="AAPL",
+            position_side="BUY",
+            expected_stop_price=149.00,
+        )
+        self.assertFalse(valid)
+        self.assertIn("EVIDENCE_STATUS_MISSING", reason)
+
+        order_none = {
+            "id": "ord_status_none",
+            "symbol": "AAPL",
+            "side": "sell",
+            "type": "stop",
+            "status": None,
+            "stop_price": 149.00,
+        }
+        valid, reason = verify_broker_stop_order_evidence(
+            order_none,
+            expected_order_id="ord_status_none",
+            expected_symbol="AAPL",
+            position_side="BUY",
+            expected_stop_price=149.00,
+        )
+        self.assertFalse(valid)
+        self.assertIn("EVIDENCE_STATUS_MISSING", reason)
+
+    def test_stop_evidence_non_working_status_rejected(self):
+        """Broker order with non-working status (e.g. suspended, pending_cancel) must fail-closed."""
+        for bad_status in ["suspended", "pending_cancel", "unknown", "rejected"]:
+            order = {
+                "id": f"ord_status_{bad_status}",
+                "symbol": "AAPL",
+                "side": "sell",
+                "type": "stop",
+                "status": bad_status,
+                "stop_price": 149.00,
+            }
+            valid, reason = verify_broker_stop_order_evidence(
+                order,
+                expected_order_id=f"ord_status_{bad_status}",
+                expected_symbol="AAPL",
+                position_side="BUY",
+                expected_stop_price=149.00,
+            )
+            self.assertFalse(valid)
+            self.assertTrue(
+                "EVIDENCE_STATUS_NON_WORKING" in reason or "EVIDENCE_STATUS_TERMINAL" in reason,
+                f"Expected non-working/terminal status rejection for status '{bad_status}', got '{reason}'"
+            )
+
+    def test_stop_evidence_qty_missing_when_expected_qty_provided_rejected(self):
+        """When expected_qty is provided, missing qty field must fail-closed."""
+        order_no_qty = {
+            "id": "ord_no_qty",
+            "symbol": "AAPL",
+            "side": "sell",
+            "type": "stop",
+            "status": "new",
+            "stop_price": 149.00,
+        }
+        valid, reason = verify_broker_stop_order_evidence(
+            order_no_qty,
+            expected_order_id="ord_no_qty",
+            expected_symbol="AAPL",
+            position_side="BUY",
+            expected_stop_price=149.00,
+            expected_qty=100.0,
+        )
+        self.assertFalse(valid)
+        self.assertIn("EVIDENCE_QTY_MISSING", reason)
+
+    def test_stop_evidence_qty_invalid_rejected(self):
+        """Non-finite, zero, negative, or malformed qty must fail-closed."""
+        for invalid_val in [float("nan"), float("inf"), 0.0, -10.0, "not_a_number"]:
+            order_bad_qty = {
+                "id": "ord_bad_qty",
+                "symbol": "AAPL",
+                "side": "sell",
+                "type": "stop",
+                "status": "new",
+                "qty": invalid_val,
+                "stop_price": 149.00,
+            }
+            valid, reason = verify_broker_stop_order_evidence(
+                order_bad_qty,
+                expected_order_id="ord_bad_qty",
+                expected_symbol="AAPL",
+                position_side="BUY",
+                expected_stop_price=149.00,
+                expected_qty=100.0,
+            )
+            self.assertFalse(valid)
+            self.assertIn("EVIDENCE_QTY_INVALID", reason)
+
+    def test_stop_evidence_tick_size_and_quantization_contract(self):
+        """
+        Stop price tolerance scales dynamically with instrument tick size:
+        1. >= $1.00: tick size = $0.01 (half tick tolerance = $0.005).
+        2. < $1.00: tick size = $0.0001 (half tick tolerance = $0.00005).
+        """
+        # Case A: Standard stock (>= $1.00)
+        # Expected stop: 50.00. Broker returns 50.004 (within half tick 0.005) -> Pass
+        order_dollar_ok = {
+            "id": "ord_dlr_ok",
+            "symbol": "AAPL",
+            "side": "sell",
+            "type": "stop",
+            "status": "new",
+            "stop_price": 50.004,
+        }
+        valid, reason = verify_broker_stop_order_evidence(
+            order_dollar_ok,
+            expected_order_id="ord_dlr_ok",
+            expected_symbol="AAPL",
+            position_side="BUY",
+            expected_stop_price=50.00,
+            fill_price=50.20,
+        )
+        self.assertTrue(valid, f"Expected verified, got {reason}")
+
+        # Expected stop: 50.00. Broker returns 50.02 (diff 0.02 > 0.005 tolerance) -> Fail
+        order_dollar_mismatch = {
+            "id": "ord_dlr_mismatch",
+            "symbol": "AAPL",
+            "side": "sell",
+            "type": "stop",
+            "status": "new",
+            "stop_price": 50.02,
+        }
+        valid, reason = verify_broker_stop_order_evidence(
+            order_dollar_mismatch,
+            expected_order_id="ord_dlr_mismatch",
+            expected_symbol="AAPL",
+            position_side="BUY",
+            expected_stop_price=50.00,
+            fill_price=50.20,
+        )
+        self.assertFalse(valid)
+        self.assertIn("EVIDENCE_STOP_PRICE_MISMATCH", reason)
+
+        # Case B: Sub-dollar stock (< $1.00)
+        # Expected stop: 0.5000. Broker returns 0.50004 (diff 0.00004 <= half tick 0.00005) -> Pass
+        order_sub_ok = {
+            "id": "ord_sub_ok",
+            "symbol": "PENNY",
+            "side": "sell",
+            "type": "stop",
+            "status": "new",
+            "stop_price": 0.50004,
+        }
+        valid, reason = verify_broker_stop_order_evidence(
+            order_sub_ok,
+            expected_order_id="ord_sub_ok",
+            expected_symbol="PENNY",
+            position_side="BUY",
+            expected_stop_price=0.5000,
+            fill_price=0.5200,
+        )
+        self.assertTrue(valid, f"Expected verified for sub-dollar, got {reason}")
+
+        # Expected stop: 0.5000. Broker returns 0.5010 (diff 0.0010 > 0.00005 tolerance) -> Fail
+        order_sub_mismatch = {
+            "id": "ord_sub_mismatch",
+            "symbol": "PENNY",
+            "side": "sell",
+            "type": "stop",
+            "status": "new",
+            "stop_price": 0.5010,
+        }
+        valid, reason = verify_broker_stop_order_evidence(
+            order_sub_mismatch,
+            expected_order_id="ord_sub_mismatch",
+            expected_symbol="PENNY",
+            position_side="BUY",
+            expected_stop_price=0.5000,
+            fill_price=0.5200,
+        )
+        self.assertFalse(valid)
+        self.assertIn("EVIDENCE_STOP_PRICE_MISMATCH", reason)
+
+    def test_candle_guard_zero_duration_rejected(self):
+        """bar_duration_seconds=0.0 must be rejected as invalid configuration."""
+        mock_bridge = MagicMock()
+        now = time.time()
+        mock_bridge.get_quote.return_value = {
+            "symbol": "QQQ",
+            "bid": 400.00,
+            "ask": 400.05,
+            "last": 400.02,
+            "timestamp": now - 1.0,
+            "source": "alpaca",
+            "is_realtime": True,
+            "feed_identity": "iex",
+        }
+        res_zero = validate_execution_quote(
+            bridge=mock_bridge,
+            symbol="QQQ",
+            decision_price=400.00,
+            bar_timestamp=now - 330.0,
+            bar_duration_seconds=0.0,
+        )
+        self.assertFalse(res_zero.valid)
+        self.assertIn("Invalid quote-validation configuration", res_zero.reason)
+
+    def test_order_manager_missing_or_invalid_bar_duration_fail_closed(self):
+        """order_manager.execute_signal vetos fail-closed if signal bar_duration_seconds is invalid/missing."""
+        from strategies.order_manager import execute_signal
+        from strategies.base import EntryReadiness
+
+        now = time.time()
+        mock_bridge = MagicMock()
+        mock_bridge.is_connected = True
+        mock_bridge.open_position_count.return_value = 0
+        mock_bridge.has_position.return_value = False
+        mock_bridge.has_working_order.return_value = False
+        mock_bridge.get_positions.return_value = []
+        mock_bridge.get_quote.return_value = {
+            "symbol": "AAPL",
+            "bid": 150.00,
+            "ask": 150.05,
+            "last": 150.02,
+            "timestamp": now - 1.0,
+            "source": "alpaca",
+            "is_realtime": True,
+            "feed_identity": "sip",
+        }
+
+        from datetime import timezone, datetime
+        bar_iso = datetime.fromtimestamp(now - 330.0, tz=timezone.utc).isoformat()
+        # Signal with None bar_duration_seconds and explicit bar_timestamp
+        sig_none_dur = TradeSignal(
+            symbol="AAPL",
+            strategy=StrategyName.MOMENTUM_SCALP,
+            side="BUY",
+            confidence=0.80,
+            entry_price=150.00,
+            stop_price=149.00,
+            target_price=152.00,
+            atr=1.0,
+            risk_per_share=1.0,
+            reason="Test duration missing",
+            bar_timestamp=bar_iso,
+            decision_feed="sip",
+        )
+        # Explicitly set bar_duration_seconds to None
+        sig_none_dur.bar_duration_seconds = None
+
+        readiness = EntryReadiness(
+            entry_allowed=True,
+            suppression_reason=None,
+            cycle_id="cycle_dur_001",
+            bar_ts=bar_iso,
+            created_at=now,
+            expires_at=now + 300.0,
+        )
+
+        with patch("config.REQUIRE_FEED_CONCORDANCE", False), \
+             patch("config.REQUIRE_REALTIME_DATA_FOR_ORDERS", True), \
+             patch("config.SPY_TREND_GUARD_ENABLED", False), \
+             patch("strategies.intraday_risk.get_recent_symbol_loss_time", return_value=None):
+            res = execute_signal(
+                signal=sig_none_dur,
+                bridge=mock_bridge,
+                equity=100000.0,
+                current_pnl=0.0,
+                dry_run=False,
+                entry_readiness=readiness,
+            )
+            self.assertEqual(res.get("status"), "VETOED")
+            self.assertIn("BAR_DURATION_INVALID", res.get("reason", ""))
 
 
 if __name__ == "__main__":

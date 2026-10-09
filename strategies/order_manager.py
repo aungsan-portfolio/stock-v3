@@ -2099,6 +2099,29 @@ def execute_signal(
     if not dry_run and require_realtime and is_connected:
         try:
             from strategies.execution_quote import validate_execution_quote
+            bar_ts = getattr(executable_signal, "bar_timestamp", None) or getattr(signal, "bar_timestamp", None)
+            bar_dur_raw = getattr(executable_signal, "bar_duration_seconds", getattr(signal, "bar_duration_seconds", getattr(config, "ENTRY_BAR_DURATION_SECONDS", 300.0)))
+            if bar_ts is not None:
+                if bar_dur_raw is None:
+                    idempotency_manager.release(signal.symbol, side=signal.side, reason="bar_duration_missing")
+                    result["status"] = "VETOED"
+                    result["reason"] = "Execution Quote Gate failed closed: BAR_DURATION_INVALID (bar_duration_seconds missing)"
+                    return result
+                try:
+                    bar_dur_f = float(bar_dur_raw)
+                    if not math.isfinite(bar_dur_f) or bar_dur_f <= 0.0:
+                        idempotency_manager.release(signal.symbol, side=signal.side, reason="bar_duration_invalid")
+                        result["status"] = "VETOED"
+                        result["reason"] = f"Execution Quote Gate failed closed: BAR_DURATION_INVALID (bar_duration_seconds={bar_dur_raw} must be > 0)"
+                        return result
+                except (TypeError, ValueError):
+                    idempotency_manager.release(signal.symbol, side=signal.side, reason="bar_duration_malformed")
+                    result["status"] = "VETOED"
+                    result["reason"] = f"Execution Quote Gate failed closed: BAR_DURATION_INVALID (could not parse {bar_dur_raw})"
+                    return result
+            else:
+                bar_dur_f = None
+
             quote_res = validate_execution_quote(
                 bridge=bridge,
                 symbol=signal.symbol,
@@ -2108,11 +2131,11 @@ def execute_signal(
                 max_deviation_pct=getattr(config, "MAX_DECISION_DEVIATION_PCT", 1.5),
                 max_age_seconds=getattr(config, "MAX_QUOTE_AGE_SECONDS", 10.0),
                 decision_feed=getattr(executable_signal, "decision_feed", None) or getattr(signal, "decision_feed", None),
-                bar_timestamp=getattr(executable_signal, "bar_timestamp", None) or getattr(signal, "bar_timestamp", None),
+                bar_timestamp=bar_ts,
                 max_bar_age_seconds=getattr(config, "MAX_BAR_STALENESS_SECONDS", 300.0),
                 require_feed_concordance=getattr(config, "REQUIRE_FEED_CONCORDANCE", False),
                 quote=quote,
-                bar_duration_seconds=float(getattr(executable_signal, "bar_duration_seconds", getattr(signal, "bar_duration_seconds", getattr(config, "ENTRY_BAR_DURATION_SECONDS", 300.0)))),
+                bar_duration_seconds=bar_dur_f,
                 max_entry_bar_close_age_seconds=float(getattr(config, "ENTRY_BAR_CLOSE_GRACE_SECONDS", 60.0)),
             )
         except Exception as quote_exc:
