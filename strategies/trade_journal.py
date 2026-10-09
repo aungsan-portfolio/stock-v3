@@ -224,6 +224,37 @@ def log_trade(
     path = journal_file or config.DAYTRADE_TRADE_JOURNAL_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     with _journal_lock:
+        # Idempotency Guard: prevent duplicate TRADE_CLOSED writes across crashes/restarts
+        primary_trade_key = str(kwargs.get("idempotency_key") or kwargs.get("exit_order_id") or signal_id or order_id or "")
+        if path.exists() and primary_trade_key and event_type in ("TRADE_CLOSED", "TRADE", "EXIT"):
+            try:
+                with open(path, "r", encoding="utf-8") as fh_check:
+                    for line in fh_check:
+                        if not line.strip():
+                            continue
+                        if primary_trade_key in line:
+                            try:
+                                item = json.loads(line)
+                                if (
+                                    item.get("event_type") == event_type
+                                    and item.get("symbol") == symbol
+                                    and (
+                                        item.get("idempotency_key") == primary_trade_key
+                                        or item.get("exit_order_id") == primary_trade_key
+                                        or str(item.get("signal_id")) == primary_trade_key
+                                        or str(item.get("order_id")) == primary_trade_key
+                                    )
+                                ):
+                                    logger.warning(
+                                        "[JOURNAL TRADE IDEMPOTENT GUARD] Event %s for %s (key=%s) already recorded in %s. Skipping duplicate write.",
+                                        event_type, symbol, primary_trade_key, path
+                                    )
+                                    return
+                            except Exception:
+                                pass
+            except Exception as read_err:
+                logger.warning("[JOURNAL TRADE GUARD READ ERROR] %s", read_err)
+
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, default=str) + "\n")
     logger.info("Journal: %s %s %s @ %.2f | stop=%.2f target=%.2f",

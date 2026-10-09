@@ -2541,6 +2541,40 @@ def execute_signal(
                         last_err,
                     )
                     return result
+
+                if hasattr(final_ts_mgr, "has_unresolved_position_unknown") and final_ts_mgr.has_unresolved_position_unknown():
+                    idempotency_manager.release(
+                        signal.symbol,
+                        side=signal.side,
+                        reason="final_submit_position_unknown_halt",
+                    )
+                    result["status"] = "VETOED"
+                    result["reason"] = (
+                        "Trailing Stop Position Unknown Halt (Final Submit): "
+                        "Portfolio has active positions with unresolved broker query failures"
+                    )
+                    logger.warning(
+                        "[POSITION UNKNOWN FINAL SUBMIT VETO] %s: Trailing stop manager has unresolved POSITION_UNKNOWN state immediately before submit.",
+                        signal.symbol,
+                    )
+                    return result
+
+                if hasattr(final_ts_mgr, "has_pending_exit") and final_ts_mgr.has_pending_exit(signal.symbol):
+                    idempotency_manager.release(
+                        signal.symbol,
+                        side=signal.side,
+                        reason="final_submit_unreconciled_exit_pending",
+                    )
+                    result["status"] = "VETOED"
+                    result["reason"] = (
+                        f"Unreconciled Exit Pending (Final Submit): "
+                        f"Prior exit for {signal.symbol} pending broker reconciliation"
+                    )
+                    logger.warning(
+                        "[UNRECONCILED EXIT FINAL SUBMIT VETO] %s: Symbol has unreconciled pending exit immediately before submit.",
+                        signal.symbol,
+                    )
+                    return result
             except Exception as final_persist_err:
                 idempotency_manager.release(
                     signal.symbol,

@@ -7,6 +7,7 @@ Regression test suite for:
 3. TrailingStopManager.handle_naked_position exit reconciliation (TAKE_PROFIT vs STOP_OUT vs FLAT_PENDING_EXIT_RECONCILIATION)
 """
 
+import json
 import math
 import time
 from datetime import datetime, date, timezone
@@ -99,6 +100,16 @@ class TestCalendarAwareRegimeBaseline:
         prev_close, _, dt_str = _extract_prev_session_close(bars, today_date=date(2026, 10, 9))
         assert prev_close is None
         assert dt_str is None
+
+    def test_regime_baseline_rejects_missing_intermediate_session(self):
+        """Verify that if yesterday (Thursday Oct 8) is missing and only Wednesday Oct 7 exists, fail closed."""
+        bars = [
+            {"close": 150.0, "timestamp": "2026-10-07T20:00:00Z"},
+        ]
+        prev_close, _, dt_str = _extract_prev_session_close(bars, today_date=date(2026, 10, 9))
+        assert prev_close is None
+        assert dt_str is None
+
 
 
 
@@ -366,7 +377,7 @@ class TestHandleNakedPositionExitReconciliation:
         assert not mock_log.called
         assert not state.active
         assert state.reconciliation_status == "FLAT_PENDING_EXIT_RECONCILIATION"
-        assert "NVDA" in mgr.pending_exits
+        assert mgr.has_pending_exit("NVDA")
 
     def test_position_query_failure_retains_active_state(self):
         """When broker position query raises exception, retain active state fail-closed."""
@@ -475,7 +486,7 @@ class TestHandleNakedPositionExitReconciliation:
                 mgr.handle_naked_position("META", 5.0, bridge=mock_bridge)
 
         assert not mock_log.called
-        assert "META" in mgr.pending_exits
+        assert mgr.has_pending_exit("META")
         assert not state.active
         assert state.reconciliation_status == "FLAT_PENDING_EXIT_RECONCILIATION"
 
@@ -499,7 +510,7 @@ class TestHandleNakedPositionExitReconciliation:
         assert call_kwargs["symbol"] == "META"
         assert call_kwargs["exit_reason"] == "STOP_OUT"
         assert call_kwargs["exit_price"] == pytest.approx(494.80)
-        assert "META" not in mgr.pending_exits
+        assert not mgr.has_pending_exit("META")
         assert state.reconciliation_status == "RECONCILED_STOP_OUT"
 
     def test_journal_rejects_nan_and_inf_exit_prices(self):
@@ -532,4 +543,276 @@ class TestHandleNakedPositionExitReconciliation:
                 exit_reason="STOP_OUT",
                 pnl=-50.0,
             )
+
+
+# ---------------------------------------------------------------------------
+# Suite 4: Durable Pending Queue, Exactly-Once Journaling & Fail-Closed Halts
+# ---------------------------------------------------------------------------
+
+def _make_test_signal(symbol="AAPL", side="BUY", entry=150.0, stop=147.0, target=156.0, confidence=0.85, atr=1.5):
+    from strategies.base import TradeSignal, StrategyName
+    return TradeSignal(
+        symbol=symbol,
+        strategy=StrategyName.VWAP_BOUNCE,
+        side=side,
+        entry_price=entry,
+        stop_price=stop,
+        target_price=target,
+        confidence=confidence,
+        atr=atr,
+        risk_per_share=abs(entry - stop),
+        bar_timestamp=datetime.now(timezone.utc).isoformat(),
+        reason="TEST_SIGNAL",
+    )
+
+
+class TestDurablePendingQueueAndSafetyHalts:
+    def test_poller_reconciles_pending_exits_when_no_open_positions(self):
+        """Reconciliation poller processes pending exits even when cached_open_positions is empty (len == 0)."""
+        mgr = DynamicTrailingStopManager()
+        state = TrailingStopState(
+            symbol="AMD",
+            side="BUY",
+            entry_price=100.0,
+            peak_price=100.0,
+            atr=1.0,
+            stop_price=98.0,
+            trail_multiple=1.5,
+            last_updated=time.time(),
+            target_price=105.0,
+            qty=10.0,
+            order_id="stop-amd-1",
+            signal_id="sig-amd-101",
+            active=False,
+            reconciliation_status="FLAT_PENDING_EXIT_RECONCILIATION",
+        )
+        mgr.states["AMD"] = state
+        with patch.object(mgr, "_save_state", return_value=True):
+            mgr._record_pending_exit(state)
+
+        assert mgr.has_pending_exit("AMD") is True
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_order_snapshot.return_value = {
+            "id": "stop-amd-1",
+            "status": "filled",
+            "symbol": "AMD",
+            "side": "sell",
+            "order_type": "stop",
+            "filled_avg_price": 97.90,
+            "qty": 10.0,
+        }
+
+        with patch("strategies.trade_journal.log_trade") as mock_log:
+            with patch.object(mgr, "_save_state", return_value=True):
+                # When open positions are completely empty ([]), poller still runs and reconciles
+                reconciled = mgr.reconcile_pending_exits(bridge=mock_bridge)
+
+        assert mock_log.called
+        assert reconciled.get("AMD") == "RECONCILED_STOP_OUT"
+        assert mgr.has_pending_exit("AMD") is False
+
+    def test_multiple_episodes_same_symbol_do_not_collide_in_pending_queue(self):
+        """Sequential episodes for the same symbol must not overwrite each other in pending_exits."""
+        mgr = DynamicTrailingStopManager()
+        state1 = TrailingStopState(
+            symbol="AAPL",
+            side="BUY",
+            entry_price=150.0,
+            peak_price=150.0,
+            atr=1.0,
+            stop_price=148.0,
+            trail_multiple=1.5,
+            last_updated=time.time(),
+            qty=10.0,
+            order_id="stop-aapl-1",
+            signal_id="sig-aapl-ep1",
+            active=True,
+        )
+        state2 = TrailingStopState(
+            symbol="AAPL",
+            side="BUY",
+            entry_price=155.0,
+            peak_price=155.0,
+            atr=1.0,
+            stop_price=153.0,
+            trail_multiple=1.5,
+            last_updated=time.time(),
+            qty=10.0,
+            order_id="stop-aapl-2",
+            signal_id="sig-aapl-ep2",
+            active=True,
+        )
+
+        with patch.object(mgr, "_save_state", return_value=True):
+            mgr._record_pending_exit(state1)
+            mgr._record_pending_exit(state2)
+
+        # Both episodes must exist concurrently without collision
+        assert len(mgr.pending_exits) == 2
+        assert "AAPL:sig-aapl-ep1" in mgr.pending_exits
+        assert "AAPL:sig-aapl-ep2" in mgr.pending_exits
+        assert mgr.has_pending_exit("AAPL") is True
+
+    def test_journal_idempotent_guard_prevents_duplicate_trade_closed(self, tmp_path):
+        """Idempotency guard in trade_journal.log_trade prevents duplicate TRADE_CLOSED records."""
+        from strategies.trade_journal import log_trade
+        journal_path = tmp_path / "test_journal.jsonl"
+
+        # First commit
+        log_trade(
+            symbol="TSLA",
+            side="SELL",
+            strategy="VWAP_BOUNCE",
+            qty=5,
+            entry_price=200.0,
+            stop_price=195.0,
+            target_price=210.0,
+            exit_price=194.80,
+            exit_reason="STOP_OUT",
+            pnl=-26.0,
+            journal_file=journal_path,
+            idempotency_key="exit_TSLA:sig-tsla-1_STOP_OUT",
+        )
+
+        # Second commit replay (e.g. restart crash replay)
+        log_trade(
+            symbol="TSLA",
+            side="SELL",
+            strategy="VWAP_BOUNCE",
+            qty=5,
+            entry_price=200.0,
+            stop_price=195.0,
+            target_price=210.0,
+            exit_price=194.80,
+            exit_reason="STOP_OUT",
+            pnl=-26.0,
+            journal_file=journal_path,
+            idempotency_key="exit_TSLA:sig-tsla-1_STOP_OUT",
+        )
+
+        # Only 1 record should exist
+        lines = [line.strip() for line in journal_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        assert record["symbol"] == "TSLA"
+        assert record["idempotency_key"] == "exit_TSLA:sig-tsla-1_STOP_OUT"
+
+    def test_position_unknown_state_blocks_all_candidates_at_final_submit(self, monkeypatch, tmp_path):
+        """When any position is in POSITION_UNKNOWN state, candidates A and B are blocked at final submit."""
+        import strategies.order_manager as om
+        from strategies.order_idempotency import idempotency_manager
+        from strategies.trailing_stop import manager as live_ts_mgr
+        import config
+
+        test_journal = tmp_path / "test_trade_journal.jsonl"
+        monkeypatch.setattr(config, "DAYTRADE_TRADE_JOURNAL_FILE", test_journal)
+        monkeypatch.setattr(config, "REQUIRE_REALTIME_DATA_FOR_ORDERS", False)
+        monkeypatch.setattr(config, "SPY_TREND_GUARD_ENABLED", False)
+        monkeypatch.setattr(config, "VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED", False)
+        monkeypatch.setattr(config, "DAYTRADE_REQUIRE_ENTRY_READINESS", False)
+
+        with om._pending_order_contexts_lock:
+            om._pending_order_contexts.clear()
+        om.reset_session_skip_state()
+        idempotency_manager.clear()
+
+        bridge = MagicMock()
+        bridge.is_paper = True
+        bridge.account_mode = "PAPER"
+        bridge.is_connected = True
+        bridge.open_position_count.return_value = 1
+        bridge.get_positions.return_value = []
+        bridge.has_position.return_value = False
+        bridge.has_working_order.return_value = False
+        bridge.place_bracket_order = MagicMock(return_value={"order_id": "b-test"})
+
+        unknown_state = TrailingStopState(
+            symbol="NVDA",
+            side="BUY",
+            entry_price=120.0,
+            peak_price=120.0,
+            atr=1.0,
+            stop_price=118.0,
+            trail_multiple=1.5,
+            last_updated=time.time(),
+            qty=10.0,
+            active=True,
+            reconciliation_status="POSITION_UNKNOWN_RECONCILIATION_REQUIRED",
+            stop_reconciliation_required=True,
+        )
+
+        with patch.dict(live_ts_mgr.states, {"NVDA": unknown_state}, clear=True):
+            with patch.object(live_ts_mgr, "persistence_healthy", True):
+                assert live_ts_mgr.has_unresolved_position_unknown() is True
+
+                # Candidate A: AAPL
+                sig_a = _make_test_signal(symbol="AAPL", entry=150.0, stop=147.0, target=156.0)
+                res_a = om.execute_signal(sig_a, bridge, equity=50000.0, current_pnl=0.0, dry_run=False)
+
+                # Candidate B: MSFT
+                sig_b = _make_test_signal(symbol="MSFT", entry=400.0, stop=395.0, target=410.0)
+                res_b = om.execute_signal(sig_b, bridge, equity=50000.0, current_pnl=0.0, dry_run=False)
+
+                # Assertions
+                assert res_a["status"] == "VETOED"
+                assert "Trailing Stop Position Unknown Halt (Final Submit)" in res_a["reason"]
+                assert res_b["status"] == "VETOED"
+                assert "Trailing Stop Position Unknown Halt (Final Submit)" in res_b["reason"]
+
+                # Critical safety invariant: Broker submit call count MUST BE STRICTLY ZERO
+                assert bridge.place_bracket_order.call_count == 0
+
+                # Verify idempotency reservations were cleanly released (not left hanging)
+                assert "AAPL_BUY" not in idempotency_manager.reservations
+                assert "MSFT_BUY" not in idempotency_manager.reservations
+
+    def test_pending_exit_blocks_new_entry_for_same_symbol(self, monkeypatch, tmp_path):
+        """When AAPL has an unresolved pending exit, a new AAPL entry is blocked at final submit."""
+        import strategies.order_manager as om
+        from strategies.order_idempotency import idempotency_manager
+        from strategies.trailing_stop import manager as live_ts_mgr
+        import config
+
+        test_journal = tmp_path / "test_trade_journal.jsonl"
+        monkeypatch.setattr(config, "DAYTRADE_TRADE_JOURNAL_FILE", test_journal)
+        monkeypatch.setattr(config, "REQUIRE_REALTIME_DATA_FOR_ORDERS", False)
+        monkeypatch.setattr(config, "SPY_TREND_GUARD_ENABLED", False)
+        monkeypatch.setattr(config, "VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED", False)
+        monkeypatch.setattr(config, "DAYTRADE_REQUIRE_ENTRY_READINESS", False)
+
+        with om._pending_order_contexts_lock:
+            om._pending_order_contexts.clear()
+        om.reset_session_skip_state()
+        idempotency_manager.clear()
+
+        bridge = MagicMock()
+        bridge.is_paper = True
+        bridge.account_mode = "PAPER"
+        bridge.is_connected = True
+        bridge.open_position_count.return_value = 0
+        bridge.get_positions.return_value = []
+        bridge.has_position.return_value = False
+        bridge.has_working_order.return_value = False
+        bridge.place_bracket_order = MagicMock(return_value={"order_id": "b-test"})
+
+        pending_item = {
+            "episode_id": "AAPL:sig-aapl-prev",
+            "symbol": "AAPL",
+            "side": "BUY",
+            "qty": 10.0,
+            "entry_price": 150.0,
+        }
+
+        with patch.dict(live_ts_mgr.pending_exits, {"AAPL:sig-aapl-prev": pending_item}, clear=True):
+            with patch.object(live_ts_mgr, "persistence_healthy", True):
+                assert live_ts_mgr.has_pending_exit("AAPL") is True
+
+                sig = _make_test_signal(symbol="AAPL", entry=150.0, stop=147.0, target=156.0)
+                res = om.execute_signal(sig, bridge, equity=50000.0, current_pnl=0.0, dry_run=False)
+
+                assert res["status"] == "VETOED"
+                assert "Unreconciled Exit Pending (Final Submit)" in res["reason"]
+                assert bridge.place_bracket_order.call_count == 0
+                assert "AAPL_BUY" not in idempotency_manager.reservations
 

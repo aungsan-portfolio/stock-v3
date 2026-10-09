@@ -1765,6 +1765,16 @@ def evaluate_and_execute(
 
     try:
         from strategies.trailing_stop import manager
+        if bridge is not None:
+            # 1. ALWAYS reconcile pending exits every cycle, regardless of open positions count or halts
+            manager.reconcile_pending_exits(bridge)
+
+        # 2. Safety Check: Halt new entries if any active position has unresolved broker query failure
+        if manager.has_unresolved_position_unknown():
+            logger.warning("[SAFETY GATE HALT] Unresolved POSITION_UNKNOWN state in trailing stops — halting NEW entries this cycle")
+            allow_new_entries = False
+            can_evaluate_signals = False
+
         if broker_state_available:
             active_symbols = {
                 p.contract.symbol for p in cached_open_positions if p.position != 0
@@ -2530,6 +2540,17 @@ def evaluate_and_execute(
     execution_results = []
     logger.debug("[HOOK] before execute")
     for sig in all_signals:
+        try:
+            from strategies.trailing_stop import manager
+            if manager.has_unresolved_position_unknown():
+                logger.warning("[SAFETY GATE HALT] Rejecting signal %s: active POSITION_UNKNOWN state across portfolio", sig.symbol)
+                continue
+            if manager.has_pending_exit(sig.symbol):
+                logger.warning("[SAFETY GATE REJECT] Rejecting signal %s: prior exit for %s pending broker reconciliation", sig.symbol, sig.symbol)
+                continue
+        except Exception:
+            pass
+
         entry_allowed_for_sig = allow_new_entries or _inverse_etf_entry_allowed(regime_res, sig)
         if not entry_allowed_for_sig:
             logger.info(

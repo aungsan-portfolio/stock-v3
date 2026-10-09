@@ -488,12 +488,13 @@ def _extract_prev_session_close(
         completed_bars.sort(key=lambda x: x[1])
         latest_date, latest_dt, latest_bar = completed_bars[-1]
 
-        # Freshness guard: ensure completed bar is from an expected recent exchange session (1 to 5 calendar days)
-        calendar_gap_days = (today_date - latest_date).days
-        if calendar_gap_days <= 0 or calendar_gap_days > 5:
+        # Full NYSE Exchange Calendar Validation: ensure completed bar is the EXACT expected prior trading session
+        from strategies.session import get_previous_market_day
+        expected_prev_session = get_previous_market_day(today_date)
+        if latest_date != expected_prev_session:
             logger.warning(
-                "[REGIME CALENDAR GAP] Bar date %s is %d days from today %s (allowed: 1-5 days). Failing closed.",
-                latest_date, calendar_gap_days, today_date
+                "[REGIME CALENDAR MISMATCH] Latest completed bar date %s does not match expected exchange session date %s (today=%s). Failing closed.",
+                latest_date, expected_prev_session, today_date
             )
             return None, None, None
 

@@ -662,7 +662,10 @@ class DynamicTrailingStopManager:
         """Record an open position whose broker position has flattened into the durable pending exits queue."""
         symbol = state.symbol.upper().strip()
         closed_qty = float(qty_closed if qty_closed is not None and qty_closed > 0 else (state.qty or 0.0))
-        self.pending_exits[symbol] = {
+        episode_key = str(state.signal_id or state.order_id or state.tp_order_id or int(getattr(state, "entry_time", 0) or time.time()))
+        episode_id = f"{symbol}:{episode_key}"
+        self.pending_exits[episode_id] = {
+            "episode_id": episode_id,
             "symbol": symbol,
             "side": state.side,
             "qty": closed_qty,
@@ -677,13 +680,31 @@ class DynamicTrailingStopManager:
             "signal_id": getattr(state, "signal_id", None),
             "strategy": getattr(state, "strategy", None) or "UNKNOWN",
             "registered_at": time.time(),
-            "attempts": self.pending_exits.get(symbol, {}).get("attempts", 0) + 1,
+            "attempts": self.pending_exits.get(episode_id, {}).get("attempts", 0) + 1,
         }
         state.active = False
         state.reconciliation_status = "FLAT_PENDING_EXIT_RECONCILIATION"
         state.order_id = None
         state.remediation_in_progress = False
         self._save_state()
+
+    def has_pending_exit(self, symbol: str) -> bool:
+        """Check if any pending exit in durable queue matches symbol."""
+        sym_clean = symbol.upper().strip()
+        with self._lock:
+            for item in self.pending_exits.values():
+                if item.get("symbol", "").upper().strip() == sym_clean:
+                    return True
+            return False
+
+    def has_unresolved_position_unknown(self) -> bool:
+        """Check if any active position in states has unresolved broker query failure."""
+        with self._lock:
+            for s in self.states.values():
+                if s.active and s.reconciliation_status == "POSITION_UNKNOWN_RECONCILIATION_REQUIRED":
+                    return True
+            return False
+
 
     def reconcile_pending_exits(self, bridge: Optional[object] = None) -> Dict[str, str]:
         """
@@ -697,7 +718,8 @@ class DynamicTrailingStopManager:
 
         results = {}
         with self._lock:
-            for symbol, exit_item in list(self.pending_exits.items()):
+            for episode_id, exit_item in list(self.pending_exits.items()):
+                symbol = exit_item.get("symbol") or episode_id.split(":")[0]
                 try:
                     exit_reason = None
                     exit_price = None
@@ -812,6 +834,7 @@ class DynamicTrailingStopManager:
 
                     # Attempt journal write
                     expected_exit_side = "sell" if str(exit_item.get("side", "")).upper() in ("BUY", "LONG") else "buy"
+                    idempotency_key = f"exit_{episode_id}_{exit_reason}"
                     if exit_item.get("is_validation"):
                         try:
                             from strategies.validation_lane import record_validation_fill_and_close
@@ -842,16 +865,21 @@ class DynamicTrailingStopManager:
                             event_type="TRADE_CLOSED",
                             signal_id=exit_item.get("signal_id"),
                             strategy=_normalize_strategy_name(exit_item.get("strategy")),
+                            idempotency_key=idempotency_key,
                         )
 
-                    # Journal commit succeeded! Remove from pending queue
-                    del self.pending_exits[symbol]
+                    # Journal commit succeeded! Remove from pending queue atomically
+                    if episode_id in self.pending_exits:
+                        del self.pending_exits[episode_id]
+                    if symbol in self.pending_exits:
+                        del self.pending_exits[symbol]
                     if symbol in self.states:
                         self.states[symbol].reconciliation_status = f"RECONCILED_{exit_reason}"
                         self.states[symbol].active = False
                     self._save_state()
                     results[symbol] = f"RECONCILED_{exit_reason}"
-                    logger.info("[RECONCILE AUTHORITATIVE SUCCESS] %s: %s @ %.2f (pnl=%.2f)", symbol, exit_reason, exit_price, pnl_val)
+                    logger.info("[RECONCILE AUTHORITATIVE SUCCESS] %s: %s @ %.2f (pnl=%.2f, key=%s)", symbol, exit_reason, exit_price, pnl_val, idempotency_key)
+
 
                 except Exception as rec_err:
                     logger.error("[RECONCILE FAILED RETAINING PENDING] %s: %s", symbol, rec_err)
