@@ -1079,6 +1079,7 @@ class TestStopRebuildAndPersistenceHardening(unittest.TestCase):
             "side": "sell",
             "type": "stop",
             "status": "new",
+            "qty": 10.0,
             "stop_price": 50.004,
         }
         valid, reason = verify_broker_stop_order_evidence(
@@ -1087,6 +1088,7 @@ class TestStopRebuildAndPersistenceHardening(unittest.TestCase):
             expected_symbol="AAPL",
             position_side="BUY",
             expected_stop_price=50.00,
+            expected_qty=10.0,
             fill_price=50.20,
         )
         self.assertTrue(valid, f"Expected verified, got {reason}")
@@ -1098,6 +1100,7 @@ class TestStopRebuildAndPersistenceHardening(unittest.TestCase):
             "side": "sell",
             "type": "stop",
             "status": "new",
+            "qty": 10.0,
             "stop_price": 50.02,
         }
         valid, reason = verify_broker_stop_order_evidence(
@@ -1106,6 +1109,7 @@ class TestStopRebuildAndPersistenceHardening(unittest.TestCase):
             expected_symbol="AAPL",
             position_side="BUY",
             expected_stop_price=50.00,
+            expected_qty=10.0,
             fill_price=50.20,
         )
         self.assertFalse(valid)
@@ -1119,6 +1123,7 @@ class TestStopRebuildAndPersistenceHardening(unittest.TestCase):
             "side": "sell",
             "type": "stop",
             "status": "new",
+            "qty": 100.0,
             "stop_price": 0.50004,
         }
         valid, reason = verify_broker_stop_order_evidence(
@@ -1127,6 +1132,7 @@ class TestStopRebuildAndPersistenceHardening(unittest.TestCase):
             expected_symbol="PENNY",
             position_side="BUY",
             expected_stop_price=0.5000,
+            expected_qty=100.0,
             fill_price=0.5200,
         )
         self.assertTrue(valid, f"Expected verified for sub-dollar, got {reason}")
@@ -1138,6 +1144,7 @@ class TestStopRebuildAndPersistenceHardening(unittest.TestCase):
             "side": "sell",
             "type": "stop",
             "status": "new",
+            "qty": 100.0,
             "stop_price": 0.5010,
         }
         valid, reason = verify_broker_stop_order_evidence(
@@ -1146,6 +1153,7 @@ class TestStopRebuildAndPersistenceHardening(unittest.TestCase):
             expected_symbol="PENNY",
             position_side="BUY",
             expected_stop_price=0.5000,
+            expected_qty=100.0,
             fill_price=0.5200,
         )
         self.assertFalse(valid)
@@ -1241,6 +1249,212 @@ class TestStopRebuildAndPersistenceHardening(unittest.TestCase):
             )
             self.assertEqual(res.get("status"), "VETOED")
             self.assertIn("BAR_DURATION_INVALID", res.get("reason", ""))
+
+    def test_expected_qty_and_price_nan_or_invalid_fail_closed(self):
+        """F1: NaN, infinite, non-positive, or malformed expected_qty/expected_stop_price must fail closed."""
+        import math
+        order = {
+            "id": "s1",
+            "symbol": "AAPL",
+            "side": "sell",
+            "type": "stop",
+            "status": "new",
+            "qty": 10.0,
+            "stop_price": 99.0,
+        }
+        kw = dict(
+            expected_order_id="s1",
+            expected_symbol="AAPL",
+            position_side="BUY",
+            expected_stop_price=99.0,
+            expected_qty=10.0,
+        )
+        # Control passes
+        valid, _ = verify_broker_stop_order_evidence(order, **kw)
+        self.assertTrue(valid)
+
+        # 1. NaN expected_qty
+        valid, reason = verify_broker_stop_order_evidence(order, **dict(kw, expected_qty=math.nan))
+        self.assertFalse(valid)
+        self.assertIn("EVIDENCE_EXPECTED_QTY_INVALID", reason)
+
+        # 2. NaN expected_stop_price
+        valid, reason = verify_broker_stop_order_evidence(order, **dict(kw, expected_stop_price=math.nan))
+        self.assertFalse(valid)
+        self.assertIn("EVIDENCE_EXPECTED_STOP_PRICE_INVALID", reason)
+
+        # 3. Non-positive expected_qty (0, -10, inf)
+        for bad_q in [0.0, -10.0, float("inf"), float("-inf")]:
+            valid, reason = verify_broker_stop_order_evidence(order, **dict(kw, expected_qty=bad_q))
+            self.assertFalse(valid)
+            self.assertIn("EVIDENCE_EXPECTED_QTY_INVALID", reason)
+
+        # 4. Non-positive expected_stop_price (0, -50, inf)
+        for bad_p in [0.0, -50.0, float("inf"), float("-inf")]:
+            valid, reason = verify_broker_stop_order_evidence(order, **dict(kw, expected_stop_price=bad_p))
+            self.assertFalse(valid)
+            self.assertIn("EVIDENCE_EXPECTED_STOP_PRICE_INVALID", reason)
+
+        # 5. Missing expected_qty when require_qty=True
+        valid, reason = verify_broker_stop_order_evidence(order, require_qty=True, **dict(kw, expected_qty=None))
+        self.assertFalse(valid)
+        self.assertIn("EVIDENCE_EXPECTED_QTY_MISSING", reason)
+
+        # 6. Missing broker qty with expected_qty=None
+        order_no_qty = {k: v for k, v in order.items() if k != "qty"}
+        valid, reason = verify_broker_stop_order_evidence(order_no_qty, require_qty=False, **dict(kw, expected_qty=None))
+        self.assertFalse(valid)
+        self.assertIn("EVIDENCE_QTY_MISSING", reason)
+
+    def test_partially_filled_stop_remaining_capacity_verified(self):
+        """F1: Partially filled order compares remaining order capacity (qty - filled_qty) against expected_qty."""
+        order_partial = {
+            "id": "s_partial",
+            "symbol": "AAPL",
+            "side": "sell",
+            "type": "stop",
+            "status": "partially_filled",
+            "qty": 10.0,
+            "filled_qty": 9.0,
+            "stop_price": 99.0,
+        }
+        kw = dict(
+            expected_order_id="s_partial",
+            expected_symbol="AAPL",
+            position_side="BUY",
+            expected_stop_price=99.0,
+        )
+        # Expected 10 shares remaining -> Fail (only 1 remaining)
+        valid, reason = verify_broker_stop_order_evidence(order_partial, expected_qty=10.0, **kw)
+        self.assertFalse(valid)
+        self.assertIn("EVIDENCE_QTY_MISMATCH", reason)
+
+        # Expected 1 share remaining -> Pass
+        valid, reason = verify_broker_stop_order_evidence(order_partial, expected_qty=1.0, **kw)
+        self.assertTrue(valid, f"Expected pass for remaining 1.0 share, got: {reason}")
+
+        # Partially filled order without filled_qty -> Fail closed
+        order_missing_filled = {k: v for k, v in order_partial.items() if k != "filled_qty"}
+        valid, reason = verify_broker_stop_order_evidence(order_missing_filled, expected_qty=1.0, **kw)
+        self.assertFalse(valid)
+        self.assertIn("EVIDENCE_FILLED_QTY_MISSING", reason)
+
+    def test_config_tolerance_override_bounded_by_tick_size(self):
+        """F7: Config tolerance override (e.g. 0.1) cannot widen beyond instrument tick size."""
+        order = {
+            "id": "s1",
+            "symbol": "AAPL",
+            "side": "sell",
+            "type": "stop",
+            "status": "new",
+            "qty": 10.0,
+            "stop_price": 99.09,
+        }
+        kw = dict(
+            expected_order_id="s1",
+            expected_symbol="AAPL",
+            position_side="BUY",
+            expected_stop_price=99.0,
+            expected_qty=10.0,
+        )
+        with patch("config.TRAILING_STOP_RECONCILE_TOLERANCE", 0.1):
+            valid, reason = verify_broker_stop_order_evidence(order, **kw)
+            self.assertFalse(valid, "Override must NOT accept 9-cent mismatch on $1+ stock")
+            self.assertIn("EVIDENCE_STOP_PRICE_MISMATCH", reason)
+
+    def test_unchanged_geometry_without_broker_requires_reconciliation(self):
+        """F2: validate_and_rebuild_geometry with bridge=None/stop_order_id=None must NOT confirm broker stop."""
+        manager = DynamicTrailingStopManager()
+        # 1. Unconfirmed stop order ID with failing bridge verification
+        mock_bridge = MagicMock()
+        mock_bridge.get_order_snapshot.return_value = None
+        res = manager.validate_and_rebuild_geometry(
+            symbol="AAPL",
+            signal_price=100.0,
+            fill_price=100.0,
+            initial_stop=99.0,
+            target_price=102.0,
+            stop_order_id="stop_unconfirmed_123",
+            bridge=mock_bridge,
+            return_details=True,
+            expected_qty=10.0,
+        )
+        self.assertIsNone(res.confirmed_broker_stop_price, "Must NOT claim confirmed stop without bridge verification")
+        self.assertTrue(res.stop_reconciliation_required)
+        self.assertFalse(res.rebuild_succeeded)
+
+        # 2. No stop order ID at all
+        res_no_id = manager.validate_and_rebuild_geometry(
+            symbol="AAPL",
+            signal_price=100.0,
+            fill_price=100.0,
+            initial_stop=99.0,
+            target_price=102.0,
+            return_details=True,
+            expected_qty=10.0,
+        )
+        self.assertIsNone(res_no_id.confirmed_broker_stop_price, "Must NOT claim confirmed stop without order ID")
+        self.assertFalse(res_no_id.rebuild_succeeded)
+
+    def test_exact_protection_full_matrix(self):
+        """F2: verify_exact_protection enforces working status, remaining capacity, price match, and finite inputs."""
+        from strategies.entry_lifecycle import verify_exact_protection
+
+        class MockBridge:
+            def __init__(self, pos_qty=10.0, stops=None):
+                self._pos_qty = pos_qty
+                self._stops = stops or []
+            def get_position_truth(self, s):
+                import types
+                return types.SimpleNamespace(qty=self._pos_qty)
+            def get_active_stops_for_symbol(self, s):
+                return self._stops
+
+        # 1. Probe reproduction: empty status must be rejected
+        b_empty_st = MockBridge(
+            pos_qty=10.0,
+            stops=[{"id": "s1", "symbol": "AAPL", "side": "SELL", "type": "stop", "qty": 10.0, "status": "", "filled_qty": 9.0, "stop_price": 99.0}]
+        )
+        ok, reason, stop_id = verify_exact_protection(bridge=b_empty_st, symbol="AAPL", filled_qty=10.0, entry_side="BUY", stop_price=99.0)
+        self.assertFalse(ok)
+        self.assertIn("NO_ACTIVE_STOP", reason)
+
+        # 2. Insufficient remaining capacity (qty=10, filled=9 -> capacity=1, needed=10)
+        b_partial = MockBridge(
+            pos_qty=10.0,
+            stops=[{"id": "s1", "symbol": "AAPL", "side": "SELL", "type": "stop", "qty": 10.0, "status": "partially_filled", "filled_qty": 9.0, "stop_price": 99.0}]
+        )
+        ok, reason, stop_id = verify_exact_protection(bridge=b_partial, symbol="AAPL", filled_qty=10.0, entry_side="BUY", stop_price=99.0)
+        self.assertFalse(ok)
+        self.assertIn("NO_ACTIVE_STOP", reason)
+
+        # 3. Stop price mismatch (expected 99.0, broker 95.0)
+        b_price_mismatch = MockBridge(
+            pos_qty=10.0,
+            stops=[{"id": "s1", "symbol": "AAPL", "side": "SELL", "type": "stop", "qty": 10.0, "status": "new", "filled_qty": 0.0, "stop_price": 95.0}]
+        )
+        ok, reason, stop_id = verify_exact_protection(bridge=b_price_mismatch, symbol="AAPL", filled_qty=10.0, entry_side="BUY", stop_price=99.0)
+        self.assertFalse(ok)
+        self.assertIn("NO_ACTIVE_STOP", reason)
+
+        # 4. Valid working stop fully verified
+        b_valid = MockBridge(
+            pos_qty=10.0,
+            stops=[{"id": "s1", "symbol": "AAPL", "side": "SELL", "type": "stop", "qty": 10.0, "status": "new", "filled_qty": 0.0, "stop_price": 99.0}]
+        )
+        ok, reason, stop_id = verify_exact_protection(bridge=b_valid, symbol="AAPL", filled_qty=10.0, entry_side="BUY", stop_price=99.0)
+        self.assertTrue(ok)
+        self.assertEqual(stop_id, "s1")
+        self.assertIn("EXACT_PROTECTION_VERIFIED", reason)
+
+        # 5. Invalid NaN parameters fail closed
+        ok, reason, _ = verify_exact_protection(bridge=b_valid, symbol="AAPL", filled_qty=float("nan"), entry_side="BUY", stop_price=99.0)
+        self.assertFalse(ok)
+        self.assertIn("EXACT_PROTECTION_INVALID_QTY", reason)
+
+        ok, reason, _ = verify_exact_protection(bridge=b_valid, symbol="AAPL", filled_qty=10.0, entry_side="BUY", stop_price=float("nan"))
+        self.assertFalse(ok)
+        self.assertIn("EXACT_PROTECTION_INVALID_STOP_PRICE", reason)
 
 
 if __name__ == "__main__":

@@ -1127,26 +1127,49 @@ def verify_exact_protection(
     Authoritative Protection Verification strictly enforcing Amendment 3:
       broker_position_qty == protected_stop_qty == intended_filled_qty
     Requires:
-      - Correct symbol
-      - Correct exit side (SELL for BUY entry, BUY for SELL entry)
-      - Exactly one active/working protective order covering the position (duplicate stops forbidden)
-      - Broker position matches intended filled qty
+      - Valid finite positive intended filled_qty and stop_price
+      - Authoritative broker position matches intended filled qty
+      - Exactly one working protective order covering the position verified via verify_broker_stop_order_evidence
+        (matching identity, symbol, opposite exit side, type, working status whitelist, remaining capacity, quantized stop price)
+      - Duplicate protective stops strictly forbidden
     Returns: (is_verified: bool, reason: str, active_stop_id: Optional[str])
     """
-    sym = symbol.upper().strip()
-    intended_qty = abs(float(filled_qty))
-    expected_exit_side = "SELL" if entry_side.upper() in ("BUY", "LONG") else "BUY"
+    sym = symbol.upper().strip() if symbol else ""
+    if not sym:
+        return False, "EXACT_PROTECTION_INVALID_SYMBOL: Symbol must be non-empty", None
+
+    # Validate intended filled_qty at boundary
+    try:
+        intended_qty = float(filled_qty)
+        if not math.isfinite(intended_qty) or intended_qty <= 0.0:
+            return False, f"EXACT_PROTECTION_INVALID_QTY: intended filled_qty {filled_qty} is not finite or <= 0", None
+    except (ValueError, TypeError):
+        return False, f"EXACT_PROTECTION_INVALID_QTY: could not parse intended filled_qty {filled_qty}", None
+
+    # Validate expected stop_price at boundary
+    try:
+        exp_stop_px = float(stop_price)
+        if not math.isfinite(exp_stop_px) or exp_stop_px <= 0.0:
+            return False, f"EXACT_PROTECTION_INVALID_STOP_PRICE: stop_price {stop_price} is not finite or <= 0", None
+    except (ValueError, TypeError):
+        return False, f"EXACT_PROTECTION_INVALID_STOP_PRICE: could not parse stop_price {stop_price}", None
 
     # 1. Fetch broker position truth
     if hasattr(bridge, "get_position_truth"):
         pos_truth = bridge.get_position_truth(sym)
-        broker_position_qty = abs(float(pos_truth.qty))
+        raw_pos_qty = getattr(pos_truth, "qty", 0.0)
     else:
         get_pos = getattr(bridge, "get_position", None)
-        raw_qty = get_pos(sym) if callable(get_pos) else 0.0
-        broker_position_qty = abs(float(raw_qty or 0.0))
+        raw_pos_qty = get_pos(sym) if callable(get_pos) else 0.0
 
-    if broker_position_qty != intended_qty:
+    try:
+        broker_position_qty = abs(float(raw_pos_qty or 0.0))
+        if not math.isfinite(broker_position_qty) or broker_position_qty <= 0.0:
+            return False, f"EXACT_PROTECTION_INVALID_BROKER_QTY: broker position qty {raw_pos_qty} is not finite or <= 0", None
+    except (ValueError, TypeError):
+        return False, f"EXACT_PROTECTION_INVALID_BROKER_QTY: could not parse broker position qty {raw_pos_qty}", None
+
+    if abs(broker_position_qty - intended_qty) > 1e-4:
         return (
             False,
             f"QTY_MISMATCH: broker_position_qty={broker_position_qty:.4f} != intended_filled_qty={intended_qty:.4f}",
@@ -1175,46 +1198,64 @@ def verify_exact_protection(
                     "symbol": sym,
                     "side": s_norm,
                     "qty": float(getattr(o, "qty", 0.0) or 0.0),
+                    "filled_qty": float(getattr(o, "filled_qty", 0.0) or 0.0),
                     "stop_price": float(getattr(o, "stop_price", 0.0) or 0.0),
                     "status": st_norm,
+                    "type": otype,
                 })
 
-    # Filter for matching non-terminal stops with correct exit side
-    matching_stops = [
-        s for s in stops
-        if str(s.get("side", "")).upper().replace("ORDERSIDE.", "").strip() == expected_exit_side
-        and str(s.get("status", "")).lower().replace("orderstatus.", "").strip() not in _TERMINAL_STATUSES
-    ]
+    if not stops:
+        return (
+            False,
+            f"NO_ACTIVE_STOP: Zero active protective stops found for {sym}",
+            None,
+        )
+
+    # 3. Verify candidate stops using canonical verify_broker_stop_order_evidence
+    from strategies.trailing_stop import verify_broker_stop_order_evidence, _extract_order_field
+
+    verified_stops = []
+    rejection_reasons = []
+    for s in stops:
+        s_id = str(_extract_order_field(s, "id", "order_id") or "")
+        if not s_id:
+            rejection_reasons.append("Stop lacks id")
+            continue
+        is_valid, reason = verify_broker_stop_order_evidence(
+            order_data=s,
+            expected_order_id=s_id,
+            expected_symbol=sym,
+            position_side=entry_side,
+            expected_stop_price=exp_stop_px,
+            expected_qty=intended_qty,
+            require_qty=True,
+        )
+        if is_valid:
+            verified_stops.append((s, s_id))
+        else:
+            rejection_reasons.append(f"{s_id}: {reason}")
 
     # Invariant: Duplicate protective stops are strictly forbidden
-    if len(matching_stops) > 1:
+    if len(verified_stops) > 1:
         return (
             False,
-            f"DUPLICATE_STOPS_FORBIDDEN: Found {len(matching_stops)} active stops for {sym}: {[s['id'] for s in matching_stops]}",
+            f"DUPLICATE_STOPS_FORBIDDEN: Found {len(verified_stops)} active stops for {sym}: {[vid for _, vid in verified_stops]}",
             None,
         )
 
-    if not matching_stops:
+    if not verified_stops:
+        reasons_summary = "; ".join(rejection_reasons[:3])
         return (
             False,
-            f"NO_ACTIVE_STOP: Zero active {expected_exit_side} protective stops found for {sym}",
+            f"NO_ACTIVE_STOP: Zero active protective stops verified for {sym} ({reasons_summary})",
             None,
         )
 
-    active_stop = matching_stops[0]
-    protected_qty = abs(float(active_stop["qty"]))
-
-    if protected_qty != intended_qty:
-        return (
-            False,
-            f"STOP_QTY_MISMATCH: protected_stop_qty={protected_qty:.4f} != intended_filled_qty={intended_qty:.4f}",
-            None,
-        )
-
+    active_stop, active_stop_id = verified_stops[0]
     return (
         True,
-        f"EXACT_PROTECTION_VERIFIED: broker_position={broker_position_qty:.4f} == stop_qty={protected_qty:.4f} == intended={intended_qty:.4f}",
-        active_stop["id"],
+        f"EXACT_PROTECTION_VERIFIED: broker_position={broker_position_qty:.4f} == stop_qty={intended_qty:.4f} (stop_id={active_stop_id})",
+        active_stop_id,
     )
 
 

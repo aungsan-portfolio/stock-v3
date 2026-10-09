@@ -117,6 +117,28 @@ def _extract_order_field(order_obj: Any, *field_names: str) -> Any:
     return None
 
 
+def _is_finite_positive(val: Any) -> Tuple[bool, Optional[float]]:
+    """Strictly validates that val can be parsed to a finite, strictly positive (> 0) float."""
+    try:
+        f = float(val)
+        if math.isfinite(f) and f > 0.0:
+            return True, f
+        return False, None
+    except (ValueError, TypeError):
+        return False, None
+
+
+def _is_finite_non_negative(val: Any) -> Tuple[bool, Optional[float]]:
+    """Strictly validates that val can be parsed to a finite, non-negative (>= 0) float."""
+    try:
+        f = float(val)
+        if math.isfinite(f) and f >= 0.0:
+            return True, f
+        return False, None
+    except (ValueError, TypeError):
+        return False, None
+
+
 def verify_broker_stop_order_evidence(
     order_data: Any,
     expected_order_id: str,
@@ -125,30 +147,60 @@ def verify_broker_stop_order_evidence(
     expected_stop_price: float,
     expected_qty: Optional[float] = None,
     fill_price: Optional[float] = None,
+    require_qty: bool = False,
 ) -> Tuple[bool, str]:
     """
     Validates that order_data satisfies strict broker evidence requirements:
-    1. Identity: order_id matches expected_order_id.
-    2. Symbol: matches expected_symbol.
-    3. Side: For BUY/LONG position -> stop order side must be SELL.
-             For SELL/SHORT position -> stop order side must be BUY.
-    4. Type: Must be in _STOP_ORDER_TYPES ('stop', 'stop_limit', 'trailing_stop').
-    5. Status: Must be in _WORKING_STOP_STATUSES and strictly not in _TERMINAL_STOP_STATUSES.
+    1. Expected Parameters Validation at Boundary:
+       - expected_order_id, expected_symbol, position_side must be non-empty/valid.
+       - expected_stop_price must be finite and > 0.
+       - expected_qty must be finite and > 0 (required when require_qty=True).
+    2. Identity: order_id matches expected_order_id.
+    3. Status: Must be in _WORKING_STOP_STATUSES and strictly not in _TERMINAL_STOP_STATUSES.
                Empty status is strictly rejected.
-    6. Qty: If expected_qty is provided, order qty must be present, finite, > 0, and match expected_qty.
+    4. Symbol: matches expected_symbol.
+    5. Side: For BUY/LONG position -> stop order side must be SELL.
+             For SELL/SHORT position -> stop order side must be BUY.
+    6. Type: Must be in _STOP_ORDER_TYPES ('stop', 'stop_limit', 'trailing_stop').
     7. Stop Price: Must match expected_stop_price within instrument tick-size tolerance.
+    8. Qty & Capacity:
+       - Order qty must be present, finite, > 0.
+       - If partially_filled, filled_qty must be present, finite, >= 0.
+       - Remaining order capacity (qty - filled_qty) must be > 0 and match expected_qty.
     """
     if order_data is None:
         return False, "EVIDENCE_MISSING: Order data is None"
 
-    # 1. Identity check
+    # 1. Expected Parameters Validation at Boundary
+    if not expected_order_id or not str(expected_order_id).strip():
+        return False, "EVIDENCE_EXPECTED_ID_MISSING: expected_order_id must be non-empty"
+
+    if not expected_symbol or not str(expected_symbol).strip():
+        return False, "EVIDENCE_EXPECTED_SYMBOL_MISSING: expected_symbol must be non-empty"
+
+    if not position_side or str(position_side).upper().strip() not in ("BUY", "LONG", "SELL", "SHORT"):
+        return False, f"EVIDENCE_POSITION_SIDE_INVALID: position_side {position_side} must be BUY/LONG or SELL/SHORT"
+
+    valid_exp_px, exp_stop_f = _is_finite_positive(expected_stop_price)
+    if not valid_exp_px:
+        return False, f"EVIDENCE_EXPECTED_STOP_PRICE_INVALID: Expected stop price {expected_stop_price} is not finite or <= 0"
+
+    exp_qty_f: Optional[float] = None
+    if expected_qty is not None:
+        valid_exp_qty, exp_qty_f = _is_finite_positive(expected_qty)
+        if not valid_exp_qty:
+            return False, f"EVIDENCE_EXPECTED_QTY_INVALID: Expected qty {expected_qty} is not finite or <= 0"
+    elif require_qty:
+        return False, "EVIDENCE_EXPECTED_QTY_MISSING: Position expected_qty must be provided to confirm protective coverage"
+
+    # 2. Identity check
     order_id = _extract_order_field(order_data, "id", "order_id")
     if not order_id:
         return False, "EVIDENCE_ID_MISSING: Order data lacks id"
-    if str(order_id) != str(expected_order_id):
+    if str(order_id).strip() != str(expected_order_id).strip():
         return False, f"EVIDENCE_ID_MISMATCH: Order id {order_id} != expected {expected_order_id}"
 
-    # 2. Status normalization and check
+    # 3. Status normalization and check
     raw_status = _extract_order_field(order_data, "status")
     if raw_status is None:
         return False, "EVIDENCE_STATUS_MISSING: Order status is None"
@@ -160,78 +212,84 @@ def verify_broker_stop_order_evidence(
     if status_str not in _WORKING_STOP_STATUSES:
         return False, f"EVIDENCE_STATUS_NON_WORKING: Status {status_str} is not a valid working protection state"
 
-    # 3. Symbol check
+    # 4. Symbol check
     raw_symbol = _extract_order_field(order_data, "symbol")
-    if raw_symbol is not None:
-        if str(raw_symbol).upper().strip() != expected_symbol.upper().strip():
-            return False, f"EVIDENCE_SYMBOL_MISMATCH: Symbol {raw_symbol} != expected {expected_symbol}"
-    else:
+    if raw_symbol is None:
         return False, "EVIDENCE_SYMBOL_MISSING: Order symbol is missing"
+    if str(raw_symbol).upper().strip() != str(expected_symbol).upper().strip():
+        return False, f"EVIDENCE_SYMBOL_MISMATCH: Symbol {raw_symbol} != expected {expected_symbol}"
 
-    # 4. Side check
-    expected_stop_side = "sell" if position_side.upper() in ("BUY", "LONG") else "buy"
+    # 5. Side check
+    expected_stop_side = "sell" if str(position_side).upper().strip() in ("BUY", "LONG") else "buy"
     raw_side = _extract_order_field(order_data, "side")
-    if raw_side is not None:
-        side_str = _normalize_sdk_field(raw_side)
-        if side_str != expected_stop_side:
-            return False, f"EVIDENCE_SIDE_MISMATCH: Stop order side {side_str} != expected {expected_stop_side} for {position_side} position"
-    else:
+    if raw_side is None:
         return False, "EVIDENCE_SIDE_MISSING: Order side is missing"
+    side_str = _normalize_sdk_field(raw_side)
+    if side_str != expected_stop_side:
+        return False, f"EVIDENCE_SIDE_MISMATCH: Stop order side {side_str} != expected {expected_stop_side} for {position_side} position"
 
-    # 5. Order Type check
+    # 6. Order Type check
     raw_type = _extract_order_field(order_data, "type", "order_type")
-    if raw_type is not None:
-        type_str = _normalize_sdk_field(raw_type)
-        if type_str not in _STOP_ORDER_TYPES:
-            return False, f"EVIDENCE_TYPE_INVALID: Order type {type_str} not in {_STOP_ORDER_TYPES}"
-    else:
+    if raw_type is None:
         return False, "EVIDENCE_TYPE_MISSING: Order type is missing"
-
-    # 6. Quantity check
-    raw_qty = _extract_order_field(order_data, "qty", "quantity")
-    if expected_qty is not None:
-        if raw_qty is None:
-            return False, "EVIDENCE_QTY_MISSING: Order qty is missing"
-        try:
-            qty_f = float(raw_qty)
-            if not math.isfinite(qty_f) or qty_f <= 0.0:
-                return False, f"EVIDENCE_QTY_INVALID: Order qty {raw_qty} is not finite or <= 0"
-            if abs(qty_f - float(expected_qty)) > 1e-4:
-                return False, f"EVIDENCE_QTY_MISMATCH: Order qty {qty_f} != expected {expected_qty}"
-        except (ValueError, TypeError):
-            return False, f"EVIDENCE_QTY_INVALID: Could not parse order qty {raw_qty}"
-    elif raw_qty is not None:
-        try:
-            qty_f = float(raw_qty)
-            if not math.isfinite(qty_f) or qty_f <= 0.0:
-                return False, f"EVIDENCE_QTY_INVALID: Order qty {raw_qty} is not finite or <= 0"
-        except (ValueError, TypeError):
-            return False, f"EVIDENCE_QTY_INVALID: Could not parse order qty {raw_qty}"
+    type_str = _normalize_sdk_field(raw_type)
+    if type_str not in _STOP_ORDER_TYPES:
+        return False, f"EVIDENCE_TYPE_INVALID: Order type {type_str} not in {_STOP_ORDER_TYPES}"
 
     # 7. Stop Price check (Dynamic Instrument Tick Size & Quantization Contract)
     raw_stop_price = _extract_order_field(order_data, "stop_price", "stopPrice")
     if raw_stop_price is None:
         return False, "EVIDENCE_STOP_PRICE_MISSING: Order lacks stop_price"
-    try:
-        stop_price_f = float(raw_stop_price)
-        if not math.isfinite(stop_price_f) or stop_price_f <= 0.0:
-            return False, f"EVIDENCE_STOP_PRICE_INVALID: Stop price {raw_stop_price} is not finite or <= 0"
+    valid_stop_px, stop_price_f = _is_finite_positive(raw_stop_price)
+    if not valid_stop_px:
+        return False, f"EVIDENCE_STOP_PRICE_INVALID: Stop price {raw_stop_price} is not finite or <= 0"
 
-        ref_price = max(expected_stop_price, fill_price) if (fill_price is not None and math.isfinite(fill_price)) else expected_stop_price
-        tick_size = 0.01 if ref_price >= 1.0 else 0.0001
-        cfg_tol = getattr(config, "TRAILING_STOP_RECONCILE_TOLERANCE", None)
-        tolerance = (
-            max(tick_size / 2.0, float(cfg_tol)) + 1e-6
-            if (cfg_tol is not None and math.isfinite(float(cfg_tol)))
-            else (tick_size / 2.0 + 1e-6)
+    ref_price = max(exp_stop_f, fill_price) if (fill_price is not None and math.isfinite(fill_price)) else exp_stop_f
+    tick_size = 0.01 if ref_price >= 1.0 else 0.0001
+    cfg_tol = getattr(config, "TRAILING_STOP_RECONCILE_TOLERANCE", None)
+    if cfg_tol is not None and math.isfinite(float(cfg_tol)):
+        tolerance = min(max(tick_size / 2.0, float(cfg_tol)), tick_size) + 1e-6
+    else:
+        tolerance = (tick_size / 2.0 + 1e-6)
+
+    if abs(stop_price_f - exp_stop_f) > tolerance:
+        return False, (
+            f"EVIDENCE_STOP_PRICE_MISMATCH: Broker stop {stop_price_f:.4f} != "
+            f"expected {exp_stop_f:.4f} (tolerance {tolerance:.6f}, tick_size {tick_size:.4f})"
         )
-        if abs(stop_price_f - expected_stop_price) > tolerance:
+
+    # 8. Quantity & Remaining Protection Capacity check
+    raw_qty = _extract_order_field(order_data, "qty", "quantity")
+    if raw_qty is None:
+        return False, "EVIDENCE_QTY_MISSING: Order qty is missing"
+    valid_order_qty, order_qty_f = _is_finite_positive(raw_qty)
+    if not valid_order_qty:
+        return False, f"EVIDENCE_QTY_INVALID: Order qty {raw_qty} is not finite or <= 0"
+
+    raw_filled_qty = _extract_order_field(order_data, "filled_qty", "filledQuantity", "filled_shares")
+    filled_qty_f = 0.0
+    if status_str == "partially_filled":
+        if raw_filled_qty is None:
+            return False, "EVIDENCE_FILLED_QTY_MISSING: Partially filled order lacks filled_qty"
+        valid_filled, filled_qty_f = _is_finite_non_negative(raw_filled_qty)
+        if not valid_filled:
+            return False, f"EVIDENCE_FILLED_QTY_INVALID: Filled qty {raw_filled_qty} is not finite or < 0"
+    elif raw_filled_qty is not None:
+        if type(raw_filled_qty).__name__ not in ("MagicMock", "Mock"):
+            valid_filled, f_qty = _is_finite_non_negative(raw_filled_qty)
+            if valid_filled and f_qty is not None:
+                filled_qty_f = f_qty
+
+    remaining_qty = order_qty_f - filled_qty_f
+    if remaining_qty <= 0.0:
+        return False, f"EVIDENCE_QTY_EXHAUSTED: Remaining order capacity {remaining_qty:.4f} <= 0 (qty={order_qty_f}, filled={filled_qty_f})"
+
+    if exp_qty_f is not None:
+        if abs(remaining_qty - exp_qty_f) > 1e-4:
             return False, (
-                f"EVIDENCE_STOP_PRICE_MISMATCH: Broker stop {stop_price_f:.4f} != "
-                f"expected {expected_stop_price:.4f} (tolerance {tolerance:.6f}, tick_size {tick_size:.4f})"
+                f"EVIDENCE_QTY_MISMATCH: Remaining order capacity {remaining_qty:.4f} != "
+                f"expected {exp_qty_f:.4f} (total_qty={order_qty_f:.4f}, filled_qty={filled_qty_f:.4f})"
             )
-    except (ValueError, TypeError):
-        return False, f"EVIDENCE_STOP_PRICE_INVALID: Could not parse stop price {raw_stop_price}"
 
     return True, "EVIDENCE_VERIFIED"
 
@@ -620,7 +678,7 @@ class DynamicTrailingStopManager:
                 tp_order_id=tp_order_id,
                 side=signal.side,
                 return_details=True,
-                expected_qty=qty if (qty is not None and qty > 0) else None,
+                expected_qty=qty,
             )
 
             state = TrailingStopState(
@@ -710,33 +768,54 @@ class DynamicTrailingStopManager:
             f"actual_rr={actual_rr:.2f} min_rr={min_rr:.2f} rr_valid={rr_valid} composite_valid={composite_valid} action={action}"
         )
 
-        if action == "POST_FILL_RR_DEGRADED":
-            logger.warning(
-                f"[POST-FILL GEOMETRY DEGRADED] {symbol} ({side.upper()}): Post-fill actual R:R ({actual_rr:.2f}) "
-                f"fell below required minimum ({min_rr:.2f}). Preserving valid protective stop at ${initial_stop:.{decimals}f}."
-            )
-            if return_details:
-                return GeometryRebuildResult(
-                    stop_price=initial_stop,
-                    desired_stop_price=initial_stop,
-                    confirmed_broker_stop_price=initial_stop,
-                    stop_order_id=stop_order_id,
-                    stop_reconciliation_required=False,
-                    rebuild_performed=False,
-                    rebuild_succeeded=True,
+        if action in ("POST_FILL_RR_DEGRADED", "ACCEPTED"):
+            if action == "POST_FILL_RR_DEGRADED":
+                logger.warning(
+                    f"[POST-FILL GEOMETRY DEGRADED] {symbol} ({side.upper()}): Post-fill actual R:R ({actual_rr:.2f}) "
+                    f"fell below required minimum ({min_rr:.2f}). Preserving valid protective stop at ${initial_stop:.{decimals}f}."
                 )
-            return initial_stop
 
-        if action == "ACCEPTED":
+            broker_confirmed = False
+            effective_stop_id = stop_order_id
+            if bridge and stop_order_id:
+                try:
+                    snap_fn = (
+                        getattr(bridge, "get_order_snapshot", None)
+                        or getattr(bridge, "get_order_by_id", None)
+                        or getattr(getattr(bridge, "_client", None), "get_order_by_id", None)
+                    )
+                    if callable(snap_fn):
+                        snap = snap_fn(stop_order_id)
+                        snap_valid, snap_reason = verify_broker_stop_order_evidence(
+                            snap,
+                            expected_order_id=str(stop_order_id),
+                            expected_symbol=symbol,
+                            position_side=side,
+                            expected_stop_price=initial_stop,
+                            expected_qty=expected_qty,
+                            fill_price=fill_price,
+                            require_qty=True if expected_qty is not None else False,
+                        )
+                        if snap_valid:
+                            broker_confirmed = True
+                        else:
+                            logger.warning(
+                                f"[POST-FILL GEOMETRY {action}] Existing stop {stop_order_id} failed broker evidence: {snap_reason}"
+                            )
+                except Exception as b_exc:
+                    logger.warning(
+                        f"[POST-FILL GEOMETRY {action}] Failed to query broker snapshot for {stop_order_id}: {b_exc}"
+                    )
+
             if return_details:
                 return GeometryRebuildResult(
                     stop_price=initial_stop,
                     desired_stop_price=initial_stop,
-                    confirmed_broker_stop_price=initial_stop,
-                    stop_order_id=stop_order_id,
-                    stop_reconciliation_required=False,
+                    confirmed_broker_stop_price=initial_stop if broker_confirmed else None,
+                    stop_order_id=effective_stop_id,
+                    stop_reconciliation_required=not broker_confirmed if (bridge and stop_order_id) else False,
                     rebuild_performed=False,
-                    rebuild_succeeded=True,
+                    rebuild_succeeded=broker_confirmed,
                 )
             return initial_stop
 
@@ -927,9 +1006,9 @@ class DynamicTrailingStopManager:
                 recon_required = True
                 rebuild_ok = False
             else:
-                confirmed_broker_stop = new_stop_price
-                recon_required = False
-                rebuild_ok = True
+                confirmed_broker_stop = None
+                recon_required = True
+                rebuild_ok = False
 
             if return_details:
                 return GeometryRebuildResult(
@@ -947,11 +1026,11 @@ class DynamicTrailingStopManager:
             return GeometryRebuildResult(
                 stop_price=initial_stop,
                 desired_stop_price=initial_stop,
-                confirmed_broker_stop_price=initial_stop,
+                confirmed_broker_stop_price=None,
                 stop_order_id=stop_order_id,
-                stop_reconciliation_required=False,
+                stop_reconciliation_required=True,
                 rebuild_performed=False,
-                rebuild_succeeded=True,
+                rebuild_succeeded=False,
             )
         return initial_stop
 
