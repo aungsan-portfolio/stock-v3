@@ -3,6 +3,7 @@ trade_journal.py -- Append-only JSONL trade journal for review and learning.
 """
 import json
 import logging
+import math
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -182,6 +183,24 @@ def log_trade(
     resolved_price_tier = kwargs.pop("price_tier", None)
     if not resolved_price_tier and entry_price and entry_price > 0:
         resolved_price_tier = "5-10" if (5.0 <= entry_price < 10.0) else (">10" if entry_price >= 10.0 else "<5")
+
+    if exit_price is not None:
+        try:
+            ep_f = float(exit_price)
+            if not math.isfinite(ep_f) or ep_f <= 0:
+                raise ValueError(f"Invalid non-finite or non-positive exit_price: {exit_price}")
+            exit_price = ep_f
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid exit_price for trade log: {exc}")
+
+    if pnl is not None:
+        try:
+            pnl_f = float(pnl)
+            if not math.isfinite(pnl_f):
+                raise ValueError(f"Invalid non-finite pnl: {pnl}")
+            pnl = pnl_f
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid pnl for trade log: {exc}")
 
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),

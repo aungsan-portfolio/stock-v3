@@ -65,10 +65,17 @@ SOURCE_FILES = [
 ]
 
 TEST_FILES = [
-    "tests/test_session_exit_and_regime_baseline_hardening.py",
     "tests/test_stop_rebuild_and_persistence_hardening.py",
-    "tests/test_validation_lane.py",
+    "tests/test_paper_experiment_lane.py",
+    "tests/test_feed_provenance_contract.py",
+    "tests/test_geometry_hard_guards.py",
+    "tests/test_trailing_stop_p1_5.py",
+    "tests/test_lifecycle_halt_integration.py",
+    "tests/test_order_manager_idempotency.py",
+    "tests/test_execution_quote.py",
     "tests/test_candidate_selection_coordination.py",
+    "tests/test_session_exit_and_regime_baseline_hardening.py",
+    "tests/test_validation_lane.py",
     "tests/test_price_tier_semantics.py",
     "tests/test_replacement_lineage.py",
     "tests/test_machine_release_gate.py",

@@ -4614,43 +4614,69 @@ class AlpacaBridge:
                             return v
                 return None
 
-            status_raw = _get_val(order, "status")
-            status = status_raw.value if hasattr(status_raw, "value") else str(status_raw or "")
-
-            sym = str(_get_val(order, "symbol") or "").upper().strip()
-
-            side_raw = _get_val(order, "side")
-            side_str = (side_raw.value if hasattr(side_raw, "value") else str(side_raw or "")).lower().strip()
-
-            type_raw = _get_val(order, "order_type", "type")
-            type_str = (type_raw.value if hasattr(type_raw, "value") else str(type_raw or "")).lower().strip()
-
-            qty_val = _get_val(order, "qty")
-            qty = float(qty_val) if qty_val is not None else 0.0
-
-            fq_val = _get_val(order, "filled_qty")
-            filled_qty = float(fq_val or 0.0)
-
-            sp_val = _get_val(order, "stop_price", "stopPrice")
-            stop_price = float(sp_val) if sp_val is not None else None
-
-            lp_val = _get_val(order, "limit_price", "limitPrice")
-            limit_price = float(lp_val) if lp_val is not None else None
-
-            avg_px_val = _get_val(order, "filled_avg_price", "filledAvgPrice")
-            avg_px = float(avg_px_val) if avg_px_val is not None else None
-
-            rep_val = _get_val(order, "replaced_by")
-            replaced_by = str(rep_val) if rep_val else None
+            oid_val = _get_val(order, "id")
+            oid = str(oid_val).strip() if (oid_val is not None and str(oid_val).strip()) else None
 
             cid_val = _get_val(order, "client_order_id")
-            cid = str(cid_val or "")
+            cid = str(cid_val).strip() if (cid_val is not None and str(cid_val).strip()) else None
 
-            oid_val = _get_val(order, "id")
-            oid = str(oid_val or clean_id)
+            status_raw = _get_val(order, "status")
+            if status_raw is not None:
+                status = (status_raw.value if hasattr(status_raw, "value") else str(status_raw)).lower().strip()
+            else:
+                status = None
+
+            sym_val = _get_val(order, "symbol")
+            sym = str(sym_val).upper().strip() if (sym_val is not None and str(sym_val).strip()) else None
+
+            side_raw = _get_val(order, "side")
+            if side_raw is not None:
+                side_str = (side_raw.value if hasattr(side_raw, "value") else str(side_raw)).lower().strip()
+            else:
+                side_str = None
+
+            type_raw = _get_val(order, "order_type", "type")
+            if type_raw is not None:
+                type_str = (type_raw.value if hasattr(type_raw, "value") else str(type_raw)).lower().strip()
+            else:
+                type_str = None
+
+            qty_val = _get_val(order, "qty", "quantity")
+            try:
+                qty = float(qty_val) if (qty_val is not None and str(qty_val).strip() != "") else None
+            except (ValueError, TypeError):
+                qty = None
+
+            fq_val = _get_val(order, "filled_qty", "filledQuantity", "filled_shares")
+            try:
+                filled_qty = float(fq_val) if (fq_val is not None and str(fq_val).strip() != "") else None
+            except (ValueError, TypeError):
+                filled_qty = None
+
+            sp_val = _get_val(order, "stop_price", "stopPrice")
+            try:
+                stop_price = float(sp_val) if (sp_val is not None and str(sp_val).strip() != "") else None
+            except (ValueError, TypeError):
+                stop_price = None
+
+            lp_val = _get_val(order, "limit_price", "limitPrice")
+            try:
+                limit_price = float(lp_val) if (lp_val is not None and str(lp_val).strip() != "") else None
+            except (ValueError, TypeError):
+                limit_price = None
+
+            avg_px_val = _get_val(order, "filled_avg_price", "filledAvgPrice")
+            try:
+                avg_px = float(avg_px_val) if (avg_px_val is not None and str(avg_px_val).strip() != "") else None
+            except (ValueError, TypeError):
+                avg_px = None
+
+            rep_val = _get_val(order, "replaced_by")
+            replaced_by = str(rep_val).strip() if (rep_val is not None and str(rep_val).strip()) else None
 
             return {
                 "id": oid,
+                "requested_order_id": clean_id,
                 "client_order_id": cid,
                 "status": status,
                 "symbol": sym,

@@ -487,6 +487,16 @@ def _extract_prev_session_close(
         # Sort by date ascending to get the latest completed session
         completed_bars.sort(key=lambda x: x[1])
         latest_date, latest_dt, latest_bar = completed_bars[-1]
+
+        # Freshness guard: ensure completed bar is from an expected recent exchange session (1 to 5 calendar days)
+        calendar_gap_days = (today_date - latest_date).days
+        if calendar_gap_days <= 0 or calendar_gap_days > 5:
+            logger.warning(
+                "[REGIME CALENDAR GAP] Bar date %s is %d days from today %s (allowed: 1-5 days). Failing closed.",
+                latest_date, calendar_gap_days, today_date
+            )
+            return None, None, None
+
         close_val = getattr(latest_bar, "close", None)
         if close_val is None and isinstance(latest_bar, dict):
             close_val = latest_bar.get("close")
@@ -494,24 +504,12 @@ def _extract_prev_session_close(
             try:
                 c_float = float(close_val)
                 if c_float > 0 and math.isfinite(c_float):
-                    return c_float, latest_bar_ts or latest_dt.timestamp(), latest_date.isoformat()
+                    return c_float, latest_dt.timestamp(), latest_date.isoformat()
             except (ValueError, TypeError):
                 pass
 
-    # Safe fallback if timestamps could not be separated by calendar (e.g. synthetic test mocks):
-    # if len >= 2 use [-2], if len == 1 use [-1]
-    if len(bars_list) >= 2:
-        fb_bar = bars_list[-2]
-    else:
-        fb_bar = bars_list[-1]
-    fb_close = getattr(fb_bar, "close", None) if not isinstance(fb_bar, dict) else fb_bar.get("close")
-    try:
-        c_float = float(fb_close)
-        if c_float > 0 and math.isfinite(c_float):
-            return c_float, latest_bar_ts, "unparsed_index_fallback"
-    except (ValueError, TypeError):
-        pass
-
+    # No guessing or blind index fallback: missing or unparseable session data fails closed
+    logger.warning("[REGIME BASELINE DATA MISSING] No valid completed previous session bar found for calendar date %s", today_date)
     return None, None, None
 
 
@@ -524,8 +522,9 @@ def _get_premarket_pct_change(symbol: str, bridge=None) -> Tuple[Optional[float]
     # 1. Try Alpaca bridge / data client
     if bridge is not None:
         try:
-            # Check for quote object first to obtain exact broker timestamp if present
+            # Check for quote object first to obtain exact broker timestamp and price from same observation
             quote_ts = None
+            price = None
             if hasattr(bridge, "get_quote"):
                 try:
                     q = bridge.get_quote(symbol)
@@ -535,12 +534,28 @@ def _get_premarket_pct_change(symbol: str, bridge=None) -> Tuple[Optional[float]
                             quote_ts = float(raw_ts)
                         elif isinstance(raw_ts, datetime):
                             quote_ts = raw_ts.timestamp()
+
+                        raw_px = getattr(q, "last", None) or getattr(q, "ask", None) if not isinstance(q, dict) else (q.get("last") or q.get("ask"))
+                        if raw_px is None and isinstance(q, dict) and "bid" in q and "ask" in q:
+                            b, a = float(q.get("bid", 0.0) or 0.0), float(q.get("ask", 0.0) or 0.0)
+                            if b > 0 and a > 0:
+                                raw_px = (b + a) / 2.0
+                        if raw_px is not None:
+                            try:
+                                px_f = float(raw_px)
+                                if math.isfinite(px_f) and px_f > 0:
+                                    price = px_f
+                            except (ValueError, TypeError):
+                                pass
                 except Exception:
                     pass
 
-            if hasattr(bridge, "get_price"):
+            if price is None and hasattr(bridge, "get_price"):
                 price = bridge.get_price(symbol, allow_historical=True)
-                if price > 0:
+                if quote_ts is None:
+                    quote_ts = now_epoch
+
+            if price is not None and price > 0:
                     prev_close = None
                     baseline_source = "alpaca_quote_vs_prev_close"
                     session_date_str = None

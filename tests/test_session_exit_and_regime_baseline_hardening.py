@@ -73,14 +73,34 @@ class TestCalendarAwareRegimeBaseline:
         assert dt_str == "2026-10-09"
 
     def test_extract_prev_session_close_unparsed_fallback(self):
-        """Verify unparsed timestamps safely fallback to index [-2]."""
+        """Verify unparsed timestamps safely fail closed with (None, None, None)."""
         bars = [
             MagicMock(close=50.0, timestamp=None, date=None),
             MagicMock(close=55.0, timestamp=None, date=None),
         ]
         prev_close, _, dt_str = _extract_prev_session_close(bars, today_date=date(2026, 10, 9))
-        assert prev_close == pytest.approx(50.0)
-        assert dt_str == "unparsed_index_fallback"
+        assert prev_close is None
+        assert dt_str is None
+
+    def test_extract_prev_session_close_only_today_bar(self):
+        """Verify that if only today's partial bar exists, fail closed with None."""
+        bars = [
+            {"close": 150.0, "timestamp": "2026-10-09T14:30:00Z"},
+        ]
+        prev_close, _, dt_str = _extract_prev_session_close(bars, today_date=date(2026, 10, 9))
+        assert prev_close is None
+        assert dt_str is None
+
+    def test_extract_prev_session_close_stale_gap_over_5_days(self):
+        """Verify that bars older than 5 calendar days are rejected as stale."""
+        bars = [
+            {"close": 150.0, "timestamp": "2026-10-01T20:00:00Z"},  # 8 days ago
+        ]
+        prev_close, _, dt_str = _extract_prev_session_close(bars, today_date=date(2026, 10, 9))
+        assert prev_close is None
+        assert dt_str is None
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +152,56 @@ class TestOrderSnapshotVerification:
         )
         assert valid is True
         assert reason == "EVIDENCE_VERIFIED"
+
+    def test_get_order_snapshot_missing_fields_fail_evidence(self):
+        """Verify missing fields (None) correctly trigger evidence rejection fail-closed."""
+        # Snapshot missing filled_qty
+        snap_missing_filled_qty = {
+            "id": "ord-1",
+            "symbol": "AAPL",
+            "side": "sell",
+            "order_type": "stop",
+            "qty": 10.0,
+            "filled_qty": None,
+            "stop_price": 150.0,
+            "status": "partially_filled",
+        }
+        valid, reason = verify_broker_stop_order_evidence(
+            snap_missing_filled_qty,
+            expected_order_id="ord-1",
+            expected_symbol="AAPL",
+            position_side="BUY",
+            expected_stop_price=150.0,
+            expected_qty=10.0,
+            fill_price=151.0,
+        )
+        assert valid is False
+        assert "EVIDENCE_FILLED_QTY_MISSING" in reason
+
+        # Snapshot missing id
+        snap_missing_id = {
+            "id": None,
+            "symbol": "AAPL",
+            "side": "sell",
+            "order_type": "stop",
+            "qty": 10.0,
+            "filled_qty": 0.0,
+            "stop_price": 150.0,
+            "status": "new",
+        }
+        valid, reason = verify_broker_stop_order_evidence(
+            snap_missing_id,
+            expected_order_id="ord-1",
+            expected_symbol="AAPL",
+            position_side="BUY",
+            expected_stop_price=150.0,
+            expected_qty=10.0,
+            fill_price=151.0,
+        )
+        assert valid is False
+        assert "EVIDENCE_ID_MISSING" in reason
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -296,3 +366,170 @@ class TestHandleNakedPositionExitReconciliation:
         assert not mock_log.called
         assert not state.active
         assert state.reconciliation_status == "FLAT_PENDING_EXIT_RECONCILIATION"
+        assert "NVDA" in mgr.pending_exits
+
+    def test_position_query_failure_retains_active_state(self):
+        """When broker position query raises exception, retain active state fail-closed."""
+        mgr = DynamicTrailingStopManager()
+        state = TrailingStopState(
+            symbol="AMD",
+            side="BUY",
+            entry_price=160.00,
+            peak_price=162.00,
+            atr=2.00,
+            stop_price=158.00,
+            trail_multiple=1.5,
+            last_updated=time.time(),
+            order_id=None,
+            qty=20.0,
+            active=True,
+        )
+        mgr.states["AMD"] = state
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_position.side_effect = ConnectionError("Broker API timeout")
+
+        with patch.object(mgr, "_save_state", return_value=True):
+            mgr.handle_naked_position("AMD", 20.0, bridge=mock_bridge)
+
+        # Must retain active state and flag reconciliation required
+        assert state.active is True
+        assert state.reconciliation_status == "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+        assert state.stop_reconciliation_required is True
+
+    def test_short_position_not_treated_as_flat_on_stop_cancellation(self):
+        """When short position (-10 qty) stop is cancelled, ensure_initialized must NOT treat it as flat."""
+        mgr = DynamicTrailingStopManager()
+        state = TrailingStopState(
+            symbol="SOXX",
+            side="SELL",
+            entry_price=220.00,
+            peak_price=220.00,
+            atr=2.00,
+            stop_price=223.00,
+            trail_multiple=1.5,
+            last_updated=time.time(),
+            order_id="stop-short-1",
+            qty=10.0,
+            active=True,
+        )
+        mgr.states["SOXX"] = state
+
+        mock_bridge = MagicMock()
+        # Broker reports short position (-10.0 shares)
+        mock_bridge.get_position.return_value = -10.0
+        # Stop order snapshot reports canceled
+        mock_bridge.get_order_snapshot.return_value = {
+            "id": "stop-short-1",
+            "status": "canceled",
+            "symbol": "SOXX",
+            "side": "buy",
+            "order_type": "stop",
+        }
+
+        with patch.object(mgr, "_save_state", return_value=True):
+            res_state = mgr.ensure_initialized(
+                symbol="SOXX",
+                side="SELL",
+                avg_cost=220.00,
+                open_orders=[],
+                current_price=221.00,
+                qty=10.0,
+                bridge=mock_bridge,
+            )
+
+        assert res_state is not None
+        assert res_state.active is True
+        assert res_state.qty == 10.0
+        assert res_state.order_id is None
+        assert res_state.last_stop_order_id == "stop-short-1"
+
+    def test_two_step_pending_exit_reconciliation_flow(self):
+        """Step 1: flat pos with pending fill enters pending_exits. Step 2: fill confirmed commits journal and cleans up."""
+        mgr = DynamicTrailingStopManager()
+        state = TrailingStopState(
+            symbol="META",
+            side="BUY",
+            entry_price=500.00,
+            peak_price=510.00,
+            atr=4.00,
+            stop_price=495.00,
+            trail_multiple=1.5,
+            last_updated=time.time(),
+            order_id=None,
+            last_stop_order_id="stop-meta-1",
+            qty=5.0,
+            active=True,
+            strategy="DAYTRADE_SCALP",
+        )
+        mgr.states["META"] = state
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_position.return_value = 0.0
+        # Step 1: Snapshot unavailable / None
+        mock_bridge.get_order_snapshot.return_value = None
+        mock_bridge._client = None
+
+        with patch("strategies.trade_journal.log_trade") as mock_log:
+            with patch.object(mgr, "_save_state", return_value=True):
+                mgr.handle_naked_position("META", 5.0, bridge=mock_bridge)
+
+        assert not mock_log.called
+        assert "META" in mgr.pending_exits
+        assert not state.active
+        assert state.reconciliation_status == "FLAT_PENDING_EXIT_RECONCILIATION"
+
+        # Step 2: Snapshot now returns filled stop
+        mock_bridge.get_order_snapshot.return_value = {
+            "id": "stop-meta-1",
+            "status": "filled",
+            "symbol": "META",
+            "side": "sell",
+            "order_type": "stop",
+            "filled_avg_price": 494.80,
+            "qty": 5.0,
+        }
+
+        with patch("strategies.trade_journal.log_trade") as mock_log:
+            with patch.object(mgr, "_save_state", return_value=True):
+                mgr.reconcile_pending_exits(bridge=mock_bridge)
+
+        assert mock_log.called
+        call_kwargs = mock_log.call_args[1]
+        assert call_kwargs["symbol"] == "META"
+        assert call_kwargs["exit_reason"] == "STOP_OUT"
+        assert call_kwargs["exit_price"] == pytest.approx(494.80)
+        assert "META" not in mgr.pending_exits
+        assert state.reconciliation_status == "RECONCILED_STOP_OUT"
+
+    def test_journal_rejects_nan_and_inf_exit_prices(self):
+        """trade_journal.log_trade must fail closed on NaN or Inf exit prices."""
+        from strategies.trade_journal import log_trade
+        with pytest.raises(ValueError, match="finite"):
+            log_trade(
+                symbol="AAPL",
+                side="SELL",
+                strategy="DAYTRADE_SCALP",
+                qty=10,
+                entry_price=150.0,
+                stop_price=145.0,
+                target_price=160.0,
+                exit_price=float("nan"),
+                exit_reason="STOP_OUT",
+                pnl=-50.0,
+            )
+
+        with pytest.raises(ValueError, match="finite"):
+            log_trade(
+                symbol="AAPL",
+                side="SELL",
+                strategy="DAYTRADE_SCALP",
+                qty=10,
+                entry_price=150.0,
+                stop_price=145.0,
+                target_price=160.0,
+                exit_price=float("inf"),
+                exit_reason="STOP_OUT",
+                pnl=-50.0,
+            )
+
