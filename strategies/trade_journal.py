@@ -263,9 +263,13 @@ def log_trade(
                                     and key_match
                                 ):
                                     logger.warning(
-                                        "[JOURNAL TRADE IDEMPOTENT GUARD] Event %s for %s (key=%s) already recorded in %s. Skipping duplicate write.",
+                                        "[JOURNAL TRADE IDEMPOTENT GUARD] Event %s for %s (key=%s) already recorded in %s. Enforcing durable sync.",
                                         event_type, symbol, primary_trade_key, path
                                     )
+                                    if hasattr(os, "fsync") and path.exists():
+                                        with open(path, "a", encoding="utf-8") as fh_sync:
+                                            fh_sync.flush()
+                                            os.fsync(fh_sync.fileno())
                                     return
                             except (json.JSONDecodeError, Exception):
                                 continue

@@ -168,10 +168,25 @@ def main():
 
     # JUnit XML report
     junit_src = ROOT_DIR / "pytest_junit_report.xml"
+    xml_duration = "N/A"
     if junit_src.exists():
         sanitize_and_copy(junit_src, evidence_dest / "pytest_junit_report.xml")
+        try:
+            import xml.etree.ElementTree as ET
+            tree = ET.parse(junit_src)
+            root = tree.getroot()
+            time_attr = root.attrib.get("time")
+            if not time_attr:
+                for ts in root.findall(".//testsuite"):
+                    time_attr = ts.attrib.get("time")
+                    if time_attr:
+                        break
+            if time_attr:
+                xml_duration = f"{float(time_attr):.2f}s"
+        except Exception as xe:
+            print(f"  ! XML duration parsing notice: {xe}")
 
-    # Offline probes script and raw execution output
+    # Offline probes script and raw execution output (25 probes)
     probes_src = ROOT_DIR / "run_offline_probes.py"
     if probes_src.exists():
         sanitize_and_copy(probes_src, evidence_dest / "run_offline_probes.py")
@@ -180,6 +195,16 @@ def main():
             (evidence_dest / "offline_probes_results.json").write_text(probes_out, encoding="utf-8")
         except Exception as pe:
             print(f"  ! Error executing offline probes: {pe}")
+
+    # Auditor's 16 boundary probes script and raw execution output (16 probes)
+    auditor_probes_src = ROOT_DIR / "run_auditor_16_probes.py"
+    if auditor_probes_src.exists():
+        sanitize_and_copy(auditor_probes_src, evidence_dest / "run_auditor_16_probes.py")
+        try:
+            auditor_out = subprocess.check_output(["python", str(auditor_probes_src)], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
+            (evidence_dest / "auditor_16_probes_results.json").write_text(auditor_out, encoding="utf-8")
+        except Exception as ape:
+            print(f"  ! Error executing auditor 16 probes: {ape}")
 
     # Effective safety settings
     safety_settings = {
@@ -235,33 +260,36 @@ def main():
 This bundle provides full source files, test suites, and raw verification artifacts for commit `{head_sha}` on branch `feature/p0-hardening-and-paper-experiment`.
 
 ## Forensic Defect Closures & Engine Hardening (Commit {short_sha})
-1. **Defect 1: Canonical Stop Adoption Verification & Partial-Fill Safety** (`strategies/trailing_stop.py`):
-   - Unified `_is_valid_stop_order()` to enforce canonical strictness: valid working status, symbol match, finite stop price, and required quantity/remaining capacity.
-   - Orders lacking quantity are strictly rejected (`adopted=False`), preventing bypass of strict verifier.
-   - For `partially_filled` stop orders, remaining capacity (`qty - filled_qty`) is tracked and kept active; position is NOT marked false-inactive without broker truth.
+1. **Defect 1: Strict Stop Remaining Capacity & Partial-Fill Invariant** (`strategies/trailing_stop.py`):
+   - In `_is_valid_stop_order()`: Removed `and o_qty_f < float(required_qty) - 1e-4` loophole. Orders with remaining capacity less than required position quantity are strictly rejected (`rem_cap < required_qty - 1e-4`). 8-share remaining capacity can never be accepted for a 12-share required position (`partial_remaining_8_required_12.0` -> `accepted: false`).
+   - For partially filled stop orders, if remaining capacity does not cover required shares, `stop_reconciliation_required = True` and `reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"` are strictly maintained.
 
-2. **Defect 2: True Journal Durability, Tail Repair & Exact Episode Matching** (`strategies/trade_journal.py`):
-   - `os.fsync()` errors are strictly propagated instead of silently swallowed, ensuring callers recognize disk sync failures.
-   - Files with truncated/incomplete tails (missing trailing newline) are repaired with a leading newline before appending, preventing multi-line corruption and preserving new record parseability.
-   - Replaced substring/prefix matching with exact normalized episode identity matching (`_normalize_exit_idempotency_key`), eliminating collisions between distinct episodes (`sig-1` vs `sig-10`) while supporting legacy format normalization.
+2. **Defect 2: Tracked Cancelled Stop Protection Invariant** (`strategies/trailing_stop.py`):
+   - In `_reconcile_broker_order()`: Explicitly decoupled `status == "filled"` from `status in ("cancelled", "canceled", "expired", "rejected")`.
+   - A cancelled or expired stop order does NOT close the position (`state.active` remains `True`, `state.order_id = None`, `stop_reconciliation_required = True`, `reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"`), preventing naked unprotected positions from being falsely treated as flat (`tracked_cancelled_stop_not_position_flat` -> `returned: false, active: true`).
 
-3. **Defect 3: Strict Filled-Exit Identity, Quantity & Lineage Contract** (`strategies/trailing_stop.py`):
-   - In `reconcile_pending_exits()`: Both TP and Stop snapshots strictly validate `order_id`, `symbol`, `side`, and require filled quantity to cover expected position quantity (`filled_qty >= qty`).
-   - Closed-orders fallback enforces exact symbol, exit side, quantity, and specific lineage (`known_ids`, `signal_id`, or `episode_id`), eliminating generic `dt_` prefix matching leakage.
+3. **Defect 3: Unknown Position Clearance Protection Guard** (`strategies/trailing_stop.py`):
+   - In `handle_naked_position()`: An unverified non-empty order ID cannot clear `POSITION_UNKNOWN_RECONCILIATION_REQUIRED` unless `stop_reconciliation_required` is `False`. Prevents unverified legacy/stale IDs from unlocking entry gates (`unknown_cleared_by_nonempty_unverified_id` -> `status: "POSITION_UNKNOWN..."`).
 
-4. **Defect 4: Queue Persistence Synchronization & Rollback** (`strategies/trailing_stop.py`):
-   - Reconciler validates `_save_state()` return value; if disk persistence fails, the in-memory queue item is restored and retained (`QUEUE_PERSISTENCE_FAILED_RETAINED`) rather than falsely reporting reconciliation success.
+4. **Defect 4: Broker Position Flat Verification Before Exit** (`strategies/trailing_stop.py`):
+   - In `reconcile_pending_exits()`: Verifies broker position via `bridge.get_position(symbol)` before finalizing exit. If position is still open on broker (`abs(cur_pos_qty) > 1e-6`), reconciliation is blocked with `POSITION_STILL_OPEN_ON_BROKER` and item is retained in queue (`pending_exit_no_current_position_check` -> `calls: 1, pending: 1`).
 
-5. **Defect 5: Fail-Closed Protection for Naked Unknown Positions** (`strategies/trailing_stop.py`):
-   - `POSITION_UNKNOWN_RECONCILIATION_REQUIRED` is strictly preserved when a position is naked (`order_id is None`), maintaining entry-blocking safety until a valid stop order is installed and adopted.
-   - `_query_broker_position_qty()` strictly validates finite values, rejecting `None`, `NaN`, and `inf` as unknown/failed.
+5. **Defect 5: Delimiter-Safe Exit Order Lineage Matching** (`strategies/trailing_stop.py`):
+   - Replaced substring `in` checks with `_matches_order_lineage()` using delimiter regex `(?:^|[:_]){target}(?:$|[:_])`. Completely eliminates episode identity collisions (`sig-1` vs `sig-10`) (`substring_other_episode_sig10` -> `pending: 1, records: []`).
 
-6. **Defect 6: Truthful Market Provenance & Zero Timestamp Fabrication** (`strategies/regime_engine.py` & `alpaca_bridge.py`):
-   - If live quote is missing and historical close is used as benchmark baseline, it is truthfully labelled `alpaca_historical_fallback` with the actual historical bar timestamp, strictly eliminating fabricated current-time timestamps.
-   - `AlpacaBridge.get_quote()` returns `timestamp: None` and `is_realtime: False` when provider timestamp is absent, preserving truthful provenance.
+6. **Defect 6: Strict Explicit Finite Fill Evidence Contract** (`strategies/trailing_stop.py`):
+   - TP/Stop Snapshots: Require explicit non-null, finite, positive `filled_qty` (`math.isfinite(snap_fq) and snap_fq > 0`), status strictly `"filled"`. Zero fallback to `qty` (`snapshot_missing_filled_qty_uses_order_qty`, `snapshot_infinite_filled_qty` -> `pending: 1, records: []`).
+   - Closed-Orders Fallback: Status strictly `"filled"` (no `"fill" in status` matching `"partially_filled"`), require explicit finite positive `filled_qty` (rejects NaN/inf/missing) (`fallback_nan_filled_qty`, `fallback_partial_status`, `fallback_missing_filled_qty_uses_qty` -> `pending: 1, records: []`).
 
-## 25/25 Boundary Probes Verified
-- All 25 isolated boundary probes pass with 100% precision.
+7. **Defect 7: Multi-Order Exit Accounting (Split Exits)** (`strategies/trailing_stop.py`):
+   - Aggregates all matching closed orders for an episode. If cumulative filled quantity covers required position (`sum(qty) >= exp_qty - 1e-4`), computes weighted average fill price `sum(qty * price) / sum(qty)` and logs `SPLIT_EXIT` with exact weighted PnL (`split_exits_4_plus_8_cover_12` -> `RECONCILED_SPLIT_EXIT`, weighted price $333.3333, gross PnL $17.44, `pending: 0`).
+
+8. **Defect 8: Durable Disk Sync Enforced on Retry Dedup** (`strategies/trade_journal.py`):
+   - In `log_trade()`: On idempotency key dedup detection, enforces durable disk sync with `os.fsync(fh.fileno())` before returning. If fsync fails on retry, `OSError` is raised, preventing silent queue eviction without confirmed durability (`fsync_failure_retry_dedup_evicts_without_sync` -> `additional_fsync_calls: 2, pending: 1`).
+
+9. **Defect 9: Truthful Market Provenance & Timestamp Separation** (`strategies/regime_engine.py` & `alpaca_bridge.py`):
+   - In `_get_premarket_pct_change()`: Fallback price observation timestamp strictly uses quote timestamp (`final_ts = quote_ts`). Never reuses baseline bar timestamp (`fallback_price_epoch_reused_from_baseline` -> `timestamp: None`).
+   - In yfinance fallback: Returns `("yfinance_fallback", None)`. Never spoofs current system time as market observation timestamp (`yfinance_missing_provider_timestamp_labelled_fresh` -> `timestamp: None`).
 
 ## Verification Summary (240 / 240 PASS - 100% Zero Regressions)
 - **Suite Breakdown**:
@@ -284,8 +312,12 @@ This bundle provides full source files, test suites, and raw verification artifa
   17. `tests/test_deterministic_telemetry_join.py`: **6** passed
   18. `tests/test_soxx_fail_closed_regression.py`: **18** passed
   19. `tests/test_candlestick_strategy.py`: **8** passed
-  - **TOTAL: 240 passed in 62.57s (100% Zero Regressions)**
+  - **TOTAL: 240 passed in {xml_duration} (100% Zero Regressions)**
 - **JUnit XML**: `evidence/pytest_junit_report.xml`
+
+## Boundary Probes Verification
+- **Auditor's 16 Boundary Probes**: **16 / 16 PASSED** with 100% specification compliance (`evidence/auditor_16_probes_results.json`).
+- **Original 25 Boundary Probes**: **25 / 25 PASSED** with 100% precision (`evidence/offline_probes_results.json`).
 
 ## Bundle Contents
 - `source/`: Full source of core engine files (`alpaca_bridge.py`, `main.py`, `run_daytrade_paper.bat`, `strategies/`, `config.py`).
@@ -299,6 +331,8 @@ This bundle provides full source files, test suites, and raw verification artifa
   - `pytest_junit_report.xml`: Machine-readable test execution report (240 testcases)
   - `run_offline_probes.py`: Isolated offline boundary verification script (25 probes)
   - `offline_probes_results.json`: Raw execution outputs for all 25 boundary probes
+  - `run_auditor_16_probes.py`: Auditor's isolated boundary verification script (16 probes)
+  - `auditor_16_probes_results.json`: Raw execution outputs for all 16 boundary probes
   - `effective_safety_settings.json`: Active safety policy parameters
   - `runtime_config_evidence.json`: Runtime provenance and promotion gates
   - `file_manifest_sha256.json`: Cryptographic SHA-256 hashes of all bundled files

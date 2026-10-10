@@ -600,7 +600,7 @@ def _get_premarket_pct_change(symbol: str, bridge=None) -> Tuple[Optional[float]
                             "[REGIME BASELINE] %s: prev_close=%.2f (session=%s), price=%.2f, change=%.2f%% (src=%s)",
                             symbol, prev_close, session_date_str or "historical", price, pct, baseline_source,
                         )
-                        final_ts = quote_ts if is_live_quote else (bar_epoch or quote_ts)
+                        final_ts = quote_ts
                         return round(pct, 2), baseline_source, final_ts
         except Exception as exc:
             logger.debug("Failed fetching premarket pct via bridge for %s: %s", symbol, exc)
@@ -615,7 +615,7 @@ def _get_premarket_pct_change(symbol: str, bridge=None) -> Tuple[Optional[float]
             prev = float(fast_info.previous_close or 0.0)
             if last > 0 and prev > 0:
                 pct = ((last - prev) / prev) * 100.0
-                return round(pct, 2), "yfinance_realtime", now_epoch
+                return round(pct, 2), "yfinance_fallback", None
     except Exception as yf_err:
         logger.debug("yfinance fallback failed for %s: %s", symbol, yf_err)
 

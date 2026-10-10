@@ -255,6 +255,7 @@ class TestHandleNakedPositionExitReconciliation:
                     "order_type": "limit",
                     "filled_avg_price": 335.10,
                     "qty": 12.0,
+                    "filled_qty": 12.0,
                 }
             elif oid == "stop-leg-1":
                 return {
@@ -316,6 +317,7 @@ class TestHandleNakedPositionExitReconciliation:
                     "order_type": "stop",
                     "filled_avg_price": 418.45,
                     "qty": 10.0,
+                    "filled_qty": 10.0,
                 }
             elif oid == "tp-leg-2":
                 return {
@@ -499,6 +501,7 @@ class TestHandleNakedPositionExitReconciliation:
             "order_type": "stop",
             "filled_avg_price": 494.80,
             "qty": 5.0,
+            "filled_qty": 5.0,
         }
 
         with patch("strategies.trade_journal.log_trade") as mock_log:
@@ -593,6 +596,7 @@ class TestDurablePendingQueueAndSafetyHalts:
         assert mgr.has_pending_exit("AMD") is True
 
         mock_bridge = MagicMock()
+        mock_bridge.get_position.return_value = 0.0
         mock_bridge.get_order_snapshot.return_value = {
             "id": "stop-amd-1",
             "status": "filled",
@@ -601,6 +605,7 @@ class TestDurablePendingQueueAndSafetyHalts:
             "order_type": "stop",
             "filled_avg_price": 97.90,
             "qty": 10.0,
+            "filled_qty": 10.0,
         }
 
         with patch("strategies.trade_journal.log_trade") as mock_log:
@@ -847,6 +852,7 @@ class TestDurablePendingQueueAndSafetyHalts:
 
         # Case 2: Active stop is verified (order_id="stop-nvda-1") -> successfully auto-clears
         state.order_id = "stop-nvda-1"
+        state.stop_reconciliation_required = False
         with patch.object(mgr, "_save_state", return_value=True):
             mgr.handle_naked_position("NVDA", 10.0, bridge=mock_bridge)
 
