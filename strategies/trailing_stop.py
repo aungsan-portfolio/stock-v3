@@ -1078,6 +1078,10 @@ class DynamicTrailingStopManager:
             if existing and existing.active:
                 existing.entry_price = average_fill_price
                 existing.qty = cumulative_qty
+                cum_qty_f = float(cumulative_qty)
+                curr_entry_qty = getattr(existing, "entry_qty", None)
+                if curr_entry_qty is None or cum_qty_f > float(curr_entry_qty):
+                    existing.entry_qty = cum_qty_f
                 if stop_order_id:
                     existing.order_id = stop_order_id
                 if tp_order_id:
@@ -1526,6 +1530,8 @@ class DynamicTrailingStopManager:
                                 f"[RECONCILE P0] Tracked order {state.order_id} in open_orders failed stop validation "
                                 f"or capacity check for required_qty={req_pos_qty}"
                             )
+                            if state.order_id and not state.last_stop_order_id:
+                                state.last_stop_order_id = str(state.order_id)
                             state.stop_reconciliation_required = True
                             state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
                     else:
@@ -1559,6 +1565,8 @@ class DynamicTrailingStopManager:
                                     f"[RECONCILE P0] Direct order lookup returned mismatch: "
                                     f"expected {symbol}/{state.order_id}, got {d_sym}/{d_id}"
                                 )
+                                if state.order_id and not state.last_stop_order_id:
+                                    state.last_stop_order_id = str(state.order_id)
                                 state.stop_reconciliation_required = True
                                 state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
                             elif d_status in ("held", "new", "accepted", "submitted", "pending_new"):
@@ -1570,6 +1578,8 @@ class DynamicTrailingStopManager:
                                     logger.warning(
                                         f"[RECONCILE P0] Direct resting order {d_id} failed capacity or stop validation for {req_pos_qty}"
                                     )
+                                    if state.order_id and not state.last_stop_order_id:
+                                        state.last_stop_order_id = str(state.order_id)
                                     state.stop_reconciliation_required = True
                                     state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
                             elif d_status in ("filled", "partially_filled"):
@@ -1637,6 +1647,8 @@ class DynamicTrailingStopManager:
                                     state.stop_price = float(matching_stop_price)
                                     state.confirmed_broker_stop_price = float(matching_stop_price)
                             else:
+                                if state.order_id and not state.last_stop_order_id:
+                                    state.last_stop_order_id = str(state.order_id)
                                 state.stop_reconciliation_required = True
                                 state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
                                 logger.warning(f"[RECONCILE UNCERTAIN] {state.symbol}: Tracked stop ID {state.order_id} missing from snapshot; retaining ID.")
@@ -2310,10 +2322,11 @@ class DynamicTrailingStopManager:
                             state.qty = abs(pos_qty)
                         self._save_state()
                         logger.info("[RECONCILIATION RECOVERED] Broker position query restored for %s with verified active stop %s.", symbol, state.order_id)
-                if symbol in self.pending_exits and bridge is not None:
-                    # Retry reconciling any pending exit in durable queue
-                    self.reconcile_pending_exits(bridge)
-                return
+                if not getattr(state, "stop_reconciliation_required", False) and state.reconciliation_status != "POSITION_UNKNOWN_RECONCILIATION_REQUIRED":
+                    if symbol in self.pending_exits and bridge is not None:
+                        # Retry reconciling any pending exit in durable queue
+                        self.reconcile_pending_exits(bridge)
+                    return
 
             # Query broker fresh to make sure position still exists and is non-zero
             is_known, pos_qty = self._query_broker_position_qty(bridge, symbol)
@@ -2437,9 +2450,23 @@ class DynamicTrailingStopManager:
                         logger.debug(f"Pre-reconcile failed for {symbol}: {rec_exc}")
 
                 # CRITICAL SAFETY GUARANTEE: If an active broker stop order exists on Alpaca, position is PROTECTED.
-                if state.order_id is not None:
+                if state.order_id is not None and not getattr(state, "stop_reconciliation_required", False) and state.reconciliation_status != "POSITION_UNKNOWN_RECONCILIATION_REQUIRED":
                     logger.info(f"Adopted existing valid broker stop order {state.order_id} for {symbol} inside handle_naked_position - skipping panic flatten.")
                     return
+
+                # If state.order_id is present but stop_reconciliation_required is True,
+                # the tracked order is insufficient/invalid and cannot protect the full position.
+                # Retain old ID as audit evidence and clear confirmed order_id for safe remediation.
+                old_stop_id = state.order_id
+                if old_stop_id:
+                    state.last_stop_order_id = str(old_stop_id)
+                    state.order_id = None
+                    if hasattr(bridge, "cancel_order"):
+                        try:
+                            bridge.cancel_order(old_stop_id)
+                            logger.info(f"[REMEDIATION] Cancelled insufficient/invalid stop order {old_stop_id} for {symbol} before replacement.")
+                        except Exception as c_err:
+                            logger.debug(f"[REMEDIATION] Note: Could not cancel old stop order {old_stop_id}: {c_err}")
 
                 # Step 2: Gap-Through Check SECOND for truly naked positions
                 current_price = None
@@ -2478,6 +2505,9 @@ class DynamicTrailingStopManager:
                                 state.remediation_in_progress = False
                                 state.remediation_attempts = 0
                                 state.escalation_alerted = False
+                                state.stop_reconciliation_required = False
+                                state.reconciliation_status = None
+                                state.confirmed_broker_stop_price = state.stop_price
                                 self._save_state()
                                 should_alert_resolved = True
                                 resolved_order_id = new_order_id
@@ -2535,6 +2565,9 @@ class DynamicTrailingStopManager:
                                                 state.order_id = cand_id
                                                 state.remediation_in_progress = False
                                                 state.remediation_attempts = 0
+                                                state.stop_reconciliation_required = False
+                                                state.reconciliation_status = None
+                                                state.confirmed_broker_stop_price = state.stop_price
                                                 self._save_state()
                                             logger.info(f"Adopted confirmed Stop Loss leg {cand_id} (type={o_type}) for {symbol} from broker bracket response.")
                                             return

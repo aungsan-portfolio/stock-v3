@@ -1841,7 +1841,7 @@ def evaluate_and_execute(
                                     manager.soft_reset(sym)
                                 continue
 
-                        if state and state.active and state.order_id is None:
+                        if state and state.active and (state.order_id is None or getattr(state, "stop_reconciliation_required", False)):
                             manager.handle_naked_position(
                                 symbol=sym,
                                 position_qty=p.position,

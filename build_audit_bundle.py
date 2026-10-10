@@ -187,6 +187,13 @@ def main():
     except Exception as e:
         print(f"  ! 3896f5d diff error: {e}")
 
+    # Prior commit diff for 8027bcd
+    try:
+        git_diff_80 = subprocess.check_output(["git", "show", "8027bcd"], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
+        (evidence_dest / "git_commit_diff_8027bcd.patch").write_text(sanitize_text(git_diff_80), encoding="utf-8")
+    except Exception as e:
+        print(f"  ! 8027bcd diff error: {e}")
+
     # Cumulative git diff since 3ef1bab
     try:
         git_diff_cumulative = subprocess.check_output(["git", "diff", "3ef1bab..HEAD"], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
@@ -253,6 +260,26 @@ def main():
             (evidence_dest / "expanded_boundary_checks_results.json").write_text(expanded_out, encoding="utf-8")
         except Exception as ee:
             print(f"  ! Error executing expanded_boundary_checks: {ee}")
+
+    # Auditor's scoped closure checks script and raw execution output (11 checks)
+    scoped_src = ROOT_DIR / "scoped_closure_checks.py"
+    if scoped_src.exists():
+        sanitize_and_copy(scoped_src, evidence_dest / "scoped_closure_checks.py")
+        try:
+            scoped_out = subprocess.check_output(["python", str(scoped_src)], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
+            (evidence_dest / "scoped_closure_results.json").write_text(scoped_out, encoding="utf-8")
+        except Exception as se:
+            print(f"  ! Error executing scoped_closure_checks: {se}")
+
+    # Scoped lifecycle blockers verification script and output (B1 and B2)
+    blockers_src = ROOT_DIR / "verify_scoped_lifecycle_blockers.py"
+    if blockers_src.exists():
+        sanitize_and_copy(blockers_src, evidence_dest / "verify_scoped_lifecycle_blockers.py")
+        try:
+            blockers_out = subprocess.check_output(["python", str(blockers_src)], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
+            (evidence_dest / "scoped_lifecycle_blockers_results.json").write_text(blockers_out, encoding="utf-8")
+        except Exception as be:
+            print(f"  ! Error executing verify_scoped_lifecycle_blockers: {be}")
 
     # Effective safety settings
     safety_settings = {
@@ -350,6 +377,18 @@ This bundle provides full source files, test suites, and raw verification artifa
     - Stop partial fill does not unilaterally reduce `state.qty`.
     - Finding a working stop alone does NOT clear `POSITION_UNKNOWN_RECONCILIATION_REQUIRED` unless broker position is confirmed known.
 
+11. **Defect 11: Lifecycle Blocker 1 (B1 - P0 Position Protection Remediation)** (`strategies/trailing_stop.py` & `strategies/orchestrator.py`):
+    - In `orchestrator.py`: Routed `handle_naked_position()` for positions requiring stop reconciliation (`state.order_id is None or state.stop_reconciliation_required`), ensuring flagged insufficient stops reach the remediation pipeline.
+    - In `handle_naked_position()`: Early-return guard permits remediation when `stop_reconciliation_required` is `True`. Tracked insufficient order ID is preserved in `last_stop_order_id` as audit evidence, cleared from `order_id` (`order_id = None`), safely cancelled on broker before submitting replacement stop covering the full position (`place_stop_order(qty=position_qty)`).
+    - Preserves fail-closed guard: Unknown broker position queries strictly avoid speculative order submission and remain active unknown (`POSITION_UNKNOWN_RECONCILIATION_REQUIRED`).
+    - Acceptance verified: position 12 / stop 1 -> safe recovery request verified to cover 12; position 12 / valid stop 12 -> no duplicate protection order; unknown broker state -> no speculative submission.
+
+12. **Defect 12: Lifecycle Blocker 2 (B2 - High Episode Cumulative Entry Accounting)** (`strategies/trailing_stop.py`):
+    - In `apply_confirmed_fill()`: When confirmed cumulative entry fill increases (`cum_qty > existing.entry_qty`), `existing.entry_qty` is updated to the cumulative fill quantity (`existing.entry_qty = float(cumulative_qty)`).
+    - In `_reconcile_broker_order()`: Partial exit observations update current position `state.qty` but strictly preserve `entry_qty`, preventing `EXCESS_EXIT_QTY_DISCREPANCY` upon eventual flat position exit reconciliation.
+    - Repeated cumulative fill notifications for the same entry volume do not double count.
+    - Acceptance verified: entry 11 -> cumulative 12 -> exit 12 reconciles one close for 12; entry 12 -> exit 4 -> remaining 8 -> final exit 8 aggregates 12; repeated cumulative entry 12 does not double count.
+
 ## Verification Summary (240 / 240 PASS - 100% Zero Regressions)
 - **Suite Breakdown**:
   1. `tests/test_stop_rebuild_and_persistence_hardening.py`: **38** passed
@@ -374,7 +413,9 @@ This bundle provides full source files, test suites, and raw verification artifa
   - **TOTAL: 240 passed in {xml_duration} (100% Zero Regressions)**
 - **JUnit XML**: `evidence/pytest_junit_report.xml`
 
-## Boundary Probes Verification
+## Boundary Probes & Lifecycle Blockers Verification
+- **Scoped Lifecycle Blockers B1 & B2 Acceptance Suite**: **5 / 5 PASSED** (`evidence/scoped_lifecycle_blockers_results.json`).
+- **Auditor's Scoped Closure Checks**: **11 / 11 CHECKS PASSED** (`evidence/scoped_closure_results.json`).
 - **Auditor's 16 Boundary Probes**: **16 / 16 PASSED** with 100% specification compliance (`evidence/auditor_16_probes_results.json`).
 - **Auditor's 4 Technical Hardening Probes**: **10 / 10 CHECKS PASSED (100%)** (`evidence/auditor_hardening_points_results.json`).
 - **Original 25 Boundary Probes**: **25 / 25 PASSED** with 100% precision (`evidence/offline_probes_results.json`).
@@ -386,11 +427,17 @@ This bundle provides full source files, test suites, and raw verification artifa
   - `git_rev_parse_head.txt`: Git HEAD SHA (`{head_sha}`)
   - `git_status_short.txt`: Git workspace status
   - `git_commit_diff_{short_sha}.patch`: Exact commit patch for `{short_sha}`
+  - `git_commit_diff_8027bcd.patch`: Commit patch for `8027bcd`
+  - `git_commit_diff_3896f5d.patch`: Commit patch for `3896f5d`
   - `git_commit_diff_bbeda16.patch`: Commit patch for `bbeda16`
   - `git_commit_diff_fd3094e.patch`: Commit patch for `fd3094e`
   - `git_commit_diff_9977c79.patch`: Core hardening commit patch for `9977c79`
   - `git_diff_cumulative_since_3ef1bab.patch`: Cumulative patch since `3ef1bab`
   - `pytest_junit_report.xml`: Machine-readable test execution report (240 testcases)
+  - `verify_scoped_lifecycle_blockers.py`: B1 and B2 acceptance verification script
+  - `scoped_lifecycle_blockers_results.json`: Execution output of B1 and B2 acceptance tests
+  - `scoped_closure_checks.py`: Auditor's scoped closure checks script (11 checks)
+  - `scoped_closure_results.json`: Execution outputs of auditor's scoped closure checks
   - `run_offline_probes.py`: Isolated offline boundary verification script (25 probes)
   - `offline_probes_results.json`: Raw execution outputs for all 25 boundary probes
   - `run_auditor_16_probes.py`: Auditor's isolated boundary verification script (16 probes)
