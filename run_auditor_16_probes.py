@@ -45,7 +45,7 @@ extract('strategies/regime_engine.py', '_extract_prev_session_close')
 extract('strategies/regime_engine.py', '_get_premarket_pct_change')
 
 mod = types.ModuleType('strategies.session')
-mod.get_previous_market_day = lambda: date(2026, 10, 8)
+mod.get_previous_market_day = lambda *a, **kw: date(2026, 10, 8)
 mod.now_eastern = lambda: NS(date=lambda: date(2026, 10, 9))
 sys.modules['strategies.session'] = mod
 jm = types.ModuleType('strategies.trade_journal')
@@ -65,7 +65,7 @@ def rec(n, x): out.append({'case': n, 'result': x})
 
 base = {'id': 'stop-1', 'symbol': 'AAPL', 'side': 'sell', 'type': 'stop', 'status': 'new', 'qty': '12', 'filled_qty': '0', 'stop_price': '331.89'}
 def adopt_state():
-    return NS(symbol='AAPL', side='BUY', active=True, order_id=None, qty=12., entry_price=331.88, stop_price=331.89, desired_stop_price=331.89, strategy='MEAN_REVERSION', reconciliation_status='POSITION_UNKNOWN_RECONCILIATION_REQUIRED', stop_reconciliation_required=True)
+    return NS(symbol='AAPL', side='BUY', active=True, order_id=None, qty=12., entry_qty=12., entry_price=331.88, stop_price=331.89, desired_stop_price=331.89, strategy='MEAN_REVERSION', reconciliation_status='POSITION_UNKNOWN_RECONCILIATION_REQUIRED', stop_reconciliation_required=True)
 def adopt_manager(s):
     m = NS(_lock=threading.RLock(), states={'AAPL': s}, pending_exits={}, _save_state=lambda: True, _extract_all_orders_including_legs=lambda x: x, _record_pending_exit=lambda s, qty_closed=None: None)
     m._is_valid_stop_order = types.MethodType(G['_is_valid_stop_order'], m)

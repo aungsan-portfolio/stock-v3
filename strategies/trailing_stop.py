@@ -363,8 +363,11 @@ class TrailingStopState:
     last_stop_order_id: Optional[str] = None
     tp_order_id: Optional[str] = None
     reconciliation_status: Optional[str] = None
+    entry_qty: Optional[float] = None
 
     def __post_init__(self):
+        if self.entry_qty is None and self.qty > 0.0:
+            self.entry_qty = float(self.qty)
         if self.desired_stop_price is None:
             self.desired_stop_price = float(self.stop_price)
         if self.confirmed_broker_stop_price is None and not self.stop_reconciliation_required:
@@ -556,6 +559,7 @@ class DynamicTrailingStopManager:
                             state_dict.setdefault("last_stop_order_id", state_dict.get("order_id"))
                             state_dict.setdefault("tp_order_id", None)
                             state_dict.setdefault("reconciliation_status", None)
+                            state_dict.setdefault("entry_qty", state_dict.get("qty"))
                             self.states[sym] = TrailingStopState(**state_dict)
             self.persistence_healthy = True
             logger.info(f"Loaded {len(self.states)} active trailing stops, {len(self.pending_exits)} pending exits.")
@@ -680,7 +684,11 @@ class DynamicTrailingStopManager:
     def _record_pending_exit(self, state: TrailingStopState, qty_closed: Optional[float] = None) -> None:
         """Record an open position whose broker position has flattened into the durable pending exits queue."""
         symbol = state.symbol.upper().strip()
-        closed_qty = float(qty_closed if qty_closed is not None and qty_closed > 0 else (state.qty or 0.0))
+        closed_qty = float(
+            state.entry_qty
+            if (getattr(state, "entry_qty", None) is not None and float(state.entry_qty) > 0)
+            else (qty_closed if qty_closed is not None and qty_closed > 0 else (state.qty or 0.0))
+        )
         episode_key = str(state.signal_id or state.order_id or state.tp_order_id or int(getattr(state, "entry_time", 0) or time.time()))
         episode_id = f"{symbol}:{episode_key}"
         self.pending_exits[episode_id] = {
@@ -789,16 +797,17 @@ class DynamicTrailingStopManager:
                         pattern = rf"(?:^|[:_]){re.escape(target)}(?:$|[:_])"
                         return bool(re.search(pattern, cid))
 
+                    conflict_detected = [False]
                     collected_orders: Dict[str, dict] = {}
                     known_ids = {str(k).strip() for k in (tp_id, stop_id, exit_item.get("last_stop_order_id")) if k}
                     sig_id = str(exit_item.get("signal_id") or "").strip()
                     ep_id = str(exit_item.get("episode_id") or "").strip()
 
                     def _process_candidate_order(o: Any) -> None:
-                        if not o:
+                        if not o or conflict_detected[0]:
                             return
                         oid = str(_extract_order_field(o, "id") or getattr(o, "id", "") or "").strip()
-                        if not oid or oid in collected_orders:
+                        if not oid:
                             return
 
                         o_sym = str(_extract_order_field(o, "symbol") or getattr(o, "symbol", "") or "").upper().strip()
@@ -844,6 +853,18 @@ class DynamicTrailingStopManager:
                             return
 
                         o_type = str(_extract_order_field(o, "order_type") or _extract_order_field(o, "type") or getattr(o, "order_type", getattr(o, "type", "")) or "").lower()
+
+                        if oid in collected_orders:
+                            existing = collected_orders[oid]
+                            if abs(existing["qty"] - f_qty) > 1e-4 or abs(existing["price"] - f_px) > 1e-4:
+                                logger.error(
+                                    f"[RECONCILE CONFLICT] {symbol}: Conflicting broker observations for order {oid}: "
+                                    f"existing(qty={existing['qty']}, px={existing['price']}) vs new(qty={f_qty}, px={f_px}). "
+                                    f"Failing closed."
+                                )
+                                conflict_detected[0] = True
+                            return
+
                         collected_orders[oid] = {
                             "id": oid,
                             "qty": f_qty,
@@ -902,6 +923,14 @@ class DynamicTrailingStopManager:
                         except Exception as co_err:
                             logger.debug("Failed querying bridge.get_orders for %s: %s", symbol, co_err)
 
+                    if conflict_detected[0]:
+                        logger.error(
+                            f"[RECONCILE CONFLICT BLOCKED] {symbol}: Conflicting observations across broker order queries. "
+                            f"Retaining pending exit fail-closed."
+                        )
+                        results[symbol] = "CONFLICTING_EXIT_EVIDENCE_DISCREPANCY"
+                        continue
+
                     # Enforce Quantity Conservation
                     total_filled = sum(m["qty"] for m in collected_orders.values())
                     if total_filled > exp_qty + 1e-4:
@@ -944,13 +973,14 @@ class DynamicTrailingStopManager:
 
                     # Attempt journal write
                     idempotency_key = f"exit_{episode_id}"
+                    journal_qty = int(qty_closed) if abs(qty_closed - round(qty_closed)) < 1e-6 else float(qty_closed)
                     if exit_item.get("is_validation"):
                         try:
                             from strategies.validation_lane import record_validation_fill_and_close
                             record_validation_fill_and_close(
                                 entry_order_id=str(exit_item.get("tp_order_id") or exit_item.get("stop_order_id") or ""),
                                 exit_price=exit_price,
-                                qty=float(qty_closed),
+                                qty=journal_qty,
                                 side=expected_exit_side.upper(),
                                 symbol=symbol,
                                 exit_reason=exit_reason,
@@ -963,7 +993,7 @@ class DynamicTrailingStopManager:
                         log_trade(
                             symbol=symbol,
                             side=expected_exit_side.upper(),
-                            qty=int(qty_closed),
+                            qty=journal_qty,
                             entry_price=entry_px,
                             stop_price=exit_item.get("stop_price") or entry_px,
                             target_price=exit_item.get("target_price") or exit_price,
@@ -1476,9 +1506,30 @@ class DynamicTrailingStopManager:
             if state and state.active:
                 if state.order_id is not None:
                     all_open_orders = self._extract_all_orders_including_legs(open_orders)
-                    open_order_ids = {_extract_order_info(o)["id"] for o in all_open_orders if _extract_order_info(o)["id"]}
-                    if str(state.order_id) not in open_order_ids:
-                        # P1-3: Do NOT immediately wipe order_id to None on snapshot miss!
+                    target_side = "sell" if str(state.side).upper() in ("BUY", "LONG") else "buy"
+                    req_pos_qty = float(state.qty if (state.qty and state.qty > 0) else (qty if qty > 0 else 0.0))
+
+                    tracked_in_open = next(
+                        (o for o in all_open_orders if _extract_order_info(o)["id"] == str(state.order_id)),
+                        None
+                    )
+                    if tracked_in_open is not None:
+                        # Order is present in open_orders snapshot! Verify its validity and capacity
+                        if self._is_valid_stop_order(tracked_in_open, target_side, required_qty=req_pos_qty, expected_symbol=symbol):
+                            t_info = _extract_order_info(tracked_in_open)
+                            if t_info.get("stop_price") is not None:
+                                state.stop_price = float(t_info["stop_price"])
+                                state.confirmed_broker_stop_price = float(t_info["stop_price"])
+                        else:
+                            # Capacity insufficient or invalid stop order
+                            logger.warning(
+                                f"[RECONCILE P0] Tracked order {state.order_id} in open_orders failed stop validation "
+                                f"or capacity check for required_qty={req_pos_qty}"
+                            )
+                            state.stop_reconciliation_required = True
+                            state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+                    else:
+                        # Tracked order NOT in open_orders snapshot -> direct lookup
                         direct_order = None
                         if bridge and hasattr(bridge, "get_order_snapshot"):
                             try:
@@ -1493,12 +1544,34 @@ class DynamicTrailingStopManager:
 
                         if direct_order is not None:
                             d_info = _extract_order_info(direct_order)
+                            d_id = str(d_info.get("id") or "")
+                            d_sym = str(d_info.get("symbol") or "").upper().strip()
                             d_status = str(d_info.get("status", "")).lower()
-                            if d_status in ("held", "new", "accepted", "submitted", "pending_new"):
-                                # Retain ID, order is active resting at broker
-                                if d_info.get("stop_price") is not None:
-                                    state.confirmed_broker_stop_price = float(d_info["stop_price"])
-                                    state.stop_price = float(d_info["stop_price"])
+
+                            # Require identity, symbol match, side match, and validity
+                            is_match = (
+                                d_id == str(state.order_id)
+                                and d_sym == symbol.upper().strip()
+                            )
+
+                            if not is_match:
+                                logger.warning(
+                                    f"[RECONCILE P0] Direct order lookup returned mismatch: "
+                                    f"expected {symbol}/{state.order_id}, got {d_sym}/{d_id}"
+                                )
+                                state.stop_reconciliation_required = True
+                                state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+                            elif d_status in ("held", "new", "accepted", "submitted", "pending_new"):
+                                if self._is_valid_stop_order(direct_order, target_side, required_qty=req_pos_qty, expected_symbol=symbol):
+                                    if d_info.get("stop_price") is not None:
+                                        state.confirmed_broker_stop_price = float(d_info["stop_price"])
+                                        state.stop_price = float(d_info["stop_price"])
+                                else:
+                                    logger.warning(
+                                        f"[RECONCILE P0] Direct resting order {d_id} failed capacity or stop validation for {req_pos_qty}"
+                                    )
+                                    state.stop_reconciliation_required = True
+                                    state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
                             elif d_status in ("filled", "partially_filled"):
                                 is_known, pos_qty = self._query_broker_position_qty(bridge, state.symbol)
                                 if not is_known:
@@ -1516,8 +1589,12 @@ class DynamicTrailingStopManager:
                                     self.reconcile_pending_exits(bridge)
                                     return state
                                 else:
-                                    logger.info(f"[RECONCILE] {state.symbol}: Stop order {state.order_id} partially filled, remaining pos={pos_qty}")
+                                    logger.info(f"[RECONCILE] {state.symbol}: Stop order {state.order_id} {d_status}, remaining pos={pos_qty}")
                                     state.qty = abs(pos_qty)
+                                    if d_status == "filled":
+                                        state.order_id = None
+                                        state.stop_reconciliation_required = True
+                                        state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
                             elif d_status in ("cancelled", "canceled", "expired", "rejected"):
                                 is_known, pos_qty = self._query_broker_position_qty(bridge, state.symbol)
                                 if not is_known:
@@ -1540,15 +1617,17 @@ class DynamicTrailingStopManager:
                                         state.last_stop_order_id = str(state.order_id)
                                     state.order_id = None
                                     state.qty = abs(pos_qty)
+                                    state.stop_reconciliation_required = True
+                                    state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
                         else:
-                            # Direct lookup unavailable or not found:
-                            # Check if a matching stop exists in all_open_orders
-                            target_side = "sell" if state.side == "BUY" else "buy"
+                            # Direct lookup not found: check if a matching stop exists in all_open_orders
                             matching_stop_id = None
                             matching_stop_price = None
                             for o in all_open_orders:
                                 info = _extract_order_info(o)
-                                if info["symbol"] == symbol.upper().strip() and self._is_valid_stop_order(o, target_side):
+                                if info["symbol"] == symbol.upper().strip() and self._is_valid_stop_order(
+                                    o, target_side, required_qty=req_pos_qty, expected_symbol=symbol
+                                ):
                                     matching_stop_id = info["id"]
                                     matching_stop_price = info["stop_price"]
                                     break
@@ -1559,6 +1638,7 @@ class DynamicTrailingStopManager:
                                     state.confirmed_broker_stop_price = float(matching_stop_price)
                             else:
                                 state.stop_reconciliation_required = True
+                                state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
                                 logger.warning(f"[RECONCILE UNCERTAIN] {state.symbol}: Tracked stop ID {state.order_id} missing from snapshot; retaining ID.")
 
                 if state.order_id is None:
@@ -1775,8 +1855,35 @@ class DynamicTrailingStopManager:
         broker_pos_qty = None
         if bridge is not None:
             is_pos_known, broker_pos_qty = self._query_broker_position_qty(bridge, state.symbol)
-            if is_pos_known and broker_pos_qty is not None and abs(broker_pos_qty) > 1e-6:
-                state.qty = abs(broker_pos_qty)
+            if not is_pos_known:
+                state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+                state.stop_reconciliation_required = True
+            elif broker_pos_qty is not None:
+                pos_f = float(broker_pos_qty)
+                side_str = str(state.side).upper().strip()
+                if pos_f > 1e-6 and side_str not in ("BUY", "LONG"):
+                    logger.critical(
+                        f"[RECONCILE SIGN MISMATCH] {state.symbol}: Broker position is LONG (+{pos_f}) "
+                        f"but local state side is {side_str}. Fail-closed unknown status."
+                    )
+                    state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+                    state.stop_reconciliation_required = True
+                    self._save_state()
+                    return False
+                elif pos_f < -1e-6 and side_str not in ("SELL", "SHORT"):
+                    logger.critical(
+                        f"[RECONCILE SIGN MISMATCH] {state.symbol}: Broker position is SHORT ({pos_f}) "
+                        f"but local state side is {side_str}. Fail-closed unknown status."
+                    )
+                    state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+                    state.stop_reconciliation_required = True
+                    self._save_state()
+                    return False
+
+                if abs(pos_f) > 1e-6:
+                    if getattr(state, "entry_qty", None) is None and getattr(state, "qty", 0.0) > 0.0:
+                        state.entry_qty = float(state.qty)
+                    state.qty = abs(pos_f)
 
         if is_pos_known and broker_pos_qty is not None and abs(broker_pos_qty) > 1e-6:
             effective_required_qty = abs(broker_pos_qty)
@@ -1798,12 +1905,47 @@ class DynamicTrailingStopManager:
                                 state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
                             logger.info(f"[RECONCILE PARTIAL] {state.symbol}: Stop order {state.order_id} status='partially_filled', remaining capacity {rem_cap} shares active.")
                     elif status in ("filled",):
-                        logger.info(f"[RECONCILE P0] {state.symbol}: Stop order {state.order_id} status='filled' -> Stop executed by broker. Recording pending exit.")
-                        state.active = False
-                        state.order_id = None
-                        self._record_pending_exit(state)
-                        self._save_state()
-                        return True
+                        logger.info(f"[RECONCILE P0] {state.symbol}: Stop order {state.order_id} status='filled'. Checking broker position truth.")
+                        check_known = is_pos_known
+                        check_qty = broker_pos_qty
+                        if not check_known and bridge is not None:
+                            check_known, check_qty = self._query_broker_position_qty(bridge, state.symbol)
+
+                        if check_known and check_qty is not None and abs(check_qty) < 1e-6:
+                            # Position is verified flat!
+                            logger.info(f"[RECONCILE P0] {state.symbol}: Stop order {state.order_id} filled and position flat. Recording pending exit.")
+                            state.active = False
+                            state.order_id = None
+                            self._record_pending_exit(state)
+                            self._save_state()
+                            return True
+                        elif check_known and check_qty is not None and abs(check_qty) > 1e-6:
+                            # Broker still holds residual position!
+                            rem_shares = abs(check_qty)
+                            logger.warning(
+                                f"[RECONCILE P0 RESIDUAL] {state.symbol}: Stop order {state.order_id} filled, "
+                                f"but broker still has {rem_shares} shares open! Retaining active state for naked remediation."
+                            )
+                            state.active = True
+                            if state.order_id:
+                                state.last_stop_order_id = str(state.order_id)
+                            state.order_id = None
+                            state.qty = rem_shares
+                            state.stop_reconciliation_required = True
+                            state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+                            self._save_state()
+                            return False
+                        else:
+                            # Query failed or unknown position
+                            logger.warning(
+                                f"[RECONCILE P0 UNKNOWN] {state.symbol}: Stop order {state.order_id} filled, "
+                                f"but broker position unknown. Retaining active state fail-closed."
+                            )
+                            state.active = True
+                            state.stop_reconciliation_required = True
+                            state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+                            self._save_state()
+                            return False
                     elif status in ("cancelled", "canceled", "expired", "rejected"):
                         logger.warning(f"[RECONCILE P0] {state.symbol}: Stop order {state.order_id} status='{status}' -> Stop cancelled/expired. Position is UNPROTECTED!")
                         state.active = True
@@ -1898,7 +2040,10 @@ class DynamicTrailingStopManager:
                                 f"Broker stop ${broker_stop_price:.2f} vs desired ${desired:.2f} (diff=${diff:.2f})."
                             )
                     else:
-                        state.stop_reconciliation_required = False
+                        if is_pos_known:
+                            state.stop_reconciliation_required = False
+                        else:
+                            state.stop_reconciliation_required = True
 
                 self._save_state()
                 confirmed_disp = state.confirmed_broker_stop_price if state.confirmed_broker_stop_price is not None else state.stop_price
@@ -2383,7 +2528,7 @@ class DynamicTrailingStopManager:
                                         if cand_sym and cand_sym != symbol.upper().strip():
                                             continue
                                         classification = _classify_held_order(candidate)
-                                        if classification == "stop" or self._is_valid_stop_order(candidate, target_side, expected_symbol=symbol):
+                                        if self._is_valid_stop_order(candidate, target_side, required_qty=position_qty, expected_symbol=symbol):
                                             cand_id = str(getattr(candidate, "id", rel_id))
                                             o_type = str(getattr(candidate, "order_type", getattr(candidate, "type", ""))).lower()
                                             with self._lock:
@@ -2399,7 +2544,7 @@ class DynamicTrailingStopManager:
                                                 state.remediation_in_progress = False
                                             return
                                         else:
-                                            logger.warning(f"Candidate order {getattr(candidate, 'id', rel_id)} for {symbol} is NOT a stop order (type={getattr(candidate, 'order_type', getattr(candidate, 'type', None))}, client_id='{getattr(candidate, 'client_order_id', '')}'). Checking next candidate...")
+                                            logger.warning(f"Candidate order {getattr(candidate, 'id', rel_id)} for {symbol} is NOT a valid stop order (type={getattr(candidate, 'order_type', getattr(candidate, 'type', None))}, client_id='{getattr(candidate, 'client_order_id', '')}'). Checking next candidate...")
                                 except Exception as rel_exc:
                                     logger.debug(f"Could not verify related order {rel_id}: {rel_exc}")
 
@@ -2415,9 +2560,12 @@ class DynamicTrailingStopManager:
                         except Exception as rec_exc:
                             logger.warning(f"Failed fetching open/held orders for {symbol}: {rec_exc}")
                     
-                    logger.info(f"Position for {symbol} is held by open broker orders (held_for_orders). Retaining working order protection and skipping emergency flatten.")
+                    logger.info(f"Position for {symbol} is held by open broker orders (held_for_orders) without verified protective stop. Retaining reconciliation requirement fail-closed.")
                     with self._lock:
                         state.remediation_in_progress = False
+                        state.stop_reconciliation_required = True
+                        state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+                        self._save_state()
                     return
                 else:
                     protection_method = "flatten"

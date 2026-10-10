@@ -173,6 +173,20 @@ def main():
     except Exception as e:
         print(f"  ! bbeda16 diff error: {e}")
 
+    # Prior commit diff for 0104e65
+    try:
+        git_diff_01 = subprocess.check_output(["git", "show", "0104e65"], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
+        (evidence_dest / "git_commit_diff_0104e65.patch").write_text(sanitize_text(git_diff_01), encoding="utf-8")
+    except Exception as e:
+        print(f"  ! 0104e65 diff error: {e}")
+
+    # Prior commit diff for 3896f5d
+    try:
+        git_diff_38 = subprocess.check_output(["git", "show", "3896f5d"], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
+        (evidence_dest / "git_commit_diff_3896f5d.patch").write_text(sanitize_text(git_diff_38), encoding="utf-8")
+    except Exception as e:
+        print(f"  ! 3896f5d diff error: {e}")
+
     # Cumulative git diff since 3ef1bab
     try:
         git_diff_cumulative = subprocess.check_output(["git", "diff", "3ef1bab..HEAD"], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
@@ -229,6 +243,16 @@ def main():
             (evidence_dest / "auditor_hardening_points_results.json").write_text(points_out, encoding="utf-8")
         except Exception as pe:
             print(f"  ! Error executing verify_auditor_points: {pe}")
+
+    # Auditor's 11 expanded boundary checks script and raw execution output (11 checks)
+    expanded_src = ROOT_DIR / "expanded_boundary_checks.py"
+    if expanded_src.exists():
+        sanitize_and_copy(expanded_src, evidence_dest / "expanded_boundary_checks.py")
+        try:
+            expanded_out = subprocess.check_output(["python", str(expanded_src)], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
+            (evidence_dest / "expanded_boundary_checks_results.json").write_text(expanded_out, encoding="utf-8")
+        except Exception as ee:
+            print(f"  ! Error executing expanded_boundary_checks: {ee}")
 
     # Effective safety settings
     safety_settings = {
