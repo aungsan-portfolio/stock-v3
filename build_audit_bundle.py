@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import zipfile
 import json
+import hashlib
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -151,6 +152,13 @@ def main():
     git_diff_head = subprocess.check_output(["git", "show", head_sha], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
     (evidence_dest / f"git_commit_diff_{short_sha}.patch").write_text(sanitize_text(git_diff_head), encoding="utf-8")
 
+    # Core fix commit diff for 9977c79
+    try:
+        git_diff_core = subprocess.check_output(["git", "show", "9977c79"], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
+        (evidence_dest / "git_commit_diff_9977c79.patch").write_text(sanitize_text(git_diff_core), encoding="utf-8")
+    except Exception as e:
+        print(f"  ! 9977c79 diff error: {e}")
+
     # Cumulative git diff since 3ef1bab
     try:
         git_diff_cumulative = subprocess.check_output(["git", "diff", "3ef1bab..HEAD"], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
@@ -162,6 +170,16 @@ def main():
     junit_src = ROOT_DIR / "pytest_junit_report.xml"
     if junit_src.exists():
         sanitize_and_copy(junit_src, evidence_dest / "pytest_junit_report.xml")
+
+    # Offline probes script and raw execution output
+    probes_src = ROOT_DIR / "run_offline_probes.py"
+    if probes_src.exists():
+        sanitize_and_copy(probes_src, evidence_dest / "run_offline_probes.py")
+        try:
+            probes_out = subprocess.check_output(["python", str(probes_src)], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
+            (evidence_dest / "offline_probes_results.json").write_text(probes_out, encoding="utf-8")
+        except Exception as pe:
+            print(f"  ! Error executing offline probes: {pe}")
 
     # Effective safety settings
     safety_settings = {
@@ -271,20 +289,34 @@ This bundle provides full source files, test suites, and raw verification artifa
 
 ## Bundle Contents
 - `source/`: Full source of core engine files (`alpaca_bridge.py`, `main.py`, `run_daytrade_paper.bat`, `strategies/`, `config.py`).
-- `tests/`: 12 comprehensive test suites covering all execution safety, persistence, stop rebuild, regime invariant, and coordination gates.
+- `tests/`: 19 comprehensive test suites covering all execution safety, persistence, stop rebuild, regime invariant, and coordination gates.
 - `evidence/`:
   - `git_rev_parse_head.txt`: Git HEAD SHA (`{head_sha}`)
   - `git_status_short.txt`: Git workspace status
   - `git_commit_diff_{short_sha}.patch`: Exact commit patch for `{short_sha}`
+  - `git_commit_diff_9977c79.patch`: Core hardening commit patch for `9977c79`
   - `git_diff_cumulative_since_3ef1bab.patch`: Cumulative patch since `3ef1bab`
-  - `pytest_junit_report.xml`: Machine-readable test execution report (140 testcases)
+  - `pytest_junit_report.xml`: Machine-readable test execution report (240 testcases)
+  - `run_offline_probes.py`: Isolated offline boundary verification script (25 probes)
+  - `offline_probes_results.json`: Raw execution outputs for all 25 boundary probes
   - `effective_safety_settings.json`: Active safety policy parameters
   - `runtime_config_evidence.json`: Runtime provenance and promotion gates
+  - `file_manifest_sha256.json`: Cryptographic SHA-256 hashes of all bundled files
 
 ## Sanitization Declaration
 This package is sanitized. No `.env` files, Alpaca API keys, secret tokens, private webhook URLs, or account numbers are included.
 """
     (bundle_dir / "README_AUDIT.md").write_text(readme_content, encoding="utf-8")
+
+    # Generate SHA-256 file manifest
+    manifest = {}
+    for root, dirs, files in os.walk(bundle_dir):
+        for file in sorted(files):
+            fp = Path(root) / file
+            rel = str(fp.relative_to(bundle_dir)).replace("\\", "/")
+            h = hashlib.sha256(fp.read_bytes()).hexdigest()
+            manifest[rel] = h
+    (evidence_dest / "file_manifest_sha256.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     print("[5/5] Creating ZIP archive...")
     if zip_output.exists():
