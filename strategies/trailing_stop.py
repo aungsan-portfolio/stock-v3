@@ -587,6 +587,15 @@ class DynamicTrailingStopManager:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_file, STATE_FILE)
+            if os.name != "nt":
+                try:
+                    dfd = os.open(state_dir, os.O_RDONLY)
+                    try:
+                        os.fsync(dfd)
+                    finally:
+                        os.close(dfd)
+                except Exception:
+                    pass
             self.persistence_healthy = True
             self.consecutive_persistence_failures = 0
             return True
@@ -715,7 +724,16 @@ class DynamicTrailingStopManager:
         state.reconciliation_status = "FLAT_PENDING_EXIT_RECONCILIATION"
         state.order_id = None
         state.remediation_in_progress = False
-        self._save_state()
+        saved = self._save_state()
+        if not saved:
+            state.stop_reconciliation_required = True
+            logger.error(
+                "[RECORD PENDING EXIT PERSISTENCE FAILED] %s: State persistence failed while recording pending exit. "
+                "Retaining fail-closed reconciliation requirement.",
+                symbol
+            )
+            return False
+        return True
 
     def has_pending_exit(self, symbol: str) -> bool:
         """Check if any pending exit in durable queue matches symbol."""
@@ -1023,6 +1041,10 @@ class DynamicTrailingStopManager:
                     # Journal commit succeeded! Remove from pending queue atomically
                     backup_ep = self.pending_exits.get(episode_id)
                     backup_sym = self.pending_exits.get(symbol)
+                    backup_state_status = self.states[symbol].reconciliation_status if symbol in self.states else None
+                    backup_state_active = self.states[symbol].active if symbol in self.states else False
+                    backup_state_recon = self.states[symbol].stop_reconciliation_required if symbol in self.states else False
+
                     if episode_id in self.pending_exits:
                         del self.pending_exits[episode_id]
                     if symbol in self.pending_exits:
@@ -1030,13 +1052,18 @@ class DynamicTrailingStopManager:
                     if symbol in self.states:
                         self.states[symbol].reconciliation_status = f"RECONCILED_{exit_reason}"
                         self.states[symbol].active = False
+                        self.states[symbol].stop_reconciliation_required = False
                     saved = self._save_state()
                     if not saved:
                         if backup_ep:
                             self.pending_exits[episode_id] = backup_ep
                         if backup_sym:
                             self.pending_exits[symbol] = backup_sym
-                        logger.error("[RECONCILE QUEUE PERSISTENCE FAILED] %s: State persistence failed after journal commit.", symbol)
+                        if symbol in self.states:
+                            self.states[symbol].reconciliation_status = backup_state_status or "FLAT_PENDING_EXIT_RECONCILIATION"
+                            self.states[symbol].active = backup_state_active
+                            self.states[symbol].stop_reconciliation_required = True
+                        logger.error("[RECONCILE QUEUE PERSISTENCE FAILED] %s: State persistence failed after journal commit. Pending exit retained.", symbol)
                         results[symbol] = "QUEUE_PERSISTENCE_FAILED_RETAINED"
                         continue
 
@@ -2562,17 +2589,71 @@ class DynamicTrailingStopManager:
 
                     terminal_cancelled_statuses = {"canceled", "cancelled", "expired", "rejected"}
                     if old_status == "filled":
-                        logger.info(f"[REMEDIATION] Old stop {old_stop_id} was filled on broker for {symbol}. Recording pending exit.")
+                        is_known, fresh_pos_qty = self._query_broker_position_qty(bridge, symbol)
+                        if not is_known:
+                            logger.warning(
+                                f"[REMEDIATION P0] Old stop {old_stop_id} was filled, but fresh broker position query failed for {symbol}. "
+                                f"Retaining ACTIVE monitoring and fail-closed reconciliation requirement without deactivating position."
+                            )
+                            with self._lock:
+                                state.active = True
+                                state.last_stop_order_id = str(old_stop_id)
+                                state.order_id = None
+                                state.stop_reconciliation_required = True
+                                state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+                                state.remediation_in_progress = False
+                                self._save_state()
+                            return
+
+                        if abs(fresh_pos_qty) < 1e-6:
+                            logger.info(f"[REMEDIATION] Old stop {old_stop_id} filled and broker position is flat for {symbol}. Recording pending exit.")
+                            with self._lock:
+                                state.last_stop_order_id = str(old_stop_id)
+                                state.order_id = None
+                                self._record_pending_exit(state, qty_closed=abs(position_qty))
+                                state.remediation_in_progress = False
+                                self._save_state()
+                            self.reconcile_pending_exits(bridge)
+                            return
+
+                        # Broker position is NOT flat: residual shares remain (e.g. partial fill or split exit)
+                        is_mismatch = False
+                        if state.side.upper() in ("BUY", "LONG") and fresh_pos_qty < -1e-6:
+                            is_mismatch = True
+                        elif state.side.upper() in ("SELL", "SHORT") and fresh_pos_qty > 1e-6:
+                            is_mismatch = True
+
+                        if is_mismatch:
+                            logger.critical(
+                                f"[REMEDIATION SIDE MISMATCH] Old stop {old_stop_id} filled, but signed broker position {fresh_pos_qty} "
+                                f"does not match local side {state.side} for {symbol}. Blocking replacement stop and retaining active fail-closed."
+                            )
+                            with self._lock:
+                                state.active = True
+                                state.qty = abs(fresh_pos_qty)
+                                state.last_stop_order_id = str(old_stop_id)
+                                state.order_id = None
+                                state.stop_reconciliation_required = True
+                                state.reconciliation_status = "SIGNED_SIDE_MISMATCH_RECONCILIATION_REQUIRED"
+                                state.remediation_in_progress = False
+                                self._save_state()
+                            return
+
+                        residual_qty = abs(fresh_pos_qty)
+                        logger.warning(
+                            f"[REMEDIATION RESIDUAL] Old stop {old_stop_id} filled, but residual position of {residual_qty:.4f} shares remains for {symbol}. "
+                            f"Retaining ACTIVE monitoring and proceeding to protect residual position."
+                        )
                         with self._lock:
+                            state.active = True
+                            state.qty = residual_qty
+                            position_qty = residual_qty
                             state.last_stop_order_id = str(old_stop_id)
                             state.order_id = None
-                            self._record_pending_exit(state)
-                            state.remediation_in_progress = False
-                            self._save_state()
-                        self.reconcile_pending_exits(bridge)
-                        return
+                            state.stop_reconciliation_required = True
+                            state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
 
-                    if old_status not in terminal_cancelled_statuses:
+                    elif old_status not in terminal_cancelled_statuses:
                         logger.warning(
                             f"[REMEDIATION BLOCKED] Old stop order {old_stop_id} on {symbol} is not confirmed terminal cancelled "
                             f"(status={old_status}). Deferring blind replacement until old order terminal state is reconciled."
@@ -2585,38 +2666,61 @@ class DynamicTrailingStopManager:
                             state.remediation_in_progress = False
                             self._save_state()
                         return
-
-                    # Terminal cancellation confirmed on broker:
-                    with self._lock:
-                        state.last_stop_order_id = str(old_stop_id)
-                        state.order_id = None
-
-                    # Authoritative fresh broker quantity re-query after old stop is confirmed terminal cancelled:
-                    is_known, fresh_pos_qty = self._query_broker_position_qty(bridge, symbol)
-                    if not is_known:
-                        logger.warning(
-                            f"[NAKED GUARD] Broker position query failed for {symbol} after old stop cancellation. "
-                            f"Retaining active state fail-closed without placing speculative orders."
-                        )
+                    else:
+                        # Terminal cancellation confirmed on broker:
                         with self._lock:
-                            state.stop_reconciliation_required = True
-                            state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
-                            state.remediation_in_progress = False
-                            self._save_state()
-                        return
+                            state.last_stop_order_id = str(old_stop_id)
+                            state.order_id = None
 
-                    if abs(fresh_pos_qty) < 1e-6:
-                        logger.info(f"Fresh broker position for {symbol} after stop cancellation is flat (qty=0). Recording pending exit.")
+                        # Authoritative fresh broker quantity re-query after old stop is confirmed terminal cancelled:
+                        is_known, fresh_pos_qty = self._query_broker_position_qty(bridge, symbol)
+                        if not is_known:
+                            logger.warning(
+                                f"[NAKED GUARD] Broker position query failed for {symbol} after old stop cancellation. "
+                                f"Retaining active state fail-closed without placing speculative orders."
+                            )
+                            with self._lock:
+                                state.active = True
+                                state.stop_reconciliation_required = True
+                                state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+                                state.remediation_in_progress = False
+                                self._save_state()
+                            return
+
+                        if abs(fresh_pos_qty) < 1e-6:
+                            logger.info(f"Fresh broker position for {symbol} after stop cancellation is flat (qty=0). Recording pending exit.")
+                            with self._lock:
+                                self._record_pending_exit(state, qty_closed=abs(position_qty))
+                                state.remediation_in_progress = False
+                                self._save_state()
+                            self.reconcile_pending_exits(bridge)
+                            return
+
+                        # Signed side alignment check:
+                        is_mismatch = False
+                        if state.side.upper() in ("BUY", "LONG") and fresh_pos_qty < -1e-6:
+                            is_mismatch = True
+                        elif state.side.upper() in ("SELL", "SHORT") and fresh_pos_qty > 1e-6:
+                            is_mismatch = True
+
+                        if is_mismatch:
+                            logger.critical(
+                                f"[NAKED GUARD SIDE MISMATCH] Signed broker position {fresh_pos_qty} does not match local side {state.side} for {symbol}. "
+                                f"Blocking replacement stop and retaining active fail-closed."
+                            )
+                            with self._lock:
+                                state.active = True
+                                state.qty = abs(fresh_pos_qty)
+                                state.stop_reconciliation_required = True
+                                state.reconciliation_status = "SIGNED_SIDE_MISMATCH_RECONCILIATION_REQUIRED"
+                                state.remediation_in_progress = False
+                                self._save_state()
+                            return
+
+                        position_qty = abs(fresh_pos_qty)
                         with self._lock:
-                            self._record_pending_exit(state, qty_closed=abs(position_qty))
-                            state.remediation_in_progress = False
-                            self._save_state()
-                        self.reconcile_pending_exits(bridge)
-                        return
-
-                    position_qty = abs(fresh_pos_qty)
-                    with self._lock:
-                        state.qty = position_qty
+                            state.active = True
+                            state.qty = position_qty
 
                 # Step 2: Gap-Through Check SECOND for truly naked positions
                 current_price = None

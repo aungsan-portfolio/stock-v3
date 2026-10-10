@@ -118,6 +118,17 @@ def log_validation_record(
     with _validation_lock:
         with open(filepath, "a", encoding="utf-8") as f:
             f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.name != "nt":
+            try:
+                dfd = os.open(dir_name or ".", os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except Exception:
+                pass
 
 
 def build_fill_composite_key(
@@ -379,15 +390,32 @@ def record_validation_fill(
                 break
 
         if updated:
+            temp_path = f"{filepath}.tmp.{os.getpid()}.{threading.get_ident()}"
             try:
-                temp_path = filepath + ".tmp"
                 with open(temp_path, "w", encoding="utf-8") as f:
                     for rec in records:
                         f.write(json.dumps(rec, default=str) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
                 os.replace(temp_path, filepath)
+                if os.name != "nt":
+                    try:
+                        dir_name = os.path.dirname(os.path.abspath(filepath))
+                        dfd = os.open(dir_name or ".", os.O_RDONLY)
+                        try:
+                            os.fsync(dfd)
+                        finally:
+                            os.close(dfd)
+                    except Exception:
+                        pass
                 return True
             except Exception as write_err:
                 logger.error("[VALIDATION LEDGER ERROR] Failed to update %s: %s", filepath, write_err)
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
                 return False
 
     return False
@@ -468,15 +496,32 @@ def record_validation_exit(
                 break
 
         if updated:
+            temp_path = f"{filepath}.tmp.{os.getpid()}.{threading.get_ident()}"
             try:
-                temp_path = filepath + ".tmp"
                 with open(temp_path, "w", encoding="utf-8") as f:
                     for rec in records:
                         f.write(json.dumps(rec, default=str) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
                 os.replace(temp_path, filepath)
+                if os.name != "nt":
+                    try:
+                        dir_name = os.path.dirname(os.path.abspath(filepath))
+                        dfd = os.open(dir_name or ".", os.O_RDONLY)
+                        try:
+                            os.fsync(dfd)
+                        finally:
+                            os.close(dfd)
+                    except Exception:
+                        pass
                 return True
             except Exception as write_err:
                 logger.error("[VALIDATION LEDGER ERROR] Failed to update %s: %s", filepath, write_err)
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
                 return False
 
     return False

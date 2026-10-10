@@ -245,6 +245,20 @@ def main():
     except Exception as e:
         print(f"  ! Diff since 9cd671b error: {e}")
 
+    # Prior commit diff for 9333081
+    try:
+        git_diff_93 = subprocess.check_output(["git", "show", "9333081"], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
+        (evidence_dest / "git_commit_diff_9333081.patch").write_text(sanitize_text(git_diff_93), encoding="utf-8")
+    except Exception as e:
+        print(f"  ! 9333081 diff error: {e}")
+
+    # Scoped diff since 9333081
+    try:
+        git_diff_since_93 = subprocess.check_output(["git", "diff", "9333081..HEAD"], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
+        (evidence_dest / "git_diff_since_9333081.patch").write_text(sanitize_text(git_diff_since_93), encoding="utf-8")
+    except Exception as e:
+        print(f"  ! Diff since 9333081 error: {e}")
+
     # Cumulative git diff since 3ef1bab
     try:
         git_diff_cumulative = subprocess.check_output(["git", "diff", "3ef1bab..HEAD"], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
@@ -477,7 +491,7 @@ This bundle provides full source files, test suites, and raw verification artifa
 - **JUnit XML**: `evidence/pytest_junit_report.xml`
 
 ## Boundary Probes & Lifecycle Blockers Verification
-- **Scoped Lifecycle Blockers B1, B2 & R1, R2 Acceptance Suite**: **15 / 15 COMPREHENSIVE TESTS PASSED** (`evidence/scoped_lifecycle_blockers_results.json`).
+- **Scoped Lifecycle Blockers & Completion Checklist Suite**: **25 / 25 COMPREHENSIVE TESTS PASSED** (`evidence/scoped_lifecycle_blockers_results.json`).
 - **Auditor's Scoped Closure Checks**: **11 / 11 CHECKS PASSED** (`evidence/scoped_closure_results.json`).
 - **Auditor's 16 Boundary Probes**: **16 / 16 PASSED** with 100% specification compliance (`evidence/auditor_16_probes_results.json`).
 - **Auditor's 4 Technical Hardening Probes**: **10 / 10 CHECKS PASSED (100%)** (`evidence/auditor_hardening_points_results.json`).
@@ -490,6 +504,10 @@ This bundle provides full source files, test suites, and raw verification artifa
   - `git_rev_parse_head.txt`: Git HEAD SHA (`{head_sha}`)
   - `git_status_short.txt`: Git workspace status
   - `git_commit_diff_{short_sha}.patch`: Exact commit patch for `{short_sha}`
+  - `git_commit_diff_9333081.patch`: Commit patch for `9333081`
+  - `git_diff_since_9333081.patch`: Scoped diff patch since `9333081`
+  - `git_commit_diff_9cd671b.patch`: Commit patch for `9cd671b`
+  - `git_diff_since_9cd671b.patch`: Scoped diff patch since `9cd671b`
   - `git_commit_diff_b3df048.patch`: Commit patch for `b3df048`
   - `git_diff_since_b3df048.patch`: Scoped diff patch since `b3df048`
   - `git_commit_diff_8027bcd.patch`: Commit patch for `8027bcd`
@@ -499,8 +517,8 @@ This bundle provides full source files, test suites, and raw verification artifa
   - `git_commit_diff_9977c79.patch`: Core hardening commit patch for `9977c79`
   - `git_diff_cumulative_since_3ef1bab.patch`: Cumulative patch since `3ef1bab`
   - `pytest_junit_report.xml`: Machine-readable test execution report (240 testcases)
-  - `verify_scoped_lifecycle_blockers.py`: B1 and B2 acceptance verification script (10 test cases)
-  - `scoped_lifecycle_blockers_results.json`: Execution output of B1 and B2 acceptance tests
+  - `verify_scoped_lifecycle_blockers.py`: Scoped lifecycle blockers and completion checklist verification script (25 test cases)
+  - `scoped_lifecycle_blockers_results.json`: Execution output of 25 comprehensive verification tests
   - `scoped_closure_checks.py`: Auditor's scoped closure checks script (11 checks)
   - `scoped_closure_results.json`: Execution outputs of auditor's scoped closure checks
   - `run_offline_probes.py`: Isolated offline boundary verification script (25 probes)

@@ -830,9 +830,392 @@ def test_r2_validation_emergency_exit():
     return results
 
 
+def test_c1_position_side_and_residual_fills():
+    results = {}
+
+    # C1 Case 1: Old stop is filled, but broker position has residual 5 shares
+    # Manager must retain active=True, update qty=5.0, and proceed to protect residual position
+    with tempfile.TemporaryDirectory() as td:
+        fake_state = os.path.join(td, "state.json")
+        with patch("strategies.trailing_stop.STATE_FILE", fake_state):
+            mgr = DynamicTrailingStopManager()
+            state = TrailingStopState(
+                symbol="AAPL",
+                side="BUY",
+                entry_price=150.0,
+                peak_price=155.0,
+                atr=1.5,
+                stop_price=145.0,
+                desired_stop_price=145.0,
+                trail_multiple=1.5,
+                last_updated=time.time(),
+                qty=12.0,
+                order_id="stop-filled-old",
+                stop_reconciliation_required=True,
+                active=True,
+            )
+            mgr.states["AAPL"] = state
+
+            placed_stops = []
+            bridge_residual = NS(
+                get_position=lambda sym: 5.0,
+                market_price=lambda sym: 152.0,
+                working_orders_plain=lambda: [],
+                cancel_order=lambda oid: True,
+                place_stop_order=lambda **kw: placed_stops.append(kw) or {"order_id": "stop-residual-5"},
+                get_order_snapshot=lambda oid: (
+                    {"id": "stop-filled-old", "symbol": "AAPL", "status": "filled", "qty": 12.0, "filled_qty": 12.0, "side": "sell", "type": "stop", "stop_price": 145.0}
+                    if oid == "stop-filled-old"
+                    else {"id": "stop-residual-5", "symbol": "AAPL", "status": "new", "qty": 5.0, "filled_qty": 0.0, "side": "sell", "type": "stop", "stop_price": 145.0}
+                ),
+                _client=NS(get_orders=lambda req: []),
+            )
+
+            mgr.handle_naked_position("AAPL", 12.0, bridge_residual, dry_run=False)
+
+            assert state.active is True, "State must remain ACTIVE when residual 5 shares exist on broker"
+            assert state.qty == 5.0, f"State qty must be updated to residual 5.0, got {state.qty}"
+            assert len(placed_stops) == 1, f"Expected 1 replacement stop for residual position, got {len(placed_stops)}"
+            assert placed_stops[0]["qty"] == 5.0, f"Expected stop placed for residual 5.0 shares, got {placed_stops[0]['qty']}"
+            assert state.order_id == "stop-residual-5"
+            assert state.stop_reconciliation_required is False
+            results["c1_case1_filled_stop_residual_shares_retains_active_monitoring"] = "PASS"
+
+    # C1 Case 2: Old stop is filled, but broker query returns unknown/fails
+    # Manager must retain active=True, flag reconciliation required fail-closed without deactivating
+    with tempfile.TemporaryDirectory() as td:
+        fake_state = os.path.join(td, "state.json")
+        with patch("strategies.trailing_stop.STATE_FILE", fake_state):
+            mgr = DynamicTrailingStopManager()
+            state = TrailingStopState(
+                symbol="AAPL",
+                side="BUY",
+                entry_price=150.0,
+                peak_price=155.0,
+                atr=1.5,
+                stop_price=145.0,
+                desired_stop_price=145.0,
+                trail_multiple=1.5,
+                last_updated=time.time(),
+                qty=12.0,
+                order_id="stop-filled-unknown",
+                stop_reconciliation_required=True,
+                active=True,
+            )
+            mgr.states["AAPL"] = state
+
+            placed_stops = []
+            def fail_get_pos(sym):
+                raise RuntimeError("Alpaca API timeout")
+
+            bridge_query_fail = NS(
+                get_position=fail_get_pos,
+                market_price=lambda sym: 152.0,
+                working_orders_plain=lambda: [],
+                cancel_order=lambda oid: True,
+                place_stop_order=lambda **kw: placed_stops.append(kw) or {"order_id": "bad"},
+                get_order_snapshot=lambda oid: {"id": "stop-filled-unknown", "symbol": "AAPL", "status": "filled", "qty": 12.0, "filled_qty": 12.0, "side": "sell", "type": "stop", "stop_price": 145.0},
+                _client=NS(get_orders=lambda req: []),
+            )
+
+            mgr.handle_naked_position("AAPL", 12.0, bridge_query_fail, dry_run=False)
+
+            assert state.active is True, "State must remain ACTIVE when position query fails"
+            assert state.stop_reconciliation_required is True
+            assert state.reconciliation_status == "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+            assert len(placed_stops) == 0, "No speculative stop order placed when position unknown"
+            results["c1_case2_filled_stop_unknown_broker_position_retains_active_monitoring"] = "PASS"
+
+    # C1 Case 3: Signed broker side mismatch on old stop cancellation (BUY local vs -5.0 broker short)
+    # Replacement stop must be blocked fail-closed, retaining active=True with signed side mismatch flag
+    with tempfile.TemporaryDirectory() as td:
+        fake_state = os.path.join(td, "state.json")
+        with patch("strategies.trailing_stop.STATE_FILE", fake_state):
+            mgr = DynamicTrailingStopManager()
+            state = TrailingStopState(
+                symbol="AAPL",
+                side="BUY",
+                entry_price=150.0,
+                peak_price=155.0,
+                atr=1.5,
+                stop_price=145.0,
+                desired_stop_price=145.0,
+                trail_multiple=1.5,
+                last_updated=time.time(),
+                qty=12.0,
+                order_id="stop-old-cancel",
+                stop_reconciliation_required=True,
+                active=True,
+            )
+            mgr.states["AAPL"] = state
+
+            placed_stops = []
+            bridge_mismatch = NS(
+                get_position=lambda sym: -5.0,  # Negative broker position: SHORT!
+                market_price=lambda sym: 152.0,
+                working_orders_plain=lambda: [],
+                cancel_order=lambda oid: True,
+                place_stop_order=lambda **kw: placed_stops.append(kw) or {"order_id": "bad"},
+                get_order_snapshot=lambda oid: {"id": "stop-old-cancel", "symbol": "AAPL", "status": "canceled", "qty": 12.0, "side": "sell", "type": "stop", "stop_price": 145.0},
+                _client=NS(get_orders=lambda req: []),
+            )
+
+            mgr.handle_naked_position("AAPL", 12.0, bridge_mismatch, dry_run=False)
+
+            assert state.active is True, "State must remain ACTIVE on side mismatch to block fresh entries"
+            assert state.stop_reconciliation_required is True
+            assert state.reconciliation_status == "SIGNED_SIDE_MISMATCH_RECONCILIATION_REQUIRED"
+            assert len(placed_stops) == 0, "Must block replacement stop on signed side mismatch"
+            results["c1_case3_signed_side_mismatch_blocks_replacement"] = "PASS"
+
+    # C1 Case 4: Signed broker side mismatch when old stop was filled (BUY local vs -5.0 broker short)
+    with tempfile.TemporaryDirectory() as td:
+        fake_state = os.path.join(td, "state.json")
+        with patch("strategies.trailing_stop.STATE_FILE", fake_state):
+            mgr = DynamicTrailingStopManager()
+            state = TrailingStopState(
+                symbol="AAPL",
+                side="BUY",
+                entry_price=150.0,
+                peak_price=155.0,
+                atr=1.5,
+                stop_price=145.0,
+                desired_stop_price=145.0,
+                trail_multiple=1.5,
+                last_updated=time.time(),
+                qty=12.0,
+                order_id="stop-old-fill-mismatch",
+                stop_reconciliation_required=True,
+                active=True,
+            )
+            mgr.states["AAPL"] = state
+
+            placed_stops = []
+            bridge_fill_mismatch = NS(
+                get_position=lambda sym: -5.0,  # Negative broker position: SHORT!
+                market_price=lambda sym: 152.0,
+                working_orders_plain=lambda: [],
+                cancel_order=lambda oid: True,
+                place_stop_order=lambda **kw: placed_stops.append(kw) or {"order_id": "bad"},
+                get_order_snapshot=lambda oid: {"id": "stop-old-fill-mismatch", "symbol": "AAPL", "status": "filled", "qty": 12.0, "filled_qty": 12.0, "side": "sell", "type": "stop", "stop_price": 145.0},
+                _client=NS(get_orders=lambda req: []),
+            )
+
+            mgr.handle_naked_position("AAPL", 12.0, bridge_fill_mismatch, dry_run=False)
+
+            assert state.active is True
+            assert state.stop_reconciliation_required is True
+            assert state.reconciliation_status == "SIGNED_SIDE_MISMATCH_RECONCILIATION_REQUIRED"
+            assert len(placed_stops) == 0, "Must block replacement stop on signed side mismatch after fill"
+            results["c1_case4_filled_stop_signed_side_mismatch_blocks_replacement"] = "PASS"
+
+    return results
+
+
+def test_c2_pending_exit_persistence_and_recovery():
+    results = {}
+
+    # C2 Case 1: _save_state failure during reconcile_pending_exits retains queue and rolls back state
+    with tempfile.TemporaryDirectory() as td:
+        fake_state = os.path.join(td, "state.json")
+        with patch("strategies.trailing_stop.STATE_FILE", fake_state):
+            mgr = DynamicTrailingStopManager()
+            state = TrailingStopState(
+                symbol="AAPL",
+                side="BUY",
+                entry_price=150.0,
+                peak_price=155.0,
+                atr=1.5,
+                stop_price=145.0,
+                desired_stop_price=145.0,
+                trail_multiple=1.5,
+                last_updated=time.time(),
+                qty=12.0,
+                order_id="stop-pers-1",
+                active=True,
+            )
+            mgr.states["AAPL"] = state
+            mgr.pending_exits["AAPL"] = {
+                "symbol": "AAPL",
+                "side": "BUY",
+                "qty": 12.0,
+                "entry_price": 150.0,
+                "exit_price": 145.0,
+                "episode_id": "AAPL_ep_1",
+                "last_stop_order_id": "stop-pers-1",
+            }
+
+            mock_order = NS(
+                id="stop-pers-1",
+                client_order_id="cl_stop_1",
+                symbol="AAPL",
+                side="sell",
+                status="filled",
+                order_type="stop",
+                filled_qty=12.0,
+                filled_avg_price=145.0,
+            )
+            bridge = NS(
+                get_position=lambda sym: 0.0,
+                working_orders_plain=lambda: [],
+                cancel_order=lambda oid: True,
+                get_order_snapshot=lambda oid: {"id": "stop-pers-1", "symbol": "AAPL", "side": "sell", "status": "filled", "filled_qty": 12.0, "filled_avg_price": 145.0, "type": "stop"},
+                _client=NS(get_orders=lambda req: [mock_order]),
+            )
+
+            # Simulate _save_state() disk failure
+            with patch.object(mgr, "_save_state", return_value=False):
+                with patch("strategies.trade_journal.log_trade", return_value=True):
+                    res = mgr.reconcile_pending_exits(bridge)
+
+            assert res.get("AAPL") == "QUEUE_PERSISTENCE_FAILED_RETAINED", f"Expected QUEUE_PERSISTENCE_FAILED_RETAINED, got {res.get('AAPL')}"
+            assert "AAPL" in mgr.pending_exits, "Pending exit must be retained in queue when save fails"
+            assert state.active is True, "State.active must be rolled back to True"
+            assert state.stop_reconciliation_required is True, "State.stop_reconciliation_required must be rolled back to True"
+            results["c2_case1_pending_exit_save_state_failure_retains_queue"] = "PASS"
+
+    # C2 Case 2: Process restart / crash recovery survives and reloads from disk cleanly
+    with tempfile.TemporaryDirectory() as td:
+        fake_state = os.path.join(td, "state.json")
+        with patch("strategies.trailing_stop.STATE_FILE", fake_state):
+            mgr1 = DynamicTrailingStopManager()
+            state1 = TrailingStopState(
+                symbol="AAPL",
+                side="BUY",
+                entry_price=150.0,
+                peak_price=155.0,
+                atr=1.5,
+                stop_price=145.0,
+                desired_stop_price=145.0,
+                trail_multiple=1.5,
+                last_updated=time.time(),
+                qty=12.0,
+                order_id="stop-crash-1",
+                active=True,
+            )
+            mgr1.states["AAPL"] = state1
+            mgr1._record_pending_exit(state1, qty_closed=12.0)
+            mgr1._save_state()
+            assert os.path.exists(fake_state), "State file must exist on disk"
+
+            # Simulate crash and restart by instantiating new manager
+            mgr2 = DynamicTrailingStopManager()
+            assert "AAPL" in mgr2.states, "Recovered manager must contain AAPL state"
+            assert len(mgr2.pending_exits) >= 1, "Recovered manager must contain pending exit"
+            assert any(p.get("symbol") == "AAPL" and p.get("qty") == 12.0 for p in mgr2.pending_exits.values()), "AAPL exit retained across crash"
+
+            mock_exit_order = NS(
+                id="stop-crash-1",
+                client_order_id="cl_crash_1",
+                symbol="AAPL",
+                side="sell",
+                status="filled",
+                order_type="stop",
+                filled_qty=12.0,
+                filled_avg_price=145.0,
+            )
+            bridge2 = NS(
+                get_position=lambda sym: 0.0,
+                working_orders_plain=lambda: [],
+                cancel_order=lambda oid: True,
+                get_order_snapshot=lambda oid: {"id": "stop-crash-1", "symbol": "AAPL", "side": "sell", "status": "filled", "filled_qty": 12.0, "filled_avg_price": 145.0, "type": "stop"},
+                _client=NS(get_orders=lambda req: [mock_exit_order]),
+            )
+            with patch("strategies.trade_journal.log_trade", return_value=True):
+                res2 = mgr2.reconcile_pending_exits(bridge2)
+
+            assert res2.get("AAPL") == "RECONCILED_STOP_OUT", f"Expected RECONCILED_STOP_OUT, got {res2.get('AAPL')}"
+            assert len(mgr2.pending_exits) == 0, "Pending exits queue must be cleared after reconciliation"
+            results["c2_case2_crash_recovery_persisted_state_and_pending_exits"] = "PASS"
+
+    return results
+
+
+def test_c3_validation_ledger_durability_and_idempotency():
+    results = {}
+    from strategies.validation_lane import record_validation_fill, record_validation_exit
+
+    with tempfile.TemporaryDirectory() as td:
+        ledger_path = os.path.join(td, "paper_validation_trades.jsonl")
+
+        # 1. Initialize validation candidate row in ledger
+        cand_record = {
+            "validation_id": "val_AAPL_001",
+            "entry_order_id": "ord_entry_001",
+            "symbol": "AAPL",
+            "side": "BUY",
+            "decision_price": 150.0,
+            "status": "SUBMITTED",
+            "timestamp": "2026-10-10T12:00:00+00:00",
+        }
+        with open(ledger_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(cand_record) + "\n")
+
+        # 2. Record validation entry fill
+        fill_res = record_validation_fill(
+            order_id="ord_entry_001",
+            fill_price=150.05,
+            qty=1.0,
+            side="BUY",
+            timestamp="2026-10-10T12:01:00+00:00",
+            execution_id="exec_fill_001",
+            filepath=ledger_path,
+        )
+        assert fill_res is True, "record_validation_fill must return True"
+
+        # 3. Record validation exit
+        exit_res1 = record_validation_exit(
+            order_id="ord_exit_001",
+            exit_price=152.00,
+            qty=1.0,
+            side="SELL",
+            timestamp="2026-10-10T12:10:00+00:00",
+            symbol="AAPL",
+            exit_reason="PROFIT_TARGET",
+            execution_id="exec_exit_001",
+            filepath=ledger_path,
+        )
+        assert exit_res1 is True, "record_validation_exit must return True"
+
+        # Verify file contents
+        with open(ledger_path, "r", encoding="utf-8") as f:
+            lines = [l.strip() for l in f if l.strip()]
+        assert len(lines) == 1, f"Expected 1 record in ledger, got {len(lines)}"
+        data = json.loads(lines[0])
+        assert data["status"] == "CLOSED"
+        assert data["exit_fill_price"] == 152.0
+        assert data["realized_pnl"] == round((152.0 - 150.05) * 1.0, 4)
+        results["c3_case1_validation_ledger_fsync_and_atomic_replace"] = "PASS"
+
+        # 4. Retry recording exit with same order_id / execution_id -> MUST return True idempotently without creating duplicate lines
+        exit_res2 = record_validation_exit(
+            order_id="ord_exit_001",
+            exit_price=152.00,
+            qty=1.0,
+            side="SELL",
+            timestamp="2026-10-10T12:10:00+00:00",
+            symbol="AAPL",
+            exit_reason="PROFIT_TARGET",
+            execution_id="exec_exit_001",
+            filepath=ledger_path,
+        )
+        assert exit_res2 is True, "Retry record_validation_exit must return True idempotently"
+
+        with open(ledger_path, "r", encoding="utf-8") as f:
+            lines2 = [l.strip() for l in f if l.strip()]
+        assert len(lines2) == 1, f"Idempotent retry must NOT create duplicate lines, got {len(lines2)}"
+        results["c3_case2_validation_ledger_retry_idempotent_no_duplicate_rows"] = "PASS"
+
+    return results
+
+
 if __name__ == "__main__":
     b1_results = test_b1_lifecycle_remediation()
     b2_results = test_b2_cumulative_entry_quantity()
     r2_results = test_r2_validation_emergency_exit()
-    all_res = {**b1_results, **b2_results, **r2_results}
+    c1_results = test_c1_position_side_and_residual_fills()
+    c2_results = test_c2_pending_exit_persistence_and_recovery()
+    c3_results = test_c3_validation_ledger_durability_and_idempotency()
+    all_res = {**b1_results, **b2_results, **r2_results, **c1_results, **c2_results, **c3_results}
     print(json.dumps(all_res, indent=2))
+
