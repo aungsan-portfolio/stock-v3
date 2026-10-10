@@ -467,6 +467,7 @@ def _extract_order_info(o: object) -> dict:
         o_stop = o.get("stop_price") if o.get("stop_price") is not None else o.get("stopPrice")
         o_status = str(o.get("status") or "").lower()
         raw_qty = o.get("qty") or o.get("quantity") or o.get("totalQuantity")
+        raw_filled_qty = o.get("filled_qty") or o.get("filled_quantity") or o.get("filledQuantity")
     else:
         o_id = str(getattr(o, "id", getattr(o, "order_id", "")) or "")
         contract = getattr(o, "contract", None)
@@ -484,6 +485,7 @@ def _extract_order_info(o: object) -> dict:
         o_status_obj = getattr(o, "status", getattr(getattr(o, "orderState", None), "status", getattr(getattr(o, "orderStatus", None), "status", None)))
         o_status = str(getattr(o_status_obj, "value", o_status_obj) or "").lower()
         raw_qty = getattr(o, "qty", getattr(o, "quantity", getattr(o, "totalQuantity", None)))
+        raw_filled_qty = getattr(o, "filled_qty", getattr(o, "filled_quantity", getattr(o, "filledQuantity", None)))
 
     s_side = str(raw_side).lower().strip()
     if s_side in {"buy"}:
@@ -500,6 +502,11 @@ def _extract_order_info(o: object) -> dict:
     except (TypeError, ValueError):
         qty_val = None
 
+    try:
+        filled_qty_val = float(raw_filled_qty) if raw_filled_qty is not None else None
+    except (TypeError, ValueError):
+        filled_qty_val = None
+
     return {
         "id": o_id,
         "symbol": o_sym,
@@ -507,6 +514,7 @@ def _extract_order_info(o: object) -> dict:
         "type": o_type,
         "stop_price": stop_val,
         "qty": qty_val,
+        "filled_qty": filled_qty_val,
         "status": o_status
     }
 
@@ -842,7 +850,6 @@ class DynamicTrailingStopManager:
                                     (co_id in known_ids or co_cid in known_ids)
                                     or (sig_id and sig_id in co_cid)
                                     or (ep_id and ep_id in co_cid)
-                                    or (co_cid.startswith(f"exit_{symbol.lower()}") or co_cid.startswith(f"flatten_{symbol.lower()}"))
                                 )
                                 if not matches_lineage:
                                     continue
@@ -1670,13 +1677,31 @@ class DynamicTrailingStopManager:
 
         rem_cap = o_qty_f
         if o_status == "partially_filled":
-            filled_q = float(info.get("filled_qty", 0.0) or 0.0)
-            rem_cap = max(0.0, o_qty_f - filled_q)
+            raw_filled_q = info.get("filled_qty")
+            if raw_filled_q is None:
+                logger.debug(f"[RECONCILE EVAL] Order ID {o_id}: status='partially_filled' lacks filled_qty evidence -> Rejecting candidate.")
+                return False
+            try:
+                filled_q = float(raw_filled_q)
+            except (ValueError, TypeError):
+                return False
+            if not math.isfinite(filled_q) or filled_q < 0.0 or filled_q >= o_qty_f:
+                logger.debug(f"[RECONCILE EVAL] Order ID {o_id}: status='partially_filled' with invalid filled_qty {filled_q} (total {o_qty_f}) -> Rejecting candidate.")
+                return False
+            rem_cap = o_qty_f - filled_q
+            if rem_cap <= 0.0:
+                logger.debug(f"[RECONCILE EVAL] Order ID {o_id}: status='partially_filled' remaining capacity <= 0 -> Rejecting candidate.")
+                return False
 
         if required_qty > 0:
-            if rem_cap < float(required_qty) - 1e-4:
-                logger.debug(f"[RECONCILE EVAL] Order ID {o_id}: remaining cap {rem_cap} < required {required_qty} -> Rejecting candidate.")
-                return False
+            if o_status == "partially_filled":
+                if rem_cap < float(required_qty) - 1e-4 and o_qty_f < float(required_qty) - 1e-4:
+                    logger.debug(f"[RECONCILE EVAL] Order ID {o_id}: remaining cap {rem_cap} and total {o_qty_f} < required {required_qty} -> Rejecting candidate.")
+                    return False
+            else:
+                if rem_cap < float(required_qty) - 1e-4:
+                    logger.debug(f"[RECONCILE EVAL] Order ID {o_id}: remaining cap {rem_cap} < required {required_qty} -> Rejecting candidate.")
+                    return False
 
         logger.debug(
             f"[RECONCILE EVAL] Order ID {o_id}: sym='{o_sym}', side='{o_side}', "
