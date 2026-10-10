@@ -817,7 +817,7 @@ class TestDurablePendingQueueAndSafetyHalts:
                 assert "AAPL_BUY" not in idempotency_manager.reservations
 
     def test_position_unknown_auto_clears_when_broker_query_restored(self):
-        """When broker position query succeeds in subsequent cycle, POSITION_UNKNOWN status auto-clears."""
+        """When broker position query succeeds and active stop is present, POSITION_UNKNOWN status auto-clears; stays retained if naked."""
         mgr = DynamicTrailingStopManager()
         state = TrailingStopState(
             symbol="NVDA",
@@ -830,6 +830,7 @@ class TestDurablePendingQueueAndSafetyHalts:
             last_updated=time.time(),
             qty=10.0,
             active=True,
+            order_id=None,
             reconciliation_status="POSITION_UNKNOWN_RECONCILIATION_REQUIRED",
             stop_reconciliation_required=True,
         )
@@ -839,6 +840,13 @@ class TestDurablePendingQueueAndSafetyHalts:
         mock_bridge = MagicMock()
         mock_bridge.get_position.return_value = 10.0
 
+        # Case 1: Naked (order_id=None) -> retains POSITION_UNKNOWN to prevent trading into unprotected hazard
+        with patch.object(mgr, "_save_state", return_value=True):
+            mgr.handle_naked_position("NVDA", 10.0, bridge=mock_bridge)
+        assert state.reconciliation_status == "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+
+        # Case 2: Active stop is verified (order_id="stop-nvda-1") -> successfully auto-clears
+        state.order_id = "stop-nvda-1"
         with patch.object(mgr, "_save_state", return_value=True):
             mgr.handle_naked_position("NVDA", 10.0, bridge=mock_bridge)
 

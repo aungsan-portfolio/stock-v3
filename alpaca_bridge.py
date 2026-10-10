@@ -3112,22 +3112,28 @@ class AlpacaBridge:
                 return None
             bid = float(getattr(quote, "bid_price", 0.0) or 0.0)
             ask = float(getattr(quote, "ask_price", 0.0) or 0.0)
-            last = float(getattr(quote, "ask_price", 0.0) or bid or 0.0)
+            mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else (ask or bid or 0.0)
+            raw_last = getattr(quote, "last_price", getattr(quote, "last", None))
+            last = float(raw_last) if (raw_last is not None and math.isfinite(float(raw_last)) and float(raw_last) > 0) else mid
             ts = getattr(quote, "timestamp", None)
+            is_rt = False
             if ts and hasattr(ts, "timestamp"):
                 ts_epoch = ts.timestamp()
+                is_rt = True
             elif isinstance(ts, (int, float)):
                 ts_epoch = float(ts)
+                is_rt = True
             else:
-                ts_epoch = time.time()
+                ts_epoch = None
 
             return {
                 "source": "alpaca",
                 "feed_identity": requested_feed,
-                "is_realtime": True,
+                "is_realtime": is_rt,
                 "timestamp": ts_epoch,
                 "bid": bid,
                 "ask": ask,
+                "mid": mid,
                 "last": last,
             }
         except Exception as exc:

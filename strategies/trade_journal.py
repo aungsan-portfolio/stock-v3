@@ -133,6 +133,16 @@ def load_journal_order_fill_state(records, account_id: Optional[str] = None, tra
 
     return states
 
+def _normalize_exit_idempotency_key(k: str) -> str:
+    """Extract base episode key from exit idempotency key without volatile reason suffix."""
+    k_str = str(k or "").strip()
+    if not k_str:
+        return ""
+    for suffix in ("_STOP_OUT", "_TAKE_PROFIT", "_TRAILING_STOP", "_EOD_FLATTEN", "_MANUAL", "_CIRCUIT_BREAKER", "_FLAT", "_PROVISIONAL"):
+        if k_str.endswith(suffix):
+            return k_str[:-len(suffix)]
+    return k_str
+
 def log_trade(
     symbol: str,
     side: str,
@@ -227,6 +237,7 @@ def log_trade(
     with _journal_lock:
         # Idempotency Guard: prevent duplicate TRADE_CLOSED writes across crashes/restarts
         primary_trade_key = str(kwargs.get("idempotency_key") or kwargs.get("exit_order_id") or signal_id or order_id or "")
+        norm_primary = _normalize_exit_idempotency_key(primary_trade_key)
         if path.exists() and primary_trade_key and event_type in ("TRADE_CLOSED", "TRADE", "EXIT"):
             try:
                 with open(path, "r", encoding="utf-8", errors="replace") as fh_check:
@@ -234,15 +245,15 @@ def log_trade(
                         line_str = line.strip()
                         if not line_str:
                             continue
-                        if primary_trade_key in line_str or (primary_trade_key.startswith("exit_") and primary_trade_key.split("_")[1] in line_str):
+                        if norm_primary in line_str or primary_trade_key in line_str:
                             try:
                                 item = json.loads(line_str)
                                 stored_key = str(item.get("idempotency_key") or "")
+                                norm_stored = _normalize_exit_idempotency_key(stored_key)
                                 key_match = (
-                                    stored_key == primary_trade_key
-                                    or (primary_trade_key.startswith("exit_") and stored_key.startswith(primary_trade_key))
-                                    or (stored_key.startswith("exit_") and primary_trade_key.startswith(stored_key))
-                                    or (item.get("exit_order_id") and item.get("exit_order_id") == primary_trade_key)
+                                    (norm_stored and norm_primary and norm_stored == norm_primary)
+                                    or (stored_key and stored_key == primary_trade_key)
+                                    or (item.get("exit_order_id") and str(item.get("exit_order_id")) == primary_trade_key)
                                     or (item.get("signal_id") and str(item.get("signal_id")) == primary_trade_key)
                                     or (item.get("order_id") and str(item.get("order_id")) == primary_trade_key)
                                 )
@@ -261,14 +272,24 @@ def log_trade(
             except Exception as read_err:
                 logger.warning("[JOURNAL TRADE GUARD READ ERROR] %s", read_err)
 
+        # Check if file has incomplete tail (missing trailing newline)
+        needs_leading_newline = False
+        if path.exists() and path.stat().st_size > 0:
+            try:
+                with open(path, "rb") as f_tail:
+                    f_tail.seek(-1, os.SEEK_END)
+                    if f_tail.read(1) != b"\n":
+                        needs_leading_newline = True
+            except Exception:
+                pass
+
         with open(path, "a", encoding="utf-8") as fh:
+            if needs_leading_newline:
+                fh.write("\n")
             fh.write(json.dumps(record, default=str) + "\n")
             fh.flush()
             if hasattr(os, "fsync"):
-                try:
-                    os.fsync(fh.fileno())
-                except Exception:
-                    pass
+                os.fsync(fh.fileno())
     logger.info("Journal: %s %s %s @ %.2f | stop=%.2f target=%.2f",
                 side, qty, symbol, entry_price, stop_price, target_price)
 

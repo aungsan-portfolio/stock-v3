@@ -622,9 +622,12 @@ class DynamicTrailingStopManager:
         if hasattr(bridge, "get_position"):
             try:
                 qty = bridge.get_position(sym_clean)
-                if qty is None:
-                    return True, 0.0
-                return True, float(qty)
+                if qty is None or not isinstance(qty, (int, float)):
+                    return False, None
+                val = float(qty)
+                if not math.isfinite(val):
+                    return False, None
+                return True, val
             except Exception as exc:
                 err_str = str(exc).lower()
                 if "position does not exist" in err_str or "404" in err_str:
@@ -635,13 +638,21 @@ class DynamicTrailingStopManager:
         if hasattr(bridge, "get_positions"):
             try:
                 positions = bridge.get_positions()
-                if positions is None:
+                if positions is None or not isinstance(positions, (list, tuple)):
                     return False, None
                 for p in positions:
                     p_sym = getattr(p, "symbol", "") or (p.get("symbol") if isinstance(p, dict) else "")
                     if str(p_sym).upper().strip() == sym_clean:
                         raw_q = getattr(p, "qty", None) if not isinstance(p, dict) else p.get("qty")
-                        return True, float(raw_q or 0.0)
+                        if raw_q is None:
+                            return False, None
+                        try:
+                            val = float(raw_q)
+                            if not math.isfinite(val):
+                                return False, None
+                            return True, val
+                        except (ValueError, TypeError):
+                            return False, None
                 return True, 0.0
             except Exception as exc:
                 logger.warning("[BROKER GET_POSITIONS FAILED] %s: %s", sym_clean, exc)
@@ -738,12 +749,22 @@ class DynamicTrailingStopManager:
 
                     tp_id = exit_item.get("tp_order_id")
                     stop_id = exit_item.get("stop_order_id") or exit_item.get("last_stop_order_id")
+                    expected_exit_side = "sell" if str(exit_item.get("side", "")).upper() in ("BUY", "LONG") else "buy"
+                    exp_qty = float(exit_item.get("qty") or 0.0)
 
                     # 1. Query TP order snapshot first
                     if tp_id and hasattr(bridge, "get_order_snapshot"):
                         try:
                             tp_snap = bridge.get_order_snapshot(str(tp_id))
-                            if tp_snap and str(tp_snap.get("status", "")).lower() == "filled":
+                            tp_filled_q = tp_snap.get("filled_qty") if (tp_snap and tp_snap.get("filled_qty") is not None) else (tp_snap.get("qty") if tp_snap else 0.0)
+                            if (
+                                tp_snap
+                                and str(tp_snap.get("id", "")).strip() == str(tp_id).strip()
+                                and str(tp_snap.get("symbol", "")).upper().strip() == symbol.upper().strip()
+                                and str(tp_snap.get("side", "")).lower().strip() == expected_exit_side
+                                and str(tp_snap.get("status", "")).lower() == "filled"
+                                and float(tp_filled_q or 0.0) >= exp_qty - 1e-4
+                            ):
                                 avg_px = tp_snap.get("filled_avg_price")
                                 if avg_px is not None:
                                     try:
@@ -761,7 +782,15 @@ class DynamicTrailingStopManager:
                     if not exit_reason and stop_id and hasattr(bridge, "get_order_snapshot"):
                         try:
                             stop_snap = bridge.get_order_snapshot(str(stop_id))
-                            if stop_snap and str(stop_snap.get("status", "")).lower() == "filled":
+                            stop_filled_q = stop_snap.get("filled_qty") if (stop_snap and stop_snap.get("filled_qty") is not None) else (stop_snap.get("qty") if stop_snap else 0.0)
+                            if (
+                                stop_snap
+                                and str(stop_snap.get("id", "")).strip() == str(stop_id).strip()
+                                and str(stop_snap.get("symbol", "")).upper().strip() == symbol.upper().strip()
+                                and str(stop_snap.get("side", "")).lower().strip() == expected_exit_side
+                                and str(stop_snap.get("status", "")).lower() == "filled"
+                                and float(stop_filled_q or 0.0) >= exp_qty - 1e-4
+                            ):
                                 avg_px = stop_snap.get("filled_avg_price")
                                 if avg_px is not None:
                                     try:
@@ -786,12 +815,17 @@ class DynamicTrailingStopManager:
                                 limit=10,
                             )
                             closed_orders = bridge._client.get_orders(req)
-                            expected_exit_side = "sell" if str(exit_item.get("side", "")).upper() in ("BUY", "LONG") else "buy"
                             known_ids = {str(k).strip() for k in (tp_id, stop_id, exit_item.get("last_stop_order_id")) if k}
+                            sig_id = str(exit_item.get("signal_id") or "").strip()
+                            ep_id = str(exit_item.get("episode_id") or "").strip()
 
                             for co in closed_orders:
                                 co_status = str(getattr(co, "status", "")).lower()
                                 if "fill" not in co_status:
+                                    continue
+
+                                co_sym = str(getattr(co, "symbol", "") or "").upper().strip()
+                                if co_sym != symbol.upper().strip():
                                     continue
 
                                 co_side = str(getattr(co, "side", "")).lower()
@@ -799,15 +833,22 @@ class DynamicTrailingStopManager:
                                     # Skip entry orders or wrong-side orders!
                                     continue
 
-                                co_id = str(getattr(co, "id", "") or "")
-                                co_cid = str(getattr(co, "client_order_id", "") or "")
+                                co_id = str(getattr(co, "id", "") or "").strip()
+                                co_cid = str(getattr(co, "client_order_id", "") or "").strip()
                                 co_type = str(getattr(co, "order_type", getattr(co, "type", "")) or "").lower()
 
-                                # Check lineage or exit prefix
-                                matches_lineage = (co_id in known_ids or co_cid in known_ids or
-                                                   co_cid.startswith(("exit_", "flatten_", "val_", "dt_")))
-                                if not matches_lineage and known_ids:
-                                    # If known IDs exist, enforce lineage
+                                # Strict lineage: matches exact ID, client ID, or this episode's signal/episode identity
+                                matches_lineage = (
+                                    (co_id in known_ids or co_cid in known_ids)
+                                    or (sig_id and sig_id in co_cid)
+                                    or (ep_id and ep_id in co_cid)
+                                    or (co_cid.startswith(f"exit_{symbol.lower()}") or co_cid.startswith(f"flatten_{symbol.lower()}"))
+                                )
+                                if not matches_lineage:
+                                    continue
+
+                                co_qty = float(getattr(co, "filled_qty", getattr(co, "qty", 0.0)) or 0.0)
+                                if co_qty < exp_qty - 1e-4:
                                     continue
 
                                 avg_px = getattr(co, "filled_avg_price", None)
@@ -844,7 +885,6 @@ class DynamicTrailingStopManager:
                         continue
 
                     # Attempt journal write
-                    expected_exit_side = "sell" if str(exit_item.get("side", "")).upper() in ("BUY", "LONG") else "buy"
                     idempotency_key = f"exit_{episode_id}"
                     if exit_item.get("is_validation"):
                         try:
@@ -880,6 +920,8 @@ class DynamicTrailingStopManager:
                         )
 
                     # Journal commit succeeded! Remove from pending queue atomically
+                    backup_ep = self.pending_exits.get(episode_id)
+                    backup_sym = self.pending_exits.get(symbol)
                     if episode_id in self.pending_exits:
                         del self.pending_exits[episode_id]
                     if symbol in self.pending_exits:
@@ -887,7 +929,16 @@ class DynamicTrailingStopManager:
                     if symbol in self.states:
                         self.states[symbol].reconciliation_status = f"RECONCILED_{exit_reason}"
                         self.states[symbol].active = False
-                    self._save_state()
+                    saved = self._save_state()
+                    if not saved:
+                        if backup_ep:
+                            self.pending_exits[episode_id] = backup_ep
+                        if backup_sym:
+                            self.pending_exits[symbol] = backup_sym
+                        logger.error("[RECONCILE QUEUE PERSISTENCE FAILED] %s: State persistence failed after journal commit.", symbol)
+                        results[symbol] = "QUEUE_PERSISTENCE_FAILED_RETAINED"
+                        continue
+
                     results[symbol] = f"RECONCILED_{exit_reason}"
                     logger.info("[RECONCILE AUTHORITATIVE SUCCESS] %s: %s @ %.2f (pnl=%.2f, key=%s)", symbol, exit_reason, exit_price, pnl_val, idempotency_key)
 
@@ -1571,40 +1622,67 @@ class DynamicTrailingStopManager:
         if not o:
             return False
         info = _extract_order_info(o)
-        o_id = info["id"]
+        o_id = info.get("id")
+        if not o_id:
+            return False
         o_sym = str(info.get("symbol") or "").upper().strip()
-        o_side = info["side"]
-        o_type = info["type"]
-        o_stop = info["stop_price"]
-        o_status = info["status"]
+        o_side = str(info.get("side") or "").lower().strip()
+        o_type = str(info.get("type") or "").lower().strip()
+        o_stop = info.get("stop_price")
+        o_status = str(info.get("status") or "").lower().strip()
         o_qty = info.get("qty")
 
         if expected_symbol:
             sym_expected = expected_symbol.upper().strip()
-            if o_sym and o_sym != sym_expected:
+            if not o_sym or o_sym != sym_expected:
                 logger.debug(f"[RECONCILE EVAL] Order ID {o_id}: symbol '{o_sym}' != expected '{sym_expected}' -> Rejecting candidate.")
                 return False
 
-        if o_status in {"canceled", "cancelled", "filled", "expired", "rejected"}:
-            logger.debug(f"[RECONCILE EVAL] Order ID {o_id}: status '{o_status}' is CLOSED/DEAD -> Rejecting candidate.")
+        if o_status in _TERMINAL_STOP_STATUSES or o_status not in _WORKING_STOP_STATUSES:
+            logger.debug(f"[RECONCILE EVAL] Order ID {o_id}: status '{o_status}' is non-working -> Rejecting candidate.")
             return False
 
         target_side_norm = target_side.lower().strip()
-        is_side_match = (o_side == target_side_norm)
-        is_stop_type = is_stop_order_type(o_type, has_stop_price=(o_stop is not None))
+        if o_side != target_side_norm:
+            return False
 
-        qty_match = True
-        if required_qty > 0 and o_qty is not None:
-            qty_match = (float(o_qty) >= float(required_qty) - 1e-4)
-            if not qty_match:
-                logger.debug(f"[RECONCILE EVAL] Order ID {o_id}: qty {o_qty} < required {required_qty} -> Rejecting candidate.")
+        if not is_stop_order_type(o_type, has_stop_price=(o_stop is not None)):
+            return False
+
+        if o_stop is None:
+            return False
+        try:
+            o_stop_f = float(o_stop)
+            if not math.isfinite(o_stop_f) or o_stop_f <= 0:
+                return False
+        except (ValueError, TypeError):
+            return False
+
+        if o_qty is None:
+            logger.debug(f"[RECONCILE EVAL] Order ID {o_id}: missing quantity -> Rejecting candidate.")
+            return False
+        try:
+            o_qty_f = float(o_qty)
+            if not math.isfinite(o_qty_f) or o_qty_f <= 0:
+                return False
+        except (ValueError, TypeError):
+            return False
+
+        rem_cap = o_qty_f
+        if o_status == "partially_filled":
+            filled_q = float(info.get("filled_qty", 0.0) or 0.0)
+            rem_cap = max(0.0, o_qty_f - filled_q)
+
+        if required_qty > 0:
+            if rem_cap < float(required_qty) - 1e-4:
+                logger.debug(f"[RECONCILE EVAL] Order ID {o_id}: remaining cap {rem_cap} < required {required_qty} -> Rejecting candidate.")
+                return False
 
         logger.debug(
-            f"[RECONCILE EVAL] Order ID {o_id}: sym='{o_sym}' (exp='{expected_symbol}'), side='{o_side}' (target='{target_side_norm}'), "
-            f"type='{o_type}', stop_price={o_stop}, qty={o_qty} -> side_match={is_side_match}, stop_type={is_stop_type}, qty_match={qty_match}"
+            f"[RECONCILE EVAL] Order ID {o_id}: sym='{o_sym}', side='{o_side}', "
+            f"type='{o_type}', stop_price={o_stop}, qty={o_qty}, rem_cap={rem_cap} -> VALID"
         )
-
-        return is_side_match and is_stop_type and qty_match
+        return True
 
     def _extract_all_orders_including_legs(self, open_orders: list) -> list:
         """Flatten open orders list to include nested bracket child legs if present."""
@@ -1625,8 +1703,14 @@ class DynamicTrailingStopManager:
                 info = _extract_order_info(o)
                 if info["id"] == str(state.order_id):
                     status = info.get("status", "").lower()
-                    if status in ("filled", "partially_filled", "cancelled", "expired"):
-                        logger.info(f"[RECONCILE P0] {state.symbol}: Stop order {state.order_id} status='{status}' -> Stop leg executed/closed by broker. Marking inactive cleanly.")
+                    if status == "partially_filled":
+                        rem_cap = float(info.get("qty", 0.0) or 0.0) - float(info.get("filled_qty", 0.0) or 0.0)
+                        if rem_cap > 0:
+                            state.qty = rem_cap
+                            state.active = True
+                            logger.info(f"[RECONCILE PARTIAL] {state.symbol}: Stop order {state.order_id} status='partially_filled', remaining capacity {rem_cap} shares active.")
+                    elif status in ("filled", "cancelled", "expired", "rejected"):
+                        logger.info(f"[RECONCILE P0] {state.symbol}: Stop order {state.order_id} status='{status}' -> Stop leg closed by broker. Marking inactive cleanly.")
                         state.active = False
                         state.order_id = None
                         self._save_state()
@@ -1637,7 +1721,7 @@ class DynamicTrailingStopManager:
         for o in all_orders:
             info = _extract_order_info(o)
             if info["symbol"] == state.symbol.upper().strip() and self._is_valid_stop_order(
-                o, target_side, required_qty=getattr(state, "qty", getattr(state, "shares", 0.0))
+                o, target_side, required_qty=getattr(state, "qty", getattr(state, "shares", 0.0)), expected_symbol=state.symbol
             ):
                 o_stop = info["stop_price"]
                 o_type = info["type"]
@@ -1964,7 +2048,18 @@ class DynamicTrailingStopManager:
 
         with self._lock:
             state = self.states.get(symbol)
-            if not state or not state.active or state.order_id is not None:
+            if not state or not state.active:
+                return
+
+            if state.order_id is not None:
+                if state.reconciliation_status == "POSITION_UNKNOWN_RECONCILIATION_REQUIRED":
+                    is_known, pos_qty = self._query_broker_position_qty(bridge, symbol)
+                    if is_known:
+                        state.reconciliation_status = None
+                        if abs(pos_qty or 0.0) > 1e-6:
+                            state.qty = abs(pos_qty)
+                        self._save_state()
+                        logger.info("[RECONCILIATION RECOVERED] Broker position query restored for %s with active stop %s.", symbol, state.order_id)
                 if symbol in self.pending_exits and bridge is not None:
                     # Retry reconciling any pending exit in durable queue
                     self.reconcile_pending_exits(bridge)
@@ -1991,10 +2086,10 @@ class DynamicTrailingStopManager:
             fresh_qty = abs(pos_qty)
             state.qty = fresh_qty
             position_qty = fresh_qty
-            if state.reconciliation_status == "POSITION_UNKNOWN_RECONCILIATION_REQUIRED":
+            if state.order_id is not None and state.reconciliation_status == "POSITION_UNKNOWN_RECONCILIATION_REQUIRED":
                 state.reconciliation_status = None
                 logger.info(
-                    "[RECONCILIATION RECOVERED] Broker position query restored for %s (qty=%.2f). Cleared POSITION_UNKNOWN status.",
+                    "[RECONCILIATION RECOVERED] Broker position query restored for %s (qty=%.2f) with active stop. Cleared POSITION_UNKNOWN status.",
                     symbol, pos_qty
                 )
 

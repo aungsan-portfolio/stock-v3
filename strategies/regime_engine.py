@@ -530,6 +530,7 @@ def _get_premarket_pct_change(symbol: str, bridge=None) -> Tuple[Optional[float]
             # Check for quote object first to obtain exact broker timestamp and price from same observation
             quote_ts = None
             price = None
+            is_live_quote = False
             if hasattr(bridge, "get_quote"):
                 try:
                     q = bridge.get_quote(symbol)
@@ -550,6 +551,7 @@ def _get_premarket_pct_change(symbol: str, bridge=None) -> Tuple[Optional[float]
                                 px_f = float(raw_px)
                                 if math.isfinite(px_f) and px_f > 0:
                                     price = px_f
+                                    is_live_quote = True
                             except (ValueError, TypeError):
                                 pass
                 except Exception:
@@ -557,20 +559,17 @@ def _get_premarket_pct_change(symbol: str, bridge=None) -> Tuple[Optional[float]
 
             if price is None and hasattr(bridge, "get_price"):
                 price = bridge.get_price(symbol, allow_historical=True)
-                if quote_ts is None:
-                    quote_ts = now_epoch
 
             if price is not None and price > 0:
                     prev_close = None
-                    baseline_source = "alpaca_quote_vs_prev_close"
+                    baseline_source = "alpaca_quote_vs_prev_close" if is_live_quote else "alpaca_historical_fallback"
                     session_date_str = None
+                    bar_epoch = None
                     if hasattr(bridge, "fetch_historical_data"):
                         try:
                             bars = bridge.fetch_historical_data(symbol)
                             if bars:
                                 prev_close, bar_epoch, session_date_str = _extract_prev_session_close(bars)
-                                if bar_epoch and quote_ts is None:
-                                    quote_ts = bar_epoch
                         except Exception:
                             pass
 
@@ -592,8 +591,6 @@ def _get_premarket_pct_change(symbol: str, bridge=None) -> Tuple[Optional[float]
                             symbol_bars = bars.get(symbol, []) if bars else []
                             if symbol_bars:
                                 prev_close, bar_epoch, session_date_str = _extract_prev_session_close(symbol_bars)
-                                if bar_epoch and quote_ts is None:
-                                    quote_ts = bar_epoch
                         except Exception:
                             pass
 
@@ -603,7 +600,8 @@ def _get_premarket_pct_change(symbol: str, bridge=None) -> Tuple[Optional[float]
                             "[REGIME BASELINE] %s: prev_close=%.2f (session=%s), price=%.2f, change=%.2f%% (src=%s)",
                             symbol, prev_close, session_date_str or "historical", price, pct, baseline_source,
                         )
-                        return round(pct, 2), baseline_source, quote_ts or now_epoch
+                        final_ts = quote_ts if is_live_quote else (bar_epoch or quote_ts)
+                        return round(pct, 2), baseline_source, final_ts
         except Exception as exc:
             logger.debug("Failed fetching premarket pct via bridge for %s: %s", symbol, exc)
 
