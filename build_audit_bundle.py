@@ -232,7 +232,7 @@ This bundle provides full source files, test suites, and raw verification artifa
    - Wrapped calendar lookups in `regime_engine.py` to strictly fail-closed return `(None, None, None)` on calendar errors.
 
 4. **Defect 4: Reason-Independent Exit Idempotency & Crash-Durable Disk Persistence** (`strategies/trade_journal.py` & `strategies/trailing_stop.py`):
-   - Changed exit idempotency key to episode identity `f"exit_{episode_id}"` (decoupled from volatile `exit_reason`), strictly preventing duplicate writes if provisional reason differs from confirmed reason.
+   - Changed exit idempotency key to episode identity `f"exit_{{episode_id}}"` (decoupled from volatile `exit_reason`), strictly preventing duplicate writes if provisional reason differs from confirmed reason.
    - Journal write uses `fh.flush()` and `os.fsync(fh.fileno())` guaranteeing physical persistence before returning.
    - Guard tolerates truncated lines safely (`json.JSONDecodeError`) and matches primary key prefix.
 
