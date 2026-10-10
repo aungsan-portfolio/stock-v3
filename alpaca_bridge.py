@@ -4773,15 +4773,18 @@ class AlpacaBridge:
         self.assert_account_mode_safety()
         self._require_connection()
         min_shares = getattr(config_module, "MIN_SHARE_COUNT", 1)
-        qty = max(int(qty), min_shares)
+        f_qty = float(qty)
+        if f_qty < min_shares:
+            raise ValueError(f"Protective stop qty {qty} is below min shares {min_shares}")
+        clean_qty = int(f_qty) if abs(f_qty - round(f_qty)) < 1e-6 else float(f_qty)
         if getattr(self, "dry_run", False):
-            logger.info("[DRY-RUN MUTATION BLOCKED] place_stop_order for %s %s qty=%d @ stop=%.2f", symbol, side, qty, stop_price)
+            logger.info("[DRY-RUN MUTATION BLOCKED] place_stop_order for %s %s qty=%s @ stop=%.2f", symbol, side, clean_qty, stop_price)
             return {"order_id": f"dry_stop_{symbol}"}
-        self.assert_machine_release_gate(is_validation=False, qty=qty, is_entry=False, symbol=symbol)
+        self.assert_machine_release_gate(is_validation=False, qty=clean_qty, is_entry=False, symbol=symbol)
         from alpaca.trading.requests import StopOrderRequest
         order = self._client.submit_order(StopOrderRequest(
             symbol=symbol.upper().strip(),
-            qty=qty,
+            qty=clean_qty,
             side=OrderSide.BUY if side.upper() == "BUY" else OrderSide.SELL,
             time_in_force=TimeInForce.GTC,
             stop_price=_round_price(stop_price)

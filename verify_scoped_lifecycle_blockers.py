@@ -45,7 +45,6 @@ def test_b1_lifecycle_remediation():
     )
     mgr.states["AAPL"] = state
 
-    # Open orders has 1-share stop (capacity insufficient)
     one_share_stop = {
         "id": "stop-1",
         "symbol": "AAPL",
@@ -53,6 +52,15 @@ def test_b1_lifecycle_remediation():
         "type": "stop",
         "status": "new",
         "qty": 1.0,
+        "stop_price": 330.0,
+    }
+    replacement_snap = {
+        "id": "stop-new-12",
+        "symbol": "AAPL",
+        "side": "sell",
+        "type": "stop",
+        "status": "new",
+        "qty": 12.0,
         "stop_price": 330.0,
     }
 
@@ -64,6 +72,7 @@ def test_b1_lifecycle_remediation():
         working_orders_plain=lambda: [one_share_stop],
         cancel_order=lambda oid: cancel_calls.append(oid) or True,
         place_stop_order=lambda **kw: place_calls.append(kw) or {"order_id": "stop-new-12"},
+        get_order_snapshot=lambda oid: replacement_snap if oid == "stop-new-12" else None,
         _client=NS(get_orders=lambda req: [NS(**one_share_stop)]),
     )
 
@@ -77,16 +86,90 @@ def test_b1_lifecycle_remediation():
     naked_eligible = state and state.active and (state.order_id is None or getattr(state, "stop_reconciliation_required", False))
     assert naked_eligible is True, "Position requiring stop reconciliation must be eligible for naked handling in orchestrator"
 
-    # 3. handle_naked_position runs
+    # 3. handle_naked_position runs with verified replacement snapshot
     mgr.handle_naked_position("AAPL", 12.0, bridge_mock, dry_run=False)
 
     assert len(place_calls) == 1, f"Expected 1 place_stop_order call, got {len(place_calls)}"
     assert place_calls[0]["qty"] == 12.0, f"Expected recovery order qty 12.0, got {place_calls[0]['qty']}"
     assert state.order_id == "stop-new-12", f"Expected new order_id stop-new-12, got {state.order_id}"
-    assert state.stop_reconciliation_required is False, "After successful replacement, stop_reconciliation_required must be False"
-    assert state.reconciliation_status is None, "After successful replacement, reconciliation_status must be None"
+    assert state.stop_reconciliation_required is False, "After confirmed replacement, stop_reconciliation_required must be False"
+    assert state.reconciliation_status is None, "After confirmed replacement, reconciliation_status must be None"
 
     results["b1_case1_insufficient_stop_replaced_covering_full_pos"] = "PASS"
+
+    # --- B1 Case 1b: cancel failure / timeout -> defer blind replacement ---
+    mgr_cancel_fail = DynamicTrailingStopManager()
+    state_cf = TrailingStopState(
+        symbol="AAPL",
+        side="BUY",
+        entry_price=331.88,
+        peak_price=332.0,
+        atr=1.5,
+        stop_price=330.0,
+        desired_stop_price=330.0,
+        trail_multiple=1.5,
+        last_updated=time.time(),
+        order_id="stop-old",
+        qty=12.0,
+        stop_reconciliation_required=True,
+    )
+    mgr_cancel_fail.states["AAPL"] = state_cf
+    cf_place_calls = []
+    bridge_cancel_fail = NS(
+        get_position=lambda sym: 12.0,
+        market_price=lambda sym: 332.0,
+        cancel_order=lambda oid: False,  # Cancellation rejected / failed
+        place_stop_order=lambda **kw: cf_place_calls.append(kw) or {"order_id": "bad-replace"},
+    )
+    mgr_cancel_fail.handle_naked_position("AAPL", 12.0, bridge_cancel_fail, dry_run=False)
+    assert len(cf_place_calls) == 0, f"Must not place replacement stop if cancel fails, got {len(cf_place_calls)}"
+    assert state_cf.stop_reconciliation_required is True
+    assert state_cf.reconciliation_status == "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+    assert state_cf.order_id == "stop-old"
+    results["b1_case1b_cancel_failure_defers_replacement"] = "PASS"
+
+    # --- B1 Case 1c: replacement snapshot invalid (insufficient capacity) -> retain unknown ---
+    mgr_bad_snap = DynamicTrailingStopManager()
+    state_bs = TrailingStopState(
+        symbol="AAPL",
+        side="BUY",
+        entry_price=331.88,
+        peak_price=332.0,
+        atr=1.5,
+        stop_price=330.0,
+        desired_stop_price=330.0,
+        trail_multiple=1.5,
+        last_updated=time.time(),
+        order_id="stop-old-2",
+        qty=12.0,
+        stop_reconciliation_required=True,
+    )
+    mgr_bad_snap.states["AAPL"] = state_bs
+    bs_place_calls = []
+    # Snapshot returned by broker has qty=1.0 instead of 12.0
+    bad_snap = {
+        "id": "stop-new-bad",
+        "symbol": "AAPL",
+        "side": "sell",
+        "type": "stop",
+        "status": "new",
+        "qty": 1.0,
+        "stop_price": 330.0,
+    }
+    bridge_bad_snap = NS(
+        get_position=lambda sym: 12.0,
+        market_price=lambda sym: 332.0,
+        cancel_order=lambda oid: True,
+        place_stop_order=lambda **kw: bs_place_calls.append(kw) or {"order_id": "stop-new-bad"},
+        get_order_snapshot=lambda oid: bad_snap,
+    )
+    mgr_bad_snap.handle_naked_position("AAPL", 12.0, bridge_bad_snap, dry_run=False)
+    assert len(bs_place_calls) == 1
+    # Flags must NOT be cleared because capacity verification failed!
+    assert state_bs.stop_reconciliation_required is True
+    assert state_bs.reconciliation_status == "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+    assert state_bs.order_id == "stop-new-bad"
+    results["b1_case1c_replacement_snapshot_invalid_retains_unknown"] = "PASS"
 
     # --- B1 Case 2: position 12 / valid stop 12 -> no duplicate protection order ---
     mgr2 = DynamicTrailingStopManager()
@@ -162,6 +245,86 @@ def test_b1_lifecycle_remediation():
     assert state3.reconciliation_status == "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
     assert state3.stop_reconciliation_required is True
     results["b1_case3_unknown_broker_state_no_speculative_submission"] = "PASS"
+
+    # --- B1 Case 4: Failed emergency flatten -> retains active fail-closed unknown ---
+    mgr4 = DynamicTrailingStopManager()
+    state4 = TrailingStopState(
+        symbol="AAPL",
+        side="BUY",
+        entry_price=331.88,
+        peak_price=332.0,
+        atr=1.5,
+        stop_price=330.0,
+        trail_multiple=1.5,
+        last_updated=time.time(),
+        qty=12.0,
+        active=True,
+    )
+    mgr4.states["AAPL"] = state4
+    bridge_fail_close = NS(
+        close_position=lambda sym: False,  # 3 attempts return False
+        working_orders_plain=lambda: [],
+        cancel_order=lambda oid: True,
+    )
+    mgr4.emergency_flatten("AAPL", 12.0, bridge=bridge_fail_close, dry_run=False)
+    assert state4.active is True, "Failed emergency flatten must NOT deactivate position!"
+    assert state4.stop_reconciliation_required is True
+    assert state4.reconciliation_status == "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+    results["b1_case4_failed_emergency_flatten_retains_active_unknown"] = "PASS"
+
+    # --- B1 Case 5: Stale position quantity overridden by fresh broker qty ---
+    mgr5 = DynamicTrailingStopManager()
+    state5 = TrailingStopState(
+        symbol="AAPL",
+        side="BUY",
+        entry_price=331.88,
+        peak_price=332.0,
+        atr=1.5,
+        stop_price=330.0,
+        trail_multiple=1.5,
+        last_updated=time.time(),
+        qty=10.0,  # Stale quantity in local state
+        order_id="stop-10",
+        active=True,
+    )
+    mgr5.states["AAPL"] = state5
+    # Fresh broker quantity is 12.0; stop order in open orders is only 10.0
+    open_stop_10 = {
+        "id": "stop-10",
+        "symbol": "AAPL",
+        "side": "sell",
+        "type": "stop",
+        "status": "new",
+        "qty": 10.0,
+        "stop_price": 330.0,
+    }
+    bridge5 = NS(get_position=lambda sym: 12.0, market_price=lambda sym: 332.0)
+    mgr5.ensure_initialized("AAPL", "BUY", 331.88, [open_stop_10], 332.0, qty=12.0, bridge=bridge5)
+    # state.qty must now reflect 12.0, so the 10-share stop must be flagged as insufficient!
+    assert state5.qty == 12.0, f"Expected state.qty to update to fresh broker qty 12.0, got {state5.qty}"
+    assert state5.stop_reconciliation_required is True, "10-share stop must be flagged insufficient for 12-share position"
+    results["b1_case5_stale_position_quantity_overridden_by_fresh_broker_qty"] = "PASS"
+
+    # --- B1 Case 6: Fractional stop quantity in place_stop_order ---
+    from alpaca_bridge import AlpacaBridge
+    submitted_orders = []
+    dummy_bridge = AlpacaBridge.__new__(AlpacaBridge)
+    dummy_bridge._is_connected = True
+    dummy_bridge._account_mode = "PAPER"
+    dummy_bridge._active_account_label = "paper"
+    dummy_bridge.dry_run = False
+    dummy_bridge._client = NS(
+        submit_order=lambda req: submitted_orders.append(req) or NS(id="order-frac-12.5")
+    )
+    dummy_bridge.assert_account_mode_safety = lambda: None
+    dummy_bridge._require_connection = lambda: None
+    dummy_bridge.assert_machine_release_gate = lambda **kw: None
+
+    res_frac = dummy_bridge.place_stop_order(symbol="AAPL", side="SELL", qty=12.5, stop_price=330.0)
+    assert res_frac["order_id"] == "order-frac-12.5"
+    assert len(submitted_orders) == 1
+    assert submitted_orders[0].qty == 12.5, f"Expected fractional qty 12.5, got {submitted_orders[0].qty}"
+    results["b1_case6_fractional_stop_quantity_preserved"] = "PASS"
 
     return results
 

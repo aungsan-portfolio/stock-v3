@@ -366,6 +366,8 @@ class TrailingStopState:
     entry_qty: Optional[float] = None
 
     def __post_init__(self):
+        if self.side:
+            self.side = "BUY" if str(self.side).upper().strip() in ("BUY", "LONG") else "SELL"
         if self.entry_qty is None and self.qty > 0.0:
             self.entry_qty = float(self.qty)
         if self.desired_stop_price is None:
@@ -1508,10 +1510,18 @@ class DynamicTrailingStopManager:
         with self._lock:
             state = self.states.get(symbol)
             if state and state.active:
+                if side:
+                    state.side = "BUY" if str(side).upper().strip() in ("BUY", "LONG") else "SELL"
+                if qty is not None and abs(float(qty)) > 0:
+                    req_pos_qty = abs(float(qty))
+                    if state.qty != req_pos_qty:
+                        state.qty = req_pos_qty
+                else:
+                    req_pos_qty = float(state.qty if (state.qty and state.qty > 0) else 0.0)
+
                 if state.order_id is not None:
                     all_open_orders = self._extract_all_orders_including_legs(open_orders)
-                    target_side = "sell" if str(state.side).upper() in ("BUY", "LONG") else "buy"
-                    req_pos_qty = float(state.qty if (state.qty and state.qty > 0) else (qty if qty > 0 else 0.0))
+                    target_side = "sell" if state.side == "BUY" else "buy"
 
                     tracked_in_open = next(
                         (o for o in all_open_orders if _extract_order_info(o)["id"] == str(state.order_id)),
@@ -1659,7 +1669,9 @@ class DynamicTrailingStopManager:
 
             stop_order_id = None
             broker_stop_price = None
-            target_side = "sell" if side == "BUY" else "buy"
+            canonical_side = "BUY" if str(side).upper().strip() in ("BUY", "LONG") else "SELL"
+            target_side = "sell" if canonical_side == "BUY" else "buy"
+            position_qty = abs(float(qty)) if qty else 0.0
             
             all_candidate_orders = []
             for o in open_orders:
@@ -2459,14 +2471,42 @@ class DynamicTrailingStopManager:
                 # Retain old ID as audit evidence and clear confirmed order_id for safe remediation.
                 old_stop_id = state.order_id
                 if old_stop_id:
-                    state.last_stop_order_id = str(old_stop_id)
-                    state.order_id = None
+                    cancel_ok = False
                     if hasattr(bridge, "cancel_order"):
                         try:
-                            bridge.cancel_order(old_stop_id)
-                            logger.info(f"[REMEDIATION] Cancelled insufficient/invalid stop order {old_stop_id} for {symbol} before replacement.")
+                            c_res = bridge.cancel_order(old_stop_id)
+                            if isinstance(c_res, bool):
+                                cancel_ok = c_res
+                            elif hasattr(c_res, "success"):
+                                cancel_ok = bool(c_res.success)
+                            elif isinstance(c_res, dict) and "success" in c_res:
+                                cancel_ok = bool(c_res["success"])
+                            elif c_res is None:
+                                cancel_ok = True
+                            else:
+                                cancel_ok = bool(c_res)
                         except Exception as c_err:
-                            logger.debug(f"[REMEDIATION] Note: Could not cancel old stop order {old_stop_id}: {c_err}")
+                            logger.warning(f"[REMEDIATION] Cancel order {old_stop_id} failed with error/timeout: {c_err}")
+                            cancel_ok = False
+                    else:
+                        cancel_ok = True
+
+                    if not cancel_ok:
+                        logger.warning(
+                            f"[REMEDIATION BLOCKED] Failed/unknown cancellation for old stop order {old_stop_id} on {symbol}. "
+                            f"Deferring blind replacement until old order terminal state is reconciled."
+                        )
+                        with self._lock:
+                            state.order_id = str(old_stop_id)
+                            state.stop_reconciliation_required = True
+                            state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+                            state.remediation_in_progress = False
+                            self._save_state()
+                        return
+
+                    with self._lock:
+                        state.last_stop_order_id = str(old_stop_id)
+                        state.order_id = None
 
                 # Step 2: Gap-Through Check SECOND for truly naked positions
                 current_price = None
@@ -2498,19 +2538,55 @@ class DynamicTrailingStopManager:
                     )
                     new_order_id = res.get("order_id") if res else None
                     if new_order_id:
+                        snap = None
+                        if hasattr(bridge, "get_order_snapshot"):
+                            try:
+                                snap = bridge.get_order_snapshot(str(new_order_id))
+                            except Exception as snap_err:
+                                logger.debug(f"[REMEDIATION] Snapshot query error for {new_order_id}: {snap_err}")
+                        elif hasattr(bridge, "_client") and hasattr(bridge._client, "get_order_by_id"):
+                            try:
+                                snap = bridge._client.get_order_by_id(str(new_order_id))
+                            except Exception as snap_err:
+                                logger.debug(f"[REMEDIATION] Client lookup error for {new_order_id}: {snap_err}")
+
+                        is_valid_evidence = False
+                        snap_reason = "NO_SNAPSHOT"
+                        if snap is not None:
+                            is_valid_evidence, snap_reason = verify_broker_stop_order_evidence(
+                                order_data=snap,
+                                expected_order_id=str(new_order_id),
+                                expected_symbol=symbol,
+                                position_side=state.side,
+                                expected_stop_price=state.stop_price,
+                                expected_qty=abs(position_qty),
+                                require_qty=True,
+                            )
+
                         with self._lock:
                             current_state = self.states.get(symbol)
                             if current_state is state and state.active:
                                 state.order_id = str(new_order_id)
                                 state.remediation_in_progress = False
-                                state.remediation_attempts = 0
-                                state.escalation_alerted = False
-                                state.stop_reconciliation_required = False
-                                state.reconciliation_status = None
-                                state.confirmed_broker_stop_price = state.stop_price
-                                self._save_state()
-                                should_alert_resolved = True
-                                resolved_order_id = new_order_id
+                                if is_valid_evidence:
+                                    state.remediation_attempts = 0
+                                    state.escalation_alerted = False
+                                    state.stop_reconciliation_required = False
+                                    state.reconciliation_status = None
+                                    state.confirmed_broker_stop_price = state.stop_price
+                                    self._save_state()
+                                    should_alert_resolved = True
+                                    resolved_order_id = new_order_id
+                                else:
+                                    # Verification failed: retain reconciliation requirement fail-closed
+                                    state.stop_reconciliation_required = True
+                                    state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+                                    self._save_state()
+                                    logger.warning(
+                                        f"[REMEDIATION UNCONFIRMED] Replacement stop {new_order_id} unconfirmed by broker: {snap_reason}. "
+                                        f"Retaining fail-closed reconciliation requirement."
+                                    )
+                                    return
                             else:
                                 logger.warning(f"State mismatch for {symbol}. Cancelling orphan order {new_order_id}.")
                                 if hasattr(bridge, "cancel_order"):
@@ -2638,146 +2714,8 @@ class DynamicTrailingStopManager:
                 except Exception as check_exc:
                     logger.debug(f"Broker closed order verification failed for {symbol}: {check_exc}")
 
-            logger.critical(f"CRITICAL: Naked position detected for {symbol} ({position_qty} shares) with no stop order protection. EMERGENCY FLATTENING POSITION!")
-            try:
-                send_discord_alert(
-                    f"🚨 **CRITICAL: NAKED POSITION EMERGENCY FLATTEN** 🚨\n"
-                    f"**Symbol**: {symbol}\n"
-                    f"**Qty**: {position_qty}\n"
-                    f"**Reason**: Naked position detected on broker side. Triggering emergency close."
-                )
-            except Exception as alert_exc:
-                logger.error(f"Failed to send Discord alert: {alert_exc}")
-            
-            try:
-                # Cancel open orders for this symbol first to release held shares
-                try:
-                    open_orders = []
-                    if hasattr(bridge, "working_orders_plain"):
-                        open_orders = bridge.working_orders_plain()
-                    elif hasattr(bridge, "ib") and hasattr(bridge.ib, "openTrades"):
-                        open_orders = bridge.ib.openTrades()
-                    for o in open_orders:
-                        o_sym = getattr(o, "symbol", None)
-                        if not o_sym:
-                            contract = getattr(o, "contract", None)
-                            if contract:
-                                o_sym = getattr(contract, "symbol", "")
-                        o_sym = str(o_sym).upper().strip() if o_sym else ""
-                        if o_sym == symbol.upper().strip():
-                            order_id = getattr(o, "id", None)
-                            if order_id and hasattr(bridge, "cancel_order"):
-                                logger.info(f"Cancelling working order {order_id} for {symbol} before emergency flatten.")
-                                bridge.cancel_order(str(order_id))
-                except Exception as cancel_exc:
-                    logger.error(f"Failed to cancel open orders for {symbol} before flattening: {cancel_exc}")
-
-                close_ok = False
-                if hasattr(bridge, "close_position"):
-                    for attempt in range(3):
-                        try:
-                            close_ok = bridge.close_position(symbol)
-                            if close_ok:
-                                break
-                        except Exception as close_err:
-                            logger.warning(f"Attempt {attempt+1} to emergency close {symbol} failed: {close_err}")
-                        time.sleep(1.5)
-                else:
-                    logger.critical(f"Bridge {bridge.__class__.__name__} does not support close_position. Cannot emergency close!")
-                
-                with self._lock:
-                    current_state = self.states.get(symbol)
-                    if current_state and current_state.active:
-                        current_state.remediation_in_progress = False
-                        if close_ok:
-                            is_success = False
-                            if isinstance(close_ok, bool):
-                                is_success = close_ok
-                            elif hasattr(close_ok, "is_filled"):
-                                is_success = close_ok.is_filled or close_ok.outcome == "FILLED"
-                            else:
-                                is_success = bool(close_ok)
-
-                            if is_success:
-                                current_state.active = False
-                                current_state.remediation_attempts = 0
-                                current_state.escalation_alerted = False
-                                
-                                # Log exit to trade journal
-                                exit_price = getattr(close_ok, "avg_fill_price", 0.0) or 0.0
-                                qty_closed = getattr(close_ok, "filled", 0.0) or 0.0
-                                
-                                if exit_price <= 0.0:
-                                    try:
-                                        exit_price = bridge.market_price(symbol) or 0.0
-                                    except Exception:
-                                        exit_price = 0.0
-                                if exit_price <= 0.0:
-                                    exit_price = current_state.stop_price
-                                if qty_closed <= 0.0:
-                                    qty_closed = getattr(current_state, "qty", 0.0) or abs(position_qty)
-                                    
-                                pnl_val = (exit_price - current_state.entry_price) * qty_closed if current_state.side == "BUY" else (current_state.entry_price - exit_price) * qty_closed
-                                
-                                try:
-                                    cid_str = str(getattr(current_state, "order_id", "") or "")
-                                    is_val = getattr(current_state, "is_validation", False) or cid_str.startswith("val_")
-                                    if is_val:
-                                        try:
-                                            from strategies.validation_lane import record_validation_exit
-                                            record_validation_exit(
-                                                order_id=cid_str,
-                                                exit_price=exit_price,
-                                                qty=float(qty_closed),
-                                                side="SELL" if current_state.side == "BUY" else "BUY",
-                                                symbol=symbol,
-                                                exit_reason="EMERGENCY_FLATTEN",
-                                            )
-                                        except Exception as val_e:
-                                            logger.error("Failed to record validation exit: %s", val_e)
-                                    else:
-                                        # HARD LANE GUARD: Validation order must NEVER route to production journal
-                                        if cid_str.startswith("val_"):
-                                            raise RuntimeError(f"HARD LANE GUARD: Validation order {cid_str} routed to production trade journal!")
-
-                                        from strategies.order_idempotency import parse_strategy_from_client_id
-                                        strat_name = _normalize_strategy_name(getattr(current_state, "strategy", None))
-                                        if strat_name == "UNKNOWN" and cid_str:
-                                            strat_name = parse_strategy_from_client_id(cid_str)
-                                        if strat_name == "UNKNOWN" and getattr(current_state, "signal_id", None):
-                                            sig_id = str(getattr(current_state, "signal_id", ""))
-                                            strat_name = parse_strategy_from_client_id(sig_id)
-                                            if strat_name == "UNKNOWN":
-                                                strat_name = "DAYTRADE_SCALP"
-
-                                        from strategies.trade_journal import log_trade
-                                        log_trade(
-                                            symbol=symbol,
-                                            side="SELL" if current_state.side == "BUY" else "BUY",
-                                            strategy=strat_name,
-                                            qty=int(qty_closed),
-                                            entry_price=current_state.entry_price,
-                                            stop_price=current_state.stop_price,
-                                            target_price=getattr(current_state, "target_price", None) or exit_price,
-                                            exit_price=exit_price,
-                                            exit_reason="EMERGENCY_FLATTEN",
-                                            pnl=pnl_val,
-                                            notes="Emergency flatten exit",
-                                            event_type="TRADE_CLOSED",
-                                            signal_id=getattr(current_state, "signal_id", None)
-                                        )
-                                except Exception as e_log:
-                                    if "HARD LANE GUARD" in str(e_log):
-                                        raise
-                                    logger.error("Failed to log emergency close to journal: %s", e_log)
-                        self._save_state()
-            except Exception as e:
-                logger.error(f"EMERGENCY FLATTEN FAILED for {symbol}: {e}")
-                with self._lock:
-                    current_state = self.states.get(symbol)
-                    if current_state and current_state.active:
-                        current_state.remediation_in_progress = False
-                        self._save_state()
+            self.emergency_flatten(symbol, position_qty, bridge=bridge, dry_run=dry_run)
+            return
 
     def emergency_flatten(self, symbol: str, position_qty: float, bridge: Optional[object] = None, dry_run: bool = False):
         """Emergency flatten a naked position immediately using broker close_position."""
@@ -2809,92 +2747,90 @@ class DynamicTrailingStopManager:
             logger.error(f"Failed to cancel open orders for {symbol} before flattening: {cancel_exc}")
 
         close_ok = False
-        if bridge and hasattr(bridge, "close_position"):
-            for attempt in range(3):
-                try:
-                    close_ok = bridge.close_position(symbol)
-                    if close_ok:
-                        break
-                except Exception as close_err:
-                    logger.warning(f"Attempt {attempt+1} to emergency close {symbol} failed: {close_err}")
-                time.sleep(1.5)
+        close_res = None
+        if bridge:
+            if hasattr(bridge, "close_position_verified"):
+                for attempt in range(3):
+                    try:
+                        res = bridge.close_position_verified(symbol)
+                        if res and getattr(res, "outcome", None) and str(getattr(res, "outcome")).upper().endswith("FLAT"):
+                            close_ok = True
+                            close_res = res
+                            break
+                    except Exception as close_err:
+                        logger.warning(f"Attempt {attempt+1} to emergency close {symbol} failed: {close_err}")
+                    time.sleep(1.5)
+            elif hasattr(bridge, "close_position"):
+                for attempt in range(3):
+                    try:
+                        res = bridge.close_position(symbol)
+                        if res is True or (hasattr(res, "outcome") and str(res.outcome).upper().endswith("FLAT")):
+                            close_ok = True
+                            close_res = res
+                            break
+                        elif res:
+                            close_ok = True
+                            close_res = res
+                            break
+                    except Exception as close_err:
+                        logger.warning(f"Attempt {attempt+1} to emergency close {symbol} failed: {close_err}")
+                    time.sleep(1.5)
 
         with self._lock:
             current_state = self.states.get(symbol)
             if current_state:
-                current_state.active = False
+                if not close_ok:
+                    current_state.active = True
+                    current_state.remediation_in_progress = False
+                    current_state.stop_reconciliation_required = True
+                    current_state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+                    self._save_state()
+                    logger.critical(
+                        f"[EMERGENCY FLATTEN FAILED] {symbol} close attempts failed. "
+                        f"Retaining active state fail-closed to block entries and continue reconciliation."
+                    )
+                    return
+
+                # Position close succeeded
                 current_state.remediation_in_progress = False
-                if close_ok:
+                current_state.remediation_attempts = 0
+                current_state.escalation_alerted = False
+
+                cid_str = str(getattr(current_state, "order_id", "") or "")
+                is_val = getattr(current_state, "is_validation", False) or cid_str.startswith("val_")
+                qty_val = abs(float(position_qty or getattr(current_state, "qty", 1.0)))
+
+                if is_val:
+                    current_state.active = False
+                    current_state.reconciliation_status = "RECONCILED_EMERGENCY_FLATTEN"
+                    exit_price = getattr(current_state, "stop_price", 0.0) or 0.0
+                    if bridge and hasattr(bridge, "market_price"):
+                        try:
+                            exit_price = bridge.market_price(symbol) or exit_price
+                        except Exception:
+                            pass
+                    if exit_price <= 0.0:
+                        exit_price = getattr(current_state, "entry_price", 0.0)
+                    side = getattr(current_state, "side", "BUY")
                     try:
-                        cid_str = str(getattr(current_state, "order_id", "") or "")
-                        is_val = getattr(current_state, "is_validation", False) or cid_str.startswith("val_")
-
-                        exit_price = getattr(current_state, "stop_price", 0.0) or 0.0
-                        if bridge and hasattr(bridge, "market_price"):
-                            try:
-                                exit_price = bridge.market_price(symbol) or exit_price
-                            except Exception:
-                                pass
-                        if exit_price <= 0.0:
-                            exit_price = getattr(current_state, "entry_price", 0.0)
-
-                        entry_price = getattr(current_state, "entry_price", exit_price)
-                        side = getattr(current_state, "side", "BUY")
-                        qty_val = abs(float(position_qty or getattr(current_state, "qty", 1.0)))
-                        pnl_val = (exit_price - entry_price) * qty_val if side == "BUY" else (entry_price - exit_price) * qty_val
-
-                        if is_val:
-                            try:
-                                from strategies.validation_lane import record_validation_exit
-                                record_validation_exit(
-                                    order_id=cid_str,
-                                    exit_price=exit_price,
-                                    qty=float(qty_val),
-                                    side="SELL" if side == "BUY" else "BUY",
-                                    symbol=symbol,
-                                    exit_reason="EMERGENCY_FLATTEN",
-                                )
-                            except Exception as val_e:
-                                logger.error("Failed to record validation exit: %s", val_e)
-                        else:
-                            # HARD LANE GUARD: Validation order must NEVER route to production journal
-                            if cid_str.startswith("val_"):
-                                raise RuntimeError(f"HARD LANE GUARD: Validation order {cid_str} routed to production trade journal!")
-
-                            from strategies.order_idempotency import parse_strategy_from_client_id
-                            raw_strat = getattr(current_state, "strategy", None)
-                            strat_str = _normalize_strategy_name(raw_strat)
-                            if strat_str == "UNKNOWN" and cid_str:
-                                strat_str = parse_strategy_from_client_id(cid_str)
-                            if strat_str == "UNKNOWN" and getattr(current_state, "signal_id", None):
-                                sig_id = str(getattr(current_state, "signal_id", ""))
-                                strat_str = parse_strategy_from_client_id(sig_id)
-                                if strat_str == "UNKNOWN":
-                                    strat_str = "DAYTRADE_SCALP"
-
-                            from strategies.trade_journal import log_trade
-                            log_trade(
-                                symbol=symbol,
-                                side="SELL" if side == "BUY" else "BUY",
-                                strategy=strat_str,
-                                qty=int(qty_val),
-                                entry_price=entry_price,
-                                stop_price=getattr(current_state, "stop_price", exit_price),
-                                target_price=getattr(current_state, "target_price", None) or exit_price,
-                                exit_price=exit_price,
-                                exit_reason="EMERGENCY_FLATTEN",
-                                pnl=pnl_val,
-                                notes="Emergency flatten forced exit",
-                                event_type="TRADE_CLOSED",
-                                signal_id=getattr(current_state, "signal_id", None),
-                            )
-                        logger.info(
-                            f"[EMERGENCY FLATTEN JOURNAL] {symbol} | exit_px={exit_price} | strategy={strat_str if not is_val else 'VALIDATION'} | pnl={pnl_val:.2f}"
+                        from strategies.validation_lane import record_validation_exit
+                        record_validation_exit(
+                            order_id=cid_str,
+                            exit_price=exit_price,
+                            qty=float(qty_val),
+                            side="SELL" if side == "BUY" else "BUY",
+                            symbol=symbol,
+                            exit_reason="EMERGENCY_FLATTEN",
                         )
-                    except Exception as e_log:
-                        if "HARD LANE GUARD" in str(e_log):
-                            raise
-                        logger.error("Failed to log emergency flatten close to journal: %s", e_log)
+                    except Exception as val_e:
+                        logger.error("Failed to record validation exit: %s", val_e)
+                else:
+                    # Production order: Record pending exit and reconcile via broker truth without price fabrication
+                    if close_res and hasattr(close_res, "order_id") and close_res.order_id:
+                        current_state.last_stop_order_id = str(close_res.order_id)
+                    self._record_pending_exit(current_state, qty_closed=qty_val)
+                    self.reconcile_pending_exits(bridge)
+
             self._save_state()
 
 manager = DynamicTrailingStopManager()
