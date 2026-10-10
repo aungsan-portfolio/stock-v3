@@ -117,6 +117,7 @@ class CancelResult:
     success: bool
     is_already_terminal: bool = False
     error_message: str = ""
+    terminal_status: Optional[str] = None
 
     def __bool__(self) -> bool:
         return self.success
@@ -4961,14 +4962,23 @@ class AlpacaBridge:
         """Cancel an order safely with race tolerance (HTTP 422 == order is terminal/uncancelable)."""
         self.assert_account_mode_safety()
         self._require_connection()
+        clean_id = str(order_id).strip()
         if getattr(self, "dry_run", False):
             self.mutation_counters.record("cancel_order", True)
-            logger.info("[DRY-RUN MUTATION BLOCKED] cancel_order %s", order_id)
-            return CancelResult(success=True, is_already_terminal=False)
+            logger.info("[DRY-RUN MUTATION BLOCKED] cancel_order %s", clean_id)
+            return CancelResult(success=True, is_already_terminal=True, terminal_status="canceled")
         try:
-            self._client.cancel_order_by_id(str(order_id).strip())
-            logger.info("Cancelled order %s", order_id)
-            return CancelResult(success=True, is_already_terminal=False)
+            self._client.cancel_order_by_id(clean_id)
+            logger.info("Cancelled order %s", clean_id)
+            term_status = None
+            try:
+                snap = self.get_order_snapshot(clean_id)
+                if snap:
+                    term_status = snap.get("status")
+            except Exception:
+                pass
+            is_term = str(term_status).lower() in {"canceled", "cancelled", "expired", "rejected", "filled"}
+            return CancelResult(success=True, is_already_terminal=is_term, terminal_status=term_status)
         except Exception as exc:
             exc_msg = str(exc)
             exc_lower = exc_msg.lower()
@@ -4983,11 +4993,18 @@ class AlpacaBridge:
             if is_terminal_or_uncancelable:
                 logger.info(
                     "[CANCEL RACE] Order %s returned 422/uncancelable (%s). Broker state must be reconciled.",
-                    order_id, exc_msg
+                    clean_id, exc_msg
                 )
-                return CancelResult(success=False, is_already_terminal=True, error_message=exc_msg)
+                term_status = None
+                try:
+                    snap = self.get_order_snapshot(clean_id)
+                    if snap:
+                        term_status = snap.get("status")
+                except Exception:
+                    pass
+                return CancelResult(success=False, is_already_terminal=True, error_message=exc_msg, terminal_status=term_status)
 
-            logger.error("Failed to cancel order %s: %s", order_id, exc)
+            logger.error("Failed to cancel order %s: %s", clean_id, exc)
             return CancelResult(success=False, is_already_terminal=False, error_message=exc_msg)
 
     def get_position_truth(self, symbol: str) -> PositionTruth:

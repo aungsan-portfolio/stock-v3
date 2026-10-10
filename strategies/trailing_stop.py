@@ -977,11 +977,13 @@ class DynamicTrailingStopManager:
                     idempotency_key = f"exit_{episode_id}"
                     journal_qty = int(qty_closed) if abs(qty_closed - round(qty_closed)) < 1e-6 else float(qty_closed)
                     if exit_item.get("is_validation"):
+                        val_written = False
                         try:
-                            from strategies.validation_lane import record_validation_fill_and_close
-                            record_validation_fill_and_close(
-                                entry_order_id=str(exit_item.get("tp_order_id") or exit_item.get("stop_order_id") or ""),
-                                exit_price=exit_price,
+                            from strategies.validation_lane import record_validation_exit
+                            target_oid = str(exit_item.get("last_stop_order_id") or exit_item.get("stop_order_id") or exit_item.get("tp_order_id") or exit_item.get("signal_id") or "")
+                            val_written = record_validation_exit(
+                                order_id=target_oid,
+                                exit_price=float(exit_price),
                                 qty=journal_qty,
                                 side=expected_exit_side.upper(),
                                 symbol=symbol,
@@ -989,7 +991,16 @@ class DynamicTrailingStopManager:
                             )
                         except Exception as val_e:
                             logger.error("Failed recording validation exit for %s: %s", symbol, val_e)
-                            raise val_e
+                            val_written = False
+
+                        if not val_written:
+                            logger.error(
+                                "[RECONCILE VALIDATION FAILED] %s: Validation ledger update returned False or unconfirmed. "
+                                "Retaining pending exit without marking state reconciled.",
+                                symbol
+                            )
+                            results[symbol] = "VALIDATION_LEDGER_WRITE_FAILED_RETAINED"
+                            continue
                     else:
                         from strategies.trade_journal import log_trade
                         log_trade(
@@ -2471,42 +2482,141 @@ class DynamicTrailingStopManager:
                 # Retain old ID as audit evidence and clear confirmed order_id for safe remediation.
                 old_stop_id = state.order_id
                 if old_stop_id:
-                    cancel_ok = False
+                    cancel_req_ok = False
+                    c_res = None
                     if hasattr(bridge, "cancel_order"):
                         try:
                             c_res = bridge.cancel_order(old_stop_id)
                             if isinstance(c_res, bool):
-                                cancel_ok = c_res
+                                cancel_req_ok = c_res
                             elif hasattr(c_res, "success"):
-                                cancel_ok = bool(c_res.success)
+                                cancel_req_ok = bool(c_res.success)
                             elif isinstance(c_res, dict) and "success" in c_res:
-                                cancel_ok = bool(c_res["success"])
+                                cancel_req_ok = bool(c_res["success"])
                             elif c_res is None:
-                                cancel_ok = True
+                                cancel_req_ok = False
                             else:
-                                cancel_ok = bool(c_res)
+                                cancel_req_ok = bool(c_res)
                         except Exception as c_err:
                             logger.warning(f"[REMEDIATION] Cancel order {old_stop_id} failed with error/timeout: {c_err}")
-                            cancel_ok = False
+                            cancel_req_ok = False
                     else:
-                        cancel_ok = True
+                        cancel_req_ok = False
 
-                    if not cancel_ok:
+                    if not cancel_req_ok:
                         logger.warning(
                             f"[REMEDIATION BLOCKED] Failed/unknown cancellation for old stop order {old_stop_id} on {symbol}. "
                             f"Deferring blind replacement until old order terminal state is reconciled."
                         )
                         with self._lock:
                             state.order_id = str(old_stop_id)
+                            state.last_stop_order_id = str(old_stop_id)
                             state.stop_reconciliation_required = True
                             state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
                             state.remediation_in_progress = False
                             self._save_state()
                         return
 
+                    # Verification of terminal broker status for old stop order:
+                    # Cancellation request acknowledgement alone is NOT terminal confirmation.
+                    old_snap = None
+                    if hasattr(bridge, "get_order_snapshot"):
+                        try:
+                            old_snap = bridge.get_order_snapshot(str(old_stop_id))
+                        except Exception as snap_err:
+                            logger.debug(f"[REMEDIATION] Snapshot query error for old stop {old_stop_id}: {snap_err}")
+                    elif hasattr(bridge, "get_order_truth"):
+                        try:
+                            ot = bridge.get_order_truth(str(old_stop_id))
+                            if ot:
+                                old_snap = {"status": ot.status, "filled_qty": ot.filled_qty, "qty": ot.qty}
+                        except Exception:
+                            pass
+                    elif hasattr(bridge, "get_order"):
+                        try:
+                            old_snap = bridge.get_order(str(old_stop_id))
+                        except Exception:
+                            pass
+                    elif hasattr(bridge, "_client") and hasattr(bridge._client, "get_order_by_id"):
+                        try:
+                            old_snap = bridge._client.get_order_by_id(str(old_stop_id))
+                        except Exception:
+                            pass
+
+                    old_status = None
+                    if old_snap is not None:
+                        if isinstance(old_snap, dict):
+                            raw_st = old_snap.get("status")
+                        elif hasattr(old_snap, "status"):
+                            raw_st = getattr(old_snap, "status")
+                            if hasattr(raw_st, "value"):
+                                raw_st = raw_st.value
+                        else:
+                            raw_st = None
+                        if raw_st is not None:
+                            old_status = str(raw_st).lower().strip()
+                    elif hasattr(c_res, "terminal_status") and c_res.terminal_status:
+                        old_status = str(c_res.terminal_status).lower().strip()
+                    elif isinstance(c_res, dict) and c_res.get("terminal_status"):
+                        old_status = str(c_res.get("terminal_status")).lower().strip()
+
+                    terminal_cancelled_statuses = {"canceled", "cancelled", "expired", "rejected"}
+                    if old_status == "filled":
+                        logger.info(f"[REMEDIATION] Old stop {old_stop_id} was filled on broker for {symbol}. Recording pending exit.")
+                        with self._lock:
+                            state.last_stop_order_id = str(old_stop_id)
+                            state.order_id = None
+                            self._record_pending_exit(state)
+                            state.remediation_in_progress = False
+                            self._save_state()
+                        self.reconcile_pending_exits(bridge)
+                        return
+
+                    if old_status not in terminal_cancelled_statuses:
+                        logger.warning(
+                            f"[REMEDIATION BLOCKED] Old stop order {old_stop_id} on {symbol} is not confirmed terminal cancelled "
+                            f"(status={old_status}). Deferring blind replacement until old order terminal state is reconciled."
+                        )
+                        with self._lock:
+                            state.order_id = str(old_stop_id)
+                            state.last_stop_order_id = str(old_stop_id)
+                            state.stop_reconciliation_required = True
+                            state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+                            state.remediation_in_progress = False
+                            self._save_state()
+                        return
+
+                    # Terminal cancellation confirmed on broker:
                     with self._lock:
                         state.last_stop_order_id = str(old_stop_id)
                         state.order_id = None
+
+                    # Authoritative fresh broker quantity re-query after old stop is confirmed terminal cancelled:
+                    is_known, fresh_pos_qty = self._query_broker_position_qty(bridge, symbol)
+                    if not is_known:
+                        logger.warning(
+                            f"[NAKED GUARD] Broker position query failed for {symbol} after old stop cancellation. "
+                            f"Retaining active state fail-closed without placing speculative orders."
+                        )
+                        with self._lock:
+                            state.stop_reconciliation_required = True
+                            state.reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+                            state.remediation_in_progress = False
+                            self._save_state()
+                        return
+
+                    if abs(fresh_pos_qty) < 1e-6:
+                        logger.info(f"Fresh broker position for {symbol} after stop cancellation is flat (qty=0). Recording pending exit.")
+                        with self._lock:
+                            self._record_pending_exit(state, qty_closed=abs(position_qty))
+                            state.remediation_in_progress = False
+                            self._save_state()
+                        self.reconcile_pending_exits(bridge)
+                        return
+
+                    position_qty = abs(fresh_pos_qty)
+                    with self._lock:
+                        state.qty = position_qty
 
                 # Step 2: Gap-Through Check SECOND for truly naked positions
                 current_price = None
@@ -2800,35 +2910,17 @@ class DynamicTrailingStopManager:
                 is_val = getattr(current_state, "is_validation", False) or cid_str.startswith("val_")
                 qty_val = abs(float(position_qty or getattr(current_state, "qty", 1.0)))
 
+                if close_res and hasattr(close_res, "order_id") and close_res.order_id:
+                    current_state.last_stop_order_id = str(close_res.order_id)
+
                 if is_val:
-                    current_state.active = False
-                    current_state.reconciliation_status = "RECONCILED_EMERGENCY_FLATTEN"
-                    exit_price = getattr(current_state, "stop_price", 0.0) or 0.0
-                    if bridge and hasattr(bridge, "market_price"):
-                        try:
-                            exit_price = bridge.market_price(symbol) or exit_price
-                        except Exception:
-                            pass
-                    if exit_price <= 0.0:
-                        exit_price = getattr(current_state, "entry_price", 0.0)
-                    side = getattr(current_state, "side", "BUY")
-                    try:
-                        from strategies.validation_lane import record_validation_exit
-                        record_validation_exit(
-                            order_id=cid_str,
-                            exit_price=exit_price,
-                            qty=float(qty_val),
-                            side="SELL" if side == "BUY" else "BUY",
-                            symbol=symbol,
-                            exit_reason="EMERGENCY_FLATTEN",
-                        )
-                    except Exception as val_e:
-                        logger.error("Failed to record validation exit: %s", val_e)
-                else:
-                    # Production order: Record pending exit and reconcile via broker truth without price fabrication
-                    if close_res and hasattr(close_res, "order_id") and close_res.order_id:
-                        current_state.last_stop_order_id = str(close_res.order_id)
-                    self._record_pending_exit(current_state, qty_closed=qty_val)
+                    current_state.is_validation = True
+
+                # Record durable pending exit without price fabrication for all positions
+                self._record_pending_exit(current_state, qty_closed=qty_val)
+
+                # Reconcile via broker truth on actual execution fill evidence
+                if bridge is not None:
                     self.reconcile_pending_exits(bridge)
 
             self._save_state()

@@ -2,9 +2,9 @@
 """
 build_audit_bundle.py
 
-Packages a sanitized source and evidence audit bundle for commit 120717b:
-- Updated source modules (strategies/, config.py)
-- Hardening test suites
+Packages a sanitized source and evidence audit bundle for commit 9cd671b:
+- Updated source modules (strategies/, config.py, alpaca_bridge.py)
+- Hardening test suites (19 suites, 240 tests)
 - Raw verification outputs (JUnit XML, console log, git HEAD, git diff patch)
 - Effective safety settings and runtime config evidence
 - Strict sanitization: NO .env, NO API keys, NO tokens, NO credentials
@@ -19,8 +19,6 @@ import hashlib
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent
-BUNDLE_DIR = ROOT_DIR / "trading_bot_audit_bundle_120717b"
-ZIP_OUTPUT = ROOT_DIR / "trading_bot_audit_bundle_120717b.zip"
 
 # Sensitive patterns to sanitize / redact
 SENSITIVE_PATTERNS = [
@@ -34,35 +32,60 @@ SENSITIVE_PATTERNS = [
 
 SOURCE_FILES = [
     "alpaca_bridge.py",
+    "config.py",
+    "errors.py",
+    "evaluate_paper_results.py",
     "main.py",
     "run_daytrade_paper.bat",
-    "strategies/execution_quote.py",
-    "strategies/trailing_stop.py",
-    "strategies/order_manager.py",
-    "strategies/validation_lane.py",
-    "strategies/entry_lifecycle.py",
-    "strategies/order_idempotency.py",
-    "strategies/intraday_risk.py",
-    "strategies/execution_geometry.py",
-    "strategies/candlestick_strategy.py",
-    "strategies/vwap_strategy.py",
-    "strategies/orchestrator.py",
-    "strategies/regime_engine.py",
-    "strategies/trade_journal.py",
+    "strategies/atomic_rotation.py",
+    "strategies/backtester.py",
     "strategies/base.py",
+    "strategies/candlestick_strategy.py",
+    "strategies/candle_confirmation.py",
+    "strategies/command_parser.py",
     "strategies/constants.py",
-    "strategies/session.py",
-    "strategies/intraday_data.py",
-    "strategies/mean_reversion.py",
-    "strategies/gap_strategy.py",
-    "strategies/orb_strategy.py",
-    "strategies/momentum_strategy.py",
-    "strategies/scoring.py",
     "strategies/correlation.py",
     "strategies/correlation_guards.py",
+    "strategies/entry_lifecycle.py",
+    "strategies/errors.py",
+    "strategies/error_handler.py",
+    "strategies/event_guard.py",
+    "strategies/execution_geometry.py",
+    "strategies/execution_health.py",
+    "strategies/execution_quote.py",
+    "strategies/gap_strategy.py",
+    "strategies/gate_ledger.py",
+    "strategies/halt_manager.py",
+    "strategies/indicators.py",
+    "strategies/intraday_data.py",
+    "strategies/intraday_risk.py",
+    "strategies/mean_reversion.py",
+    "strategies/mega_cap_guard.py",
+    "strategies/momentum_strategy.py",
+    "strategies/orb_strategy.py",
+    "strategies/orchestrator.py",
+    "strategies/order_idempotency.py",
+    "strategies/order_manager.py",
+    "strategies/order_registry.py",
+    "strategies/performance.py",
+    "strategies/performance_tracker.py",
     "strategies/position_sizer.py",
+    "strategies/regime_classifier.py",
+    "strategies/regime_engine.py",
+    "strategies/rotation_config.py",
+    "strategies/scoring.py",
+    "strategies/session.py",
+    "strategies/soxx_gate_config.py",
+    "strategies/startup_security.py",
+    "strategies/swing_risk_store.py",
+    "strategies/swing_sizing.py",
+    "strategies/trade_journal.py",
+    "strategies/trailing_stop.py",
+    "strategies/validation_lane.py",
     "strategies/veto_reasons.py",
-    "config.py",
+    "strategies/vwap_strategy.py",
+    "strategies/watchdog.py",
+    "strategies/webhook.py",
 ]
 
 TEST_FILES = [
@@ -193,6 +216,34 @@ def main():
         (evidence_dest / "git_commit_diff_8027bcd.patch").write_text(sanitize_text(git_diff_80), encoding="utf-8")
     except Exception as e:
         print(f"  ! 8027bcd diff error: {e}")
+
+    # Prior commit diff for b3df048
+    try:
+        git_diff_b3 = subprocess.check_output(["git", "show", "b3df048"], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
+        (evidence_dest / "git_commit_diff_b3df048.patch").write_text(sanitize_text(git_diff_b3), encoding="utf-8")
+    except Exception as e:
+        print(f"  ! b3df048 diff error: {e}")
+
+    # Scoped diff since b3df048
+    try:
+        git_diff_since_b3 = subprocess.check_output(["git", "diff", "b3df048..HEAD"], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
+        (evidence_dest / "git_diff_since_b3df048.patch").write_text(sanitize_text(git_diff_since_b3), encoding="utf-8")
+    except Exception as e:
+        print(f"  ! Diff since b3df048 error: {e}")
+
+    # Prior commit diff for 9cd671b
+    try:
+        git_diff_9c = subprocess.check_output(["git", "show", "9cd671b"], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
+        (evidence_dest / "git_commit_diff_9cd671b.patch").write_text(sanitize_text(git_diff_9c), encoding="utf-8")
+    except Exception as e:
+        print(f"  ! 9cd671b diff error: {e}")
+
+    # Scoped diff since 9cd671b
+    try:
+        git_diff_since_9c = subprocess.check_output(["git", "diff", "9cd671b..HEAD"], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
+        (evidence_dest / "git_diff_since_9cd671b.patch").write_text(sanitize_text(git_diff_since_9c), encoding="utf-8")
+    except Exception as e:
+        print(f"  ! Diff since 9cd671b error: {e}")
 
     # Cumulative git diff since 3ef1bab
     try:
@@ -389,6 +440,18 @@ This bundle provides full source files, test suites, and raw verification artifa
     - Repeated cumulative fill notifications for the same entry volume do not double count.
     - Acceptance verified: entry 11 -> cumulative 12 -> exit 12 reconciles one close for 12; entry 12 -> exit 4 -> remaining 8 -> final exit 8 aggregates 12; repeated cumulative entry 12 does not double count.
 
+13. **Defect 13: B1 Confirmation & Emergency Close Lifecycle Invariants** (`strategies/trailing_stop.py` & `alpaca_bridge.py`):
+    - **Failed Emergency Flatten Invariant**: When broker close attempts fail (e.g. 3 attempts return `False`), `current_state.active` is NEVER set to `False`. Position strictly remains `active = True`, retaining `reconciliation_status = "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"` and `stop_reconciliation_required = True` to halt new entries fail-closed.
+    - **Replacement Stop Working Evidence Verification**: In `handle_naked_position()`, receiving an order ID alone does NOT clear reconciliation flags. A working-stop snapshot must be verified against broker evidence (`verify_broker_stop_order_evidence`) covering order ID, symbol, side, status in `_WORKING_STOP_STATUSES`, finite stop price, and full required position quantity. If unconfirmed or rejected, retains fail-closed unknown state.
+    - **Cancellation Failure & Timeout Handling**: In `handle_naked_position()`, if `bridge.cancel_order()` returns `False` or raises an exception/timeout, blind replacement is blocked and old order terminal state must be reconciled first.
+    - **Emergency-Exit Journal Route & Fabricated Price Elimination**: In `emergency_flatten()`, eliminates fabricated execution fallback prices (`market_price`/`stop_price`/`entry_price`); routes confirmed close via `_record_pending_exit` + `reconcile_pending_exits(bridge)` for durable logging only on actual verified execution fills.
+    - **Authoritative Fresh Broker Quantity**: In `ensure_initialized()`, fresh broker-supplied `qty` overrides stale cached positive `state.qty`.
+    - **Fractional Stop Quantity Preservation**: `place_stop_order()` and trade journal preserve floating-point quantities (e.g., 12.5 shares) without `int(qty)` truncation.
+
+14. **Defect 14: Terminal Cancel Verification & Fail-Closed Validation Exits (R1 & R2 Hardening)** (`strategies/trailing_stop.py` & `alpaca_bridge.py`):
+    - **R1 (P0 Cancel Acknowledgement vs Terminal Status)**: In `handle_naked_position()`, HTTP cancellation acknowledgement (`cancel_order() == True`) is NOT treated as confirmation that the old stop is canceled. Manager queries broker snapshot/truth. If status is `pending_cancel` or non-terminal, blind replacement is deferred, retaining `state.order_id`, `state.last_stop_order_id`, and fail-closed `POSITION_UNKNOWN_RECONCILIATION_REQUIRED`. If cancel returns `None` or raises, replacement is blocked. If old stop was filled, routes cleanly to pending exit without placing replacement. If terminal cancelled (`status in ("canceled", "cancelled", "expired", "rejected")`), clears `order_id = None`, queries fresh broker position truth, and places replacement stop verified by `verify_broker_stop_order_evidence`.
+    - **R2 (High Validation Emergency Exit Price Truth)**: In `emergency_flatten()`, eliminated fabricated execution fallback prices (`stop_price`/`market_price`/`entry_price`) for validation exits. Validation exits route via `_record_pending_exit` + `reconcile_pending_exits(bridge)` so realized P&L is recorded only on verified execution fill evidence. In `reconcile_pending_exits()`, calls `record_validation_exit()`. If `record_validation_exit()` returns `False` or fails, the exit is retained in `self.pending_exits` with `"VALIDATION_LEDGER_WRITE_FAILED_RETAINED"` without marking state reconciled.
+
 ## Verification Summary (240 / 240 PASS - 100% Zero Regressions)
 - **Suite Breakdown**:
   1. `tests/test_stop_rebuild_and_persistence_hardening.py`: **38** passed
@@ -414,7 +477,7 @@ This bundle provides full source files, test suites, and raw verification artifa
 - **JUnit XML**: `evidence/pytest_junit_report.xml`
 
 ## Boundary Probes & Lifecycle Blockers Verification
-- **Scoped Lifecycle Blockers B1 & B2 Acceptance Suite**: **5 / 5 PASSED** (`evidence/scoped_lifecycle_blockers_results.json`).
+- **Scoped Lifecycle Blockers B1, B2 & R1, R2 Acceptance Suite**: **15 / 15 COMPREHENSIVE TESTS PASSED** (`evidence/scoped_lifecycle_blockers_results.json`).
 - **Auditor's Scoped Closure Checks**: **11 / 11 CHECKS PASSED** (`evidence/scoped_closure_results.json`).
 - **Auditor's 16 Boundary Probes**: **16 / 16 PASSED** with 100% specification compliance (`evidence/auditor_16_probes_results.json`).
 - **Auditor's 4 Technical Hardening Probes**: **10 / 10 CHECKS PASSED (100%)** (`evidence/auditor_hardening_points_results.json`).
@@ -427,6 +490,8 @@ This bundle provides full source files, test suites, and raw verification artifa
   - `git_rev_parse_head.txt`: Git HEAD SHA (`{head_sha}`)
   - `git_status_short.txt`: Git workspace status
   - `git_commit_diff_{short_sha}.patch`: Exact commit patch for `{short_sha}`
+  - `git_commit_diff_b3df048.patch`: Commit patch for `b3df048`
+  - `git_diff_since_b3df048.patch`: Scoped diff patch since `b3df048`
   - `git_commit_diff_8027bcd.patch`: Commit patch for `8027bcd`
   - `git_commit_diff_3896f5d.patch`: Commit patch for `3896f5d`
   - `git_commit_diff_bbeda16.patch`: Commit patch for `bbeda16`
@@ -434,7 +499,7 @@ This bundle provides full source files, test suites, and raw verification artifa
   - `git_commit_diff_9977c79.patch`: Core hardening commit patch for `9977c79`
   - `git_diff_cumulative_since_3ef1bab.patch`: Cumulative patch since `3ef1bab`
   - `pytest_junit_report.xml`: Machine-readable test execution report (240 testcases)
-  - `verify_scoped_lifecycle_blockers.py`: B1 and B2 acceptance verification script
+  - `verify_scoped_lifecycle_blockers.py`: B1 and B2 acceptance verification script (10 test cases)
   - `scoped_lifecycle_blockers_results.json`: Execution output of B1 and B2 acceptance tests
   - `scoped_closure_checks.py`: Auditor's scoped closure checks script (11 checks)
   - `scoped_closure_results.json`: Execution outputs of auditor's scoped closure checks
