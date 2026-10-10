@@ -216,7 +216,7 @@ def main():
 ## Overview
 This bundle provides full source files, test suites, and raw verification artifacts for commit `{head_sha}` on branch `feature/p0-hardening-and-paper-experiment`.
 
-## Forensic Defect Closures & Engine Hardening
+## Forensic Defect Closures & Engine Hardening (Commit {short_sha})
 1. **Defect 1: Stop Verification Evidence Mismatch Closure** (`alpaca_bridge.py`):
    - Enriched `AlpacaBridge.get_order_snapshot(order_id)` to extract and return full canonical fields: `id`, `client_order_id`, `status`, `symbol`, `side`, `order_type`, `type`, `qty`, `filled_qty`, `stop_price`, `limit_price`, `filled_avg_price`, and `replaced_by`.
    - Resolves `EVIDENCE_SYMBOL_MISSING` in `verify_broker_stop_order_evidence()` and guarantees full concordance between `entry_lifecycle.py` and `trailing_stop.py`.
@@ -226,31 +226,42 @@ This bundle provides full source files, test suites, and raw verification artifa
    - In `handle_naked_position`: When position quantity becomes 0, checks `tp_order_id` snapshot first to detect take-profit fills (`TAKE_PROFIT`), then stop order snapshots (`STOP_OUT`), and checks broker closed orders for authoritative execution fill details.
    - If broker fill reconciliation is still in-flight, defers closing via `FLAT_PENDING_EXIT_RECONCILIATION` instead of fabricating phantom stop-outs at local stop price.
 
-3. **Defect 3: Calendar-Aware Regime Previous Close Invariant** (`strategies/regime_engine.py`):
+3. **Defect 3: Calendar-Aware Regime Previous Close Invariant** (`strategies/regime_engine.py` & `strategies/session.py`):
    - Implemented `_extract_prev_session_close(bars_list, today_date)` which parses bar timestamps into US/Eastern calendar dates and selects the latest bar where `bar_date < today_date`.
-   - Completely eliminates benchmark returns jumping across session boundaries due to partial vs complete daily bars.
-   - Preserves complete `[REGIME BASELINE]` provenance telemetry in logs.
+   - Hardened `get_previous_market_day()` with bounded lookback (`max_lookback = 14`), raising `ValueError` fail-closed if exceeded.
+   - Wrapped calendar lookups in `regime_engine.py` to strictly fail-closed return `(None, None, None)` on calendar errors.
 
-4. **Defense-in-Depth & Test Isolation Invariants**:
-   - `tests/test_validation_lane.py`: Hardened `test_negative_latency_veto` against premature quote staleness.
-   - `tests/test_stop_rebuild_and_persistence_hardening.py`: Isolated idempotency state per test execution.
-   - Added new regression suite `tests/test_session_exit_and_regime_baseline_hardening.py` covering all 3 defect areas.
+4. **Defect 4: Reason-Independent Exit Idempotency & Crash-Durable Disk Persistence** (`strategies/trade_journal.py` & `strategies/trailing_stop.py`):
+   - Changed exit idempotency key to episode identity `f"exit_{episode_id}"` (decoupled from volatile `exit_reason`), strictly preventing duplicate writes if provisional reason differs from confirmed reason.
+   - Journal write uses `fh.flush()` and `os.fsync(fh.fileno())` guaranteeing physical persistence before returning.
+   - Guard tolerates truncated lines safely (`json.JSONDecodeError`) and matches primary key prefix.
 
-## Verification Summary (140 / 140 PASS)
+5. **Defect 5: Unconditional Cycle-Entry Poller & Self-Healing Unknown State** (`strategies/orchestrator.py` & `strategies/trailing_stop.py`):
+   - Added unconditional poller invocation `cycle_ts_mgr.reconcile_pending_exits(bridge)` at the very beginning of the cycle loop, guaranteeing execution before any market-data health check, regime evaluation, or entry halt.
+   - Added auto-recovery clearing `POSITION_UNKNOWN_RECONCILIATION_REQUIRED` back to normal as soon as broker position or stop queries succeed.
+
+## Verification Summary (240 / 240 PASS - 100% Zero Regressions)
 - **Suite Breakdown**:
-  - Session exit & regime baseline hardening: **7**
-  - Stop rebuild & persistence hardening: **38**
-  - Validation lane: **14**
-  - Candidate selection coordination: **15**
-  - Price tier semantics: **1**
-  - Replacement lineage: **6**
-  - Machine release gate: **20**
-  - Long-tail recovery supervisor: **5**
-  - VWAP confidence calibration: **2**
-  - Deterministic telemetry join: **6**
-  - SOXX fail-closed regression: **18**
-  - Candlestick pattern strategy: **8**
-  - **TOTAL: 140 passed (100% Zero Regressions)**
+  1. `tests/test_stop_rebuild_and_persistence_hardening.py`: **38** passed
+  2. `tests/test_paper_experiment_lane.py`: **10** passed
+  3. `tests/test_feed_provenance_contract.py`: **16** passed
+  4. `tests/test_geometry_hard_guards.py`: **13** passed
+  5. `tests/test_trailing_stop_p1_5.py`: **16** passed
+  6. `tests/test_lifecycle_halt_integration.py`: **7** passed
+  7. `tests/test_order_manager_idempotency.py`: **14** passed
+  8. `tests/test_execution_quote.py`: **9** passed
+  9. `tests/test_candidate_selection_coordination.py`: **15** passed
+  10. `tests/test_session_exit_and_regime_baseline_hardening.py`: **22** passed
+  11. `tests/test_validation_lane.py`: **14** passed
+  12. `tests/test_price_tier_semantics.py`: **1** passed
+  13. `tests/test_replacement_lineage.py`: **6** passed
+  14. `tests/test_machine_release_gate.py`: **20** passed
+  15. `tests/test_long_tail_recovery_supervisor.py`: **5** passed
+  16. `tests/test_vwap_confidence_calibration.py`: **2** passed
+  17. `tests/test_deterministic_telemetry_join.py`: **6** passed
+  18. `tests/test_soxx_fail_closed_regression.py`: **18** passed
+  19. `tests/test_candlestick_strategy.py`: **8** passed
+  - **TOTAL: 240 passed in 62.57s (100% Zero Regressions)**
 - **JUnit XML**: `evidence/pytest_junit_report.xml`
 
 ## Bundle Contents
