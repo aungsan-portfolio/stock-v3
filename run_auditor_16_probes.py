@@ -74,11 +74,13 @@ def adopt_manager(s):
 def item():
     return dict(episode_id='AAPL:sig-1', symbol='AAPL', side='BUY', qty=12., entry_price=331.88, stop_price=331.89, target_price=334.99, tp_order_id='tp-1', stop_order_id='stop-1', last_stop_order_id='stop-1', is_validation=False, strategy='MEAN_REVERSION', signal_id='sig-1')
 def manager(save=lambda: True):
-    return NS(_lock=threading.RLock(), states={}, pending_exits={'AAPL:sig-1': item()}, _save_state=save, _query_broker_position_qty=lambda b, sym: (True, 0.))
+    m = NS(_lock=threading.RLock(), states={}, pending_exits={'AAPL:sig-1': item()}, _save_state=save)
+    m._query_broker_position_qty = types.MethodType(G['_query_broker_position_qty'], m)
+    return m
 def filled(**kw):
     return dict(id='tp-1', status='filled', symbol='AAPL', side='sell', qty=12., filled_qty=12., filled_avg_price=335.10, **kw)
-def bridge(snapshot=None, orders=None):
-    return NS(get_order_snapshot=lambda oid: snapshot if oid == 'tp-1' else None, _client=NS(get_orders=lambda req: orders) if orders is not None else None)
+def bridge(snapshot=None, orders=None, pos=0.0):
+    return NS(get_position=lambda s: pos, get_order_snapshot=lambda oid: snapshot if oid == 'tp-1' else None, _client=NS(get_orders=lambda req: orders) if orders is not None else None)
 
 partial = {**base, 'status': 'partially_filled', 'filled_qty': '4'}
 

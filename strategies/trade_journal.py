@@ -238,6 +238,7 @@ def log_trade(
         # Idempotency Guard: prevent duplicate TRADE_CLOSED writes across crashes/restarts
         primary_trade_key = str(kwargs.get("idempotency_key") or kwargs.get("exit_order_id") or signal_id or order_id or "")
         norm_primary = _normalize_exit_idempotency_key(primary_trade_key)
+        found_existing_record = False
         if path.exists() and primary_trade_key and event_type in ("TRADE_CLOSED", "TRADE", "EXIT"):
             try:
                 with open(path, "r", encoding="utf-8", errors="replace") as fh_check:
@@ -248,33 +249,41 @@ def log_trade(
                         if norm_primary in line_str or primary_trade_key in line_str:
                             try:
                                 item = json.loads(line_str)
-                                stored_key = str(item.get("idempotency_key") or "")
-                                norm_stored = _normalize_exit_idempotency_key(stored_key)
-                                key_match = (
-                                    (norm_stored and norm_primary and norm_stored == norm_primary)
-                                    or (stored_key and stored_key == primary_trade_key)
-                                    or (item.get("exit_order_id") and str(item.get("exit_order_id")) == primary_trade_key)
-                                    or (item.get("signal_id") and str(item.get("signal_id")) == primary_trade_key)
-                                    or (item.get("order_id") and str(item.get("order_id")) == primary_trade_key)
-                                )
-                                if (
-                                    item.get("event_type") == event_type
-                                    and item.get("symbol") == symbol
-                                    and key_match
-                                ):
-                                    logger.warning(
-                                        "[JOURNAL TRADE IDEMPOTENT GUARD] Event %s for %s (key=%s) already recorded in %s. Enforcing durable sync.",
-                                        event_type, symbol, primary_trade_key, path
-                                    )
-                                    if hasattr(os, "fsync") and path.exists():
-                                        with open(path, "a", encoding="utf-8") as fh_sync:
-                                            fh_sync.flush()
-                                            os.fsync(fh_sync.fileno())
-                                    return
-                            except (json.JSONDecodeError, Exception):
+                            except Exception:
                                 continue
+                            if not item or not isinstance(item, dict):
+                                continue
+                            stored_key = str(item.get("idempotency_key") or "")
+                            norm_stored = _normalize_exit_idempotency_key(stored_key)
+                            key_match = (
+                                (norm_stored and norm_primary and norm_stored == norm_primary)
+                                or (stored_key and stored_key == primary_trade_key)
+                                or (item.get("exit_order_id") and str(item.get("exit_order_id")) == primary_trade_key)
+                                or (item.get("signal_id") and str(item.get("signal_id")) == primary_trade_key)
+                                or (item.get("order_id") and str(item.get("order_id")) == primary_trade_key)
+                            )
+                            if (
+                                item.get("event_type") == event_type
+                                and item.get("symbol") == symbol
+                                and key_match
+                            ):
+                                found_existing_record = True
+                                break
+            except OSError:
+                raise
             except Exception as read_err:
                 logger.warning("[JOURNAL TRADE GUARD READ ERROR] %s", read_err)
+
+        if found_existing_record:
+            logger.warning(
+                "[JOURNAL TRADE IDEMPOTENT GUARD] Event %s for %s (key=%s) already recorded in %s. Enforcing durable sync.",
+                event_type, symbol, primary_trade_key, path
+            )
+            if hasattr(os, "fsync") and path.exists():
+                with open(path, "a", encoding="utf-8") as fh_sync:
+                    fh_sync.flush()
+                    os.fsync(fh_sync.fileno())
+            return
 
         # Check if file has incomplete tail (missing trailing newline)
         needs_leading_newline = False

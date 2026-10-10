@@ -159,6 +159,20 @@ def main():
     except Exception as e:
         print(f"  ! 9977c79 diff error: {e}")
 
+    # Prior commit diff for fd3094e
+    try:
+        git_diff_fd = subprocess.check_output(["git", "show", "fd3094e"], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
+        (evidence_dest / "git_commit_diff_fd3094e.patch").write_text(sanitize_text(git_diff_fd), encoding="utf-8")
+    except Exception as e:
+        print(f"  ! fd3094e diff error: {e}")
+
+    # Prior commit diff for bbeda16
+    try:
+        git_diff_bb = subprocess.check_output(["git", "show", "bbeda16"], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
+        (evidence_dest / "git_commit_diff_bbeda16.patch").write_text(sanitize_text(git_diff_bb), encoding="utf-8")
+    except Exception as e:
+        print(f"  ! bbeda16 diff error: {e}")
+
     # Cumulative git diff since 3ef1bab
     try:
         git_diff_cumulative = subprocess.check_output(["git", "diff", "3ef1bab..HEAD"], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
@@ -205,6 +219,16 @@ def main():
             (evidence_dest / "auditor_16_probes_results.json").write_text(auditor_out, encoding="utf-8")
         except Exception as ape:
             print(f"  ! Error executing auditor 16 probes: {ape}")
+
+    # Auditor's 4 technical hardening points direct verification script and output
+    auditor_points_src = ROOT_DIR / "verify_auditor_points.py"
+    if auditor_points_src.exists():
+        sanitize_and_copy(auditor_points_src, evidence_dest / "verify_auditor_points.py")
+        try:
+            points_out = subprocess.check_output(["python", str(auditor_points_src)], cwd=str(ROOT_DIR), encoding="utf-8", errors="replace")
+            (evidence_dest / "auditor_hardening_points_results.json").write_text(points_out, encoding="utf-8")
+        except Exception as pe:
+            print(f"  ! Error executing verify_auditor_points: {pe}")
 
     # Effective safety settings
     safety_settings = {
@@ -271,25 +295,36 @@ This bundle provides full source files, test suites, and raw verification artifa
 3. **Defect 3: Unknown Position Clearance Protection Guard** (`strategies/trailing_stop.py`):
    - In `handle_naked_position()`: An unverified non-empty order ID cannot clear `POSITION_UNKNOWN_RECONCILIATION_REQUIRED` unless `stop_reconciliation_required` is `False`. Prevents unverified legacy/stale IDs from unlocking entry gates (`unknown_cleared_by_nonempty_unverified_id` -> `status: "POSITION_UNKNOWN..."`).
 
-4. **Defect 4: Broker Position Flat Verification Before Exit** (`strategies/trailing_stop.py`):
-   - In `reconcile_pending_exits()`: Verifies broker position via `bridge.get_position(symbol)` before finalizing exit. If position is still open on broker (`abs(cur_pos_qty) > 1e-6`), reconciliation is blocked with `POSITION_STILL_OPEN_ON_BROKER` and item is retained in queue (`pending_exit_no_current_position_check` -> `calls: 1, pending: 1`).
+4. **Defect 4: Canonical Broker Position Query Tri-State Contract** (`strategies/trailing_stop.py`):
+   - In `reconcile_pending_exits()`: Binds canonical `self._query_broker_position_qty(bridge, symbol)` fail-closed.
+   - Case 1 (Broker qty > 0, e.g. 12): blocks reconciliation with `POSITION_STILL_OPEN_ON_BROKER` and retains pending queue item (`pending_exit_no_current_position_check`).
+   - Case 2 (Broker qty = 0): confirms flat state, permitting reconciliation only if valid fill evidence exists.
+   - Case 3 (Timeout / None / NaN / query error): retains pending exit with `POSITION_UNKNOWN_RETAINED` (fail-closed).
 
 5. **Defect 5: Delimiter-Safe Exit Order Lineage Matching** (`strategies/trailing_stop.py`):
    - Replaced substring `in` checks with `_matches_order_lineage()` using delimiter regex `(?:^|[:_]){{target}}(?:$|[:_])`. Completely eliminates episode identity collisions (`sig-1` vs `sig-10`) (`substring_other_episode_sig10` -> `pending: 1, records: []`).
 
 6. **Defect 6: Strict Explicit Finite Fill Evidence Contract** (`strategies/trailing_stop.py`):
    - TP/Stop Snapshots: Require explicit non-null, finite, positive `filled_qty` (`math.isfinite(snap_fq) and snap_fq > 0`), status strictly `"filled"`. Zero fallback to `qty` (`snapshot_missing_filled_qty_uses_order_qty`, `snapshot_infinite_filled_qty` -> `pending: 1, records: []`).
-   - Closed-Orders Fallback: Status strictly `"filled"` (no `"fill" in status` matching `"partially_filled"`), require explicit finite positive `filled_qty` (rejects NaN/inf/missing) (`fallback_nan_filled_qty`, `fallback_partial_status`, `fallback_missing_filled_qty_uses_qty` -> `pending: 1, records: []`).
+   - Closed-Orders Fallback: Status strictly terminal (`"filled"`, `"canceled"`, `"cancelled"`, `"expired"`), require explicit finite positive `filled_qty` (rejects NaN/inf/missing/non-terminal `partially_filled`) (`fallback_nan_filled_qty`, `fallback_partial_status`, `fallback_missing_filled_qty_uses_qty` -> `pending: 1, records: []`).
 
-7. **Defect 7: Multi-Order Exit Accounting (Split Exits)** (`strategies/trailing_stop.py`):
-   - Aggregates all matching closed orders for an episode. If cumulative filled quantity covers required position (`sum(qty) >= exp_qty - 1e-4`), computes weighted average fill price `sum(qty * price) / sum(qty)` and logs `SPLIT_EXIT` with exact weighted PnL (`split_exits_4_plus_8_cover_12` -> `RECONCILED_SPLIT_EXIT`, weighted price $333.3333, gross PnL $17.44, `pending: 0`).
+7. **Defect 7: Multi-Order Exit Accounting & Quantity Conservation** (`strategies/trailing_stop.py`):
+   - Unified Candidate Collection: Aggregates orders across TP snapshot, Stop snapshot, and closed orders into a deduplicated map keyed by broker `order_id` (zero double-counting).
+   - Cancelled Partial Fills: Aggregates cancelled/expired orders that had partial fills (`filled_qty > 0`).
+   - Quantity Conservation: If `total_filled > exp_qty + 1e-4`, triggers `EXCESS_EXIT_QTY_DISCREPANCY` fail-closed. If exact match `abs(total_filled - exp_qty) <= 1e-4`, computes weighted average fill price and logs `SPLIT_EXIT` (`split_exits_4_plus_8_cover_12` -> `RECONCILED_SPLIT_EXIT`, weighted price $333.3333, gross PnL $17.44, `pending: 0`).
 
 8. **Defect 8: Durable Disk Sync Enforced on Retry Dedup** (`strategies/trade_journal.py`):
-   - In `log_trade()`: On idempotency key dedup detection, enforces durable disk sync with `os.fsync(fh.fileno())` before returning. If fsync fails on retry, `OSError` is raised, preventing silent queue eviction without confirmed durability (`fsync_failure_retry_dedup_evicts_without_sync` -> `additional_fsync_calls: 2, pending: 1`).
+   - In `log_trade()`: On idempotency key dedup detection, enforces durable disk sync with `os.fsync(fh.fileno())` before returning. If fsync fails on retry, `OSError` propagates directly without falling through to write duplicate rows (`fsync_failure_retry_dedup_evicts_without_sync` -> `additional_fsync_calls: 1, pending: 1`).
 
 9. **Defect 9: Truthful Market Provenance & Timestamp Separation** (`strategies/regime_engine.py` & `alpaca_bridge.py`):
    - In `_get_premarket_pct_change()`: Fallback price observation timestamp strictly uses quote timestamp (`final_ts = quote_ts`). Never reuses baseline bar timestamp (`fallback_price_epoch_reused_from_baseline` -> `timestamp: None`).
    - In yfinance fallback: Returns `("yfinance_fallback", None)`. Never spoofs current system time as market observation timestamp (`yfinance_missing_provider_timestamp_labelled_fresh` -> `timestamp: None`).
+
+10. **Defect 10: Stop Adoption Uses Fresh Signed Broker Position** (`strategies/trailing_stop.py`):
+    - `_reconcile_broker_order()` queries fresh broker position `self._query_broker_position_qty(bridge, state.symbol)`.
+    - Stop adoption checks candidate remaining capacity against fresh broker position: rejects if broker qty 12 and stop capacity 8; accepts if broker qty 8 and stop capacity 8.
+    - Stop partial fill does not unilaterally reduce `state.qty`.
+    - Finding a working stop alone does NOT clear `POSITION_UNKNOWN_RECONCILIATION_REQUIRED` unless broker position is confirmed known.
 
 ## Verification Summary (240 / 240 PASS - 100% Zero Regressions)
 - **Suite Breakdown**:
@@ -317,6 +352,7 @@ This bundle provides full source files, test suites, and raw verification artifa
 
 ## Boundary Probes Verification
 - **Auditor's 16 Boundary Probes**: **16 / 16 PASSED** with 100% specification compliance (`evidence/auditor_16_probes_results.json`).
+- **Auditor's 4 Technical Hardening Probes**: **10 / 10 CHECKS PASSED (100%)** (`evidence/auditor_hardening_points_results.json`).
 - **Original 25 Boundary Probes**: **25 / 25 PASSED** with 100% precision (`evidence/offline_probes_results.json`).
 
 ## Bundle Contents
@@ -326,6 +362,8 @@ This bundle provides full source files, test suites, and raw verification artifa
   - `git_rev_parse_head.txt`: Git HEAD SHA (`{head_sha}`)
   - `git_status_short.txt`: Git workspace status
   - `git_commit_diff_{short_sha}.patch`: Exact commit patch for `{short_sha}`
+  - `git_commit_diff_bbeda16.patch`: Commit patch for `bbeda16`
+  - `git_commit_diff_fd3094e.patch`: Commit patch for `fd3094e`
   - `git_commit_diff_9977c79.patch`: Core hardening commit patch for `9977c79`
   - `git_diff_cumulative_since_3ef1bab.patch`: Cumulative patch since `3ef1bab`
   - `pytest_junit_report.xml`: Machine-readable test execution report (240 testcases)
@@ -333,6 +371,8 @@ This bundle provides full source files, test suites, and raw verification artifa
   - `offline_probes_results.json`: Raw execution outputs for all 25 boundary probes
   - `run_auditor_16_probes.py`: Auditor's isolated boundary verification script (16 probes)
   - `auditor_16_probes_results.json`: Raw execution outputs for all 16 boundary probes
+  - `verify_auditor_points.py`: Auditor's 4 technical hardening points verification script
+  - `auditor_hardening_points_results.json`: Raw execution outputs for 4 hardening points (10 checks)
   - `effective_safety_settings.json`: Active safety policy parameters
   - `runtime_config_evidence.json`: Runtime provenance and promotion gates
   - `file_manifest_sha256.json`: Cryptographic SHA-256 hashes of all bundled files
