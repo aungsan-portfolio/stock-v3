@@ -21,7 +21,7 @@ G = dict(
         warning=lambda *a, **k: None,
         info=lambda *a, **k: None,
         debug=lambda *a, **k: None,
-        error=lambda msg, *a, **k: print("LOGGER ERROR:", msg % a if a else msg),
+        error=lambda *a, **k: None,
         critical=lambda *a, **k: None,
     ),
     TradeSignal=object,
