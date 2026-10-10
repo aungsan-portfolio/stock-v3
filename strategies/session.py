@@ -87,8 +87,13 @@ def get_previous_market_day(from_day: Optional[date] = None) -> date:
     """Return the date of the most recent prior trading session on the NYSE calendar."""
     ref_day = from_day or now_eastern().date()
     day = ref_day - timedelta(days=1)
+    max_lookback = 14  # Strict bound: prevent runaway lookback on corrupted calendar
+    looked_back = 0
     while not is_market_day(day):
         day -= timedelta(days=1)
+        looked_back += 1
+        if looked_back > max_lookback:
+            raise ValueError(f"Calendar lookback exceeded {max_lookback} days from {ref_day}")
     return day
 
 

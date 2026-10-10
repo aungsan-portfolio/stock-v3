@@ -4,6 +4,7 @@ trade_journal.py -- Append-only JSONL trade journal for review and learning.
 import json
 import logging
 import math
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -228,35 +229,46 @@ def log_trade(
         primary_trade_key = str(kwargs.get("idempotency_key") or kwargs.get("exit_order_id") or signal_id or order_id or "")
         if path.exists() and primary_trade_key and event_type in ("TRADE_CLOSED", "TRADE", "EXIT"):
             try:
-                with open(path, "r", encoding="utf-8") as fh_check:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh_check:
                     for line in fh_check:
-                        if not line.strip():
+                        line_str = line.strip()
+                        if not line_str:
                             continue
-                        if primary_trade_key in line:
+                        if primary_trade_key in line_str or (primary_trade_key.startswith("exit_") and primary_trade_key.split("_")[1] in line_str):
                             try:
-                                item = json.loads(line)
+                                item = json.loads(line_str)
+                                stored_key = str(item.get("idempotency_key") or "")
+                                key_match = (
+                                    stored_key == primary_trade_key
+                                    or (primary_trade_key.startswith("exit_") and stored_key.startswith(primary_trade_key))
+                                    or (stored_key.startswith("exit_") and primary_trade_key.startswith(stored_key))
+                                    or (item.get("exit_order_id") and item.get("exit_order_id") == primary_trade_key)
+                                    or (item.get("signal_id") and str(item.get("signal_id")) == primary_trade_key)
+                                    or (item.get("order_id") and str(item.get("order_id")) == primary_trade_key)
+                                )
                                 if (
                                     item.get("event_type") == event_type
                                     and item.get("symbol") == symbol
-                                    and (
-                                        item.get("idempotency_key") == primary_trade_key
-                                        or item.get("exit_order_id") == primary_trade_key
-                                        or str(item.get("signal_id")) == primary_trade_key
-                                        or str(item.get("order_id")) == primary_trade_key
-                                    )
+                                    and key_match
                                 ):
                                     logger.warning(
                                         "[JOURNAL TRADE IDEMPOTENT GUARD] Event %s for %s (key=%s) already recorded in %s. Skipping duplicate write.",
                                         event_type, symbol, primary_trade_key, path
                                     )
                                     return
-                            except Exception:
-                                pass
+                            except (json.JSONDecodeError, Exception):
+                                continue
             except Exception as read_err:
                 logger.warning("[JOURNAL TRADE GUARD READ ERROR] %s", read_err)
 
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, default=str) + "\n")
+            fh.flush()
+            if hasattr(os, "fsync"):
+                try:
+                    os.fsync(fh.fileno())
+                except Exception:
+                    pass
     logger.info("Journal: %s %s %s @ %.2f | stop=%.2f target=%.2f",
                 side, qty, symbol, entry_price, stop_price, target_price)
 

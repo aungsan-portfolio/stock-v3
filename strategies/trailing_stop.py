@@ -705,6 +705,17 @@ class DynamicTrailingStopManager:
                     return True
             return False
 
+    def clear_position_unknown(self, symbol: str) -> bool:
+        """Clear POSITION_UNKNOWN_RECONCILIATION_REQUIRED status once broker truth is restored."""
+        with self._lock:
+            state = self.states.get(symbol.upper().strip())
+            if state and state.reconciliation_status == "POSITION_UNKNOWN_RECONCILIATION_REQUIRED":
+                state.reconciliation_status = None
+                self._save_state()
+                logger.info("[POSITION UNKNOWN CLEARED] Successfully cleared unknown position status for %s", symbol)
+                return True
+            return False
+
 
     def reconcile_pending_exits(self, bridge: Optional[object] = None) -> Dict[str, str]:
         """
@@ -834,7 +845,7 @@ class DynamicTrailingStopManager:
 
                     # Attempt journal write
                     expected_exit_side = "sell" if str(exit_item.get("side", "")).upper() in ("BUY", "LONG") else "buy"
-                    idempotency_key = f"exit_{episode_id}_{exit_reason}"
+                    idempotency_key = f"exit_{episode_id}"
                     if exit_item.get("is_validation"):
                         try:
                             from strategies.validation_lane import record_validation_fill_and_close
@@ -1639,6 +1650,12 @@ class DynamicTrailingStopManager:
                 state.remediation_attempts = 0
                 state.escalation_alerted = False
                 state.remediation_in_progress = False
+                if state.reconciliation_status == "POSITION_UNKNOWN_RECONCILIATION_REQUIRED":
+                    state.reconciliation_status = None
+                    logger.info(
+                        "[RECONCILIATION RECOVERED] Active broker stop restored for %s. Cleared POSITION_UNKNOWN status.",
+                        state.symbol
+                    )
                 if o_stop is not None:
                     state.confirmed_broker_stop_price = broker_stop_price
                     state.stop_price = broker_stop_price  # Broker truth is the effective resting stop
@@ -1974,6 +1991,12 @@ class DynamicTrailingStopManager:
             fresh_qty = abs(pos_qty)
             state.qty = fresh_qty
             position_qty = fresh_qty
+            if state.reconciliation_status == "POSITION_UNKNOWN_RECONCILIATION_REQUIRED":
+                state.reconciliation_status = None
+                logger.info(
+                    "[RECONCILIATION RECOVERED] Broker position query restored for %s (qty=%.2f). Cleared POSITION_UNKNOWN status.",
+                    symbol, pos_qty
+                )
 
 
             try:

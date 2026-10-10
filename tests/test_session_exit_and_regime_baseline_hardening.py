@@ -672,10 +672,10 @@ class TestDurablePendingQueueAndSafetyHalts:
             exit_reason="STOP_OUT",
             pnl=-26.0,
             journal_file=journal_path,
-            idempotency_key="exit_TSLA:sig-tsla-1_STOP_OUT",
+            idempotency_key="exit_TSLA:sig-tsla-1",
         )
 
-        # Second commit replay (e.g. restart crash replay)
+        # Second commit replay (e.g. restart crash replay or reason change)
         log_trade(
             symbol="TSLA",
             side="SELL",
@@ -684,11 +684,11 @@ class TestDurablePendingQueueAndSafetyHalts:
             entry_price=200.0,
             stop_price=195.0,
             target_price=210.0,
-            exit_price=194.80,
-            exit_reason="STOP_OUT",
-            pnl=-26.0,
+            exit_price=205.00,
+            exit_reason="TAKE_PROFIT",
+            pnl=25.0,
             journal_file=journal_path,
-            idempotency_key="exit_TSLA:sig-tsla-1_STOP_OUT",
+            idempotency_key="exit_TSLA:sig-tsla-1",
         )
 
         # Only 1 record should exist
@@ -696,7 +696,7 @@ class TestDurablePendingQueueAndSafetyHalts:
         assert len(lines) == 1
         record = json.loads(lines[0])
         assert record["symbol"] == "TSLA"
-        assert record["idempotency_key"] == "exit_TSLA:sig-tsla-1_STOP_OUT"
+        assert record["idempotency_key"] == "exit_TSLA:sig-tsla-1"
 
     def test_position_unknown_state_blocks_all_candidates_at_final_submit(self, monkeypatch, tmp_path):
         """When any position is in POSITION_UNKNOWN state, candidates A and B are blocked at final submit."""
@@ -815,4 +815,41 @@ class TestDurablePendingQueueAndSafetyHalts:
                 assert "Unreconciled Exit Pending (Final Submit)" in res["reason"]
                 assert bridge.place_bracket_order.call_count == 0
                 assert "AAPL_BUY" not in idempotency_manager.reservations
+
+    def test_position_unknown_auto_clears_when_broker_query_restored(self):
+        """When broker position query succeeds in subsequent cycle, POSITION_UNKNOWN status auto-clears."""
+        mgr = DynamicTrailingStopManager()
+        state = TrailingStopState(
+            symbol="NVDA",
+            side="BUY",
+            entry_price=120.0,
+            peak_price=120.0,
+            atr=1.0,
+            stop_price=118.0,
+            trail_multiple=1.5,
+            last_updated=time.time(),
+            qty=10.0,
+            active=True,
+            reconciliation_status="POSITION_UNKNOWN_RECONCILIATION_REQUIRED",
+            stop_reconciliation_required=True,
+        )
+        mgr.states["NVDA"] = state
+        assert mgr.has_unresolved_position_unknown() is True
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_position.return_value = 10.0
+
+        with patch.object(mgr, "_save_state", return_value=True):
+            mgr.handle_naked_position("NVDA", 10.0, bridge=mock_bridge)
+
+        assert state.reconciliation_status is None
+        assert mgr.has_unresolved_position_unknown() is False
+
+    def test_calendar_bounded_lookback_raises_on_extreme_lookback(self):
+        """Calendar lookback exceeds 14 days safety ceiling raises ValueError fail-closed."""
+        from strategies.session import get_previous_market_day
+        with patch("strategies.session.is_market_day", return_value=False):
+            with pytest.raises(ValueError, match="Calendar lookback exceeded"):
+                get_previous_market_day(date(2026, 10, 9))
+
 

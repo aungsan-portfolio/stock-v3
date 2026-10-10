@@ -1532,6 +1532,14 @@ def evaluate_and_execute(
     except Exception:
         pass
 
+    # Phase 0 Poller Invariant: Unconditionally reconcile pending exits at cycle entry,
+    # before any data health check, broker query, market regime evaluation, or entry halt.
+    try:
+        from strategies.trailing_stop import manager as cycle_ts_mgr
+        if bridge is not None:
+            cycle_ts_mgr.reconcile_pending_exits(bridge)
+    except Exception as entry_poller_err:
+        logger.error("[ENTRY POLLER ERROR] Failed reconciling pending exits at cycle entry: %s", entry_poller_err)
 
     global _consecutive_broker_failures
     broker_fetch_ok = True

@@ -489,13 +489,17 @@ def _extract_prev_session_close(
         latest_date, latest_dt, latest_bar = completed_bars[-1]
 
         # Full NYSE Exchange Calendar Validation: ensure completed bar is the EXACT expected prior trading session
-        from strategies.session import get_previous_market_day
-        expected_prev_session = get_previous_market_day(today_date)
-        if latest_date != expected_prev_session:
-            logger.warning(
-                "[REGIME CALENDAR MISMATCH] Latest completed bar date %s does not match expected exchange session date %s (today=%s). Failing closed.",
-                latest_date, expected_prev_session, today_date
-            )
+        try:
+            from strategies.session import get_previous_market_day
+            expected_prev_session = get_previous_market_day(today_date)
+            if latest_date != expected_prev_session:
+                logger.warning(
+                    "[REGIME CALENDAR MISMATCH] Latest completed bar date %s does not match expected exchange session date %s (today=%s). Failing closed.",
+                    latest_date, expected_prev_session, today_date
+                )
+                return None, None, None
+        except Exception as cal_err:
+            logger.error("[REGIME CALENDAR ERROR] Failed to determine previous market day: %s. Failing closed.", cal_err)
             return None, None, None
 
         close_val = getattr(latest_bar, "close", None)
