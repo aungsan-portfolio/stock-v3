@@ -275,7 +275,7 @@ This bundle provides full source files, test suites, and raw verification artifa
    - In `reconcile_pending_exits()`: Verifies broker position via `bridge.get_position(symbol)` before finalizing exit. If position is still open on broker (`abs(cur_pos_qty) > 1e-6`), reconciliation is blocked with `POSITION_STILL_OPEN_ON_BROKER` and item is retained in queue (`pending_exit_no_current_position_check` -> `calls: 1, pending: 1`).
 
 5. **Defect 5: Delimiter-Safe Exit Order Lineage Matching** (`strategies/trailing_stop.py`):
-   - Replaced substring `in` checks with `_matches_order_lineage()` using delimiter regex `(?:^|[:_]){target}(?:$|[:_])`. Completely eliminates episode identity collisions (`sig-1` vs `sig-10`) (`substring_other_episode_sig10` -> `pending: 1, records: []`).
+   - Replaced substring `in` checks with `_matches_order_lineage()` using delimiter regex `(?:^|[:_]){{target}}(?:$|[:_])`. Completely eliminates episode identity collisions (`sig-1` vs `sig-10`) (`substring_other_episode_sig10` -> `pending: 1, records: []`).
 
 6. **Defect 6: Strict Explicit Finite Fill Evidence Contract** (`strategies/trailing_stop.py`):
    - TP/Stop Snapshots: Require explicit non-null, finite, positive `filled_qty` (`math.isfinite(snap_fq) and snap_fq > 0`), status strictly `"filled"`. Zero fallback to `qty` (`snapshot_missing_filled_qty_uses_order_qty`, `snapshot_infinite_filled_qty` -> `pending: 1, records: []`).
