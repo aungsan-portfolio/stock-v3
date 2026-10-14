@@ -188,3 +188,156 @@ def test_ensure_symbol_protection_skips_when_already_covered():
     success = bridge.ensure_symbol_protection("COST", qty=5.0)
     assert success is True
     bridge._client.submit_order.assert_not_called()
+
+
+# ─── P0/P1 Hardening Tests (Daily Loss, Fail-Closed, Rollover, Quote Eligibility) ────────
+
+def _make_rotation_decision(
+    exit_symbol: str = "AMZN",
+    enter_symbol: str = "JPM",
+    exit_qty: float = 8.0,
+    exit_entry_price: float = 251.57,
+    exit_current_price: float = 255.07,
+    unrealized_r: float = 0.5,
+    enter_conf: float = 0.62,
+    enter_price: float = 215.50,
+):
+    from position_rotator import IncomingSignal, OpenPosition, RotationDecision
+    exit_pos = OpenPosition(
+        symbol=exit_symbol,
+        side="long",
+        qty=exit_qty,
+        avg_entry_price=exit_entry_price,
+        current_price=exit_current_price,
+        unrealized_pnl=(exit_current_price - exit_entry_price) * exit_qty,
+        current_conf=0.43,
+        unrealized_r=unrealized_r,
+    )
+    enter_sig = IncomingSignal(
+        symbol=enter_symbol,
+        action="BUY",
+        confidence=enter_conf,
+        price=enter_price,
+    )
+    return RotationDecision(
+        should_rotate=True,
+        exit_position=exit_pos,
+        enter_signal=enter_sig,
+        reason="Conviction upgrade",
+    )
+
+
+def test_fresh_unpersisted_daily_loss_breach_vetoes_precheck_and_preserves_incumbent():
+    """P0 Gap 1: Fresh live daily loss breach halts engine and vetoes rotation before close."""
+    engine = AtomicRotationEngine()
+    bridge = AlpacaBridge(mode="swing", dry_run=True)
+    bridge._connected = True
+    bridge._client = MagicMock()
+    bridge._account_id = "PA3R71I7JFDZ"
+    # Starting equity $100,000, current equity $99,690 (loss = $310 > $300 cap)
+    bridge._start_of_day_equity = 100000.0
+    bridge.get_net_liquidation = MagicMock(return_value=99690.0)
+
+    decision = _make_rotation_decision(exit_symbol="AMZN", enter_symbol="JPM", unrealized_r=0.5)
+
+    feasible, reason = engine.check_feasibility(decision, bridge, [])
+    assert feasible is False
+    assert "daily loss" in reason.lower()
+
+    # Full execution aborts cleanly without closing incumbent
+    bridge.close_position_verified = MagicMock()
+    summary = engine.rotate(decision, bridge, [])
+    assert summary.rotation_completed is False
+    assert summary.replacement_entered is False
+    bridge.close_position_verified.assert_not_called()
+
+
+def test_daily_loss_verification_exception_fails_closed():
+    """P0 Gap 2: Risk check exceptions must fail closed (veto rotation/entry)."""
+    engine = AtomicRotationEngine()
+    bridge = MagicMock()
+    # Simulate exception in _is_daily_loss_halted
+    bridge._is_daily_loss_halted.side_effect = RuntimeError("Broker database unreachable")
+
+    decision = _make_rotation_decision(exit_symbol="AMZN", enter_symbol="JPM", unrealized_r=0.5)
+    feasible, reason = engine.check_feasibility(decision, bridge, [])
+    assert feasible is False
+    assert "failing closed" in reason.lower()
+
+
+def test_session_rollover_preserves_stream_disconnect_halt():
+    """P1 Gap 3: Session rollover resets expired daily loss halt but preserves stream disconnect."""
+    import json
+    import tempfile
+    from pathlib import Path
+    import config as config_mod
+
+    bridge = AlpacaBridge(mode="swing", dry_run=True)
+    bridge._account_id = "PA3R71I7JFDZ"
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp_path = Path(td)
+        with patch.object(config_mod, "DATA_DIR", tmp_path):
+            # Create a previous session halt file (dated yesterday)
+            halt_file = tmp_path / "swing_daily_loss_halt_PA3R71I7JFDZ.json"
+            halt_file.write_text(json.dumps({
+                "account_id": "PA3R71I7JFDZ",
+                "session_date_et": "2026-10-13",
+                "daily_pnl": "-350.00",
+                "daily_loss_limit": "300.00",
+                "halted": True,
+                "reason": "DAILY_LOSS_LIMIT",
+            }), encoding="utf-8")
+
+            # Set entry gate with both DAILY_LOSS_LIMIT and TRADE_STREAM_DISCONNECTED
+            bridge.entry_gate.reasons = {"DAILY_LOSS_LIMIT", "TRADE_STREAM_DISCONNECTED"}
+            bridge.entry_gate.halted = True
+            bridge.entry_gate.halt_reason = "TRADE_STREAM_DISCONNECTED"
+
+            # Check halt state for new session date "2026-10-14"
+            is_halted, reason = bridge.entry_gate.check_daily_loss_halt_state("PA3R71I7JFDZ", "2026-10-14")
+
+            # Daily loss limit file must be unlinked
+            assert not halt_file.exists()
+            assert "DAILY_LOSS_LIMIT" not in bridge.entry_gate.reasons
+
+            # BUT TRADE_STREAM_DISCONNECTED must still be active (never wiped out)
+            assert is_halted is True
+            assert bridge.entry_gate.halted is True
+            assert "TRADE_STREAM_DISCONNECTED" in bridge.entry_gate.reasons
+
+
+def test_validate_quote_rejects_fallback_price_sources_for_entry():
+    """P1 Gap 4: Entry execution strictly requires two-sided quotes; fallbacks are rejected."""
+    bridge = AlpacaBridge(mode="swing", dry_run=True)
+    bridge._connected = True
+
+    from alpaca_bridge import QuoteDecision
+
+    # 1. Alpaca two-sided top-of-book quote -> Accepted
+    with patch.object(bridge, "get_order_quote") as mock_goq:
+        mock_goq.return_value = QuoteDecision(True, 150.0, "alpaca", "ok")
+        ok, px, reason = bridge.validate_quote("AAPL", require_two_sided=True)
+        assert ok is True
+        assert px == 150.0
+
+    # 2. Alpaca IEX trade fallback -> Rejected for entry
+    with patch.object(bridge, "get_order_quote") as mock_goq:
+        mock_goq.return_value = QuoteDecision(True, 150.0, "alpaca_iex_trade_fallback", "ok_fallback_from_wide_iex_spread")
+        ok, px, reason = bridge.validate_quote("AAPL", require_two_sided=True)
+        assert ok is False
+        assert "fallback price source" in reason.lower()
+
+    # 3. Alpaca IEX bar fallback -> Rejected for entry
+    with patch.object(bridge, "get_order_quote") as mock_goq:
+        mock_goq.return_value = QuoteDecision(True, 150.0, "alpaca_iex_bar_fallback", "ok_fallback_from_wide_iex_spread")
+        ok, px, reason = bridge.validate_quote("AAPL", require_two_sided=True)
+        assert ok is False
+        assert "fallback price source" in reason.lower()
+
+    # 4. Yahoo Finance fallback -> Rejected for entry
+    with patch.object(bridge, "get_order_quote") as mock_goq:
+        mock_goq.return_value = QuoteDecision(True, 150.0, "yfinance_fallback", "ok_fallback_from_wide_iex_spread")
+        ok, px, reason = bridge.validate_quote("AAPL", require_two_sided=True)
+        assert ok is False
+        assert "fallback price source" in reason.lower()

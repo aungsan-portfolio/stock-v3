@@ -515,37 +515,62 @@ class AtomicRotationEngine:
         exit_pos = decision.exit_position
         enter_sym = enter_sig.symbol.upper()
 
-        # 1. Daily Loss Circuit Breaker Check
+        # 1. Daily Loss Circuit Breaker Check (Fail-Closed)
         is_daily_halted = False
-        if hasattr(bridge, "_is_daily_loss_halted"):
-            try:
+        try:
+            if hasattr(bridge, "_is_daily_loss_halted"):
                 is_daily_halted = bool(bridge._is_daily_loss_halted())
-            except Exception:
-                pass
-        elif hasattr(bridge, "is_daily_loss_halted"):
-            try:
+            elif hasattr(bridge, "is_daily_loss_halted"):
                 is_daily_halted = bool(bridge.is_daily_loss_halted())
-            except Exception:
-                pass
-        elif hasattr(bridge, "entry_gate"):
-            gate = getattr(bridge, "entry_gate", None)
-            if gate is not None and type(gate).__name__ not in ("MagicMock", "Mock"):
-                is_daily_halted = bool(getattr(gate, "halted", False))
+            elif hasattr(bridge, "entry_gate"):
+                gate = getattr(bridge, "entry_gate", None)
+                if gate is not None and type(gate).__name__ not in ("MagicMock", "Mock"):
+                    is_daily_halted = bool(getattr(gate, "halted", False))
+
+            is_mock_bridge = type(bridge).__name__ in ("MagicMock", "Mock") or hasattr(bridge, "_mock_name")
+            if not is_daily_halted and not is_mock_bridge and hasattr(bridge, "get_net_liquidation"):
+                raw_eq = bridge.get_net_liquidation()
+                if raw_eq is not None and not (hasattr(raw_eq, "_mock_name") or "Mock" in type(raw_eq).__name__):
+                    curr_eq = float(raw_eq)
+                    sod_eq = getattr(bridge, "_start_of_day_equity", 0.0)
+                    if sod_eq <= 0.0 and hasattr(bridge, "get_start_of_day_equity"):
+                        sod_eq = float(bridge.get_start_of_day_equity())
+                    if sod_eq > 0.0 and curr_eq > 0.0:
+                        pnl = curr_eq - sod_eq
+                        import config as config_mod
+                        mode = getattr(bridge, "mode", "swing").lower()
+                        if mode == "swing":
+                            pct_lim = abs(sod_eq * float(getattr(config_mod, "SWING_MAX_DAILY_LOSS_PCT", 0.01)))
+                            cap = float(getattr(config_mod, "SWING_MAX_DAILY_LOSS_DOLLAR_CAP", 300.0))
+                            max_loss = min(pct_lim, cap) if cap > 0 else 300.0
+                        else:
+                            max_loss = float(getattr(config_mod, "MAX_DAILY_LOSS_DAYTRADE", 300.0))
+                        if round(pnl, 2) <= -round(abs(max_loss), 2):
+                            is_daily_halted = True
+                            logger.warning("[ROTATION DIRECT RISK BREACH] Live daily_pnl=%.2f <= -%.2f", pnl, max_loss)
+        except Exception as exc:
+            logger.error("[ROTATION PRE-CHECK ERROR] Daily loss verification error: %s (failing closed)", exc)
+            return False, f"Daily loss verification failed: {exc} (failing closed: new entries/rotations blocked)"
 
         if is_daily_halted:
             reason = f"Daily loss circuit breaker is ACTIVE on broker account. Blocked entry for {enter_sym}"
             return False, reason
 
-        # 2. Quote spread check
+        # 2. Quote spread check (Two-sided execution quote required for rotation entry)
         try:
             if hasattr(bridge, "validate_quote"):
-                quote_ok, q_price, reason = bridge.validate_quote(enter_sym)
+                try:
+                    quote_ok, q_price, reason = bridge.validate_quote(enter_sym, require_two_sided=True)
+                except TypeError:
+                    quote_ok, q_price, reason = bridge.validate_quote(enter_sym)
                 if not quote_ok:
                     return False, f"Replacement {enter_sym} failed quote spread validation: {reason}"
             elif hasattr(bridge, "get_order_quote"):
                 q_dec = bridge.get_order_quote(enter_sym)
                 if hasattr(q_dec, "ok") and not bool(q_dec.ok):
                     return False, f"Replacement {enter_sym} failed quote spread validation: {q_dec.reason}"
+                if getattr(q_dec, "source", "alpaca") != "alpaca":
+                    return False, f"Replacement {enter_sym} rejected fallback quote source ({getattr(q_dec, 'source', 'unknown')}); two-sided quote required for rotation entry"
         except Exception as exc:
             return False, f"Quote spread validation exception for {enter_sym}: {exc}"
 

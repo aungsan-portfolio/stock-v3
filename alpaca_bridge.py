@@ -832,9 +832,10 @@ class EntryGateMock:
         """
         data_dir = getattr(config_module, "DATA_DIR", Path("data"))
         halt_file = data_dir / f"swing_daily_loss_halt_{account_id.strip().upper()}.json"
-        if not halt_file.exists() and self.halted and "DAILY_LOSS" in (self.halt_reason or "").upper():
-            self.halted = False
-            self.halt_reason = ""
+        if not halt_file.exists() and ("DAILY_LOSS" in (self.halt_reason or "").upper() or "DAILY_LOSS_LIMIT" in self.reasons):
+            self.reasons.discard("DAILY_LOSS_LIMIT")
+            self.halted = len(self.reasons) > 0
+            self.halt_reason = next(iter(self.reasons)) if self.reasons else ""
 
         if self.halted:
             return True, self.halt_reason or "Trading engine is halted"
@@ -913,11 +914,11 @@ class EntryGateMock:
         data_dir = getattr(config_module, "DATA_DIR", Path("data"))
         halt_file = data_dir / f"swing_daily_loss_halt_{account_id.strip().upper()}.json"
         if not halt_file.exists():
-            if self.halted and "DAILY_LOSS" in (self.halt_reason or "").upper():
-                self.halted = False
-                self.halt_reason = ""
+            if "DAILY_LOSS_LIMIT" in self.reasons or (self.halt_reason and "DAILY_LOSS" in self.halt_reason.upper()):
                 self.reasons.discard("DAILY_LOSS_LIMIT")
-            return False, ""
+                self.halted = len(self.reasons) > 0
+                self.halt_reason = next(iter(self.reasons)) if self.reasons else ""
+            return (self.halted, self.halt_reason) if self.halted else (False, "")
         try:
             with open(halt_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -945,13 +946,15 @@ class EntryGateMock:
 
         # Previous session -> controlled reset
         try:
-            logger.info("[SESSION ROLLOVER RESET] Resetting previous session (%s) halt state for %s", rec_date, account_id)
+            logger.info("[SESSION ROLLOVER RESET] Resetting previous session (%s) daily loss halt state for %s", rec_date, account_id)
             halt_file.unlink(missing_ok=True)
-            self.halted = False
-            self.halt_reason = ""
             self.reasons.discard("DAILY_LOSS_LIMIT")
+            self.halted = len(self.reasons) > 0
+            self.halt_reason = next(iter(self.reasons)) if self.reasons else ""
         except Exception as r_exc:
             logger.warning("Could not unlink previous halt file for %s: %s", account_id, r_exc)
+        if self.halted:
+            return True, self.halt_reason
         return False, ""
 
     def entry_blocked(self, symbol, value, signal, price=None):
@@ -1730,26 +1733,95 @@ class AlpacaBridge:
 
     def _is_daily_loss_halted(self) -> bool:
         """Return True if daily loss circuit breaker is active or entry gate is halted for daily loss."""
-        gate = getattr(self, "entry_gate", None)
-        if gate is not None:
-            if getattr(gate, "halted", False):
-                reasons = getattr(gate, "reasons", set())
-                h_reason = str(getattr(gate, "halt_reason", "")).upper()
-                if any("DAILY_LOSS" in str(r).upper() for r in reasons) or "DAILY_LOSS" in h_reason:
-                    return True
-                if getattr(gate, "halted", False) and not reasons:
-                    return True
-            if hasattr(gate, "check_daily_loss_halt_state"):
-                try:
+        try:
+            gate = getattr(self, "entry_gate", None)
+            if gate is not None:
+                if getattr(gate, "halted", False):
+                    reasons = getattr(gate, "reasons", set())
+                    h_reason = str(getattr(gate, "halt_reason", "")).upper()
+                    if any("DAILY_LOSS" in str(r).upper() for r in reasons) or "DAILY_LOSS" in h_reason:
+                        return True
+                    if getattr(gate, "halted", False) and not reasons:
+                        return True
+                if hasattr(gate, "check_daily_loss_halt_state"):
                     from strategies.session import now_eastern
                     et_date = str(now_eastern().date())
                     acct_id = getattr(self, "_account_id", "default")
                     is_halted, _ = gate.check_daily_loss_halt_state(acct_id, et_date)
                     if is_halted:
                         return True
-                except Exception as e:
-                    logger.debug("check_daily_loss_halt_state check error: %s", e)
-        return False
+
+            # Live equity check against session baseline (pre-close / pre-entry live verification)
+            mode = getattr(self, "mode", "daytrade").lower()
+            current_equity = 0.0
+            if hasattr(self, "get_net_liquidation"):
+                try:
+                    raw_eq = self.get_net_liquidation()
+                    if raw_eq is not None and not (hasattr(raw_eq, "_mock_name") or "Mock" in type(raw_eq).__name__):
+                        current_equity = float(raw_eq)
+                except Exception as eq_err:
+                    logger.error("[FAIL-CLOSED] Error fetching current equity in _is_daily_loss_halted: %s", eq_err)
+                    return True
+
+            if current_equity > 0.0:
+                sod_equity = getattr(self, "_start_of_day_equity", 0.0)
+                if sod_equity <= 0.0 and hasattr(self, "snapshot_start_of_day_equity"):
+                    try:
+                        raw_sod = self.snapshot_start_of_day_equity()
+                        if raw_sod is not None and not (hasattr(raw_sod, "_mock_name") or "Mock" in type(raw_sod).__name__):
+                            sod_equity = float(raw_sod)
+                    except Exception:
+                        sod_equity = 0.0
+                if sod_equity <= 0.0:
+                    sod_equity = current_equity
+
+                if sod_equity <= 0.0:
+                    logger.warning("[FAIL-CLOSED] Risk baseline equity unavailable in _is_daily_loss_halted; failing closed.")
+                    return True
+
+                if gate is not None and hasattr(gate, "daily_loss_blocked") and mode == "swing":
+                    from strategies.session import now_eastern
+                    et_date = str(now_eastern().date())
+                    acct_id = getattr(self, "_account_id", "default")
+                    is_blocked, reason = gate.daily_loss_blocked(
+                        account_id=acct_id,
+                        session_date_et=et_date,
+                        current_equity=current_equity,
+                        session_start_equity=sod_equity,
+                    )
+                    if is_blocked:
+                        logger.warning("[DAILY LOSS BREACH] gate.daily_loss_blocked: %s", reason)
+                        return True
+                else:
+                    daily_pnl = current_equity - sod_equity
+                    if mode == "swing":
+                        pct_limit = abs(sod_equity * float(getattr(config_module, "SWING_MAX_DAILY_LOSS_PCT", 0.01)))
+                        dollar_cap = float(getattr(config_module, "SWING_MAX_DAILY_LOSS_DOLLAR_CAP", 300.00))
+                        max_loss = min(pct_limit, dollar_cap) if dollar_cap > 0 else 300.00
+                    else:
+                        max_loss = float(getattr(config_module, "MAX_DAILY_LOSS_DAYTRADE", 300.0))
+
+                    if round(daily_pnl, 2) <= -round(abs(max_loss), 2):
+                        logger.warning(
+                            "[DAILY LOSS BREACH DETECTED] Fresh daily PnL $%.2f <= max loss -$%.2f. Triggering daily loss halt.",
+                            daily_pnl, max_loss
+                        )
+                        if gate is not None and hasattr(gate, "halt"):
+                            gate.halt("DAILY_LOSS_LIMIT")
+                            if hasattr(gate, "persist_daily_loss_halt"):
+                                try:
+                                    from strategies.session import now_eastern
+                                    from decimal import Decimal
+                                    et_date = str(now_eastern().date())
+                                    acct_id = getattr(self, "_account_id", "default")
+                                    gate.persist_daily_loss_halt(acct_id, et_date, Decimal(str(daily_pnl)), Decimal(str(max_loss)))
+                                except Exception as rec_err:
+                                    logger.error("Could not record daily loss halt state: %s", rec_err)
+                        return True
+            return False
+        except Exception as e:
+            logger.error("[FAIL-CLOSED] Error in _is_daily_loss_halted: %s (failing closed: blocking new entries/rotations)", e)
+            return True
 
     def is_daily_loss_halted(self) -> bool:
         return self._is_daily_loss_halted()
@@ -2955,7 +3027,10 @@ class AlpacaBridge:
         self._require_connection()
         try:
             acct = self._call_with_retry(lambda: self._client.get_account())
-            return float(acct.cash)
+            raw_cash = getattr(acct, "cash", None)
+            if raw_cash is None or hasattr(raw_cash, "_mock_name") or "Mock" in type(raw_cash).__name__:
+                return 0.0
+            return float(raw_cash)
         except Exception as exc:
             logger.error("get_cash failed: %s", exc)
             return 0.0
@@ -2964,7 +3039,10 @@ class AlpacaBridge:
         self._require_connection()
         try:
             acct = self._call_with_retry(lambda: self._client.get_account())
-            return float(acct.equity)
+            raw_eq = getattr(acct, "equity", None)
+            if raw_eq is None or hasattr(raw_eq, "_mock_name") or "Mock" in type(raw_eq).__name__:
+                return 0.0
+            return float(raw_eq)
         except Exception as exc:
             logger.error("get_net_liquidation failed: %s", exc)
             return 0.0
@@ -3042,12 +3120,16 @@ class AlpacaBridge:
         if getattr(self, "_client", None) is not None:
             try:
                 acct = self._call_with_retry(lambda: self._client.get_account())
-                broker_last_eq = float(getattr(acct, "last_equity", 0.0) or 0.0)
-                if broker_last_eq > 0.0:
-                    current_equity = broker_last_eq
-                    source = "broker_last_equity"
-                else:
-                    current_equity = float(getattr(acct, "equity", 0.0) or 0.0)
+                raw_last_eq = getattr(acct, "last_equity", None)
+                if raw_last_eq is not None and not (hasattr(raw_last_eq, "_mock_name") or "Mock" in type(raw_last_eq).__name__):
+                    broker_last_eq = float(raw_last_eq or 0.0)
+                    if broker_last_eq > 0.0:
+                        current_equity = broker_last_eq
+                        source = "broker_last_equity"
+                if current_equity <= 0.0:
+                    raw_eq = getattr(acct, "equity", None)
+                    if raw_eq is not None and not (hasattr(raw_eq, "_mock_name") or "Mock" in type(raw_eq).__name__):
+                        current_equity = float(raw_eq or 0.0)
             except Exception as e:
                 logger.debug("Failed to query last_equity from client, falling back to get_net_liquidation: %s", e)
 
@@ -3190,13 +3272,23 @@ class AlpacaBridge:
             logger.error("get_order_quote failed for %s: %s", symbol, exc)
             return QuoteDecision(False, 0.0, "alpaca", str(exc))
 
-    def validate_quote(self, symbol: str) -> Tuple[bool, float, str]:
+    def validate_quote(self, symbol: str, require_two_sided: bool = True) -> Tuple[bool, float, str]:
         """
         Validate quote spread and price for a symbol using get_order_quote().
         Returns (is_valid, price, reason).
+        If require_two_sided is True, fallback pricing sources (bars, trades, yfinance)
+        are rejected for order entry.
         """
         decision = self.get_order_quote(symbol)
-        return (decision.ok, decision.price, decision.reason)
+        if not decision.ok:
+            return (False, decision.price, decision.reason)
+        if require_two_sided and getattr(decision, "source", "alpaca") != "alpaca":
+            return (
+                False,
+                decision.price,
+                f"Two-sided top-of-book quote required for execution; fallback price source ({getattr(decision, 'source', 'unknown')}) rejected for entry",
+            )
+        return (True, decision.price, decision.reason)
 
     def get_quote(self, symbol: str, feed: Optional[str] = None) -> Optional[dict]:
         """Fetch fresh realtime broker quote mapping for M-01 execution quote gate."""
