@@ -127,15 +127,16 @@ def test_bar_end_utc_alignment():
 
     with patch("strategies.intraday_data._get_alpaca_credentials", return_value=("mock_k", "mock_s")), \
          patch("strategies.intraday_data._get_alpaca_client") as mock_get_client, \
+         patch("strategies.intraday_data._read_cache", return_value=None), \
          patch("strategies.intraday_data._sdk_get_stock_bars_soft_bounded", return_value=mock_bars), \
          patch("strategies.intraday_data._validate_intraday_data", side_effect=lambda df, *args, **kwargs: df):
 
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
 
-        results = fetch_batch_intraday_alpaca(["AAPL"], interval="5m", lookback_days=1, purpose="ENTRY_SIGNAL")
-        assert "AAPL" in results
-        df = results["AAPL"]
+        results = fetch_batch_intraday_alpaca(["TESTSYM3"], interval="5m", lookback_days=1, purpose="ENTRY_SIGNAL")
+        assert "TESTSYM3" in results
+        df = results["TESTSYM3"]
         assert "bar_start_utc" in df.attrs
         assert "bar_end_utc" in df.attrs
 
@@ -170,13 +171,14 @@ def test_breadth_telemetry_isolation_in_batch_fetch():
 
     with patch("strategies.intraday_data._get_alpaca_credentials", return_value=("mock_k", "mock_s")), \
          patch("strategies.intraday_data._get_alpaca_client") as mock_get_client, \
+         patch("strategies.intraday_data._read_cache", return_value=None), \
          patch("strategies.intraday_data._sdk_get_stock_bars_soft_bounded", return_value=mock_bars), \
          patch("strategies.intraday_data._validate_intraday_data", side_effect=lambda df, *args, **kwargs: df):
 
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
 
-        fetch_batch_intraday_alpaca(["AAPL"], interval="5m", lookback_days=1, purpose="REGIME_BREADTH")
+        fetch_batch_intraday_alpaca(["TESTSYM4"], interval="5m", lookback_days=1, purpose="REGIME_BREADTH")
 
         breadth_telem = get_intraday_feed_telemetry("REGIME_BREADTH")
         feed_telem = get_intraday_feed_telemetry("ENTRY_SIGNAL")
