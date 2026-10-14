@@ -12,7 +12,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from collections import defaultdict
-from typing import Optional, Tuple, Any, Union
+from typing import Optional, Tuple, Any, Union, List
 
 import config
 from strategies.base import TradeSignal
@@ -1776,13 +1776,16 @@ def execute_signal(
         guard_sym = "SPY"
         try:
             from strategies.intraday_data import fetch_intraday
+            from strategies.orchestrator import _prepare_closed_bars
             if is_inverse_exempt:
                 bench_map = getattr(config, "INVERSE_ETF_BENCHMARK_MAP", {})
                 guard_sym = bench_map.get(signal.symbol.upper().strip(), getattr(config, "SPY_TREND_GUARD_SYMBOL", "SPY"))
             else:
                 guard_sym = getattr(config, "SPY_TREND_GUARD_SYMBOL", "SPY")
 
-            spy_df = fetch_intraday(guard_sym)
+            spy_df = fetch_intraday(guard_sym, interval="5m", bridge=bridge, purpose="POSITION_MONITORING")
+            if spy_df is not None and not spy_df.empty:
+                spy_df = _prepare_closed_bars(spy_df)
             if spy_df is not None and not spy_df.empty and len(spy_df) >= 2:
                 last_close = float(spy_df["close"].iloc[-1])
                 last_open  = float(spy_df["open"].iloc[-1])
@@ -2542,7 +2545,10 @@ def execute_signal(
                     )
                     return result
 
-                if hasattr(final_ts_mgr, "has_unresolved_position_unknown") and final_ts_mgr.has_unresolved_position_unknown():
+                if (
+                    (hasattr(final_ts_mgr, "has_unresolved_position_unknown") and final_ts_mgr.has_unresolved_position_unknown())
+                    or (hasattr(final_ts_mgr, "has_unresolved_signed_side_mismatch") and final_ts_mgr.has_unresolved_signed_side_mismatch())
+                ):
                     idempotency_manager.release(
                         signal.symbol,
                         side=signal.side,
@@ -2551,10 +2557,10 @@ def execute_signal(
                     result["status"] = "VETOED"
                     result["reason"] = (
                         "Trailing Stop Position Unknown Halt (Final Submit): "
-                        "Portfolio has active positions with unresolved broker query failures"
+                        "Portfolio has active positions with unresolved broker query failures or signed-side mismatches"
                     )
                     logger.warning(
-                        "[POSITION UNKNOWN FINAL SUBMIT VETO] %s: Trailing stop manager has unresolved POSITION_UNKNOWN state immediately before submit.",
+                        "[POSITION UNKNOWN FINAL SUBMIT VETO] %s: Trailing stop manager has unresolved POSITION_UNKNOWN or SIGNED_SIDE_MISMATCH state immediately before submit.",
                         signal.symbol,
                     )
                     return result

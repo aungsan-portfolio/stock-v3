@@ -100,6 +100,7 @@ class ValidationTradeRecord:
     validation_only: bool = True
     quarantined_from_production_budget: bool = True
     status: str = "PENDING"  # PENDING, SUBMITTED, FILLED, CLOSED, VETOED
+    qty: float = 1.0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -277,7 +278,7 @@ def load_validation_fill_states(
 
             # 1. Entry fill
             entry_oid = str(rec.get("entry_order_id") or "").strip()
-            entry_px = rec.get("entry_fill_price") or rec.get("decision_price")
+            entry_px = rec.get("entry_fill_price") or rec.get("entry_price")
             entry_status = str(rec.get("status") or "").upper().strip()
             if entry_oid and entry_px is not None and entry_status in ("FILLED", "CLOSED"):
                 e_key = (scoped_acc, date_key, entry_oid, sym, side)
@@ -432,6 +433,7 @@ def record_validation_exit(
     exit_reason: str = "STOP_OUT",
     execution_id: Optional[str] = None,
     filepath: str = DEFAULT_VALIDATION_LEDGER_PATH,
+    parent_order_id: Optional[str] = None,
 ) -> bool:
     """Record an exit fill on an open validation trade record in paper_validation_trades.jsonl."""
     if not os.path.exists(filepath):
@@ -456,44 +458,196 @@ def record_validation_exit(
 
         target_oid = str(order_id or "").strip()
         target_sym = str(symbol or "").upper().strip()
-        comp_key = build_fill_composite_key(target_oid, side, exit_price, qty, timestamp, execution_id)
+        target_cid = str(client_order_id or "").strip()
+        target_poid = str(parent_order_id or "").strip()
+        exit_side_norm = str(side or "").upper().strip()
+        try:
+            fill_qty = float(qty)
+            exit_px = float(exit_price)
+        except (ValueError, TypeError):
+            logger.error("[VALIDATION EXIT INVALID NUMBERS] qty=%s exit_price=%s", qty, exit_price)
+            return False
 
+        if not math.isfinite(fill_qty) or fill_qty <= 0 or not math.isfinite(exit_px) or exit_px <= 0:
+            logger.error("[VALIDATION EXIT NON-FINITE] fill_qty=%s exit_px=%s must be finite and > 0", fill_qty, exit_px)
+            return False
+
+        comp_key = build_fill_composite_key(target_oid, exit_side_norm, exit_price, qty, timestamp, execution_id)
+
+        # 1. Partial-Fill Safe Deduplication Guard:
+        # Check if this exact execution (by execution_id or deterministic composite key)
+        # has already been recorded in any record in the ledger.
+        for rec in reversed(records):
+            r_sym = str(rec.get("symbol") or "").upper().strip()
+            if target_sym and r_sym != target_sym:
+                continue
+            r_exit_exec = str(rec.get("exit_execution_id") or "").strip()
+            r_exit_exec_ids = [str(x).strip() for x in rec.get("exit_execution_ids", []) if x]
+
+            if (execution_id and (r_exit_exec == execution_id or execution_id in r_exit_exec_ids)) or \
+               (comp_key and (r_exit_exec == comp_key or comp_key in r_exit_exec_ids)):
+                # This specific exit fill execution was already recorded
+                return True
+
+        # 2. Candidate Selection with Strict Directional and Filled Guards:
+        # - Must match symbol
+        # - Must be FILLED with verified entry fill price > 0 (prohibit closing un-filled SUBMITTED records)
+        # - Must match opposite side (SELL closes BUY/LONG; BUY closes SELL/SHORT)
+        # - Prohibit closing records that are already fully CLOSED
+        eligible_candidates = []
         for rec in reversed(records):
             r_sym = str(rec.get("symbol") or "").upper().strip()
             r_status = str(rec.get("status") or "").upper().strip()
-            r_exit_oid = str(rec.get("exit_order_id") or "").strip()
-            r_exit_exec = str(rec.get("exit_execution_id") or "").strip()
+            r_side = str(rec.get("side") or "BUY").upper().strip()
+            r_epx = rec.get("entry_fill_price")
 
-            # If already closed with exact same exit execution ID, idempotent no-op
-            if target_sym and r_sym == target_sym and r_status == "CLOSED":
-                if (target_oid and r_exit_oid == target_oid) or (execution_id and r_exit_exec == execution_id):
-                    return True
+            if target_sym and r_sym != target_sym:
+                continue
+            if r_status != "FILLED" or r_epx is None or float(r_epx) <= 0:
+                continue
 
-            if target_sym and r_sym == target_sym and r_status in ("FILLED", "SUBMITTED"):
-                rec["exit_order_id"] = target_oid
-                rec["exit_fill_price"] = float(exit_price)
-                rec["exit_price"] = float(exit_price)
-                rec["exit_execution_id"] = comp_key
-                rec["status"] = "CLOSED"
-                rec["event_type"] = "TRADE_CLOSED"
-                rec["exit_reason"] = str(exit_reason)
+            # Direction check
+            if exit_side_norm == "SELL" and r_side not in ("BUY", "LONG"):
+                continue
+            if exit_side_norm == "BUY" and r_side not in ("SELL", "SHORT"):
+                continue
 
-                entry_px = float(rec.get("entry_fill_price") or rec.get("decision_price") or 0.0)
-                pos_side = str(rec.get("side") or "BUY").upper().strip()
-                if entry_px > 0:
-                    if pos_side in ("BUY", "LONG"):
-                        pnl = (float(exit_price) - entry_px) * float(qty)
-                    else:
-                        pnl = (entry_px - float(exit_price)) * float(qty)
-                    rec["realized_pnl"] = round(pnl, 4)
-                    rec["pnl"] = round(pnl, 4)
+            eligible_candidates.append(rec)
 
-                updated = True
-                logger.info(
-                    "[VALIDATION EXIT RECORDED] %s exited @ $%.2f | P&L: $%.4f (reason=%s, exit_oid=%s)",
-                    rec.get("symbol"), exit_price, rec.get("realized_pnl", 0.0), exit_reason, order_id
+        if not eligible_candidates:
+            logger.warning(
+                "[VALIDATION EXIT UNMATCHED] No open filled candidate found for %s (side=%s, oid=%s)",
+                target_sym, exit_side_norm, target_oid
+            )
+            return False
+
+        # 3. Mandatory Lineage Matching:
+        # Rule: Lineage correlation MUST be proven.
+        # - If target_poid is provided: must EXACTLY match candidate entry_order_id.
+        #   If target_poid does not match, it is an explicit parent mismatch (weaker token matching PROHIBITED).
+        # - If target_poid is not provided, but target_cid is provided: must EXACTLY match candidate client_order_id or validation_id.
+        # - If neither target_poid nor target_cid is provided: lineage is absent.
+        #   Even if only one candidate exists, it CANNOT be matched. Fail closed and retain pending.
+        matched_rec = None
+
+        if target_poid:
+            for cand in eligible_candidates:
+                c_eoid = str(cand.get("entry_order_id") or "").strip()
+                if c_eoid == target_poid:
+                    matched_rec = cand
+                    break
+            if matched_rec is None:
+                logger.warning(
+                    "[VALIDATION EXIT PARENT MISMATCH] Parent order ID '%s' did not match any open entry "
+                    "for %s across %d candidate(s). Rejecting exit fail-closed.",
+                    target_poid, target_sym, len(eligible_candidates)
                 )
-                break
+                return False
+
+        elif target_cid:
+            for cand in eligible_candidates:
+                c_cid = str(cand.get("client_order_id") or "").strip()
+                c_vid = str(cand.get("validation_id") or "").strip()
+                if (c_cid and target_cid == c_cid) or (c_vid and target_cid == c_vid):
+                    matched_rec = cand
+                    break
+            if matched_rec is None:
+                logger.warning(
+                    "[VALIDATION EXIT CLIENT ID MISMATCH] Client order ID '%s' did not match any open entry "
+                    "for %s across %d candidate(s). Rejecting exit fail-closed.",
+                    target_cid, target_sym, len(eligible_candidates)
+                )
+                return False
+
+        else:
+            logger.warning(
+                "[VALIDATION EXIT NO LINEAGE] Exit order %s for %s has no parent_order_id or client_order_id. "
+                "Lineage correlation cannot be proven across %d candidate(s); retaining pending fail-closed.",
+                target_oid, target_sym, len(eligible_candidates)
+            )
+            return False
+
+        # 4. Entry Quantity Validation & Overfill Rejection:
+        rec = matched_rec
+        entry_qty_val = rec.get("qty")
+        if entry_qty_val is None:
+            logger.error("[VALIDATION EXIT UNKNOWN ENTRY QTY] Record %s has no qty field. Failing closed.", rec.get("validation_id"))
+            return False
+        try:
+            entry_qty = float(entry_qty_val)
+        except (ValueError, TypeError):
+            logger.error("[VALIDATION EXIT INVALID ENTRY QTY] Record %s has invalid qty %s. Failing closed.", rec.get("validation_id"), entry_qty_val)
+            return False
+
+        if not math.isfinite(entry_qty) or entry_qty <= 0:
+            logger.error("[VALIDATION EXIT NON-POSITIVE ENTRY QTY] entry_qty=%s must be > 0. Failing closed.", entry_qty)
+            return False
+
+        already_closed = float(rec.get("closed_qty", 0.0) or 0.0)
+        remaining_qty = entry_qty - already_closed
+
+        if fill_qty > remaining_qty + 1e-4:
+            logger.error(
+                "[VALIDATION OVERFILL REJECTED] %s: fill_qty=%.4f > remaining_qty=%.4f "
+                "(entry_qty=%.4f, already_closed=%.4f). Rejecting exit fill and retaining evidence.",
+                target_sym, fill_qty, remaining_qty, entry_qty, already_closed
+            )
+            return False
+
+        delta_closed = fill_qty
+        new_closed_qty = round(already_closed + delta_closed, 4)
+        rec["closed_qty"] = new_closed_qty
+
+        # 5. Quantity-Weighted Average Exit Price & Cumulative Realized PnL:
+        prior_exit_notional = float(rec.get("exit_notional", 0.0) or (already_closed * float(rec.get("exit_fill_price", 0.0) or 0.0)))
+        delta_notional = delta_closed * exit_px
+        new_exit_notional = round(prior_exit_notional + delta_notional, 4)
+        rec["exit_notional"] = new_exit_notional
+
+        entry_px = float(rec.get("entry_fill_price") or 0.0)
+        pos_side = str(rec.get("side") or "BUY").upper().strip()
+        if pos_side in ("BUY", "LONG"):
+            delta_pnl = (exit_px - entry_px) * delta_closed
+        else:
+            delta_pnl = (entry_px - exit_px) * delta_closed
+
+        prior_realized_pnl = float(rec.get("realized_pnl", 0.0) or rec.get("pnl", 0.0) or 0.0)
+        cumulative_realized_pnl = round(prior_realized_pnl + delta_pnl, 4)
+        rec["realized_pnl"] = cumulative_realized_pnl
+        rec["pnl"] = cumulative_realized_pnl
+
+        weighted_exit_px = round(new_exit_notional / new_closed_qty, 4) if new_closed_qty > 0 else exit_px
+        rec["exit_fill_price"] = weighted_exit_px
+        rec["exit_price"] = weighted_exit_px
+
+        # Record exit execution ID for deduplication
+        exit_execs = rec.get("exit_execution_ids", [])
+        if not isinstance(exit_execs, list):
+            exit_execs = [str(exit_execs)] if exit_execs else []
+        if comp_key not in exit_execs:
+            exit_execs.append(comp_key)
+        if execution_id and execution_id not in exit_execs:
+            exit_execs.append(execution_id)
+        rec["exit_execution_ids"] = exit_execs
+        rec["exit_execution_id"] = comp_key
+        rec["exit_order_id"] = target_oid
+
+        # Mark CLOSED only when cumulative closed quantity satisfies entry quantity
+        if new_closed_qty >= (entry_qty - 1e-6):
+            rec["status"] = "CLOSED"
+            rec["event_type"] = "TRADE_CLOSED"
+            rec["exit_reason"] = str(exit_reason)
+            logger.info(
+                "[VALIDATION EXIT RECORDED] %s %s fully exited (total_qty=%.4f, weighted_exit_px=$%.4f) | Realized P&L: $%.4f (reason=%s, exit_oid=%s)",
+                rec.get("symbol"), pos_side, entry_qty, weighted_exit_px, cumulative_realized_pnl, exit_reason, order_id
+            )
+        else:
+            rec["event_type"] = "PARTIAL_EXIT"
+            logger.info(
+                "[VALIDATION PARTIAL EXIT] %s closed %.4f/%.4f shares @ $%.2f (weighted_avg=$%.4f, partial_pnl=$%.4f, exit_oid=%s)",
+                rec.get("symbol"), new_closed_qty, entry_qty, exit_px, weighted_exit_px, delta_pnl, order_id
+            )
+        updated = True
 
         if updated:
             temp_path = f"{filepath}.tmp.{os.getpid()}.{threading.get_ident()}"
@@ -750,6 +904,7 @@ def evaluate_and_route_validation_candidate(
         return result
 
     # 4. Construct Validation Trade Record
+    shares = max(1, min(int(fixed_shares), 3))
     val_id = f"val_{signal.symbol}_{signal.strategy}_{int(now)}"
     quote_mid = (quote.bid + quote.ask) / 2.0 if quote else exec_price
     record = ValidationTradeRecord(
@@ -775,10 +930,10 @@ def evaluate_and_route_validation_candidate(
         policy_rejected=True,
         validation_only=True,
         status="SUBMITTED" if not dry_run else "DRY_RUN",
+        qty=float(shares),
     )
 
     # 5. Order Placement (1 Share Fixed Tiny Sizing)
-    shares = max(1, min(int(fixed_shares), 3))
     client_order_id = f"val_{signal.symbol.lower()}_{int(now % 100000)}"
 
     order_payload = {

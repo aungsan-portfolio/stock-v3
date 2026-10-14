@@ -30,20 +30,24 @@ class VWAPBounceStrategy(BaseStrategy):
 
     def evaluate(self, symbol: str, df: pd.DataFrame, spread_dollars: Optional[float] = None) -> Optional[TradeSignal]:
         if not config.STRATEGY_VWAP_BOUNCE_ENABLED:
+            logger.debug("[VWAP DIAGNOSTIC] symbol=%s invoked=True data_ready=False setup_evaluated=False signal_generated=False reason=STRATEGY_DISABLED", symbol)
             return None
 
         if len(df) < 30:
+            logger.debug("[VWAP DIAGNOSTIC] symbol=%s invoked=True data_ready=False setup_evaluated=False signal_generated=False reason=INSUFFICIENT_BARS (bars=%d < 30)", symbol, len(df))
             return None
 
         if "atr" not in df.columns:
             df = add_all_indicators(df)
 
         if "vwap" not in df.columns or df["vwap"].isna().all():
+            logger.debug("[VWAP DIAGNOSTIC] symbol=%s invoked=True data_ready=False setup_evaluated=False signal_generated=False reason=MISSING_VWAP_DATA", symbol)
             return None
 
         reclaim_bars = config.VWAP_RECLAIM_BARS
         tail = df.tail(reclaim_bars + 5)
         if len(tail) < reclaim_bars + 1:
+            logger.debug("[VWAP DIAGNOSTIC] symbol=%s invoked=True data_ready=False setup_evaluated=False signal_generated=False reason=INSUFFICIENT_RECLAIM_WINDOW", symbol)
             return None
 
         last = df.iloc[-1]
@@ -55,6 +59,7 @@ class VWAPBounceStrategy(BaseStrategy):
         vwap_upper = float(last.get("vwap_upper", vwap))
 
         if atr <= 0 or np.isnan(atr):
+            logger.debug("[VWAP DIAGNOSTIC] symbol=%s invoked=True data_ready=False setup_evaluated=False signal_generated=False reason=INVALID_ATR", symbol)
             return None
 
         if spread_dollars is None:
@@ -87,6 +92,7 @@ class VWAPBounceStrategy(BaseStrategy):
                 rally_touched = True
 
         if not pullback_touched and not rally_touched:
+            logger.debug("[VWAP DIAGNOSTIC] symbol=%s invoked=True data_ready=True setup_evaluated=True signal_generated=False reason=NO_TOUCH_EVENT", symbol)
             return None
 
         held_above = all(c >= v - tolerance for c, v in zip(recent_closes, recent_vwaps))
@@ -225,6 +231,11 @@ class VWAPBounceStrategy(BaseStrategy):
                     confidence += 0.05
 
                 confidence = min(confidence, 1.0)
+
+                logger.info(
+                    "[VWAP DIAGNOSTIC] symbol=%s invoked=True data_ready=True setup_evaluated=True signal_generated=True reason=BUY_SIGNAL_GENERATED side=BUY price=%.2f conf=%.2f",
+                    symbol, price, confidence
+                )
 
                 return TradeSignal(
                     symbol=symbol,
@@ -377,6 +388,11 @@ class VWAPBounceStrategy(BaseStrategy):
 
                 confidence = min(confidence, 1.0)
 
+                logger.info(
+                    "[VWAP DIAGNOSTIC] symbol=%s invoked=True data_ready=True setup_evaluated=True signal_generated=True reason=SELL_SIGNAL_GENERATED side=SELL price=%.2f conf=%.2f",
+                    symbol, price, confidence
+                )
+
                 return TradeSignal(
                     symbol=symbol,
                     strategy=self.name,
@@ -398,4 +414,8 @@ class VWAPBounceStrategy(BaseStrategy):
                     },
                 )
 
+        logger.debug(
+            "[VWAP DIAGNOSTIC] symbol=%s invoked=True data_ready=True setup_evaluated=True signal_generated=False reason=CONDITIONS_NOT_MET (pullback=%s rally=%s held_above=%s held_below=%s rsi=%.1f)",
+            symbol, pullback_touched, rally_touched, held_above, held_below, rsi
+        )
         return None

@@ -6,7 +6,8 @@ Direct Boundary Verification Probes for Auditor's 4 Technical Hardening Points:
 3. Split-exit aggregation, quantity conservation & duplicate orders (snapshot+closed dedup, cancelled partial fill, excess quantity fail-closed)
 4. Stop adoption uses fresh signed broker position (12 pos vs 8 stop rejected, 8 pos vs 8 stop accepted, unknown retained if position unknown)
 """
-import ast, json, math, os, sys, tempfile, threading, types
+import ast, json, math, os, sys, tempfile, threading, types, typing
+from typing import Any, Dict, List, Optional, Tuple, Set, Union, Callable
 from datetime import datetime, date, timezone
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -16,6 +17,15 @@ ROOT = Path(__file__).resolve().parent
 
 G = dict(
     globals(),
+    typing=typing,
+    Any=Any,
+    Dict=Dict,
+    List=List,
+    Optional=Optional,
+    Tuple=Tuple,
+    Set=Set,
+    Union=Union,
+    Callable=Callable,
     config=NS(NAKED_LIMIT_PROTECTION='warn'),
     logger=types.SimpleNamespace(
         warning=lambda *a, **k: None,

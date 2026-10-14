@@ -5346,7 +5346,85 @@ class AlpacaBridge:
                         try:
                             from strategies.validation_lane import record_validation_fill, record_validation_exit
                             val_cid = client_ref or role_cid or (reg.get("client_order_id") if reg else None)
-                            if order_type in ("STOP_LOSS", "TAKE_PROFIT") or (side == "SELL" and getattr(reg, "side", "") != "SELL"):
+                            reg_side = (reg.get("side") if isinstance(reg, dict) else getattr(reg, "side", "")) or ""
+                            reg_type = (reg.get("order_type") if isinstance(reg, dict) else getattr(reg, "order_type", "")) or ""
+                            role_type = str(role_info.get("order_role") or role_info.get("role") or "").upper()
+
+                            o_type = str(getattr(o, "order_type", "") or getattr(o, "type", "") or "").lower()
+                            has_stop_px = bool(getattr(o, "stop_price", None) and float(o.stop_price) > 0)
+                            is_broker_stop = has_stop_px or (o_type in ("stop", "stop_limit", "trailing_stop"))
+
+                            clean_parent_oid = str(parent_oid).strip() if parent_oid is not None else ""
+                            is_self_parent = bool(clean_parent_oid and clean_parent_oid == order_id_str)
+                            has_child_parent_oid = bool(clean_parent_oid and not is_self_parent)
+
+                            # Authoritative Broker / Lineage Exit Evidence:
+                            has_exit_role = (
+                                order_type in ("STOP_LOSS", "TAKE_PROFIT")
+                                or reg_type in ("STOP_LOSS", "TAKE_PROFIT", "EXIT", "TRAILING_STOP")
+                                or role_type in ("STOP_LOSS", "TAKE_PROFIT", "EXIT", "TRAILING_STOP")
+                            )
+                            has_opposing_side = bool(
+                                reg_side and (
+                                    (side == "SELL" and reg_side in ("BUY", "LONG"))
+                                    or (side == "BUY" and reg_side in ("SELL", "SHORT"))
+                                )
+                            )
+                            has_exit_evidence = (
+                                has_child_parent_oid
+                                or has_exit_role
+                                or has_opposing_side
+                                or (is_broker_stop and not is_self_parent and not (reg_type == "ENTRY" or role_type == "ENTRY"))
+                            )
+
+                            # Authoritative Entry Evidence:
+                            has_registered_entry = (reg_type == "ENTRY" or role_type == "ENTRY")
+                            explicit_entry_role = (
+                                has_registered_entry
+                                or (is_self_parent and not has_exit_role and order_type == "ENTRY")
+                            )
+                            has_matching_side = bool(
+                                reg_side and (
+                                    (side == "SELL" and reg_side in ("SELL", "SHORT"))
+                                    or (side == "BUY" and reg_side in ("BUY", "LONG"))
+                                )
+                            )
+                            has_entry_evidence = (
+                                explicit_entry_role
+                                or has_matching_side
+                                or (not has_child_parent_oid and not has_exit_role and order_type == "ENTRY")
+                            )
+
+                            # Conflict Guard: If explicit entry role conflicts with authoritative child/opposing exit evidence, fail closed
+                            has_conflict = False
+                            if explicit_entry_role:
+                                if has_child_parent_oid:
+                                    has_conflict = True
+                                elif has_opposing_side:
+                                    has_conflict = True
+                                elif role_type in ("STOP_LOSS", "TAKE_PROFIT", "EXIT"):
+                                    has_conflict = True
+
+                            if has_conflict:
+                                logger.error(
+                                    "[VALIDATION ROLE CONFLICT] Order %s (sym=%s) has conflicting role evidence: "
+                                    "explicit entry role vs broker child/opposing exit evidence (parent_oid=%s, is_self=%s, opp_side=%s). "
+                                    "Failing closed without advancing watermark or writing to ledger.",
+                                    order_id_str, o.symbol, clean_parent_oid, is_self_parent, has_opposing_side
+                                )
+                                continue
+
+                            is_exit_fill = False
+                            is_entry_fill = False
+
+                            if has_exit_evidence and not explicit_entry_role:
+                                is_exit_fill = True
+                            elif has_entry_evidence:
+                                is_entry_fill = True
+
+                            ledger_committed = False
+
+                            if is_exit_fill:
                                 exit_recorded = record_validation_exit(
                                     order_id=order_id_str,
                                     exit_price=fill_price_float,
@@ -5355,23 +5433,20 @@ class AlpacaBridge:
                                     timestamp=filled_utc.isoformat(),
                                     client_order_id=val_cid,
                                     symbol=o.symbol,
-                                    exit_reason=order_type,
+                                    exit_reason=order_type if order_type in ("STOP_LOSS", "TAKE_PROFIT") else ("STOP_LOSS" if is_broker_stop else "EXIT"),
                                     execution_id=synth_exec_id,
+                                    parent_order_id=str(clean_parent_oid) if has_child_parent_oid else None,
                                 )
-                                if not exit_recorded:
-                                    record_validation_fill(
-                                        order_id=order_id_str,
-                                        fill_price=fill_price_float,
-                                        qty=qty_to_log,
-                                        side=side,
-                                        timestamp=filled_utc.isoformat(),
-                                        slippage=slippage,
-                                        client_order_id=val_cid,
-                                        symbol=o.symbol,
-                                        execution_id=synth_exec_id,
+                                if exit_recorded:
+                                    ledger_committed = True
+                                else:
+                                    logger.warning(
+                                        "[VALIDATION EXIT UNRECONCILED] Exit fill for %s order_id=%s qty=%s @ $%.2f "
+                                        "could not be matched to an open entry; retaining un-watermarked for retry",
+                                        o.symbol, order_id_str, qty_to_log, fill_price_float,
                                     )
-                            else:
-                                record_validation_fill(
+                            elif is_entry_fill:
+                                fill_recorded = record_validation_fill(
                                     order_id=order_id_str,
                                     fill_price=fill_price_float,
                                     qty=qty_to_log,
@@ -5382,16 +5457,37 @@ class AlpacaBridge:
                                     symbol=o.symbol,
                                     execution_id=synth_exec_id,
                                 )
-                            logger.info(
-                                "[VALIDATION FILL ISOLATED] Symbol=%s Side=%s Qty=%s @ $%.2f routed exclusively to validation ledger",
-                                o.symbol, side, qty_to_log, fill_price_float
-                            )
+                                if fill_recorded:
+                                    ledger_committed = True
+                                else:
+                                    logger.warning(
+                                        "[VALIDATION ENTRY UNCOMMITTED] Entry fill for %s order_id=%s qty=%s @ $%.2f "
+                                        "failed ledger write; retaining un-watermarked for retry",
+                                        o.symbol, order_id_str, qty_to_log, fill_price_float,
+                                    )
+                            else:
+                                logger.warning(
+                                    "[VALIDATION ROLE AMBIGUOUS] Order %s (sym=%s, side=%s) has ambiguous role evidence; "
+                                    "retaining un-watermarked fail-closed.",
+                                    order_id_str, o.symbol, side
+                                )
+
+                            if ledger_committed:
+                                logger.info(
+                                    "[VALIDATION FILL COMMITTED] Symbol=%s Side=%s Qty=%s @ $%.2f durably committed to validation ledger",
+                                    o.symbol, side, qty_to_log, fill_price_float
+                                )
+                                fill_state.add_fill(delta_qty, incremental_price, synth_exec_id)
+                                synced_count += 1
+                            else:
+                                logger.warning(
+                                    "[VALIDATION FILL UNCOMMITTED] Symbol=%s Side=%s Qty=%s @ $%.2f was NOT committed to ledger. "
+                                    "Watermark NOT advanced; fill will be retried on subsequent sync polls.",
+                                    o.symbol, side, qty_to_log, fill_price_float
+                                )
                         except Exception as v_err:
                             logger.error("[VALIDATION FILL ISOLATION ERROR] %s: %s", o.symbol, v_err)
 
-                        # Advance local in-memory cumulative state to avoid reprocessing
-                        fill_state.add_fill(delta_qty, incremental_price, synth_exec_id)
-                        synced_count += 1
                         continue
 
                     log_fill(

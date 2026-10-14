@@ -111,8 +111,8 @@ class TestJournalIsolationTripwire:
 
     def test_emergency_flatten_validation_routing(self, tmp_path):
         """Verify that positions with val_ order_id are routed exclusively to validation lane."""
-        manager = DynamicTrailingStopManager()
-        manager.STATE_FILE = str(tmp_path / "trailing_state_test.json")
+        test_state_file = tmp_path / "trailing_state_test.json"
+        manager = DynamicTrailingStopManager(state_file=test_state_file)
 
         state = TrailingStopState(
             symbol="AAPL",
@@ -221,4 +221,71 @@ class TestJournalIsolationTripwire:
 
         assert hasattr(VetoReason, "STRATEGY_DISABLED")
         assert VetoReason.STRATEGY_DISABLED.value == "STRATEGY_DISABLED"
+
+    def test_trailing_state_persistence_isolation(self, tmp_path):
+        """Regression: ensure DynamicTrailingStopManager with injected path never touches production trailing_state.json."""
+        repo_root = Path(__file__).resolve().parent.parent
+        prod_state = repo_root / "data" / "trailing_state.json"
+        hash_before = _hash_file(prod_state)
+
+        test_state_file = tmp_path / "isolated_trailing_state.json"
+        mgr = DynamicTrailingStopManager(state_file=test_state_file)
+        assert mgr.STATE_FILE == str(test_state_file.resolve())
+
+        # Register a state and save
+        state = TrailingStopState(
+            symbol="ISOLATION_TEST",
+            side="BUY",
+            entry_price=100.0,
+            peak_price=105.0,
+            atr=1.5,
+            stop_price=98.0,
+            trail_multiple=1.5,
+            last_updated=0.0,
+            qty=10.0,
+        )
+        mgr.states["ISOLATION_TEST"] = state
+        mgr._record_pending_exit(state, qty_closed=10.0)
+        mgr._save_state()
+
+        # Injected file must exist and contain the test symbol
+        assert test_state_file.exists()
+        saved_data = json.loads(test_state_file.read_text(encoding="utf-8"))
+        assert "ISOLATION_TEST" in saved_data
+
+        # Production state file bytes must remain 100% identical
+        hash_after = _hash_file(prod_state)
+        assert hash_after == hash_before, "CRITICAL: Production data/trailing_state.json was modified by isolated test manager!"
+
+    def test_trailing_state_restart_from_injected_path(self, tmp_path):
+        """Regression: verify manager correctly loads persisted state from injected path across restarts."""
+        test_state_file = tmp_path / "restart_trailing_state.json"
+        mgr1 = DynamicTrailingStopManager(state_file=test_state_file)
+        state = TrailingStopState(
+            symbol="RESTART_TEST",
+            side="BUY",
+            entry_price=50.0,
+            peak_price=55.0,
+            atr=1.0,
+            stop_price=49.0,
+            trail_multiple=1.5,
+            last_updated=0.0,
+            qty=5.0,
+            active=True,
+        )
+        mgr1.states["RESTART_TEST"] = state
+        mgr1._save_state()
+
+        # Restart with new manager instance pointing to same file
+        mgr2 = DynamicTrailingStopManager(state_file=test_state_file)
+        assert "RESTART_TEST" in mgr2.states
+        assert mgr2.states["RESTART_TEST"].entry_price == 50.0
+        assert mgr2.states["RESTART_TEST"].qty == 5.0
+
+    def test_trailing_state_default_constructor_preserves_canonical_path(self):
+        """Regression: verify default constructor points to canonical production trailing_state.json."""
+        repo_root = Path(__file__).resolve().parent.parent
+        expected_path = str((repo_root / "data" / "trailing_state.json").resolve())
+        mgr = DynamicTrailingStopManager()
+        assert mgr.STATE_FILE == expected_path
 

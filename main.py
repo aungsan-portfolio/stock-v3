@@ -2962,6 +2962,22 @@ def _run_daytrade_bot_lifecycle(args) -> int:
     print(f"  Market Data    : {fp['actual_feed'].upper()} ({fp['feed_capability']}) | Tier: {fp['subscription_tier']}")
     print(f"{'='*60}\n")
 
+    # ── Startup Telemetry & Engine Provenance ──
+    import subprocess
+    try:
+        head_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        head_sha = "UNKNOWN"
+
+    print(f"{'='*60}")
+    print("  [RUNTIME ENGINE & STRATEGY PROVENANCE]")
+    print(f"  Python Version : {sys.version.split()[0]} ({sys.executable})")
+    print(f"  Commit / Build : {head_sha[:7]} ({head_sha})")
+    print(f"  Strategy Flags : ORB={getattr(config, 'STRATEGY_ORB_ENABLED', False)} | VWAP={getattr(config, 'STRATEGY_VWAP_BOUNCE_ENABLED', False)} | GAP={getattr(config, 'STRATEGY_GAP_AND_GO_ENABLED', True)} | MOM={getattr(config, 'STRATEGY_MOMENTUM_SCALP_ENABLED', False)} | CANDLE={getattr(config, 'STRATEGY_CANDLESTICK_ENABLED', True)}")
+    print(f"  Texture Filter : TRANSITIONING=LOCKED (No momentum/candlestick scalps in live)")
+    print(f"  Risk Breakers  : Max Daily Loss=${getattr(config, 'MAX_DAILY_LOSS_DAYTRADE', 300.0):.2f} | Max Spread={getattr(config, 'MAX_ACCEPTABLE_SPREAD_PCT', 0.75):.2f}%")
+    print(f"{'='*60}\n")
+
     try:
         from preflight import PreflightDecision, run_preflight_audit, print_preflight_scorecard
         from strategies.session import is_market_open

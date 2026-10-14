@@ -178,29 +178,58 @@ _feed_telemetry_lock = threading.Lock()
 _last_stale_bar_ts: Dict[str, Any] = {}
 _last_stale_cycle_bar_id: Optional[Any] = None
 
+_breadth_telemetry = {
+    "stale_bar_consecutive": 0,
+    "stale_observation_total": 0,
+    "stale_bar_total": 0,
+    "stale_bar_skip_count": 0,
+    "poll_count": 0,
+    "last_batch_duration_seconds": 0.0,
+    "batch_timeout_count": 0,
+    "consecutive_fetch_timeouts": 0,
+    "last_batch_timestamp": 0.0,
+    "total_bars_fetched": 0,
+}
+_breadth_telemetry_lock = threading.Lock()
+_last_breadth_stale_bar_ts: Dict[str, Any] = {}
 
-def get_intraday_feed_telemetry() -> dict:
+
+def get_intraday_feed_telemetry(purpose: Optional[str] = None) -> dict:
+    if str(purpose or "").upper() == "REGIME_BREADTH":
+        with _breadth_telemetry_lock:
+            data = dict(_breadth_telemetry)
+            data["last_stale_bar_ts"] = dict(_last_breadth_stale_bar_ts)
+            return data
     with _feed_telemetry_lock:
         data = dict(_feed_telemetry)
         data["last_stale_bar_ts"] = dict(_last_stale_bar_ts)
         return data
 
 
-def reset_intraday_feed_telemetry() -> None:
+def reset_intraday_feed_telemetry(purpose: Optional[str] = None) -> None:
     global _last_stale_cycle_bar_id
-    with _feed_telemetry_lock:
-        _feed_telemetry["stale_bar_consecutive"] = 0
-        _feed_telemetry["stale_observation_total"] = 0
-        _feed_telemetry["stale_bar_total"] = 0
-        _feed_telemetry["stale_bar_skip_count"] = 0
-        _feed_telemetry["poll_count"] = 0
-        _feed_telemetry["last_batch_duration_seconds"] = 0.0
-        _feed_telemetry["batch_timeout_count"] = 0
-        _feed_telemetry["consecutive_fetch_timeouts"] = 0
-        _feed_telemetry["last_batch_timestamp"] = 0.0
-        _feed_telemetry["total_bars_fetched"] = 0
-    _last_stale_bar_ts.clear()
-    _last_stale_cycle_bar_id = None
+    if purpose is None or str(purpose).upper() == "REGIME_BREADTH":
+        with _breadth_telemetry_lock:
+            for k in _breadth_telemetry:
+                if isinstance(_breadth_telemetry[k], float):
+                    _breadth_telemetry[k] = 0.0
+                elif isinstance(_breadth_telemetry[k], int):
+                    _breadth_telemetry[k] = 0
+            _last_breadth_stale_bar_ts.clear()
+    if purpose is None or str(purpose).upper() != "REGIME_BREADTH":
+        with _feed_telemetry_lock:
+            _feed_telemetry["stale_bar_consecutive"] = 0
+            _feed_telemetry["stale_observation_total"] = 0
+            _feed_telemetry["stale_bar_total"] = 0
+            _feed_telemetry["stale_bar_skip_count"] = 0
+            _feed_telemetry["poll_count"] = 0
+            _feed_telemetry["last_batch_duration_seconds"] = 0.0
+            _feed_telemetry["batch_timeout_count"] = 0
+            _feed_telemetry["consecutive_fetch_timeouts"] = 0
+            _feed_telemetry["last_batch_timestamp"] = 0.0
+            _feed_telemetry["total_bars_fetched"] = 0
+        _last_stale_bar_ts.clear()
+        _last_stale_cycle_bar_id = None
 
 
 def get_feed_provenance() -> dict:
@@ -306,10 +335,10 @@ class ValidatedBarBatch:
 def should_validate_staleness(purpose: Optional[str], lookback_days: Optional[int]) -> bool:
     """
     Determines whether staleness validation must be enforced.
-    Strict Invariant: Real-time decision contexts (ENTRY_SIGNAL, REALTIME, EXECUTION, PREFLIGHT)
+    Strict Invariant: Real-time decision contexts (ENTRY_SIGNAL, REALTIME, EXECUTION, PREFLIGHT, REGIME_BREADTH)
     MUST validate freshness unconditionally, even if historical lookback_days > 1.
     """
-    if str(purpose or "").upper() in ("ENTRY_SIGNAL", "REALTIME", "EXECUTION", "PREFLIGHT"):
+    if str(purpose or "").upper() in ("ENTRY_SIGNAL", "REALTIME", "EXECUTION", "PREFLIGHT", "REGIME_BREADTH"):
         return True
     return bool(lookback_days is not None and lookback_days <= 1)
 
@@ -944,32 +973,47 @@ def _validate_intraday_data(
                 delay_seconds = completed_bar.post_close_delay_seconds
                 bar_id = getattr(completed_bar, "close_time", None) or getattr(completed_bar, "start_time", None)
 
-                with _feed_telemetry_lock:
-                    _feed_telemetry["poll_count"] += 1
-                    if delay_seconds <= grace_seconds:
-                        if purpose == "ENTRY_SIGNAL":
-                            # Fresh completed bar resets consecutive stale counter for entry gate
-                            _feed_telemetry["stale_bar_consecutive"] = 0
-                            _feed_telemetry["stale_bar_skip_count"] = 0
-                    else:
-                        # Cumulative stale observations recorded across all polling ticks
-                        _feed_telemetry["stale_observation_total"] += 1
-                        _feed_telemetry["stale_bar_total"] = _feed_telemetry["stale_observation_total"]
-                        last_ts = _last_stale_bar_ts.get(symbol)
-                        if last_ts != bar_id:
-                            # Only ENTRY_SIGNAL stale bars increment the entry circuit-breaker counter
-                            if purpose == "ENTRY_SIGNAL":
-                                global _last_stale_cycle_bar_id
-                                if _last_stale_cycle_bar_id != bar_id:
-                                    _last_stale_cycle_bar_id = bar_id
-                                    _feed_telemetry["stale_bar_consecutive"] += 1
-                                    _feed_telemetry["stale_bar_skip_count"] = _feed_telemetry["stale_bar_consecutive"]
-                            else:
-                                _feed_telemetry["stale_monitoring_count"] = _feed_telemetry.get("stale_monitoring_count", 0) + 1
-                            _last_stale_bar_ts[symbol] = bar_id
+                if str(purpose or "").upper() == "REGIME_BREADTH":
+                    with _breadth_telemetry_lock:
+                        _breadth_telemetry["poll_count"] += 1
+                        if delay_seconds <= grace_seconds:
+                            _breadth_telemetry["stale_bar_consecutive"] = 0
+                            _breadth_telemetry["stale_bar_skip_count"] = 0
                         else:
-                            # Same bar timestamp re-polled within intra-bar cadence: do NOT increment consecutive
-                            pass
+                            _breadth_telemetry["stale_observation_total"] += 1
+                            _breadth_telemetry["stale_bar_total"] = _breadth_telemetry["stale_observation_total"]
+                            last_ts = _last_breadth_stale_bar_ts.get(symbol)
+                            if last_ts != bar_id:
+                                _breadth_telemetry["stale_bar_consecutive"] += 1
+                                _breadth_telemetry["stale_bar_skip_count"] = _breadth_telemetry["stale_bar_consecutive"]
+                                _last_breadth_stale_bar_ts[symbol] = bar_id
+                else:
+                    with _feed_telemetry_lock:
+                        _feed_telemetry["poll_count"] += 1
+                        if delay_seconds <= grace_seconds:
+                            if purpose == "ENTRY_SIGNAL":
+                                # Fresh completed bar resets consecutive stale counter for entry gate
+                                _feed_telemetry["stale_bar_consecutive"] = 0
+                                _feed_telemetry["stale_bar_skip_count"] = 0
+                        else:
+                            # Cumulative stale observations recorded across all polling ticks
+                            _feed_telemetry["stale_observation_total"] += 1
+                            _feed_telemetry["stale_bar_total"] = _feed_telemetry["stale_observation_total"]
+                            last_ts = _last_stale_bar_ts.get(symbol)
+                            if last_ts != bar_id:
+                                # Only ENTRY_SIGNAL stale bars increment the entry circuit-breaker counter
+                                if purpose == "ENTRY_SIGNAL":
+                                    global _last_stale_cycle_bar_id
+                                    if _last_stale_cycle_bar_id != bar_id:
+                                        _last_stale_cycle_bar_id = bar_id
+                                        _feed_telemetry["stale_bar_consecutive"] += 1
+                                        _feed_telemetry["stale_bar_skip_count"] = _feed_telemetry["stale_bar_consecutive"]
+                                else:
+                                    _feed_telemetry["stale_monitoring_count"] = _feed_telemetry.get("stale_monitoring_count", 0) + 1
+                                _last_stale_bar_ts[symbol] = bar_id
+                            else:
+                                # Same bar timestamp re-polled within intra-bar cadence: do NOT increment consecutive
+                                pass
 
                 if delay_seconds > grace_seconds:
                     msg = f"Data validation: {symbol} completed bar is stale: post-close delay={delay_seconds:.1f}s (grace={grace_seconds:.1f}s, purpose={purpose}). Skipping candle for this cycle."
@@ -1575,6 +1619,7 @@ def fetch_intraday_batch(
     prepost: bool = False,
     bridge = None,
     purpose: str = "ENTRY_SIGNAL",
+    total_timeout_seconds: Optional[float] = None,
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
     """Fetch 5m bars for multiple symbols concurrently in a single batch.
 
@@ -1623,6 +1668,7 @@ def fetch_intraday_batch(
                 lookback_days=lookback_days,
                 prepost=prepost,
                 purpose=purpose,
+                total_timeout_seconds=total_timeout_seconds,
             )
             results.update(alpaca_batch)
         except Exception as a_exc:
@@ -1630,7 +1676,7 @@ def fetch_intraday_batch(
 
     # 3. Check for any remaining missing symbols (e.g. non-Alpaca or offline fallback)
     still_missing = [s for s in valid_symbols if s not in results or results[s].empty]
-    if still_missing and (bridge is None or not getattr(bridge, "is_connected", False)):
+    if still_missing and (bridge is None or not getattr(bridge, "is_connected", False)) and str(purpose or "").upper() != "REGIME_BREADTH":
         for msym in still_missing:
             try:
                 ydf = fetch_intraday_yfinance(msym, interval, lookback_days, prepost, purpose=purpose)

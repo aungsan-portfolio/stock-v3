@@ -10,6 +10,7 @@ import os
 import math
 import threading
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional, Tuple, Union, Any
 
@@ -77,6 +78,7 @@ _WORKING_STOP_STATUSES = frozenset([
     "calculated",
     "partially_filled",
     "open",
+    "submitted",
 ])
 
 _TERMINAL_STOP_STATUSES = frozenset([
@@ -289,9 +291,9 @@ def verify_broker_stop_order_evidence(
         return False, f"EVIDENCE_QTY_EXHAUSTED: Remaining order capacity {remaining_qty:.4f} <= 0 (qty={order_qty_f}, filled={filled_qty_f})"
 
     if exp_qty_f is not None:
-        if abs(remaining_qty - exp_qty_f) > 1e-4:
+        if remaining_qty < exp_qty_f - 1e-4:
             return False, (
-                f"EVIDENCE_QTY_MISMATCH: Remaining order capacity {remaining_qty:.4f} != "
+                f"EVIDENCE_QTY_MISMATCH: Remaining order capacity {remaining_qty:.4f} < "
                 f"expected {exp_qty_f:.4f} (total_qty={order_qty_f:.4f}, filled_qty={filled_qty_f:.4f})"
             )
 
@@ -306,6 +308,24 @@ def _normalize_strategy_name(raw) -> str:
     if isinstance(raw, str) and raw.strip() and raw.strip() != "UNKNOWN":
         return raw.strip()
     return "UNKNOWN"
+
+
+def _timestamp_to_epoch(val: Any) -> Optional[float]:
+    """Safely convert any timestamp/datetime/epoch representation to UTC float epoch seconds."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val) if math.isfinite(val) and val > 0 else None
+    if isinstance(val, datetime):
+        return val.timestamp()
+    if isinstance(val, str):
+        try:
+            val_clean = val.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(val_clean)
+            return dt.timestamp()
+        except Exception:
+            return None
+    return None
 
 
 def _classify_held_order(order) -> str:
@@ -525,8 +545,11 @@ def _extract_order_info(o: object) -> dict:
 
 
 class DynamicTrailingStopManager:
-    def __init__(self):
+    def __init__(self, state_file: Optional[object] = None):
         self._lock = threading.RLock()
+        self.STATE_FILE: str = os.path.abspath(
+            os.fspath(STATE_FILE if state_file is None else state_file)
+        )
         self.persistence_healthy: bool = True
         self.last_persistence_error: Optional[str] = None
         self.last_persistence_error_time: float = 0.0
@@ -537,15 +560,15 @@ class DynamicTrailingStopManager:
             self._load_state()
 
     def _load_state(self):
-        if not os.path.exists(STATE_FILE):
+        if not os.path.exists(self.STATE_FILE):
             return
         try:
-            if os.path.getsize(STATE_FILE) == 0:
-                logger.warning(f"Trailing stop state file {STATE_FILE} is empty. Initializing empty state.")
+            if os.path.getsize(self.STATE_FILE) == 0:
+                logger.warning(f"Trailing stop state file {self.STATE_FILE} is empty. Initializing empty state.")
                 self.persistence_healthy = False
                 self.last_persistence_error = "STATE_FILE_EMPTY"
                 return
-            with open(STATE_FILE, "r") as f:
+            with open(self.STATE_FILE, "r") as f:
                 data = json.load(f)
                 if isinstance(data, dict):
                     if "__pending_exits__" in data and isinstance(data["__pending_exits__"], dict):
@@ -553,7 +576,13 @@ class DynamicTrailingStopManager:
                     for sym, state_dict in data.items():
                         if sym == "__pending_exits__":
                             continue
-                        if state_dict.get('active') or (state_dict.get("reconciliation_status") and "PENDING" in str(state_dict.get("reconciliation_status"))):
+                        rec_status = str(state_dict.get("reconciliation_status") or "")
+                        has_unresolved_rec = bool(
+                            rec_status
+                            and not rec_status.startswith("RECONCILED_")
+                        )
+                        has_stop_rec = bool(state_dict.get("stop_reconciliation_required"))
+                        if state_dict.get('active') or has_unresolved_rec or has_stop_rec:
                             # P1.5.2 Migration for legacy state dictionaries
                             state_dict.setdefault("desired_stop_price", state_dict.get("stop_price"))
                             state_dict.setdefault("confirmed_broker_stop_price", state_dict.get("stop_price"))
@@ -572,9 +601,9 @@ class DynamicTrailingStopManager:
 
     def _save_state(self, raise_on_error: bool = False) -> bool:
         import threading
-        tmp_file = f"{STATE_FILE}.tmp.{os.getpid()}.{threading.get_ident()}"
+        tmp_file = f"{self.STATE_FILE}.tmp.{os.getpid()}.{threading.get_ident()}"
         try:
-            state_dir = os.path.dirname(STATE_FILE)
+            state_dir = os.path.dirname(self.STATE_FILE)
             os.makedirs(state_dir, exist_ok=True)
             payload = {
                 sym: asdict(state)
@@ -586,7 +615,7 @@ class DynamicTrailingStopManager:
                 json.dump(payload, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_file, STATE_FILE)
+            os.replace(tmp_file, self.STATE_FILE)
             if os.name != "nt":
                 try:
                     dfd = os.open(state_dir, os.O_RDONLY)
@@ -610,7 +639,7 @@ class DynamicTrailingStopManager:
             logger.error(
                 "[PERSISTENCE HEALTH FAILED] Failed to save trailing stop state atomically to %s: %s "
                 "(consecutive_failures=%d, all active positions flagged for reconciliation)",
-                STATE_FILE,
+                self.STATE_FILE,
                 exc,
                 self.consecutive_persistence_failures,
             )
@@ -625,7 +654,7 @@ class DynamicTrailingStopManager:
                 )
             if raise_on_error:
                 raise TrailingStatePersistenceError(
-                    f"Failed to save trailing stop state atomically to {STATE_FILE}: {exc}"
+                    f"Failed to save trailing stop state atomically to {self.STATE_FILE}: {exc}"
                 ) from exc
             return False
 
@@ -745,23 +774,86 @@ class DynamicTrailingStopManager:
             return False
 
     def has_unresolved_position_unknown(self) -> bool:
-        """Check if any active position in states has unresolved broker query failure."""
+        """Check if any position in states has unresolved broker query failure or signed-side mismatch."""
         with self._lock:
             for s in self.states.values():
-                if s.active and s.reconciliation_status == "POSITION_UNKNOWN_RECONCILIATION_REQUIRED":
+                if getattr(s, "reconciliation_status", None) in (
+                    "POSITION_UNKNOWN_RECONCILIATION_REQUIRED",
+                    "SIGNED_SIDE_MISMATCH_RECONCILIATION_REQUIRED",
+                ):
+                    return True
+            return False
+
+    def has_unresolved_signed_side_mismatch(self) -> bool:
+        """Check if any position in states has an unresolved signed-side mismatch with broker."""
+        with self._lock:
+            for s in self.states.values():
+                if getattr(s, "reconciliation_status", None) == "SIGNED_SIDE_MISMATCH_RECONCILIATION_REQUIRED":
                     return True
             return False
 
     def clear_position_unknown(self, symbol: str) -> bool:
-        """Clear POSITION_UNKNOWN_RECONCILIATION_REQUIRED status once broker truth is restored."""
+        """Clear unresolved position unknown or signed-side mismatch status once broker truth is restored."""
         with self._lock:
             state = self.states.get(symbol.upper().strip())
-            if state and state.reconciliation_status == "POSITION_UNKNOWN_RECONCILIATION_REQUIRED":
+            if state and getattr(state, "reconciliation_status", None) in (
+                "POSITION_UNKNOWN_RECONCILIATION_REQUIRED",
+                "SIGNED_SIDE_MISMATCH_RECONCILIATION_REQUIRED",
+            ):
                 state.reconciliation_status = None
                 self._save_state()
-                logger.info("[POSITION UNKNOWN CLEARED] Successfully cleared unknown position status for %s", symbol)
+                logger.info("[POSITION UNKNOWN CLEARED] Successfully cleared unknown/mismatch status for %s", symbol)
                 return True
             return False
+
+    def _recover_orphaned_flat_states(self, bridge: Optional[object]) -> int:
+        """
+        Recover orphaned flat states where the broker position is confirmed 0 (flat),
+        but local state is active or unreconciled and no pending exit is yet queued.
+        Constructs a durable pending exit with exact episode metadata so deterministic
+        exit reconciliation can proceed.
+        """
+        if bridge is None:
+            return 0
+
+        recovered_count = 0
+        with self._lock:
+            for symbol, state in list(self.states.items()):
+                # Skip if already has a pending exit queued
+                has_pending = (
+                    self.has_pending_exit(symbol)
+                    if hasattr(self, "has_pending_exit")
+                    else any(item.get("symbol", "").upper().strip() == symbol.upper().strip() for item in getattr(self, "pending_exits", {}).values())
+                )
+                if has_pending:
+                    continue
+
+                should_check = (
+                    state.active
+                    or getattr(state, "stop_reconciliation_required", False)
+                    or getattr(state, "reconciliation_status", None) in (
+                        "POSITION_UNKNOWN_RECONCILIATION_REQUIRED",
+                        "SIGNED_SIDE_MISMATCH_RECONCILIATION_REQUIRED",
+                        "FLAT_PENDING_EXIT_RECONCILIATION",
+                    )
+                )
+                if not should_check:
+                    continue
+
+                is_known, pos_qty = self._query_broker_position_qty(bridge, symbol)
+                if not is_known or pos_qty is None:
+                    continue
+
+                if abs(pos_qty) < 1e-6:
+                    logger.info(
+                        "[ORPHANED FLAT RECOVERY] %s: Broker position is flat (qty=0), but state was active/unreconciled without pending exit. "
+                        "Reconstructing pending exit.",
+                        symbol
+                    )
+                    self._record_pending_exit(state, qty_closed=abs(float(state.entry_qty or state.qty or 0.0)))
+                    recovered_count += 1
+
+        return recovered_count
 
 
     def reconcile_pending_exits(self, bridge: Optional[object] = None) -> Dict[str, str]:
@@ -771,8 +863,36 @@ class DynamicTrailingStopManager:
         commits to trade journal atomically, and removes from pending queue upon success.
         Returns a mapping of symbol -> reconciliation status.
         """
+        recover_fn = getattr(self, "_recover_orphaned_flat_states", None)
+        if bridge is not None and callable(recover_fn):
+            recover_fn(bridge)
+
         if not self.pending_exits or bridge is None:
             return {}
+
+        def _to_epoch(val: Any) -> Optional[float]:
+            if val is None:
+                return None
+            from datetime import datetime as _dt
+            if isinstance(val, (int, float)):
+                return float(val) if math.isfinite(val) else None
+            if isinstance(val, _dt):
+                return val.timestamp()
+            if isinstance(val, str):
+                s = val.strip()
+                if not s:
+                    return None
+                try:
+                    f = float(s)
+                    return f if math.isfinite(f) else None
+                except ValueError:
+                    pass
+                try:
+                    dt = _dt.fromisoformat(s.replace("Z", "+00:00"))
+                    return dt.timestamp()
+                except Exception:
+                    pass
+            return None
 
         results = {}
         with self._lock:
@@ -823,6 +943,32 @@ class DynamicTrailingStopManager:
                     sig_id = str(exit_item.get("signal_id") or "").strip()
                     ep_id = str(exit_item.get("episode_id") or "").strip()
 
+                    # Build foreign episode/signal identifiers to detect explicit cross-episode conflict
+                    other_foreign_ids = set()
+                    pending_dict = getattr(self, "pending_exits", {}) or {}
+                    if isinstance(pending_dict, dict):
+                        for other_ep, other_item in pending_dict.items():
+                            if other_ep != episode_id and isinstance(other_item, dict):
+                                other_foreign_ids.add(str(other_ep).strip())
+                                for k in ("signal_id", "episode_id", "stop_order_id", "last_stop_order_id", "tp_order_id"):
+                                    v = other_item.get(k)
+                                    if v:
+                                        other_foreign_ids.add(str(v).strip())
+                    states_dict = getattr(self, "states", {}) or {}
+                    if isinstance(states_dict, dict):
+                        for other_sym, other_state in states_dict.items():
+                            other_sig = getattr(other_state, "signal_id", None)
+                            other_sig_str = str(other_sig).strip() if other_sig else ""
+                            is_foreign = (other_sym != symbol) or (bool(other_sig_str) and other_sig_str != sig_id)
+                            if is_foreign:
+                                if other_sig_str:
+                                    other_foreign_ids.add(other_sig_str)
+                                for attr in ("order_id", "last_stop_order_id", "tp_order_id"):
+                                    val = getattr(other_state, attr, None)
+                                    if val:
+                                        other_foreign_ids.add(str(val).strip())
+                    other_foreign_ids.discard("")
+
                     def _process_candidate_order(o: Any) -> None:
                         if not o or conflict_detected[0]:
                             return
@@ -838,11 +984,50 @@ class DynamicTrailingStopManager:
                         if o_side != expected_exit_side:
                             return
 
+                        # Timestamp guard: Exit fill MUST NOT occur before entry
+                        raw_filled_at = _extract_order_field(o, "filled_at") or getattr(o, "filled_at", None) or _extract_order_field(o, "submitted_at") or getattr(o, "submitted_at", None)
+                        if raw_filled_at is not None:
+                            order_epoch = _to_epoch(raw_filled_at)
+                            entry_epoch = _to_epoch(exit_item.get("entry_time"))
+                            if order_epoch is not None and entry_epoch is not None:
+                                if order_epoch < entry_epoch:
+                                    logger.warning(
+                                        "[RECONCILE PRE-ENTRY ORDER REJECTED] %s: Order %s timestamp (%.1f) is before entry (%.1f)",
+                                        symbol, oid, order_epoch, entry_epoch
+                                    )
+                                    return
+
                         o_cid = str(_extract_order_field(o, "client_order_id") or getattr(o, "client_order_id", "") or "").strip()
+
+                        # Explicit conflict check:
+                        # Evaluates whether broker order ID or client_order_id references a registered foreign episode or foreign token.
+                        # Rule: Conflict takes strict precedence. If foreign mapping is present, it is rejected
+                        # as conflicting evidence even if current episode identity also matches.
+                        has_explicit_conflict = False
+                        if oid and oid in other_foreign_ids:
+                            has_explicit_conflict = True
+                        if not has_explicit_conflict and o_cid:
+                            for fid in other_foreign_ids:
+                                if fid and _matches_order_lineage(o_cid, fid):
+                                    has_explicit_conflict = True
+                                    break
+
+                        if has_explicit_conflict:
+                            logger.error(
+                                "[RECONCILE CONFLICT BLOCKED] %s: Order %s (client_order_id '%s') "
+                                "conflicts with foreign episode/signal/order while current episode is '%s'. Retaining fail-closed.",
+                                symbol, oid, o_cid, episode_id
+                            )
+                            conflict_detected[0] = True
+                            return
+
+                        matches_curr_lineage = (
+                            _matches_order_lineage(o_cid, sig_id)
+                            or _matches_order_lineage(o_cid, ep_id)
+                        )
                         matches_lineage = (
                             (oid in known_ids or (o_cid and o_cid in known_ids))
-                            or _matches_order_lineage(o_cid, sig_id)
-                            or _matches_order_lineage(o_cid, ep_id)
+                            or matches_curr_lineage
                         )
                         if not matches_lineage:
                             return
@@ -998,7 +1183,10 @@ class DynamicTrailingStopManager:
                         val_written = False
                         try:
                             from strategies.validation_lane import record_validation_exit
-                            target_oid = str(exit_item.get("last_stop_order_id") or exit_item.get("stop_order_id") or exit_item.get("tp_order_id") or exit_item.get("signal_id") or "")
+                            confirmed_oids = [str(k).strip() for k in collected_orders.keys() if str(k).strip()]
+                            actual_broker_exit_oid = confirmed_oids[0] if confirmed_oids else ""
+                            target_oid = actual_broker_exit_oid or str(exit_item.get("last_stop_order_id") or exit_item.get("stop_order_id") or exit_item.get("tp_order_id") or exit_item.get("signal_id") or "")
+                            actual_exec_id = f"RECONCILE_{episode_id}_{actual_broker_exit_oid}" if actual_broker_exit_oid else f"RECONCILE_{episode_id}"
                             val_written = record_validation_exit(
                                 order_id=target_oid,
                                 exit_price=float(exit_price),
@@ -1006,6 +1194,9 @@ class DynamicTrailingStopManager:
                                 side=expected_exit_side.upper(),
                                 symbol=symbol,
                                 exit_reason=exit_reason,
+                                execution_id=actual_exec_id,
+                                parent_order_id=str(exit_item.get("entry_order_id") or "") or None,
+                                client_order_id=str(exit_item.get("signal_id") or exit_item.get("client_order_id") or "") or None,
                             )
                         except Exception as val_e:
                             logger.error("Failed recording validation exit for %s: %s", symbol, val_e)
@@ -1126,6 +1317,10 @@ class DynamicTrailingStopManager:
                     existing.order_id = stop_order_id
                 if tp_order_id:
                     existing.tp_order_id = tp_order_id
+                if (stop_order_id or existing.order_id) and cum_qty_f > 0:
+                    if getattr(existing, "stop_reconciliation_required", False):
+                        existing.stop_reconciliation_required = False
+                        existing.reconciliation_status = None
                 existing.last_updated = time.time()
                 self._save_state()
                 logger.info(f"Updated Trailing Stop for {symbol}: fill=${average_fill_price:.4f}, cumulative_qty={cumulative_qty:.4f}")
@@ -1572,6 +1767,8 @@ class DynamicTrailingStopManager:
                             if t_info.get("stop_price") is not None:
                                 state.stop_price = float(t_info["stop_price"])
                                 state.confirmed_broker_stop_price = float(t_info["stop_price"])
+                            state.stop_reconciliation_required = False
+                            state.reconciliation_status = None
                         else:
                             # Capacity insufficient or invalid stop order
                             logger.warning(
@@ -1622,6 +1819,8 @@ class DynamicTrailingStopManager:
                                     if d_info.get("stop_price") is not None:
                                         state.confirmed_broker_stop_price = float(d_info["stop_price"])
                                         state.stop_price = float(d_info["stop_price"])
+                                    state.stop_reconciliation_required = False
+                                    state.reconciliation_status = None
                                 else:
                                     logger.warning(
                                         f"[RECONCILE P0] Direct resting order {d_id} failed capacity or stop validation for {req_pos_qty}"
@@ -1694,6 +1893,8 @@ class DynamicTrailingStopManager:
                                 if matching_stop_price is not None:
                                     state.stop_price = float(matching_stop_price)
                                     state.confirmed_broker_stop_price = float(matching_stop_price)
+                                state.stop_reconciliation_required = False
+                                state.reconciliation_status = None
                             else:
                                 if state.order_id and not state.last_stop_order_id:
                                     state.last_stop_order_id = str(state.order_id)

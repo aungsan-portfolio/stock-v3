@@ -212,6 +212,7 @@ def test_load_validation_fill_states_reconciler_idempotency(tmp_path):
         timestamp="2026-10-01T14:23:00Z",
         exit_reason="STOP_LOSS",
         execution_id="EXEC_AMD_OUT",
+        parent_order_id="entry_amd_123",
         filepath=ledger,
     )
 

@@ -55,15 +55,17 @@ Before migrating the Day Trading strategy from paper trading to real money tradi
 
 | Metric | Empirical Value | Gate Threshold | Gate Status |
 |---|---|---|---|
-| **Win Rate** | **32.3%** | $\ge 40\%$ | ❌ FAILED |
+| **Win Rate** | **32.3%** | $\ge 40\%$ (Policy Gate Floor) | ❌ FAILED |
 | **Gross Profit Factor** | **1.10** | $\ge 1.25$ | ❌ FAILED |
 | **Reward / Risk** | **2.29 : 1** | $\ge 1.50 : 1$ | ✅ PASS |
 | **Avg Win / Avg Loss** | **+0.309% / -0.135%** | — | — |
 | **Net Expectancy** | **-0.0408% / trade** | $> 0.0\%$ | ❌ NEGATIVE |
-| **Expected Drawdown** | **-13.1% (over 322 trades)** | $\le 5.0\%$ | ❌ VIOLATION |
+| **Cumulative Expected Drag** | **-13.1% (Linear: 322 * -0.0408%)** | — | Informative Linear Drag |
+| **True Portfolio Max Drawdown** | **NOT COMPUTED / NOT VERIFIED** | $\le 5.0\%$ | ⚠️ NOT EVALUABLE |
 
 > [!IMPORTANT]
-> **Decision Rule**: The `TRANSITIONING` texture filter is **mathematically justified and locked**.
+> **Decision Rule**: The `TRANSITIONING` texture filter is **empirically justified by negative Net Expectancy (-4.08 bps/trade) and PF < 1.25**, NOT by a verified portfolio drawdown breach.
+> **Cost Model Attribution**: Implied cost drag is $4.92\text{ bps/trade}$ ($+0.0084\%$ gross vs $-0.0408\%$ net), representing broker friction model (slippage, spread half-cost, and fees). Break-even win rate without friction is $30.4\%$; the $40.0\%$ threshold serves as an institutional safety margin.
 > **DO NOT** allow `MOMENTUM_SCALP` or `CANDLESTICK` in `TRANSITIONING` texture.
 > **Next Review Gate**: Only re-evaluate when $N \ge 500$ new sample signals are recorded or under a verified market regime transition.
 

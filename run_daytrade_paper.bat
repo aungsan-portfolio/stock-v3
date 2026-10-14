@@ -23,6 +23,9 @@ if exist .env (
         if "!KEY_NAME!"=="DAYTRADE_APCA_API_BASE_URL" set "APCA_API_BASE_URL=!KEY_VAL!"
         if "!KEY_NAME!"=="MAX_BAR_STALENESS_SECONDS" set "MAX_BAR_STALENESS_SECONDS=!KEY_VAL!"
         if "!KEY_NAME!"=="EXPERIMENTAL_MR_SHADOW_ENABLED" set "EXPERIMENTAL_MR_SHADOW_ENABLED=!KEY_VAL!"
+        if "!KEY_NAME!"=="REGIME_BREADTH_BATCH_ENABLED" set "REGIME_BREADTH_BATCH_ENABLED=!KEY_VAL!"
+        if "!KEY_NAME!"=="ENTRY_BAR_CLOSE_GRACE_SECONDS" set "ENTRY_BAR_CLOSE_GRACE_SECONDS=!KEY_VAL!"
+        if "!KEY_NAME!"=="DAYTRADE_RECOVERY_MAX_CANDIDATES" set "DAYTRADE_RECOVERY_MAX_CANDIDATES=!KEY_VAL!"
     )
 ) else (
     echo [ERROR] .env file not found. Please create .env from .env.example.
@@ -32,6 +35,11 @@ if exist .env (
 
 REM Ensure D2 Mean Reversion Shadow Experiment is active (ratified shadow lane)
 if not defined EXPERIMENTAL_MR_SHADOW_ENABLED set "EXPERIMENTAL_MR_SHADOW_ENABLED=true"
+
+REM Latency Remediation & Resilient Batch Configuration Defaults
+if not defined REGIME_BREADTH_BATCH_ENABLED set "REGIME_BREADTH_BATCH_ENABLED=true"
+if not defined ENTRY_BAR_CLOSE_GRACE_SECONDS set "ENTRY_BAR_CLOSE_GRACE_SECONDS=90.0"
+if not defined DAYTRADE_RECOVERY_MAX_CANDIDATES set "DAYTRADE_RECOVERY_MAX_CANDIDATES=31"
 
 REM Explicit Daytrade Paper Execution Authorization (paper-only execution gate)
 set "DAYTRADE_PAPER_EXECUTION_ENABLED=true"

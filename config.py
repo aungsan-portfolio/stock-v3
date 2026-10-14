@@ -333,8 +333,8 @@ MARKET_HOURS_GATE_ENABLED        = True
 
 # ── P1.5.2 / P1.5.2.1 Bar Staleness & Reconciliation Settings ───
 INTRADAY_BAR_SECONDS             = 300.0  # 5-minute default bar interval
-ENTRY_BAR_CLOSE_GRACE_SECONDS    = 60.0   # 60s pilot grace period post completed bar close for new entry signals (calibrated 2026-09-08: REST median delay ~58s)
-BAR_CLOSE_GRACE_SECONDS          = 60.0   # Backward-compatible alias for entry grace
+ENTRY_BAR_CLOSE_GRACE_SECONDS    = float(os.environ.get("ENTRY_BAR_CLOSE_GRACE_SECONDS", "90.0"))   # 90s grace period post completed bar close (matches DAYTRADE_BAR_PUBLICATION_TIMEOUT_S)
+BAR_CLOSE_GRACE_SECONDS          = ENTRY_BAR_CLOSE_GRACE_SECONDS   # Backward-compatible alias for entry grace
 POSITION_ATR_MAX_AGE_SECONDS     = 360.0  # 360s max age for active-position ATR updates during mid-bar polling
 PREFLIGHT_MAX_RECOVERABLE_DELAY_SECONDS = float(os.environ.get("PREFLIGHT_MAX_RECOVERABLE_DELAY_SECONDS", "360.0"))  # 360s (300s bar + 60s grace) max recoverable delay for preflight startup audit
 BAR_FUTURE_TOLERANCE_SECONDS     = 5.0    # 5s clock skew tolerance for completed bars
@@ -356,7 +356,7 @@ DAYTRADE_REQUIRE_ENTRY_READINESS          = os.environ.get("DAYTRADE_REQUIRE_ENT
 # ── Latency Remediation & Resilient Recovery Settings ──
 DAYTRADE_RECOVERY_MAX_WORKERS          = int(os.environ.get("DAYTRADE_RECOVERY_MAX_WORKERS", "4"))
 DAYTRADE_SYMBOL_FETCH_TIMEOUT_SECONDS   = float(os.environ.get("DAYTRADE_SYMBOL_FETCH_TIMEOUT_SECONDS", "2.5"))
-DAYTRADE_RECOVERY_MAX_CANDIDATES       = int(os.environ.get("DAYTRADE_RECOVERY_MAX_CANDIDATES", "5"))
+DAYTRADE_RECOVERY_MAX_CANDIDATES       = int(os.environ.get("DAYTRADE_RECOVERY_MAX_CANDIDATES", "31"))
 DAYTRADE_RECOVERY_TOTAL_TIMEOUT_SECONDS = float(os.environ.get("DAYTRADE_RECOVERY_TOTAL_TIMEOUT_SECONDS", "8.0"))
 ALPACA_DATA_CONNECT_TIMEOUT            = float(os.environ.get("ALPACA_DATA_CONNECT_TIMEOUT", "0.75"))
 ALPACA_DATA_READ_TIMEOUT               = float(os.environ.get("ALPACA_DATA_READ_TIMEOUT", "1.75"))
@@ -407,7 +407,7 @@ ALPACA_SUBSCRIPTION_TIER: str = os.environ.get("ALPACA_SUBSCRIPTION_TIER", "free
 REQUIRE_FEED_CONCORDANCE: bool = os.environ.get("REQUIRE_FEED_CONCORDANCE", "false").lower().strip() in ("true", "1", "yes")
 MAX_BAR_STALENESS_SECONDS: float = float(os.environ.get("MAX_BAR_STALENESS_SECONDS", 300.0))
 ENTRY_BAR_DURATION_SECONDS: float = float(os.environ.get("ENTRY_BAR_DURATION_SECONDS", 300.0))
-ENTRY_BAR_CLOSE_GRACE_SECONDS: float = float(os.environ.get("ENTRY_BAR_CLOSE_GRACE_SECONDS", 60.0))
+ENTRY_BAR_CLOSE_GRACE_SECONDS: float = float(os.environ.get("ENTRY_BAR_CLOSE_GRACE_SECONDS", 90.0))
 
 # WebSocket keepalive & connection management
 ALPACA_WS_PING_INTERVAL_SECONDS: int = int(os.environ.get("ALPACA_WS_PING_INTERVAL_SECONDS", 20))

@@ -1173,6 +1173,7 @@ def test_c3_validation_ledger_durability_and_idempotency():
             symbol="AAPL",
             exit_reason="PROFIT_TARGET",
             execution_id="exec_exit_001",
+            parent_order_id="ord_entry_001",
             filepath=ledger_path,
         )
         assert exit_res1 is True, "record_validation_exit must return True"
@@ -1197,6 +1198,7 @@ def test_c3_validation_ledger_durability_and_idempotency():
             symbol="AAPL",
             exit_reason="PROFIT_TARGET",
             execution_id="exec_exit_001",
+            parent_order_id="ord_entry_001",
             filepath=ledger_path,
         )
         assert exit_res2 is True, "Retry record_validation_exit must return True idempotently"
@@ -1209,6 +1211,555 @@ def test_c3_validation_ledger_durability_and_idempotency():
     return results
 
 
+def test_c4_lineage_and_signed_side_mismatch():
+    results = {}
+    from datetime import datetime, timezone
+
+    # Acceptance test cases for lineage, precedence, conflict detection, crash recovery, and signed mismatch guards
+    entry_time = time.time() - 600
+
+    # 1. Unrelated unique post-entry fill: MUST retain pending and write 0 journal records (fail-closed)
+    with tempfile.TemporaryDirectory() as td:
+        fake_state_file = os.path.join(td, "trailing_state.json")
+        fake_journal = pathlib.Path(td) / "journal.jsonl"
+        with patch("strategies.trailing_stop.STATE_FILE", fake_state_file), patch("config.DAYTRADE_TRADE_JOURNAL_FILE", fake_journal):
+            mgr = DynamicTrailingStopManager()
+            state = TrailingStopState(
+                symbol="AAPL",
+                side="BUY",
+                entry_price=100.0,
+                peak_price=100.0,
+                atr=1.0,
+                stop_price=95.0,
+                trail_multiple=1.5,
+                last_updated=0.0,
+                qty=12.0,
+                entry_qty=12.0,
+                order_id="current-stop",
+                signal_id="current-episode-signal",
+                entry_time=entry_time,
+            )
+            mgr.states["AAPL"] = state
+            unrelated_post_order = {
+                "id": "unrelated-exit-1",
+                "client_order_id": "unmapped-client-id",
+                "symbol": "AAPL",
+                "side": "sell",
+                "type": "market",
+                "status": "filled",
+                "filled_qty": 12.0,
+                "filled_avg_price": 105.0,
+                "filled_at": datetime.fromtimestamp(entry_time + 30, timezone.utc),
+            }
+            bridge = NS(
+                get_position=lambda sym: 0.0,
+                get_order_snapshot=lambda oid: None,
+                _client=NS(get_orders=lambda req: [NS(**unrelated_post_order)]),
+            )
+            res = mgr.reconcile_pending_exits(bridge)
+            assert len(mgr.pending_exits) == 1, f"Expected 1 pending exit retained, got {len(mgr.pending_exits)}"
+            assert not os.path.exists(fake_journal) or len(open(fake_journal).readlines()) == 0, "Expected 0 journal records"
+            results["c4_case1_unrelated_unique_post_entry_retains_pending_zero_journal"] = "PASS"
+
+    # 2. Unrelated pre-entry fill (-90s): MUST reject order, retain pending, and write 0 journal records
+    with tempfile.TemporaryDirectory() as td:
+        fake_state_file = os.path.join(td, "trailing_state.json")
+        fake_journal = pathlib.Path(td) / "journal.jsonl"
+        with patch("strategies.trailing_stop.STATE_FILE", fake_state_file), patch("config.DAYTRADE_TRADE_JOURNAL_FILE", fake_journal):
+            mgr = DynamicTrailingStopManager()
+            state = TrailingStopState(
+                symbol="AAPL",
+                side="BUY",
+                entry_price=100.0,
+                peak_price=100.0,
+                atr=1.0,
+                stop_price=95.0,
+                trail_multiple=1.5,
+                last_updated=0.0,
+                qty=12.0,
+                entry_qty=12.0,
+                order_id="current-stop",
+                signal_id="current-episode-signal",
+                entry_time=entry_time,
+            )
+            mgr.states["AAPL"] = state
+            unrelated_pre_order = {
+                "id": "unrelated-exit-1",
+                "client_order_id": "unmapped-client-id",
+                "symbol": "AAPL",
+                "side": "sell",
+                "type": "market",
+                "status": "filled",
+                "filled_qty": 12.0,
+                "filled_avg_price": 105.0,
+                "filled_at": datetime.fromtimestamp(entry_time - 90, timezone.utc),
+            }
+            bridge = NS(
+                get_position=lambda sym: 0.0,
+                get_order_snapshot=lambda oid: None,
+                _client=NS(get_orders=lambda req: [NS(**unrelated_pre_order)]),
+            )
+            res = mgr.reconcile_pending_exits(bridge)
+            assert len(mgr.pending_exits) == 1, f"Expected 1 pending exit retained, got {len(mgr.pending_exits)}"
+            assert not os.path.exists(fake_journal) or len(open(fake_journal).readlines()) == 0, "Expected 0 journal records"
+            results["c4_case2_unrelated_pre_entry_rejected_retains_pending"] = "PASS"
+
+    # 3. Exact broker order ID + generic client ID: Valid exact-ID recovery -> Reconciles cleanly, idempotent on retry
+    with tempfile.TemporaryDirectory() as td:
+        fake_state_file = os.path.join(td, "trailing_state.json")
+        fake_journal = pathlib.Path(td) / "journal.jsonl"
+        with patch("strategies.trailing_stop.STATE_FILE", fake_state_file), patch("config.DAYTRADE_TRADE_JOURNAL_FILE", fake_journal):
+            mgr = DynamicTrailingStopManager()
+            state = TrailingStopState(
+                symbol="AAPL",
+                side="BUY",
+                entry_price=100.0,
+                peak_price=100.0,
+                atr=1.0,
+                stop_price=95.0,
+                trail_multiple=1.5,
+                last_updated=0.0,
+                qty=12.0,
+                entry_qty=12.0,
+                order_id="current-stop",
+                signal_id="current-episode-signal",
+                entry_time=entry_time,
+            )
+            mgr.states["AAPL"] = state
+            linked_order = {
+                "id": "current-stop",
+                "client_order_id": "broker-generated-client-id",
+                "symbol": "AAPL",
+                "side": "sell",
+                "type": "market",
+                "status": "filled",
+                "filled_qty": 12.0,
+                "filled_avg_price": 105.0,
+                "filled_at": datetime.fromtimestamp(entry_time + 30, timezone.utc),
+            }
+            bridge = NS(
+                get_position=lambda sym: 0.0,
+                get_order_snapshot=lambda oid: None,
+                _client=NS(get_orders=lambda req: [NS(**linked_order)]),
+            )
+            res1 = mgr.reconcile_pending_exits(bridge)
+            assert len(mgr.pending_exits) == 0, f"Expected 0 pending exits after reconciliation, got {len(mgr.pending_exits)}"
+            assert os.path.exists(fake_journal) and len(open(fake_journal).readlines()) == 1, "Expected exactly 1 journal record"
+            # Retry reconciliation idempotently
+            res2 = mgr.reconcile_pending_exits(bridge)
+            assert len(mgr.pending_exits) == 0
+            assert len(open(fake_journal).readlines()) == 1, "Expected retry to be idempotent with 1 journal record"
+            results["c4_case3_linked_current_order_reconciles_single_close_idempotent"] = "PASS"
+
+    # 4. Explicit Conflict: Order ID matches, BUT Client ID explicitly references another episode -> Conflict detected, retained fail-closed
+    with tempfile.TemporaryDirectory() as td:
+        fake_state_file = os.path.join(td, "trailing_state.json")
+        fake_journal = pathlib.Path(td) / "journal.jsonl"
+        with patch("strategies.trailing_stop.STATE_FILE", fake_state_file), patch("config.DAYTRADE_TRADE_JOURNAL_FILE", fake_journal):
+            mgr = DynamicTrailingStopManager()
+            state = TrailingStopState(
+                symbol="AAPL",
+                side="BUY",
+                entry_price=100.0,
+                peak_price=100.0,
+                atr=1.0,
+                stop_price=95.0,
+                trail_multiple=1.5,
+                last_updated=0.0,
+                qty=12.0,
+                entry_qty=12.0,
+                order_id="current-stop",
+                signal_id="current-episode-signal",
+                entry_time=entry_time,
+            )
+            mgr.states["AAPL"] = state
+            # Foreign episode registered on MSFT
+            mgr.states["MSFT"] = TrailingStopState(
+                symbol="MSFT",
+                side="BUY",
+                entry_price=300.0,
+                peak_price=300.0,
+                atr=2.0,
+                stop_price=290.0,
+                trail_multiple=1.5,
+                last_updated=0.0,
+                qty=5.0,
+                entry_qty=5.0,
+                order_id="foreign-stop-9",
+                signal_id="other-episode-signal",
+                entry_time=entry_time,
+            )
+            conflicting_order = {
+                "id": "current-stop",
+                "client_order_id": "exit_other-episode-signal",  # Explicit conflict with registered foreign episode
+                "symbol": "AAPL",
+                "side": "sell",
+                "type": "market",
+                "status": "filled",
+                "filled_qty": 12.0,
+                "filled_avg_price": 105.0,
+                "filled_at": datetime.fromtimestamp(entry_time + 30, timezone.utc),
+            }
+            bridge = NS(
+                get_position=lambda sym: 0.0 if sym == "AAPL" else 5.0,
+                get_order_snapshot=lambda oid: None,
+                _client=NS(get_orders=lambda req: [NS(**conflicting_order)]),
+            )
+            res = mgr.reconcile_pending_exits(bridge)
+            assert len(mgr.pending_exits) == 1, "Expected 1 pending exit retained due to explicit conflict"
+            assert res.get("AAPL") == "CONFLICTING_EXIT_EVIDENCE_DISCREPANCY", "Status must be CONFLICTING_EXIT_EVIDENCE_DISCREPANCY"
+            assert not os.path.exists(fake_journal) or len(open(fake_journal).readlines()) == 0, "Expected 0 journal records on conflict"
+            results["c4_case4_explicit_conflict_retains_pending_zero_journal"] = "PASS"
+
+    # 4b. Explicit Conflict Precedence on Dual Match: Order contains BOTH current and foreign lineage -> Conflict strictly takes precedence
+    with tempfile.TemporaryDirectory() as td:
+        fake_state_file = os.path.join(td, "trailing_state.json")
+        fake_journal = pathlib.Path(td) / "journal.jsonl"
+        with patch("strategies.trailing_stop.STATE_FILE", fake_state_file), patch("config.DAYTRADE_TRADE_JOURNAL_FILE", fake_journal):
+            mgr = DynamicTrailingStopManager()
+            state = TrailingStopState(
+                symbol="AAPL",
+                side="BUY",
+                entry_price=100.0,
+                peak_price=100.0,
+                atr=1.0,
+                stop_price=95.0,
+                trail_multiple=1.5,
+                last_updated=0.0,
+                qty=12.0,
+                entry_qty=12.0,
+                order_id="current-stop",
+                signal_id="current-episode-signal",
+                entry_time=entry_time,
+            )
+            mgr.states["AAPL"] = state
+            # Foreign episode registered on MSFT
+            mgr.states["MSFT"] = TrailingStopState(
+                symbol="MSFT",
+                side="BUY",
+                entry_price=300.0,
+                peak_price=300.0,
+                atr=2.0,
+                stop_price=290.0,
+                trail_multiple=1.5,
+                last_updated=0.0,
+                qty=5.0,
+                entry_qty=5.0,
+                order_id="foreign-stop-9",
+                signal_id="foreign-episode-signal",
+                entry_time=entry_time,
+            )
+            dual_order = {
+                "id": "current-stop",
+                "client_order_id": "exit_current-episode-signal_foreign-episode-signal",  # Matches current AND foreign
+                "symbol": "AAPL",
+                "side": "sell",
+                "type": "market",
+                "status": "filled",
+                "filled_qty": 12.0,
+                "filled_avg_price": 105.0,
+                "filled_at": datetime.fromtimestamp(entry_time + 30, timezone.utc),
+            }
+            bridge = NS(
+                get_position=lambda sym: 0.0 if sym == "AAPL" else 5.0,
+                get_order_snapshot=lambda oid: None,
+                _client=NS(get_orders=lambda req: [NS(**dual_order)]),
+            )
+            res = mgr.reconcile_pending_exits(bridge)
+            assert len(mgr.pending_exits) == 1, "Expected 1 pending exit retained due to dual-match conflict"
+            assert res.get("AAPL") == "CONFLICTING_EXIT_EVIDENCE_DISCREPANCY", "Status must be CONFLICTING_EXIT_EVIDENCE_DISCREPANCY"
+            assert not os.path.exists(fake_journal) or len(open(fake_journal).readlines()) == 0, "Expected 0 journal records on dual match conflict"
+            results["c4_case4b_dual_match_conflict_precedence_retains_pending"] = "PASS"
+
+    # 4d. Shared Broker Order ID Conflict Precedence: Order ID mapped to both current and foreign episode -> Conflict strictly takes precedence
+    with tempfile.TemporaryDirectory() as td:
+        fake_state_file = os.path.join(td, "trailing_state.json")
+        fake_journal = pathlib.Path(td) / "journal.jsonl"
+        with patch("strategies.trailing_stop.STATE_FILE", fake_state_file), patch("config.DAYTRADE_TRADE_JOURNAL_FILE", fake_journal):
+            mgr = DynamicTrailingStopManager()
+            mgr.states["AAPL"] = TrailingStopState(
+                symbol="AAPL", side="BUY", entry_price=100.0, peak_price=100.0, atr=1.0,
+                stop_price=95.0, trail_multiple=1.5, last_updated=0.0, qty=12.0, entry_qty=12.0,
+                order_id="current-stop", signal_id="current-episode-signal", entry_time=entry_time,
+            )
+            mgr.states["MSFT"] = TrailingStopState(
+                symbol="MSFT", side="BUY", entry_price=300.0, peak_price=300.0, atr=2.0,
+                stop_price=290.0, trail_multiple=1.5, last_updated=0.0, qty=5.0, entry_qty=5.0,
+                order_id="current-stop", signal_id="foreign-episode-signal", entry_time=entry_time,
+            )
+            shared_order = {
+                "id": "current-stop", "client_order_id": "current-episode-signal",
+                "symbol": "AAPL", "side": "sell", "type": "market", "status": "filled",
+                "filled_qty": 12.0, "filled_avg_price": 105.0,
+                "filled_at": datetime.fromtimestamp(entry_time + 30, timezone.utc),
+            }
+            bridge = NS(
+                get_position=lambda sym: 0.0 if sym == "AAPL" else 5.0,
+                get_order_snapshot=lambda oid: None,
+                _client=NS(get_orders=lambda req: [NS(**shared_order)]),
+            )
+            res = mgr.reconcile_pending_exits(bridge)
+            assert len(mgr.pending_exits) == 1, "Expected 1 pending exit retained due to shared order ID conflict"
+            assert res.get("AAPL") == "CONFLICTING_EXIT_EVIDENCE_DISCREPANCY", "Status must be CONFLICTING_EXIT_EVIDENCE_DISCREPANCY"
+            assert not os.path.exists(fake_journal) or len(open(fake_journal).readlines()) == 0, "Expected 0 journal records on shared order ID conflict"
+            results["c4_case4d_shared_broker_order_id_conflict_precedence"] = "PASS"
+
+    # 4e. Unmapped Literal Word Client ID Control: Exact current broker order ID with unmapped literal client ID -> Reconciled
+    with tempfile.TemporaryDirectory() as td:
+        fake_state_file = os.path.join(td, "trailing_state.json")
+        fake_journal = pathlib.Path(td) / "journal.jsonl"
+        with patch("strategies.trailing_stop.STATE_FILE", fake_state_file), patch("config.DAYTRADE_TRADE_JOURNAL_FILE", fake_journal):
+            mgr = DynamicTrailingStopManager()
+            mgr.states["AAPL"] = TrailingStopState(
+                symbol="AAPL", side="BUY", entry_price=100.0, peak_price=100.0, atr=1.0,
+                stop_price=95.0, trail_multiple=1.5, last_updated=0.0, qty=12.0, entry_qty=12.0,
+                order_id="current-stop", signal_id="current-episode-signal", entry_time=entry_time,
+            )
+            unmapped_order = {
+                "id": "current-stop", "client_order_id": "broker-other-episode-note",
+                "symbol": "AAPL", "side": "sell", "type": "market", "status": "filled",
+                "filled_qty": 12.0, "filled_avg_price": 105.0,
+                "filled_at": datetime.fromtimestamp(entry_time + 30, timezone.utc),
+            }
+            bridge = NS(
+                get_position=lambda sym: 0.0,
+                get_order_snapshot=lambda oid: None,
+                _client=NS(get_orders=lambda req: [NS(**unmapped_order)]),
+            )
+            res = mgr.reconcile_pending_exits(bridge)
+            assert len(mgr.pending_exits) == 0, "Expected pending exits cleared on valid recovery"
+            assert res.get("AAPL") == "RECONCILED_MARKET_EXIT", "Status must be RECONCILED_MARKET_EXIT"
+            assert os.path.exists(fake_journal) and len(open(fake_journal).readlines()) == 1, "Expected 1 journal record on valid recovery"
+            results["c4_case4e_unmapped_literal_word_client_id_reconciled"] = "PASS"
+
+    # 4c. Reverse Conflict Precedence: Candidate broker order ID belongs to foreign episode, client ID matches current lineage -> Conflict strictly takes precedence
+    with tempfile.TemporaryDirectory() as td:
+        fake_state_file = os.path.join(td, "trailing_state.json")
+        fake_journal = pathlib.Path(td) / "journal.jsonl"
+        with patch("strategies.trailing_stop.STATE_FILE", fake_state_file), patch("config.DAYTRADE_TRADE_JOURNAL_FILE", fake_journal):
+            mgr = DynamicTrailingStopManager()
+            state = TrailingStopState(
+                symbol="AAPL",
+                side="BUY",
+                entry_price=100.0,
+                peak_price=100.0,
+                atr=1.0,
+                stop_price=95.0,
+                trail_multiple=1.5,
+                last_updated=0.0,
+                qty=12.0,
+                entry_qty=12.0,
+                order_id="current-stop",
+                signal_id="current-episode-signal",
+                entry_time=entry_time,
+            )
+            mgr.states["AAPL"] = state
+            # Foreign episode registered on MSFT
+            mgr.states["MSFT"] = TrailingStopState(
+                symbol="MSFT",
+                side="BUY",
+                entry_price=300.0,
+                peak_price=300.0,
+                atr=2.0,
+                stop_price=290.0,
+                trail_multiple=1.5,
+                last_updated=0.0,
+                qty=5.0,
+                entry_qty=5.0,
+                order_id="foreign-stop-9",
+                signal_id="foreign-episode-signal",
+                entry_time=entry_time,
+            )
+            reverse_order = {
+                "id": "foreign-stop-9",
+                "client_order_id": "current-episode-signal",  # Matches current AAPL signal, but ID belongs to MSFT!
+                "symbol": "AAPL",
+                "side": "sell",
+                "type": "market",
+                "status": "filled",
+                "filled_qty": 12.0,
+                "filled_avg_price": 105.0,
+                "filled_at": datetime.fromtimestamp(entry_time + 30, timezone.utc),
+            }
+            bridge = NS(
+                get_position=lambda sym: 0.0 if sym == "AAPL" else 5.0,
+                get_order_snapshot=lambda oid: None,
+                _client=NS(get_orders=lambda req: [NS(**reverse_order)]),
+            )
+            res = mgr.reconcile_pending_exits(bridge)
+            assert len(mgr.pending_exits) == 1, "Expected 1 pending exit retained due to reverse conflict"
+            assert res.get("AAPL") == "CONFLICTING_EXIT_EVIDENCE_DISCREPANCY", "Status must be CONFLICTING_EXIT_EVIDENCE_DISCREPANCY"
+            assert not os.path.exists(fake_journal) or len(open(fake_journal).readlines()) == 0, "Expected 0 journal records on reverse conflict"
+            results["c4_case4c_reverse_conflict_broker_order_id_belongs_to_foreign_episode"] = "PASS"
+
+    # 5. Fault-Injected Initial-Save Failure -> Crash/Restart -> Authoritative Later Fill: Disk-loaded cold start, single close, idempotent retry
+    with tempfile.TemporaryDirectory() as td:
+        fake_state_file = os.path.join(td, "trailing_state.json")
+        fake_journal = pathlib.Path(td) / "journal.jsonl"
+        with patch("strategies.trailing_stop.STATE_FILE", fake_state_file), patch("config.DAYTRADE_TRADE_JOURNAL_FILE", fake_journal):
+            # Pre-crash phase: persist active entry state to disk before crash/restart
+            mgr_init = DynamicTrailingStopManager()
+            state_init = TrailingStopState(
+                symbol="AAPL",
+                side="BUY",
+                entry_price=100.0,
+                peak_price=100.0,
+                atr=1.0,
+                stop_price=95.0,
+                trail_multiple=1.5,
+                last_updated=0.0,
+                qty=12.0,
+                entry_qty=12.0,
+                order_id="stop-1",
+                signal_id="sig-crash-recover",
+                entry_time=entry_time,
+                active=True,
+                reconciliation_status=None,
+            )
+            mgr_init.states["AAPL"] = state_init
+            saved_ok = mgr_init._save_state()
+            assert saved_ok is True, "Pre-crash entry state must be saved to disk"
+            assert os.path.exists(fake_state_file), "Disk state file must exist"
+
+            # Fault injection: simulate save failure during exit recording
+            with patch.object(mgr_init, "_save_state", return_value=False):
+                mgr_init._record_pending_exit(state_init)
+                assert state_init.stop_reconciliation_required is True
+
+            # SIMULATE CRASH: drop all references
+            del mgr_init
+            del state_init
+
+            # SIMULATE RESTART: Fresh instance loaded directly from disk
+            mgr_restarted = DynamicTrailingStopManager()
+            assert "AAPL" in mgr_restarted.states, "Fresh manager must load AAPL from disk"
+            assert mgr_restarted.states["AAPL"].active is True
+            assert len(mgr_restarted.pending_exits) == 0, "Pending exits queue starts empty on cold start"
+
+            recovered_fill = {
+                "id": "stop-1",
+                "client_order_id": "generic-broker-client-id",
+                "symbol": "AAPL",
+                "side": "sell",
+                "type": "stop",
+                "status": "filled",
+                "filled_qty": 12.0,
+                "filled_avg_price": 95.0,
+                "filled_at": datetime.fromtimestamp(entry_time + 40, timezone.utc),
+            }
+            bridge = NS(
+                get_position=lambda sym: 0.0,
+                get_order_snapshot=lambda oid: None,
+                _client=NS(get_orders=lambda req: [NS(**recovered_fill)]),
+            )
+            res1 = mgr_restarted.reconcile_pending_exits(bridge)
+            assert len(mgr_restarted.pending_exits) == 0, "Authoritative fill after crash must reconcile and clear pending"
+            assert os.path.exists(fake_journal) and len(open(fake_journal).readlines()) == 1, "Expected exactly 1 journal row"
+            # Idempotent retry on restarted manager
+            res2 = mgr_restarted.reconcile_pending_exits(bridge)
+            assert len(mgr_restarted.pending_exits) == 0
+            assert len(open(fake_journal).readlines()) == 1, "Retry must not duplicate journal rows"
+            results["c4_case5_initial_save_failure_restart_authoritative_fill_reconciles"] = "PASS"
+
+    # 6. Fault-Injected Initial-Save Failure -> Crash/Restart -> Unlinked Later Fill: Disk-loaded cold start, retained fail-closed, journal=0, entry blocked
+    with tempfile.TemporaryDirectory() as td:
+        fake_state_file = os.path.join(td, "trailing_state.json")
+        fake_journal = pathlib.Path(td) / "journal.jsonl"
+        with patch("strategies.trailing_stop.STATE_FILE", fake_state_file), patch("config.DAYTRADE_TRADE_JOURNAL_FILE", fake_journal):
+            # Pre-crash phase: persist active entry state to disk before crash/restart
+            mgr_init = DynamicTrailingStopManager()
+            state_init = TrailingStopState(
+                symbol="AAPL",
+                side="BUY",
+                entry_price=100.0,
+                peak_price=100.0,
+                atr=1.0,
+                stop_price=95.0,
+                trail_multiple=1.5,
+                last_updated=0.0,
+                qty=12.0,
+                entry_qty=12.0,
+                order_id="stop-1",
+                signal_id="sig-crash-unlinked",
+                entry_time=entry_time,
+                active=True,
+                reconciliation_status=None,
+            )
+            mgr_init.states["AAPL"] = state_init
+            saved_ok = mgr_init._save_state()
+            assert saved_ok is True, "Pre-crash entry state must be saved to disk"
+            assert os.path.exists(fake_state_file), "Disk state file must exist"
+
+            # Fault injection: simulate save failure during exit recording
+            with patch.object(mgr_init, "_save_state", return_value=False):
+                mgr_init._record_pending_exit(state_init)
+                assert state_init.stop_reconciliation_required is True
+
+            # SIMULATE CRASH: drop all references
+            del mgr_init
+            del state_init
+
+            # SIMULATE RESTART: Fresh instance loaded directly from disk
+            mgr_restarted = DynamicTrailingStopManager()
+            assert "AAPL" in mgr_restarted.states, "Fresh manager must load AAPL from disk"
+            assert mgr_restarted.states["AAPL"].active is True
+            assert len(mgr_restarted.pending_exits) == 0, "Pending exits queue starts empty on cold start"
+
+            unlinked_fill = {
+                "id": "unlinked-order-99",
+                "client_order_id": "unmapped-client-id",
+                "symbol": "AAPL",
+                "side": "sell",
+                "type": "market",
+                "status": "filled",
+                "filled_qty": 12.0,
+                "filled_avg_price": 95.0,
+                "filled_at": datetime.fromtimestamp(entry_time + 40, timezone.utc),
+            }
+            bridge = NS(
+                get_position=lambda sym: 0.0,
+                get_order_snapshot=lambda oid: None,
+                _client=NS(get_orders=lambda req: [NS(**unlinked_fill)]),
+            )
+            res = mgr_restarted.reconcile_pending_exits(bridge)
+            assert len(mgr_restarted.pending_exits) == 1, "Unlinked fill after crash must retain pending fail-closed"
+            assert not os.path.exists(fake_journal) or len(open(fake_journal).readlines()) == 0, "Expected 0 journal rows for unlinked fill"
+            assert mgr_restarted.has_pending_exit("AAPL") is True, "Entry block via has_pending_exit must remain active"
+            results["c4_case6_initial_save_failure_restart_unlinked_fill_retains_pending"] = "PASS"
+
+    # 7. Signed side mismatch halt predicates across active=True and active=False and cold-start restart
+    for active_val in (True, False):
+        with tempfile.TemporaryDirectory() as td:
+            fake_state_file = os.path.join(td, "trailing_state.json")
+            with patch("strategies.trailing_stop.STATE_FILE", fake_state_file):
+                state_mismatch = TrailingStopState(
+                    symbol="MSFT",
+                    side="BUY",
+                    entry_price=400.0,
+                    peak_price=400.0,
+                    atr=2.0,
+                    stop_price=395.0,
+                    trail_multiple=1.5,
+                    last_updated=0.0,
+                    active=active_val,
+                    reconciliation_status="SIGNED_SIDE_MISMATCH_RECONCILIATION_REQUIRED",
+                )
+                mgr = DynamicTrailingStopManager()
+                mgr.states["MSFT"] = state_mismatch
+                assert mgr.has_unresolved_position_unknown() is True
+                assert mgr.has_unresolved_signed_side_mismatch() is True
+                mgr._save_state()
+
+                # COLD START / RESTART VERIFICATION
+                mgr_restarted = DynamicTrailingStopManager()
+                assert "MSFT" in mgr_restarted.states, f"Fresh manager must load MSFT from disk for active={active_val}"
+                assert mgr_restarted.has_unresolved_position_unknown() is True, f"has_unresolved_position_unknown must be True for active={active_val} after reload"
+                assert mgr_restarted.has_unresolved_signed_side_mismatch() is True, f"has_unresolved_signed_side_mismatch must be True for active={active_val} after reload"
+                results[f"c4_case7_signed_side_mismatch_halt_active_{active_val}"] = "PASS"
+
+    return results
+
+
 if __name__ == "__main__":
     b1_results = test_b1_lifecycle_remediation()
     b2_results = test_b2_cumulative_entry_quantity()
@@ -1216,6 +1767,10 @@ if __name__ == "__main__":
     c1_results = test_c1_position_side_and_residual_fills()
     c2_results = test_c2_pending_exit_persistence_and_recovery()
     c3_results = test_c3_validation_ledger_durability_and_idempotency()
-    all_res = {**b1_results, **b2_results, **r2_results, **c1_results, **c2_results, **c3_results}
+    c4_results = test_c4_lineage_and_signed_side_mismatch()
+    all_res = {**b1_results, **b2_results, **r2_results, **c1_results, **c2_results, **c3_results, **c4_results}
+    res_path = pathlib.Path(__file__).resolve().parent / "scoped_lifecycle_blockers_results.json"
+    res_path.write_text(json.dumps(all_res, indent=2), encoding="utf-8")
     print(json.dumps(all_res, indent=2))
+
 

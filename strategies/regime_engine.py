@@ -12,11 +12,14 @@ and scanner candidate breadth to dynamically classify market regime into:
 
 import logging
 import math
+import os
 import threading
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import pandas as pd
 
 import config
 from strategies.session import now_eastern
@@ -209,16 +212,47 @@ def compute_vwap_breadth(
     evaluated_symbols = []
 
     candidates = symbols or []
+    use_batch = os.environ.get("REGIME_BREADTH_BATCH_ENABLED", "").lower() in ("true", "1", "yes")
+    batch_fetched = {}
+    if use_batch and candidates and not symbol_data:
+        try:
+            from strategies.intraday_data import fetch_intraday_batch
+            batch_fetched, _ = fetch_intraday_batch(
+                candidates,
+                interval="1m",
+                bridge=bridge,
+                purpose="REGIME_BREADTH",
+                total_timeout_seconds=10.0,
+            )
+        except Exception as b_err:
+            logger.debug("[BREADTH] Batch fetch failed: %s", b_err)
+            batch_fetched = {}
+
     for sym in candidates:
         df = None
         if symbol_data and sym in symbol_data:
             df = symbol_data[sym]
+        elif batch_fetched and sym in batch_fetched:
+            df = batch_fetched[sym]
         elif bridge is not None:
             try:
                 from strategies.intraday_data import fetch_intraday
-                df = fetch_intraday(sym, bridge=bridge)
+                df = fetch_intraday(sym, interval="1m", bridge=bridge, purpose="REGIME_BREADTH")
             except Exception:
                 df = None
+
+        if df is not None and not df.empty:
+            try:
+                now_utc = pd.Timestamp.now(tz="UTC")
+                idx = df.index
+                if idx.tz is None:
+                    idx_utc = idx.tz_localize("UTC")
+                else:
+                    idx_utc = idx.tz_convert("UTC")
+                closed_mask = (idx_utc + pd.Timedelta(seconds=60)) <= now_utc
+                df = df.loc[closed_mask]
+            except Exception:
+                pass
 
         if df is not None and not df.empty and len(df) >= 2:
             try:
@@ -893,17 +927,29 @@ class RegimeStateTracker:
     """
     Thread-safe hysteresis state tracker wrapping evaluate_market_regime().
     Maintains recovery cool-down to prevent flapping between DATA_DEGRADED and normal modes,
-    and texture dwell hysteresis (N=3 consecutive bars) to prevent texture whipping.
+    and texture dwell hysteresis (N=3 consecutive distinct completed bars) to prevent texture whipping.
     """
-    def __init__(self, recovery_bars: Optional[int] = None, texture_dwell_bars: Optional[int] = None):
+    def __init__(
+        self,
+        recovery_bars: Optional[int] = None,
+        texture_dwell_bars: Optional[int] = None,
+        bar_interval_seconds: float = 300.0,
+        max_gap_tolerance_seconds: float = 360.0,
+        allow_unanchored_advance: bool = False,
+    ):
         cfg_settings = getattr(config, "DATA_HEALTH_SETTINGS", {})
-        self._recovery_bars = recovery_bars if recovery_bars is not None else int(cfg_settings.get("recovery_bars", 3))
+        # Recovery is explicitly measured in healthy poll cycles
+        self._recovery_polls = recovery_bars if recovery_bars is not None else int(cfg_settings.get("recovery_bars", 3))
         self._texture_dwell_bars = texture_dwell_bars if texture_dwell_bars is not None else 3
+        self._bar_interval_seconds = bar_interval_seconds
+        self._max_gap_tolerance_seconds = max_gap_tolerance_seconds
+        self._allow_unanchored_advance = allow_unanchored_advance
         self._consecutive_healthy = 0
         self._latched_degraded = False
         self._active_texture: Optional[str] = None
         self._candidate_texture: Optional[str] = None
         self._candidate_texture_count: int = 0
+        self._last_processed_bar_dt: Optional[datetime] = None
         self._lock = threading.RLock()
 
     @property
@@ -931,6 +977,11 @@ class RegimeStateTracker:
         with self._lock:
             return self._candidate_texture_count
 
+    @property
+    def last_processed_bar_dt(self) -> Optional[datetime]:
+        with self._lock:
+            return self._last_processed_bar_dt
+
     def reset(self) -> None:
         with self._lock:
             self._consecutive_healthy = 0
@@ -938,87 +989,181 @@ class RegimeStateTracker:
             self._active_texture = None
             self._candidate_texture = None
             self._candidate_texture_count = 0
+            self._last_processed_bar_dt = None
 
-    def update(self, raw_result: MarketRegimeResult) -> MarketRegimeResult:
+    def _validate_bar_advance(
+        self,
+        bar_dt: Optional[datetime],
+        is_completed_bar_boundary: bool,
+    ) -> Tuple[bool, bool]:
+        """
+        Validates whether incoming bar observation satisfies canonical grid alignment,
+        monotonic sequence, and sub-interval/gap tolerances.
+        Returns: (is_valid_advance, is_gap)
+        """
+        if not is_completed_bar_boundary or bar_dt is None:
+            return False, False
+
+        # 1. Canonical grid alignment: completed bars must sit on clean interval boundaries
+        if self._bar_interval_seconds >= 60.0:
+            step_min = int(self._bar_interval_seconds // 60)
+            if bar_dt.second != 0 or (bar_dt.minute % step_min != 0):
+                logger.warning(
+                    "[TEXTURE HYSTERESIS] Off-grid bar timestamp rejected (%s not aligned to %dm grid). Watermark retained.",
+                    bar_dt.isoformat(),
+                    step_min,
+                )
+                return False, False
+        elif self._bar_interval_seconds > 0.0:
+            step_sec = int(self._bar_interval_seconds)
+            if (bar_dt.second % step_sec) != 0:
+                logger.warning(
+                    "[TEXTURE HYSTERESIS] Off-grid bar timestamp rejected (%s not aligned to %ds grid). Watermark retained.",
+                    bar_dt.isoformat(),
+                    step_sec,
+                )
+                return False, False
+
+        # 2. Bootstrap on first valid completed bar
+        if self._last_processed_bar_dt is None:
+            return True, False
+
+        # 3. Monotonicity check: reject duplicate or out-of-order older bars
+        if bar_dt <= self._last_processed_bar_dt:
+            return False, False
+
+        # 4. Strictly newer bar: enforce minimum interval floor (>= 80% or interval - 60s)
+        delta_s = (bar_dt - self._last_processed_bar_dt).total_seconds()
+        min_interval_s = max(self._bar_interval_seconds - 60.0, self._bar_interval_seconds * 0.8)
+        if delta_s < min_interval_s:
+            logger.warning(
+                "[TEXTURE HYSTERESIS] Sub-interval bar rejected (delta %.1fs < min %.1fs). Watermark retained.",
+                delta_s,
+                min_interval_s,
+            )
+            return False, False
+
+        is_gap = delta_s > self._max_gap_tolerance_seconds
+        return True, is_gap
+
+    def update(
+        self,
+        raw_result: MarketRegimeResult,
+        completed_bar_ts: Optional[Union[str, datetime]] = None,
+        is_completed_bar_boundary: bool = False,
+    ) -> MarketRegimeResult:
         with self._lock:
+            # ─────────────────────────────────────────────────────────────
+            # 1. EMERGENCY RISK & DATA HEALTH GATES (EVERY POLL INVARIANT)
+            # ─────────────────────────────────────────────────────────────
             if raw_result.mode == MODE_DATA_DEGRADED:
                 self._consecutive_healthy = 0
                 self._latched_degraded = True
                 self._active_texture = None
                 self._candidate_texture = None
                 self._candidate_texture_count = 0
+                # Preserve _last_processed_bar_dt across degraded events so old bars cannot be re-accepted upon recovery
                 return raw_result
 
             if self._latched_degraded:
                 self._consecutive_healthy += 1
-                if self._consecutive_healthy < self._recovery_bars:
-                    # Still in cool-down recovery window -> keep degraded state latched
+                if self._consecutive_healthy < self._recovery_polls:
                     latched_reasons = [
-                        f"DATA_DEGRADED (Cool-down recovery: {self._consecutive_healthy}/{self._recovery_bars} fresh bars)"
+                        f"DATA_DEGRADED (Cool-down recovery: {self._consecutive_healthy}/{self._recovery_polls} healthy polls)"
                     ] + raw_result.reasons
-                    return MarketRegimeResult(
+                    return replace(
+                        raw_result,
                         mode=MODE_DATA_DEGRADED,
-                        score=0,
-                        allow_new_longs=False,
-                        requires_opening_buffer=True,
-                        position_scale=0.0,
-                        confidence_boost=0.0,
-                        allow_new_shorts=False,
-                        allow_inverse_etf_longs=False,
-                        reasons=latched_reasons,
-                        factor_scores=raw_result.factor_scores,
-                        data=raw_result.data,
-                        evaluated_at=raw_result.evaluated_at,
-                        scanner_candidate_count=raw_result.scanner_candidate_count,
-                        max_trades_day=0,
                         halt_new_entries=True,
+                        allow_new_longs=False,
+                        reasons=latched_reasons,
                         market_texture=TEXTURE_VOLATILE,
                     )
-                # Reached recovery threshold -> unlatch
                 self._latched_degraded = False
                 logger.info(
-                    "[REGIME TRACKER] Data health restored after %d consecutive healthy bars; unlatching %s",
+                    "[REGIME TRACKER] Data health restored after %d consecutive healthy polls; unlatching %s",
                     self._consecutive_healthy,
                     raw_result.mode,
                 )
 
-            # 2. Texture Dwell Hysteresis (N=3 consecutive bars required before flipping texture)
+            # ─────────────────────────────────────────────────────────────
+            # 2. PARSE & VALIDATE COMPLETED BAR TIMESTAMP
+            # ─────────────────────────────────────────────────────────────
+            bar_dt: Optional[datetime] = None
+            if completed_bar_ts is not None:
+                if isinstance(completed_bar_ts, datetime):
+                    bar_dt = completed_bar_ts if completed_bar_ts.tzinfo else completed_bar_ts.replace(tzinfo=timezone.utc)
+                elif isinstance(completed_bar_ts, str):
+                    try:
+                        dt = datetime.fromisoformat(completed_bar_ts.replace("Z", "+00:00"))
+                        bar_dt = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        bar_dt = None
+
+            # ─────────────────────────────────────────────────────────────
+            # 3. TEXTURE DWELL HYSTERESIS (DISTINCT COMPLETED BARS ONLY)
+            # ─────────────────────────────────────────────────────────────
             raw_texture = raw_result.market_texture
-            if self._active_texture is None:
-                self._active_texture = raw_texture
-                self._candidate_texture = raw_texture
-                self._candidate_texture_count = 1
-                confirmed_texture = raw_texture
-            elif raw_texture == self._active_texture:
-                self._candidate_texture = raw_texture
-                self._candidate_texture_count = 0
-                confirmed_texture = self._active_texture
-            else:
-                if raw_texture == self._candidate_texture:
-                    self._candidate_texture_count += 1
+
+            # Strict mode invariant: unanchored calls (no timestamp) do NOT advance dwell
+            if completed_bar_ts is None:
+                if self._allow_unanchored_advance:
+                    is_valid_advance = True
+                    is_gap = False
                 else:
+                    is_valid_advance = False
+                    is_gap = False
+            else:
+                is_valid_advance, is_gap = self._validate_bar_advance(bar_dt, is_completed_bar_boundary)
+
+            if is_valid_advance:
+                if self._active_texture is None:
+                    # Bootstrap on first valid completed bar
+                    self._active_texture = raw_texture
                     self._candidate_texture = raw_texture
                     self._candidate_texture_count = 1
-
-                if self._candidate_texture_count >= self._texture_dwell_bars:
-                    logger.info(
-                        "[TEXTURE HYSTERESIS] Texture transition confirmed: %s -> %s after %d consecutive bars",
-                        self._active_texture,
-                        self._candidate_texture,
-                        self._candidate_texture_count,
+                elif is_gap:
+                    # Missing bar gap resets consecutive streak
+                    logger.warning(
+                        "[TEXTURE HYSTERESIS] Bar interval gap detected (delta > %.1fs). Resetting consecutive counter streak.",
+                        self._max_gap_tolerance_seconds,
                     )
-                    self._active_texture = self._candidate_texture
+                    self._candidate_texture = raw_texture
+                    self._candidate_texture_count = 1
+                elif raw_texture == self._active_texture:
+                    self._candidate_texture = raw_texture
                     self._candidate_texture_count = 0
-                    confirmed_texture = self._active_texture
                 else:
-                    logger.debug(
-                        "[TEXTURE HYSTERESIS] Dwell window active (%d/%d bars for %s). Retaining confirmed texture: %s",
-                        self._candidate_texture_count,
-                        self._texture_dwell_bars,
-                        self._candidate_texture,
-                        self._active_texture,
-                    )
-                    confirmed_texture = self._active_texture
+                    if raw_texture == self._candidate_texture:
+                        self._candidate_texture_count += 1
+                    else:
+                        self._candidate_texture = raw_texture
+                        self._candidate_texture_count = 1
+
+                    if self._candidate_texture_count >= self._texture_dwell_bars:
+                        logger.info(
+                            "[TEXTURE HYSTERESIS] Texture transition confirmed: %s -> %s after %d consecutive distinct bars",
+                            self._active_texture,
+                            self._candidate_texture,
+                            self._candidate_texture_count,
+                        )
+                        self._active_texture = self._candidate_texture
+                        self._candidate_texture_count = 0
+                    else:
+                        logger.debug(
+                            "[TEXTURE HYSTERESIS] Dwell window active (%d/%d bars for %s). Retaining confirmed texture: %s",
+                            self._candidate_texture_count,
+                            self._texture_dwell_bars,
+                            self._candidate_texture,
+                            self._active_texture,
+                        )
+
+                # CRITICAL WATERMARK INVARIANT:
+                # Always update watermark immediately upon accepting valid completed bar observation
+                if bar_dt is not None:
+                    self._last_processed_bar_dt = bar_dt
+
+            confirmed_texture = self._active_texture if self._active_texture is not None else raw_texture
 
             if confirmed_texture != raw_result.market_texture:
                 halt = raw_result.halt_new_entries

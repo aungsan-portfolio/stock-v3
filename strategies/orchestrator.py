@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import os
 import time
@@ -7,6 +7,8 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Dict, Any, Tuple
 import sys
+import pandas as pd
+
 
 import config
 from dataclasses import dataclass
@@ -27,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 _consecutive_broker_failures = 0
 _last_evaluated_5m_bar_str: Optional[str] = None
+_last_regime_bar_str: Optional[str] = None
 _skipped_bar_ids: set[str] = set()
 _engine_boot_ts: float = time.time()
 
@@ -1699,8 +1702,32 @@ def evaluate_and_execute(
             scanner_count = len(watchlist) if watchlist else 0
         if not live_paper and scanner_count > 0 and scanner_count < 2:
             scanner_count = 5  # Unit test mock default
+
+        # Determine 5-minute bar boundary for texture dwell hysteresis
+        now_utc = datetime.now(timezone.utc)
+        current_5m_bar_ts = now_utc.replace(second=0, microsecond=0)
+        current_5m_bar_ts = current_5m_bar_ts.replace(minute=(current_5m_bar_ts.minute // 5) * 5)
+        completed_5m_bar_ts = current_5m_bar_ts - timedelta(minutes=5)
+        completed_5m_bar_str = completed_5m_bar_ts.isoformat()
+
+        global _last_regime_bar_str
+        if "_last_regime_bar_str" not in globals():
+            _last_regime_bar_str = None
+        pub_timeout = float(getattr(config, "DAYTRADE_BAR_PUBLICATION_TIMEOUT_S", 90.0))
+        bar_age = (now_utc - current_5m_bar_ts).total_seconds()
+        is_completed_boundary = bool(_last_regime_bar_str != completed_5m_bar_str and bar_age <= pub_timeout)
+
         raw_regime_res = evaluate_market_regime(bridge=bridge, scanner_candidate_count=scanner_count, symbols=watchlist)
-        regime_res = _regime_state_tracker.update(raw_regime_res)
+        regime_res = _regime_state_tracker.update(
+            raw_regime_res,
+            completed_bar_ts=completed_5m_bar_ts,
+            is_completed_bar_boundary=is_completed_boundary,
+        )
+
+        # Consumed boundary watermark updated only upon healthy observation acceptance
+        # to allow intra-window retries (bar_age <= pub_timeout) if transient DATA_DEGRADED occurs
+        if is_completed_boundary and regime_res.mode != MODE_DATA_DEGRADED:
+            _last_regime_bar_str = completed_5m_bar_str
 
         # Synchronize transient DATA_DEGRADED halt
         if regime_res.mode == MODE_DATA_DEGRADED:
@@ -1901,7 +1928,6 @@ def evaluate_and_execute(
     current_5m_bar_ts = current_5m_bar_ts.replace(minute=(current_5m_bar_ts.minute // 5) * 5)
 
     # Calculate last completed 5m bar boundary (bar_start -> bar_end)
-    from datetime import timedelta
     completed_5m_bar_ts = current_5m_bar_ts - timedelta(minutes=5)
     completed_5m_bar_str = completed_5m_bar_ts.isoformat()
 

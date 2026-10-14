@@ -69,3 +69,12 @@ Thumbs.db
 evidence/
 .pytest_temp/
 pytest_*.txt
+*.bak*
+temp_pytest/
+temp_pytest*/
+archive_bundles/
+backups/
+*.patch
+*.zip
+*results.json
+pytest_junit_report.xml
