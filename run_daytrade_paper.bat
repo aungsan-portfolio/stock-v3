@@ -26,6 +26,8 @@ if exist .env (
         if "!KEY_NAME!"=="REGIME_BREADTH_BATCH_ENABLED" set "REGIME_BREADTH_BATCH_ENABLED=!KEY_VAL!"
         if "!KEY_NAME!"=="ENTRY_BAR_CLOSE_GRACE_SECONDS" set "ENTRY_BAR_CLOSE_GRACE_SECONDS=!KEY_VAL!"
         if "!KEY_NAME!"=="DAYTRADE_RECOVERY_MAX_CANDIDATES" set "DAYTRADE_RECOVERY_MAX_CANDIDATES=!KEY_VAL!"
+        if "!KEY_NAME!"=="ALPACA_DATA_CONNECT_TIMEOUT" set "ALPACA_DATA_CONNECT_TIMEOUT=!KEY_VAL!"
+        if "!KEY_NAME!"=="ALPACA_DATA_READ_TIMEOUT" set "ALPACA_DATA_READ_TIMEOUT=!KEY_VAL!"
     )
 ) else (
     echo [ERROR] .env file not found. Please create .env from .env.example.
@@ -40,6 +42,8 @@ REM Latency Remediation & Resilient Batch Configuration Defaults
 if not defined REGIME_BREADTH_BATCH_ENABLED set "REGIME_BREADTH_BATCH_ENABLED=true"
 if not defined ENTRY_BAR_CLOSE_GRACE_SECONDS set "ENTRY_BAR_CLOSE_GRACE_SECONDS=90.0"
 if not defined DAYTRADE_RECOVERY_MAX_CANDIDATES set "DAYTRADE_RECOVERY_MAX_CANDIDATES=31"
+if not defined ALPACA_DATA_CONNECT_TIMEOUT set "ALPACA_DATA_CONNECT_TIMEOUT=3.5"
+if not defined ALPACA_DATA_READ_TIMEOUT set "ALPACA_DATA_READ_TIMEOUT=7.5"
 
 REM Explicit Daytrade Paper Execution Authorization (paper-only execution gate)
 set "DAYTRADE_PAPER_EXECUTION_ENABLED=true"

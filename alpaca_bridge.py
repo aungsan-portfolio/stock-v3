@@ -665,6 +665,9 @@ class MockIB:
     def __init__(self, bridge):
         self.bridge = bridge
 
+    def isConnected(self) -> bool:
+        return bool(getattr(self.bridge, "is_connected", False))
+
     def positions(self) -> List[MockPosition]:
         self.bridge._require_connection()
         try:
@@ -6086,7 +6089,7 @@ class AlpacaBridge:
     def market_price(self, symbol: str) -> Optional[float]:
         self._require_connection()
         try:
-            quotes = self._data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol.upper().strip()))
+            quotes = self._data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol.upper().strip(), feed="iex"))
             q = quotes.get(symbol.upper().strip())
             if q is not None:
                 bid = float(getattr(q, "bid_price", 0) or 0)

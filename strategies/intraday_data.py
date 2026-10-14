@@ -1840,17 +1840,22 @@ def fetch_daily_alpaca(symbol: str, lookback_days: int = None) -> pd.DataFrame:
                 adjustment=Adjustment.ALL,
             )
             bars_dict = client.get_stock_bars(req)
-        except Exception:
-            try:
-                req = StockBarsRequest(
-                    symbol_or_symbols=symbol.upper().strip(),
-                    timeframe=TimeFrame.Day,
-                    start=start,
-                    feed="sip",
-                    adjustment=Adjustment.ALL,
-                )
-                bars_dict = client.get_stock_bars(req)
-            except Exception:
+        except Exception as iex_exc:
+            tier = str(getattr(config, "ALPACA_SUBSCRIPTION_TIER", "free")).lower().strip()
+            if tier != "free":
+                try:
+                    req = StockBarsRequest(
+                        symbol_or_symbols=symbol.upper().strip(),
+                        timeframe=TimeFrame.Day,
+                        start=start,
+                        feed="sip",
+                        adjustment=Adjustment.ALL,
+                    )
+                    bars_dict = client.get_stock_bars(req)
+                except Exception:
+                    return pd.DataFrame()
+            else:
+                logger.debug("Alpaca IEX daily bars fetch failed for %s on free tier: %s", symbol, iex_exc)
                 return pd.DataFrame()
         if not hasattr(bars_dict, "df") or bars_dict.df.empty:
             return pd.DataFrame()

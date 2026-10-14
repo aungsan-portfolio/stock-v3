@@ -620,6 +620,7 @@ def _get_premarket_pct_change(symbol: str, bridge=None) -> Tuple[Optional[float]
                                 start=now_utc - timedelta(days=7),
                                 end=now_utc,
                                 adjustment=Adjustment.ALL,
+                                feed="iex",
                             )
                             bars = bridge._data_client.get_stock_bars(req)
                             symbol_bars = bars.get(symbol, []) if bars else []

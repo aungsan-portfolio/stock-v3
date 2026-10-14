@@ -199,6 +199,20 @@ def fetch_ohlcv(
             time.sleep(attempt * 1.5)
 
     if df.empty:
+        # Zero-budget fallback: Fetch free Alpaca IEX daily bars
+        try:
+            from strategies.intraday_data import fetch_daily_alpaca
+            days_map = {"5y": 1825, "2y": 730, "1y": 365, "6mo": 180, "3mo": 90, "1mo": 30}
+            days_back = days_map.get(str(period).lower() if period else "5y", 1825)
+            alpaca_df = fetch_daily_alpaca(symbol, lookback_days=days_back)
+            if alpaca_df is not None and not alpaca_df.empty:
+                col_map = {c: c.capitalize() for c in alpaca_df.columns if c.lower() in ("open", "high", "low", "close", "volume")}
+                df = alpaca_df.rename(columns=col_map).copy()
+                logger.info("[FALLBACK] Fetched %s via free Alpaca IEX daily bars fallback", symbol)
+        except Exception as alpaca_exc:
+            logger.debug("[FALLBACK] Alpaca IEX daily bar fallback failed for %s: %s", symbol, alpaca_exc)
+
+    if df.empty:
         raise ValueError(f"No data returned for {symbol}")
 
     required_cols = ["Open", "High", "Low", "Close", "Volume"]

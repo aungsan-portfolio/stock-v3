@@ -170,6 +170,14 @@ def get_macro_benchmark_indicators() -> Dict[str, Any]:
 
         if vix_df is not None and not vix_df.empty:
             res["vix"] = round(float(vix_df["Close"].iloc[-1]), 2)
+        elif spy_df is not None and len(spy_df) >= 20:
+            # Zero-budget empirical fallback proxy: SPY 20-day annualized realized volatility
+            spy_daily_returns = spy_df["Close"].pct_change().dropna()
+            if len(spy_daily_returns) >= 20:
+                realized_vol_20d = float(spy_daily_returns.tail(20).std() * (252 ** 0.5) * 100.0)
+                if math.isfinite(realized_vol_20d) and realized_vol_20d > 0:
+                    res["vix"] = round(realized_vol_20d, 2)
+                    logger.info("[MACRO BENCHMARK] VIX feed unavailable; using SPY 20d realized vol proxy: %.2f", res["vix"])
     except Exception as exc:
         logger.warning("[MACRO BENCHMARK] Failed fetching VIX: %s", exc)
 
