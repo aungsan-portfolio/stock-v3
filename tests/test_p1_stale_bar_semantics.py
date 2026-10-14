@@ -34,8 +34,13 @@ from strategies.execution_health import get_execution_health, HealthStatus
 from alpaca_bridge import StreamState, EntryGateMock
 
 
+import config
+
+
 @pytest.fixture(autouse=True)
-def reset_telemetry():
+def reset_telemetry(monkeypatch):
+    monkeypatch.setattr(config, "ENTRY_BAR_CLOSE_GRACE_SECONDS", 60.0)
+    monkeypatch.setattr(config, "BAR_CLOSE_GRACE_SECONDS", 60.0)
     reset_intraday_feed_telemetry()
     yield
     reset_intraday_feed_telemetry()

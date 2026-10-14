@@ -234,7 +234,7 @@ def compute_vwap_breadth(
             df = symbol_data[sym]
         elif batch_fetched and sym in batch_fetched:
             df = batch_fetched[sym]
-        elif bridge is not None:
+        elif (not use_batch) and (not symbol_data) and bridge is not None:
             try:
                 from strategies.intraday_data import fetch_intraday
                 df = fetch_intraday(sym, interval="1m", bridge=bridge, purpose="REGIME_BREADTH")

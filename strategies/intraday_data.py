@@ -260,15 +260,26 @@ def _sdk_get_stock_bars_soft_bounded(client, request, timeout: Optional[float] =
     with _metrics_lock:
         MARKET_DATA_METRICS["executor_active"] += 1
 
-    def invoke():
-        try:
-            return client.get_stock_bars(request)
-        finally:
+    slot_released = [False]
+    def _release_slot():
+        if not slot_released[0]:
+            slot_released[0] = True
             _alpaca_call_slots.release()
             with _metrics_lock:
                 MARKET_DATA_METRICS["executor_active"] = max(0, MARKET_DATA_METRICS["executor_active"] - 1)
 
-    future = _alpaca_call_pool.submit(invoke)
+    def invoke():
+        try:
+            return client.get_stock_bars(request)
+        finally:
+            _release_slot()
+
+    try:
+        future = _alpaca_call_pool.submit(invoke)
+    except Exception:
+        _release_slot()
+        raise
+
     eff_timeout = timeout if timeout is not None else ALPACA_FUTURE_TIMEOUT_SECONDS
     try:
         return future.result(timeout=eff_timeout)
@@ -276,7 +287,9 @@ def _sdk_get_stock_bars_soft_bounded(client, request, timeout: Optional[float] =
         cancelled = future.cancel()
         with _metrics_lock:
             MARKET_DATA_METRICS["soft_timeout_total"] += 1
-        if not cancelled:
+        if cancelled:
+            _release_slot()
+        else:
             def _track_late():
                 try:
                     future.result()
@@ -759,11 +772,9 @@ def select_last_completed_bar(
         seconds=interval_seconds
     )
 
-    selection_cutoff = normalized_now + pd.Timedelta(
-        seconds=close_tolerance_seconds
-    )
-
-    completed_mask = close_times <= selection_cutoff
+    # An intraday candle is only completed when its close time has been reached by now_utc.
+    # Positive tolerance must not treat forming/unclosed candles as completed.
+    completed_mask = close_times <= normalized_now
 
     if not completed_mask.any():
         earliest_close = close_times.min()
@@ -958,7 +969,7 @@ def _validate_intraday_data(
                         df=df,
                         interval_seconds=interval_seconds,
                         now_utc=current_time,
-                        close_tolerance_seconds=future_tolerance,
+                        close_tolerance_seconds=0.0,
                     )
                 except ValueError as ve:
                     err_msg = str(ve)
@@ -1163,7 +1174,10 @@ def fetch_intraday_alpaca(
             df.attrs["subscription_tier"] = tier
             if hasattr(df, "index") and len(df.index) > 0:
                 last_idx = df.index[-1]
-                df.attrs["bar_end_utc"] = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
+                int_sec = _parse_interval_seconds(interval)
+                bar_end = last_idx + pd.Timedelta(seconds=int_sec)
+                df.attrs["bar_start_utc"] = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
+                df.attrs["bar_end_utc"] = bar_end.isoformat() if hasattr(bar_end, "isoformat") else str(bar_end)
             _write_cache(key, df.copy())
         return df
     except Exception as e:
@@ -1293,12 +1307,16 @@ def fetch_batch_intraday_alpaca(
         chunks = [pending_symbols[i : i + chunk_size] for i in range(0, len(pending_symbols), chunk_size)]
         num_chunks = len(chunks)
 
+        is_breadth = str(purpose or "").upper() == "REGIME_BREADTH"
+        target_telemetry = _breadth_telemetry if is_breadth else _feed_telemetry
+        target_lock = _breadth_telemetry_lock if is_breadth else _feed_telemetry_lock
+
         for chunk_idx, chunk_symbols in enumerate(chunks):
             rem_t = _rem()
             if total_timeout_seconds is not None and (rem_t is None or rem_t <= 0.05):
-                with _feed_telemetry_lock:
-                    _feed_telemetry["batch_timeout_count"] += 1
-                    _feed_telemetry["consecutive_fetch_timeouts"] = _feed_telemetry.get("consecutive_fetch_timeouts", 0) + 1
+                with target_lock:
+                    target_telemetry["batch_timeout_count"] += 1
+                    target_telemetry["consecutive_fetch_timeouts"] = target_telemetry.get("consecutive_fetch_timeouts", 0) + 1
                 logger.warning(
                     "[BATCH FETCH TIMEOUT] Total budget exhausted (%.2fs remaining) before chunk %d/%d.",
                     rem_t or 0.0, chunk_idx + 1, num_chunks,
@@ -1343,7 +1361,10 @@ def fetch_batch_intraday_alpaca(
                         validated_df.attrs["subscription_tier"] = tier
                         if hasattr(validated_df, "index") and len(validated_df.index) > 0:
                             last_idx = validated_df.index[-1]
-                            validated_df.attrs["bar_end_utc"] = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
+                            int_sec = _parse_interval_seconds(interval)
+                            bar_end = last_idx + pd.Timedelta(seconds=int_sec)
+                            validated_df.attrs["bar_start_utc"] = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
+                            validated_df.attrs["bar_end_utc"] = bar_end.isoformat() if hasattr(bar_end, "isoformat") else str(bar_end)
                         _write_cache(key, validated_df.copy())
                         results[sym] = validated_df
                     else:
@@ -1396,7 +1417,10 @@ def fetch_batch_intraday_alpaca(
                                     fb_validated_df.attrs["subscription_tier"] = tier
                                     if hasattr(fb_validated_df, "index") and len(fb_validated_df.index) > 0:
                                         last_idx = fb_validated_df.index[-1]
-                                        fb_validated_df.attrs["bar_end_utc"] = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
+                                        int_sec = _parse_interval_seconds(interval)
+                                        bar_end = last_idx + pd.Timedelta(seconds=int_sec)
+                                        fb_validated_df.attrs["bar_start_utc"] = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
+                                        fb_validated_df.attrs["bar_end_utc"] = bar_end.isoformat() if hasattr(bar_end, "isoformat") else str(bar_end)
                                     _write_cache(key, fb_validated_df.copy())
                                     results[sym] = fb_validated_df
                                 else:
@@ -1427,12 +1451,12 @@ def fetch_batch_intraday_alpaca(
                 time.sleep(chunk_delay_ms / 1000.0)
 
         elapsed = time.monotonic() - start_mono
-        with _feed_telemetry_lock:
-            _feed_telemetry["last_batch_duration_seconds"] = elapsed
-            _feed_telemetry["last_batch_timestamp"] = time.time()
-            _feed_telemetry["total_bars_fetched"] += len(results)
+        with target_lock:
+            target_telemetry["last_batch_duration_seconds"] = elapsed
+            target_telemetry["last_batch_timestamp"] = time.time()
+            target_telemetry["total_bars_fetched"] += len(results)
             if len(results) > 0:
-                _feed_telemetry["consecutive_fetch_timeouts"] = 0
+                target_telemetry["consecutive_fetch_timeouts"] = 0
 
         coverage_pct = (len(results) / len(clean_symbols)) * 100.0 if clean_symbols else 100.0
         logger.info(
@@ -2108,7 +2132,7 @@ def get_intraday_features(
             df,
             interval_seconds=interval_seconds,
             now_utc=now_utc,
-            close_tolerance_seconds=future_tolerance,
+            close_tolerance_seconds=0.0,
         )
         normalized_index = _normalize_utc_index(df.index)
         completed_positions = (normalized_index <= completed.start_time).nonzero()[0]
