@@ -131,6 +131,9 @@ def get_macro_benchmark_indicators() -> Dict[str, Any]:
     res = {
         "adx": None,
         "vix": None,
+        "vix_source": None,
+        "vix_status": "UNAVAILABLE",
+        "spy_realized_vol_20d": None,
         "spy_price": None,
         "spy_sma50": None,
         "sma50_slope": None,
@@ -159,6 +162,13 @@ def get_macro_benchmark_indicators() -> Dict[str, Any]:
         logger.warning("[MACRO BENCHMARK] Failed fetching or computing SPY indicators: %s", exc)
 
     try:
+        if spy_df is not None and len(spy_df) >= 21:
+            spy_daily_returns = spy_df["Close"].pct_change().dropna()
+            if len(spy_daily_returns) >= 20:
+                realized_vol_20d = float(spy_daily_returns.tail(20).std() * (252 ** 0.5) * 100.0)
+                if math.isfinite(realized_vol_20d) and realized_vol_20d > 0:
+                    res["spy_realized_vol_20d"] = round(realized_vol_20d, 2)
+
         vix_df = None
         for vix_sym in ("^VIX", "VIX"):
             try:
@@ -170,14 +180,19 @@ def get_macro_benchmark_indicators() -> Dict[str, Any]:
 
         if vix_df is not None and not vix_df.empty:
             res["vix"] = round(float(vix_df["Close"].iloc[-1]), 2)
-        elif spy_df is not None and len(spy_df) >= 20:
-            # Zero-budget empirical fallback proxy: SPY 20-day annualized realized volatility
-            spy_daily_returns = spy_df["Close"].pct_change().dropna()
-            if len(spy_daily_returns) >= 20:
-                realized_vol_20d = float(spy_daily_returns.tail(20).std() * (252 ** 0.5) * 100.0)
-                if math.isfinite(realized_vol_20d) and realized_vol_20d > 0:
-                    res["vix"] = round(realized_vol_20d, 2)
-                    logger.info("[MACRO BENCHMARK] VIX feed unavailable; using SPY 20d realized vol proxy: %.2f", res["vix"])
+            res["vix_source"] = "CBOE_VIX"
+            res["vix_status"] = "VALID"
+        else:
+            res["vix"] = None
+            res["vix_source"] = None
+            res["vix_status"] = "UNAVAILABLE"
+            if getattr(config, "ALLOW_VIX_PROXY_FALLBACK", False) and res["spy_realized_vol_20d"] is not None:
+                res["vix"] = res["spy_realized_vol_20d"]
+                res["vix_source"] = "SPY_REALIZED_VOL_PROXY"
+                res["vix_status"] = "PROXY"
+                logger.info("[MACRO BENCHMARK] ALLOW_VIX_PROXY_FALLBACK=True; using SPY 20d realized vol proxy: %.2f", res["vix"])
+            else:
+                logger.warning("[MACRO BENCHMARK] VIX feed unavailable; res['vix'] set to None (fail-closed regime classification)")
     except Exception as exc:
         logger.warning("[MACRO BENCHMARK] Failed fetching VIX: %s", exc)
 

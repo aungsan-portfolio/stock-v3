@@ -158,8 +158,8 @@ TECH_CORRELATED_CLUSTER = {"NVDA", "AAPL", "MSFT", "AMZN", "TSLA", "META", "AMD"
 SOXX_TECH_LONG_VETO_THRESHOLD = -0.75  # SOXX -0.75% threshold
 
 
-def _get_soxx_realtime_pct_change() -> Optional[float]:
-    """Fetch real-time % change for SOXX semiconductor ETF."""
+def _get_soxx_realtime_pct_change(bridge=None) -> Optional[float]:
+    """Fetch real-time % change for SOXX semiconductor ETF relative to prior session close."""
     try:
         from strategies.regime_engine import get_soxx_pct_change
         cached = get_soxx_pct_change()
@@ -168,17 +168,35 @@ def _get_soxx_realtime_pct_change() -> Optional[float]:
     except Exception:
         pass
     try:
+        from strategies.regime_engine import _get_premarket_pct_change
+        pct, source, ts = _get_premarket_pct_change("SOXX", bridge=bridge)
+        if pct is not None:
+            return pct
+    except Exception:
+        pass
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker("SOXX")
+        fast_info = getattr(ticker, "fast_info", None)
+        if fast_info:
+            last = float(getattr(fast_info, "last_price", 0.0) or 0.0)
+            prev = float(getattr(fast_info, "previous_close", 0.0) or 0.0)
+            if last > 0 and prev > 0:
+                return round(((last - prev) / prev) * 100.0, 2)
+    except Exception as e:
+        logger.debug("[SOXX GATE] yfinance fast_info fallback failed: %s", e)
+    try:
         import yfinance as yf
         soxx = yf.Ticker("SOXX")
-        hist = soxx.history(period="1d", interval="1m")
-        if hist.empty:
-            return None
-        open_price = hist["Close"].iloc[0]
-        last_price = hist["Close"].iloc[-1]
-        return ((last_price - open_price) / open_price) * 100.0
+        hist = soxx.history(period="5d", interval="1d")
+        if len(hist) >= 2:
+            prev_close = float(hist["Close"].iloc[-2])
+            last_price = float(hist["Close"].iloc[-1])
+            if prev_close > 0 and last_price > 0:
+                return round(((last_price - prev_close) / prev_close) * 100.0, 2)
     except Exception as e:
-        logger.debug("[SOXX GATE] Error fetching SOXX: %s", e)
-        return None
+        logger.debug("[SOXX GATE] Error fetching SOXX daily history: %s", e)
+    return None
 
 
 from rs_calculator import RelativeStrengthEvaluator
@@ -198,6 +216,7 @@ def check_soxx_tech_long_gate(
     pred_conf: float = 0.55,
     symbol_df=None,
     soxx_df=None,
+    bridge=None,
 ) -> Tuple[bool, str]:
     """
     Blocks BUY/Long entries on Tech/Semi symbols if SOXX ETF is weak (<= -0.75%),
@@ -211,10 +230,21 @@ def check_soxx_tech_long_gate(
     if sym_upper not in SOXX_GOVERNED_SYMBOLS and sym_upper not in {"NVDA", "AMD", "INTC", "SMCI", "QCOM", "MU", "AVGO"}:
         return True, "SOXX gate: N/A (non-tech symbol)"
 
-    soxx_pct = _get_soxx_realtime_pct_change()
+    if bridge is not None:
+        try:
+            soxx_pct = _get_soxx_realtime_pct_change(bridge=bridge)
+        except TypeError:
+            soxx_pct = _get_soxx_realtime_pct_change()
+    else:
+        soxx_pct = _get_soxx_realtime_pct_change()
     if soxx_pct is None:
-        logger.warning("[SOXX GATE] Could not fetch SOXX data. Allowing %s entry.", symbol)
-        return True, "SOXX gate: data unavailable (pass)"
+        fail_closed = getattr(config, "SOXX_GATE_FAIL_CLOSED", False)
+        if fail_closed:
+            logger.warning("[SOXX GATE] Could not fetch SOXX benchmark data. Failing closed (blocking %s entry).", symbol)
+            return False, "SOXX gate: data unavailable (fail-closed)"
+        else:
+            logger.warning("[SOXX GATE] Could not fetch SOXX data. Allowing %s entry.", symbol)
+            return True, "SOXX gate: data unavailable (pass)"
 
     # Convert pct change from percentage (e.g. -1.49) to float ratio (e.g. -0.0149)
     soxx_ratio = soxx_pct / 100.0

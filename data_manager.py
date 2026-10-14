@@ -222,8 +222,26 @@ def fetch_ohlcv(
 
     df = df[required_cols].copy()
     df.index = pd.to_datetime(df.index, utc=True).tz_localize(None)
+    df = df[~df.index.duplicated(keep="last")]
     df.sort_index(inplace=True)
-    df.dropna(inplace=True)
+    df.dropna(subset=required_cols, inplace=True)
+
+    valid_ohlc = (
+        (df["High"] >= df["Low"]) &
+        (df["High"] >= df["Open"]) &
+        (df["High"] >= df["Close"]) &
+        (df["Low"] <= df["Open"]) &
+        (df["Low"] <= df["Close"]) &
+        (df["Open"] > 0) &
+        (df["High"] > 0) &
+        (df["Low"] > 0) &
+        (df["Close"] > 0) &
+        (df["Volume"] >= 0)
+    )
+    invalid_rows = len(df) - int(valid_ohlc.sum())
+    if invalid_rows > 0:
+        logger.warning("Dropped %d inconsistent OHLC rows for %s", invalid_rows, symbol)
+        df = df[valid_ohlc].copy()
 
     if len(df) < config.MIN_HISTORY_DAYS:
         raise ValueError(

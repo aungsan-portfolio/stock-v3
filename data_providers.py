@@ -86,6 +86,7 @@ class MultiSourceDataProvider:
                 if alpaca_df is not None and not alpaca_df.empty:
                     col_map = {c: c.capitalize() for c in alpaca_df.columns if c.lower() in ("open", "high", "low", "close", "volume")}
                     df = alpaca_df.rename(columns=col_map).copy()
+                    df.attrs["volume_source"] = "alpaca_iex"
                     logger.info("Fallback: Fetched %s via free Alpaca IEX daily bars", symbol)
             except Exception as e:
                 errors.append(f"Alpaca IEX: {e}")
@@ -130,6 +131,7 @@ class MultiSourceDataProvider:
         df = ticker.history(period=period, interval=interval, auto_adjust=True)
         if df.empty:
             raise ValueError(f"No history returned by yfinance")
+        df.attrs["volume_source"] = "yfinance_consolidated"
         return df
 
     def _fetch_ibkr(self, symbol: str, period: str, interval: str) -> pd.DataFrame:
@@ -213,6 +215,7 @@ class MultiSourceDataProvider:
     def _clean_and_validate(self, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
         """Clean index, sort, normalize column names, and verify split/dividend adjustments."""
         required_cols = ["Open", "High", "Low", "Close", "Volume"]
+        vol_source = getattr(df, "attrs", {}).get("volume_source", "unknown")
 
         # Normalize column names (e.g. lower/camel to capitalized)
         df.columns = [col.capitalize() for col in df.columns]
@@ -225,8 +228,30 @@ class MultiSourceDataProvider:
 
         # Format index as UTC date-only/tz-naive timezone
         df.index = pd.to_datetime(df.index, utc=True).tz_localize(None)
+        # Deduplicate index keeping latest row
+        df = df[~df.index.duplicated(keep="last")]
         df.sort_index(inplace=True)
-        df.dropna(inplace=True)
+        df.dropna(subset=required_cols, inplace=True)
+
+        # Validate OHLC geometric consistency
+        valid_ohlc = (
+            (df["High"] >= df["Low"]) &
+            (df["High"] >= df["Open"]) &
+            (df["High"] >= df["Close"]) &
+            (df["Low"] <= df["Open"]) &
+            (df["Low"] <= df["Close"]) &
+            (df["Open"] > 0) &
+            (df["High"] > 0) &
+            (df["Low"] > 0) &
+            (df["Close"] > 0) &
+            (df["Volume"] >= 0)
+        )
+        invalid_rows = len(df) - int(valid_ohlc.sum())
+        if invalid_rows > 0:
+            logger.warning("Dropped %d inconsistent OHLC rows for %s", invalid_rows, symbol)
+            df = df[valid_ohlc].copy()
+
+        df.attrs["volume_source"] = vol_source
 
         # Validate against extreme prices / missing volumes / corporate action anomalies
         # An unadjusted split leaves a huge gap: e.g. Close drops 50% overnight with no matching volume ratio shift

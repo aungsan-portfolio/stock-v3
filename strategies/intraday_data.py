@@ -1531,11 +1531,19 @@ def fetch_intraday(
         )
 
     if bridge is None or not getattr(bridge, "is_connected", False):
+        tier = str(getattr(config, "ALPACA_SUBSCRIPTION_TIER", "free")).lower().strip()
         if _has_alpaca_credentials():
-            providers = [
-                (DataProvider.ALPACA, "iex"),
-                (DataProvider.ALPACA, "sip"),
-            ]
+            if tier == "free":
+                providers = [
+                    (DataProvider.ALPACA, "iex"),
+                    (DataProvider.YFINANCE, None),
+                ]
+            else:
+                cfg_feed = str(getattr(config, "ALPACA_DATA_FEED", "iex")).lower().strip()
+                providers = [
+                    (DataProvider.ALPACA, cfg_feed),
+                    (DataProvider.YFINANCE, None),
+                ]
         else:
             providers = [
                 (DataProvider.YFINANCE, None),
@@ -1626,9 +1634,10 @@ def fetch_intraday(
         return df
     except Exception as e:
         logger.exception("Failed to fetch broker data for %s: %s. Falling back to data providers.", symbol, e)
+        df = pd.DataFrame()
         if _has_alpaca_credentials():
             df = fetch_intraday_alpaca(symbol, interval=interval, lookback_days=lookback_days, prepost=prepost, purpose=purpose)
-        else:
+        if df.empty:
             df = fetch_intraday_yfinance(symbol, interval=interval, lookback_days=lookback_days, prepost=prepost, purpose=purpose)
         if not df.empty:
             _write_cache(fallback_key, df.copy())
@@ -1846,7 +1855,7 @@ def fetch_daily_alpaca(symbol: str, lookback_days: int = None) -> pd.DataFrame:
         from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
-        from alpaca.data.enums import Adjustment
+        from alpaca.data.enums import Adjustment, DataFeed
         from datetime import timezone
 
         client = _get_alpaca_client()
@@ -1855,24 +1864,25 @@ def fetch_daily_alpaca(symbol: str, lookback_days: int = None) -> pd.DataFrame:
             configure_alpaca_data_client_timeouts(client)
         start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
         bars_dict = None
+        tier = str(getattr(config, "ALPACA_SUBSCRIPTION_TIER", "free")).lower().strip()
+        feed_enum = DataFeed.IEX if tier == "free" else _normalize_data_feed(getattr(config, "ALPACA_DATA_FEED", "iex"))
         try:
             req = StockBarsRequest(
                 symbol_or_symbols=symbol.upper().strip(),
                 timeframe=TimeFrame.Day,
                 start=start,
-                feed="iex",
+                feed=feed_enum,
                 adjustment=Adjustment.ALL,
             )
             bars_dict = client.get_stock_bars(req)
         except Exception as iex_exc:
-            tier = str(getattr(config, "ALPACA_SUBSCRIPTION_TIER", "free")).lower().strip()
             if tier != "free":
                 try:
                     req = StockBarsRequest(
                         symbol_or_symbols=symbol.upper().strip(),
                         timeframe=TimeFrame.Day,
                         start=start,
-                        feed="sip",
+                        feed=DataFeed.SIP,
                         adjustment=Adjustment.ALL,
                     )
                     bars_dict = client.get_stock_bars(req)
@@ -1890,6 +1900,8 @@ def fetch_daily_alpaca(symbol: str, lookback_days: int = None) -> pd.DataFrame:
 
         df = df.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume"})
         df.index.name = "datetime"
+        df.attrs["volume_source"] = "alpaca_iex"
+        df.attrs["feed_identity"] = "iex" if tier == "free" else getattr(feed_enum, "value", str(feed_enum)).lower()
         if not df.empty:
             _write_cache(key, df.copy())
         return df

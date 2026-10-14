@@ -666,7 +666,15 @@ class MockIB:
         self.bridge = bridge
 
     def isConnected(self) -> bool:
-        return bool(getattr(self.bridge, "is_connected", False))
+        if not self.bridge:
+            return False
+        is_conn = bool(getattr(self.bridge, "is_connected", False))
+        if not is_conn:
+            return False
+        conn_health = getattr(self.bridge, "_conn_health", None)
+        if conn_health is not None and not getattr(conn_health, "is_healthy", True):
+            return False
+        return True
 
     def positions(self) -> List[MockPosition]:
         self.bridge._require_connection()
@@ -3413,7 +3421,11 @@ class AlpacaBridge:
                 return {}
 
             from alpaca.data.enums import Adjustment
-            feed = str(getattr(config_module, "ALPACA_DATA_FEED", "iex")).lower()
+            tier = str(getattr(config_module, "ALPACA_SUBSCRIPTION_TIER", "free")).lower().strip()
+            if tier == "free":
+                feed = "iex"
+            else:
+                feed = str(getattr(config_module, "ALPACA_DATA_FEED", "iex")).lower()
             bars = self._data_client.get_stock_bars(StockBarsRequest(
                 symbol_or_symbols=clean_symbols,
                 timeframe=tf,

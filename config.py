@@ -414,6 +414,10 @@ ALPACA_WS_PING_INTERVAL_SECONDS: int = int(os.environ.get("ALPACA_WS_PING_INTERV
 ALPACA_WS_PING_TIMEOUT_SECONDS: int = int(os.environ.get("ALPACA_WS_PING_TIMEOUT_SECONDS", 60))
 ALPACA_WS_MAX_QUEUE: int = int(os.environ.get("ALPACA_WS_MAX_QUEUE", 1024))
 
+# Zero-budget feed & fail-closed risk safety flags
+ALLOW_VIX_PROXY_FALLBACK: bool = os.environ.get("ALLOW_VIX_PROXY_FALLBACK", "false").lower().strip() in ("true", "1", "yes")
+SOXX_GATE_FAIL_CLOSED: bool = os.environ.get("SOXX_GATE_FAIL_CLOSED", "true").lower().strip() in ("true", "1", "yes")
+
 
 def _require_positive_int(name: str, value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:

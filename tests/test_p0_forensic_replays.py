@@ -131,6 +131,7 @@ class TestP0ForensicReplays(unittest.TestCase):
 
         with patch("strategies.intraday_data._get_alpaca_credentials", return_value=("test_key", "test_sec")), \
              patch("strategies.intraday_data._get_alpaca_client", return_value=mock_client), \
+             patch.object(config, "ALPACA_SUBSCRIPTION_TIER", "unlimited"), \
              patch("strategies.session.is_market_open", return_value=True):
 
             res = fetch_batch_intraday_alpaca(["AAPL"], interval="5m", lookback_days=1, purpose="ENTRY_SIGNAL")
@@ -346,13 +347,14 @@ class TestP0ForensicReplays(unittest.TestCase):
             reason="Sub noise floor test",
         )
 
-        res = execute_signal(
-            signal=sig,
-            bridge=None,
-            equity=100000.0,
-            current_pnl=0.0,
-            dry_run=True,
-        )
+        with patch.object(config, "DAYTRADE_REQUIRE_ENTRY_READINESS", False):
+            res = execute_signal(
+                signal=sig,
+                bridge=None,
+                equity=100000.0,
+                current_pnl=0.0,
+                dry_run=True,
+            )
         self.assertEqual(res["status"], "REJECTED")
         self.assertIn("REJECTED_NOISE_FLOOR_BREACH", res["reason"])
 
@@ -396,6 +398,7 @@ class TestP0ForensicReplays(unittest.TestCase):
 
         with patch("strategies.intraday_data._get_alpaca_credentials", return_value=("test_key", "test_sec")), \
              patch("strategies.intraday_data._get_alpaca_client", return_value=mock_client), \
+             patch.object(config, "ALPACA_SUBSCRIPTION_TIER", "unlimited"), \
              patch("strategies.session.is_market_open", return_value=True), \
              self.assertLogs("strategies.intraday_data", level="WARNING") as cm:
 
