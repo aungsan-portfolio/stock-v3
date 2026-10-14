@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -182,7 +183,7 @@ def test_real_caller_production_path(caplog):
     def _gather_evidence(epoch, incumbent_symbol, replacement_symbol, client_order_id, pre_position_snapshot):
         return BrokerEvidenceBundle(
             reconciliation_epoch=epoch,
-            captured_at="2026-09-22T14:30:00+00:00",
+            captured_at=datetime.now(timezone.utc).isoformat(),
             incumbent_symbol=incumbent_symbol,
             replacement_symbol=replacement_symbol,
             close_order=OrderSnapshot(
@@ -287,7 +288,7 @@ def test_integration_partial_fill_replay(caplog):
     def _gather_evidence(epoch, incumbent_symbol, replacement_symbol, client_order_id, pre_position_snapshot):
         return BrokerEvidenceBundle(
             reconciliation_epoch=epoch,
-            captured_at="2026-09-22T14:30:00+00:00",
+            captured_at=datetime.now(timezone.utc).isoformat(),
             incumbent_symbol=incumbent_symbol,
             replacement_symbol=replacement_symbol,
             close_order=OrderSnapshot(
@@ -344,7 +345,7 @@ def test_integration_delta_mismatch_replay(caplog):
     def _gather_evidence(epoch, incumbent_symbol, replacement_symbol, client_order_id, pre_position_snapshot):
         return BrokerEvidenceBundle(
             reconciliation_epoch=epoch,
-            captured_at="2026-09-22T14:30:00+00:00",
+            captured_at=datetime.now(timezone.utc).isoformat(),
             incumbent_symbol=incumbent_symbol,
             replacement_symbol=replacement_symbol,
             close_order=OrderSnapshot(
@@ -404,7 +405,7 @@ def test_integration_timeout_replay(caplog):
     def _gather_evidence(epoch, incumbent_symbol, replacement_symbol, client_order_id, pre_position_snapshot):
         return BrokerEvidenceBundle(
             reconciliation_epoch=epoch,
-            captured_at="2026-09-22T14:30:00+00:00",
+            captured_at=datetime.now(timezone.utc).isoformat(),
             incumbent_symbol=incumbent_symbol,
             replacement_symbol=replacement_symbol,
             close_order=OrderSnapshot(

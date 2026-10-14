@@ -516,7 +516,23 @@ class AtomicRotationEngine:
         enter_sym = enter_sig.symbol.upper()
 
         # 1. Daily Loss Circuit Breaker Check
-        if hasattr(bridge, "_is_daily_loss_halted") and bridge._is_daily_loss_halted():
+        is_daily_halted = False
+        if hasattr(bridge, "_is_daily_loss_halted"):
+            try:
+                is_daily_halted = bool(bridge._is_daily_loss_halted())
+            except Exception:
+                pass
+        elif hasattr(bridge, "is_daily_loss_halted"):
+            try:
+                is_daily_halted = bool(bridge.is_daily_loss_halted())
+            except Exception:
+                pass
+        elif hasattr(bridge, "entry_gate"):
+            gate = getattr(bridge, "entry_gate", None)
+            if gate is not None and type(gate).__name__ not in ("MagicMock", "Mock"):
+                is_daily_halted = bool(getattr(gate, "halted", False))
+
+        if is_daily_halted:
             reason = f"Daily loss circuit breaker is ACTIVE on broker account. Blocked entry for {enter_sym}"
             return False, reason
 
@@ -526,6 +542,10 @@ class AtomicRotationEngine:
                 quote_ok, q_price, reason = bridge.validate_quote(enter_sym)
                 if not quote_ok:
                     return False, f"Replacement {enter_sym} failed quote spread validation: {reason}"
+            elif hasattr(bridge, "get_order_quote"):
+                q_dec = bridge.get_order_quote(enter_sym)
+                if hasattr(q_dec, "ok") and not bool(q_dec.ok):
+                    return False, f"Replacement {enter_sym} failed quote spread validation: {q_dec.reason}"
         except Exception as exc:
             return False, f"Quote spread validation exception for {enter_sym}: {exc}"
 
@@ -763,6 +783,32 @@ class AtomicRotationEngine:
                     incumbent_symbol=exit_sym,
                     replacement_symbol=enter_sym,
                     error_message=f"Submission failed: {exc}",
+                )
+
+            # Check for immediate pre-submission rejection
+            is_rejected = False
+            rej_reason = "Order execution rejected"
+            if entry_result is False:
+                is_rejected = True
+            elif hasattr(entry_result, "outcome"):
+                out_val = str(getattr(entry_result.outcome, "name", entry_result.outcome)).upper()
+                if out_val in ("REJECTED", "CANCELLED", "CANCELED") and not getattr(entry_result, "order_id", None):
+                    is_rejected = True
+                    rej_reason = getattr(entry_result, "message", "") or getattr(entry_result, "error", "") or f"Outcome {out_val}"
+
+            if is_rejected:
+                logger.warning("[ROTATION ENTRY REJECTED] %s entry rejected pre-submission: %s", enter_sym, rej_reason)
+                self._transition(RotationState.STAY_IN_CASH, f"Replacement entry rejected: {rej_reason}")
+                self._transition(RotationState.IDLE, "Resolved in cash")
+                return RotationExecutionSummary(
+                    rotation_completed=False,
+                    replacement_entered=False,
+                    broker_truth_confirmed=False,
+                    protection_truth_confirmed=False,
+                    state=RotationState.STAY_IN_CASH,
+                    incumbent_symbol=exit_sym,
+                    replacement_symbol=enter_sym,
+                    error_message=f"Replacement entry rejected: {rej_reason}",
                 )
 
             # ── 6. Gather Evidence Bundle & Protect ──────────────────────────

@@ -293,8 +293,13 @@ def _place_paper_orders(signals, broker: str = "ibkr", bridge=None, dry_run: boo
                 _print_startup_reconciliation(recon)
 
             if getattr(bridge.entry_gate, "halted", False):
-                print("⚠️ Trading halted by startup reconciliation / risk gate. Skipping signal execution.")
-                return 1
+                halt_msg = getattr(bridge.entry_gate, "halt_reason", "Risk gate active")
+                print(f"⚠️ Entry gate halted ({halt_msg}). Skipping new BUY entries and rotations; processing protective stops and SELL exits.")
+                signals = [
+                    s for s in signals
+                    if (hasattr(s, "action") and s.action.upper() == "SELL")
+                    or (isinstance(s, dict) and s.get("action", "").upper() == "SELL")
+                ]
 
             result = bridge.execute_all(signals)
             print(f"\n✅ Orders accepted : {result.get('placed', 0)}")

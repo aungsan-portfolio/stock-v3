@@ -24,7 +24,7 @@ from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce, QueryOrderS
 from alpaca.trading.requests import LimitOrderRequest, StopLossRequest, TakeProfitRequest, GetOrdersRequest, MarketOrderRequest
 import websockets
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest
+from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest, StockLatestTradeRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from requests.adapters import HTTPAdapter
@@ -830,8 +830,14 @@ class EntryGateMock:
         Dedicated daily-loss circuit breaker for Swing Trading using end-to-end Decimal arithmetic.
         Enforces min(SOD_equity * SWING_MAX_DAILY_LOSS_PCT, SWING_MAX_DAILY_LOSS_DOLLAR_CAP).
         """
+        data_dir = getattr(config_module, "DATA_DIR", Path("data"))
+        halt_file = data_dir / f"swing_daily_loss_halt_{account_id.strip().upper()}.json"
+        if not halt_file.exists() and self.halted and "DAILY_LOSS" in (self.halt_reason or "").upper():
+            self.halted = False
+            self.halt_reason = ""
+
         if self.halted:
-            return True, "Trading engine is halted"
+            return True, self.halt_reason or "Trading engine is halted"
 
         try:
             d_current_equity = Decimal(str(current_equity))
@@ -857,7 +863,7 @@ class EntryGateMock:
 
         if d_daily_pnl <= -d_limit:
             self.persist_daily_loss_halt(account_id, session_date_et, d_daily_pnl, d_limit)
-            self.halt()
+            self.halt("DAILY_LOSS_LIMIT")
             return True, f"Max daily loss limit reached (${d_daily_pnl:.2f} <= -${d_limit:.2f})"
 
         return False, ""
@@ -907,30 +913,34 @@ class EntryGateMock:
         data_dir = getattr(config_module, "DATA_DIR", Path("data"))
         halt_file = data_dir / f"swing_daily_loss_halt_{account_id.strip().upper()}.json"
         if not halt_file.exists():
+            if self.halted and "DAILY_LOSS" in (self.halt_reason or "").upper():
+                self.halted = False
+                self.halt_reason = ""
+                self.reasons.discard("DAILY_LOSS_LIMIT")
             return False, ""
         try:
             with open(halt_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception as exc:
             logger.error("Corrupted daily loss halt file for %s: %s (failing closed)", account_id, exc)
-            self.halt()
+            self.halt("CORRUPTED_HALT_STATE")
             return True, f"CORRUPTED_HALT_STATE: {exc}"
 
         rec_acct = str(data.get("account_id", "")).strip().upper()
         if rec_acct != account_id.strip().upper():
             logger.error("Halt file account mismatch: expected %s, got %s (failing closed)", account_id, rec_acct)
-            self.halt()
+            self.halt("HALT_STATE_ACCOUNT_MISMATCH")
             return True, "HALT_STATE_ACCOUNT_MISMATCH"
 
         rec_date = str(data.get("session_date_et", "")).strip()
         if rec_date > current_session_date_et:
             logger.error("Future session date %s detected in halt state for %s (failing closed)", rec_date, account_id)
-            self.halt()
+            self.halt("FUTURE_SESSION_DATE_DETECTED")
             return True, "FUTURE_SESSION_DATE_DETECTED"
 
         if rec_date == current_session_date_et:
             if data.get("halted", False):
-                self.halt()
+                self.halt("DAILY_LOSS_LIMIT")
                 return True, f"DAILY_LOSS_LIMIT_REACHED (pnl={data.get('daily_pnl')}, limit={data.get('daily_loss_limit')})"
 
         # Previous session -> controlled reset
@@ -939,6 +949,7 @@ class EntryGateMock:
             halt_file.unlink(missing_ok=True)
             self.halted = False
             self.halt_reason = ""
+            self.reasons.discard("DAILY_LOSS_LIMIT")
         except Exception as r_exc:
             logger.warning("Could not unlink previous halt file for %s: %s", account_id, r_exc)
         return False, ""
@@ -957,9 +968,9 @@ class EntryGateMock:
                     if sod_equity <= 0.0:
                         logger.warning("Risk baseline unavailable; blocking new entries only. Protective exits remain enabled.")
                         return True, "Risk baseline unavailable (blocking new entries only; protective exits remain enabled)"
-                    pct_limit = abs(sod_equity * float(getattr(config_module, "SWING_MAX_DAILY_LOSS_PCT", 0.01)))
-                    dollar_cap = float(getattr(config_module, "SWING_MAX_DAILY_LOSS_DOLLAR_CAP", 300.00))
-                    max_loss = min(pct_limit, dollar_cap) if dollar_cap > 0 else 300.00
+                    pct_limit = abs(sod_equity * float(getattr(config_module, "SWING_MAX_DAILY_LOSS_PCT", 0.015)))
+                    dollar_cap = float(getattr(config_module, "SWING_MAX_DAILY_LOSS_DOLLAR_CAP", 1500.00))
+                    max_loss = min(pct_limit, dollar_cap) if dollar_cap > 0 else 1500.00
                 else:
                     max_loss = float(getattr(config_module, "MAX_DAILY_LOSS_DAYTRADE", 300.0))
                 if round(daily_pnl, 2) <= -round(abs(max_loss), 2):
@@ -1716,6 +1727,32 @@ class AlpacaBridge:
                 gate.clear("OFF_MARKET_STANDBY")
             else:
                 gate.halted = False
+
+    def _is_daily_loss_halted(self) -> bool:
+        """Return True if daily loss circuit breaker is active or entry gate is halted for daily loss."""
+        gate = getattr(self, "entry_gate", None)
+        if gate is not None:
+            if getattr(gate, "halted", False):
+                reasons = getattr(gate, "reasons", set())
+                h_reason = str(getattr(gate, "halt_reason", "")).upper()
+                if any("DAILY_LOSS" in str(r).upper() for r in reasons) or "DAILY_LOSS" in h_reason:
+                    return True
+                if getattr(gate, "halted", False) and not reasons:
+                    return True
+            if hasattr(gate, "check_daily_loss_halt_state"):
+                try:
+                    from strategies.session import now_eastern
+                    et_date = str(now_eastern().date())
+                    acct_id = getattr(self, "_account_id", "default")
+                    is_halted, _ = gate.check_daily_loss_halt_state(acct_id, et_date)
+                    if is_halted:
+                        return True
+                except Exception as e:
+                    logger.debug("check_daily_loss_halt_state check error: %s", e)
+        return False
+
+    def is_daily_loss_halted(self) -> bool:
+        return self._is_daily_loss_halted()
 
     @property
     def is_connected(self) -> bool:
@@ -2965,12 +3002,6 @@ class AlpacaBridge:
         et_date = str(now_eastern().date())
         acct_id = getattr(self, "_account_id", "default")
 
-        self._require_connection()
-        acct = self._call_with_retry(lambda: self._client.get_account())
-        broker_last_eq = float(getattr(acct, "last_equity", 0.0) or 0.0)
-        if broker_last_eq <= 0.0:
-            broker_last_eq = float(acct.equity)
-
         # 1. Inspect persisted file/date first (fail-closed before querying broker)
         try:
             state = self._load_daytrade_risk_state(acct_id)
@@ -2983,36 +3014,61 @@ class AlpacaBridge:
         state_prov = state.get("provenance", {}) if isinstance(state, dict) else {}
         state_source = state_prov.get("source", "") if isinstance(state_prov, dict) else ""
         has_valid_stamp = (state_source == "broker_last_equity")
+        is_legacy_nominal = (not has_valid_stamp) and (float(state.get("start_of_day_equity", 0.0) or 0.0) == 100000.0)
 
-        # 2. If valid state exists for today and this account AND has valid provenance stamp:
+        # 2. If valid state exists for today and this account: restore/preserve
         if (
             state
             and state.get("date") == et_date
             and state.get("account_id") == acct_id
-            and has_valid_stamp
+            and (not is_legacy_nominal)
+            and (getattr(self, "mode", "daytrade") != "daytrade" or has_valid_stamp)
         ):
-            self._start_of_day_equity = broker_last_eq
-            self._start_of_day_equity_date = et_date
-            self._daytrade_suspended = bool(state.get("suspended", False))
-            logger.info("[%s] Verified start-of-day equity: $%.2f for date %s (source=%s)", acct_id, self._start_of_day_equity, et_date, state_source)
+            sod_equity = float(state.get("start_of_day_equity", 0.0) or 0.0)
+            if sod_equity > 0.0:
+                self._start_of_day_equity = sod_equity
+                self._start_of_day_equity_date = et_date
+                self._daytrade_suspended = bool(state.get("suspended", False))
+                logger.info("[%s] Verified start-of-day equity: $%.2f for date %s (source=%s)", acct_id, self._start_of_day_equity, et_date, state_source or "persisted")
+                return self._start_of_day_equity
+
+        # Also preserve if in-memory already set for today with positive equity
+        if getattr(self, "_start_of_day_equity_date", None) == et_date and getattr(self, "_start_of_day_equity", 0.0) > 0.0:
             return self._start_of_day_equity
 
-        # 3. New date or legacy nominal state -> anchor to broker last_equity
-        self._start_of_day_equity = broker_last_eq
+        # 3. New date or legacy nominal state -> query broker equity and save once
+        current_equity = 0.0
+        source = "get_net_liquidation"
+        if getattr(self, "_client", None) is not None:
+            try:
+                acct = self._call_with_retry(lambda: self._client.get_account())
+                broker_last_eq = float(getattr(acct, "last_equity", 0.0) or 0.0)
+                if broker_last_eq > 0.0:
+                    current_equity = broker_last_eq
+                    source = "broker_last_equity"
+                else:
+                    current_equity = float(getattr(acct, "equity", 0.0) or 0.0)
+            except Exception as e:
+                logger.debug("Failed to query last_equity from client, falling back to get_net_liquidation: %s", e)
+
+        if current_equity <= 0.0:
+            current_equity = self.get_net_liquidation()
+
+        self._start_of_day_equity = current_equity
         self._start_of_day_equity_date = et_date
         self._daytrade_suspended = False
         self._save_daytrade_risk_state(
             et_date,
-            broker_last_eq,
+            current_equity,
             False,
             account_id=acct_id,
-            source="broker_last_equity"
+            source=source
         )
-        if state and not has_valid_stamp:
+        if state and is_legacy_nominal:
             logger.warning("[%s] Legacy risk state without broker_last_equity provenance stamp rejected. Re-initialized from broker last_equity: $%.2f for date %s",
                            acct_id, self._start_of_day_equity, et_date)
         else:
-            logger.info("[%s] Initialized start-of-day equity from broker last_equity: $%.2f for date %s", acct_id, self._start_of_day_equity, et_date)
+            logger.info("[%s] Initialized start-of-day equity: $%.2f for date %s (source=%s)", acct_id, self._start_of_day_equity, et_date, source)
         return self._start_of_day_equity
 
     def get_position(self, symbol: str) -> float:
@@ -3072,26 +3128,75 @@ class AlpacaBridge:
         symbol = symbol.upper().strip()
         try:
             quotes = self._call_with_retry(lambda: self._data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol, feed="iex")))
-            q = quotes.get(symbol)
-            if q is None:
-                return QuoteDecision(False, 0.0, "alpaca", "No latest quote returned")
+            q = quotes.get(symbol) if isinstance(quotes, dict) else (getattr(quotes, symbol, None) or quotes)
 
-            bid = float(getattr(q, "bid_price", 0) or 0)
-            ask = float(getattr(q, "ask_price", 0) or 0)
+            bid = float(getattr(q, "bid_price", 0) or 0) if q else 0.0
+            ask = float(getattr(q, "ask_price", 0) or 0) if q else 0.0
             mid = (bid + ask) / 2 if bid > 0 and ask > 0 else (ask or bid or 0.0)
-
-            if mid <= 0:
-                return QuoteDecision(False, 0.0, "alpaca", "Quote mid-price is zero")
 
             spread_pct = (ask - bid) / mid if mid > 0 else 0.0
             max_spread = float(self._c("MAX_QUOTE_SPREAD_PCT", 0.02))
-            if spread_pct > max_spread:
-                return QuoteDecision(False, mid, "alpaca", f"Spread {spread_pct:.4f} exceeds max {max_spread:.4f}")
 
-            return QuoteDecision(True, mid, "alpaca", "ok")
+            if mid > 0 and 0.0 <= spread_pct <= max_spread:
+                return QuoteDecision(True, mid, "alpaca", "ok")
+
+            # IEX quote has wide spread (>2%) or missing top-of-book — engage zero-budget fallbacks
+            # Fallback 1: Latest executed trade on Alpaca (feed="iex")
+            try:
+                trades = self._call_with_retry(lambda: self._data_client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol, feed="iex")))
+                t = trades.get(symbol) if isinstance(trades, dict) else (getattr(trades, symbol, None) or trades)
+                t_price = float(getattr(t, "price", 0.0) or 0.0) if t else 0.0
+                if t_price > 0:
+                    logger.info("[IEX SPREAD FALLBACK] %s IEX spread %.4f exceeds %.4f (bid=%.2f, ask=%.2f). Using latest trade price $%.2f",
+                                symbol, spread_pct, max_spread, bid, ask, t_price)
+                    return QuoteDecision(True, t_price, "alpaca_iex_trade_fallback", "ok_fallback_from_wide_iex_spread")
+            except Exception as t_exc:
+                logger.debug("Latest trade fallback failed for %s: %s", symbol, t_exc)
+
+            # Fallback 2: Latest 1-minute bar on Alpaca (feed="iex")
+            try:
+                end_utc = _dt.datetime.now(_dt.timezone.utc)
+                start_utc = end_utc - _dt.timedelta(minutes=30)
+                bars_res = self._call_with_retry(lambda: self._data_client.get_stock_bars(StockBarsRequest(
+                    symbol_or_symbols=symbol,
+                    timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+                    start=start_utc,
+                    feed="iex",
+                )))
+                bar_list = bars_res.data.get(symbol, []) if hasattr(bars_res, "data") else (bars_res.get(symbol, []) if isinstance(bars_res, dict) else [])
+                if bar_list:
+                    last_bar_close = float(getattr(bar_list[-1], "close", 0.0) or 0.0)
+                    if last_bar_close > 0:
+                        logger.info("[IEX SPREAD FALLBACK] %s using latest 1m bar close $%.2f", symbol, last_bar_close)
+                        return QuoteDecision(True, last_bar_close, "alpaca_iex_bar_fallback", "ok_fallback_from_wide_iex_spread")
+            except Exception as b_exc:
+                logger.debug("Latest 1m bar fallback failed for %s: %s", symbol, b_exc)
+
+            # Fallback 3: Yahoo Finance fast_info (real-time consolidated tape)
+            try:
+                import yfinance as yf
+                yf_px = float(yf.Ticker(symbol).fast_info.get("last_price", 0.0) or 0.0)
+                if yf_px > 0:
+                    logger.info("[IEX SPREAD FALLBACK] %s using Yahoo Finance fast_info last_price $%.2f", symbol, yf_px)
+                    return QuoteDecision(True, yf_px, "yfinance_fallback", "ok_fallback_from_wide_iex_spread")
+            except Exception as y_exc:
+                logger.debug("Yahoo Finance fallback failed for %s: %s", symbol, y_exc)
+
+            if mid <= 0:
+                return QuoteDecision(False, 0.0, "alpaca", "Quote mid-price is zero and fallbacks exhausted")
+
+            return QuoteDecision(False, mid, "alpaca", f"Spread {spread_pct:.4f} exceeds max {max_spread:.4f}")
         except Exception as exc:
             logger.error("get_order_quote failed for %s: %s", symbol, exc)
             return QuoteDecision(False, 0.0, "alpaca", str(exc))
+
+    def validate_quote(self, symbol: str) -> Tuple[bool, float, str]:
+        """
+        Validate quote spread and price for a symbol using get_order_quote().
+        Returns (is_valid, price, reason).
+        """
+        decision = self.get_order_quote(symbol)
+        return (decision.ok, decision.price, decision.reason)
 
     def get_quote(self, symbol: str, feed: Optional[str] = None) -> Optional[dict]:
         """Fetch fresh realtime broker quote mapping for M-01 execution quote gate."""
@@ -6756,29 +6861,48 @@ class AlpacaBridge:
             except Exception as e:
                 logger.debug("get_order_by_client_id lookup: %s", e)
 
-        inc_pos = self.get_position(sym_inc)
-        inc_snap = (
-            PositionSnapshot(
-                symbol=sym_inc,
-                qty=float(inc_pos.qty),
-                avg_entry_price=float(inc_pos.avg_entry_price),
-                current_price=float(inc_pos.current_price),
-                unrealized_pl=float(inc_pos.unrealized_pl),
-            )
-            if inc_pos and float(getattr(inc_pos, "qty", 0.0) or 0.0) != 0 else None
-        )
+        def _get_pos_snapshot(sym: str) -> Optional[PositionSnapshot]:
+            try:
+                if self._client and hasattr(self._client, "get_open_position"):
+                    p = self._client.get_open_position(sym)
+                    if p:
+                        q_val = float(getattr(p, "qty", 0.0) or 0.0)
+                        if abs(q_val) > 1e-6:
+                            return PositionSnapshot(
+                                symbol=sym,
+                                qty=q_val,
+                                avg_entry_price=float(getattr(p, "avg_entry_price", 0.0) or 0.0),
+                                current_price=float(getattr(p, "current_price", 0.0) or 0.0),
+                                unrealized_pl=float(getattr(p, "unrealized_pl", 0.0) or 0.0),
+                            )
+            except Exception as e:
+                logger.debug("get_open_position for %s: %s", sym, e)
 
-        rep_pos = self.get_position(sym_rep)
-        rep_snap = (
-            PositionSnapshot(
-                symbol=sym_rep,
-                qty=float(rep_pos.qty),
-                avg_entry_price=float(rep_pos.avg_entry_price),
-                current_price=float(rep_pos.current_price),
-                unrealized_pl=float(rep_pos.unrealized_pl),
-            )
-            if rep_pos and float(getattr(rep_pos, "qty", 0.0) or 0.0) != 0 else None
-        )
+            try:
+                pos_val = self.get_position(sym) if hasattr(self, "get_position") else 0.0
+                if isinstance(pos_val, (int, float)):
+                    if abs(float(pos_val)) > 1e-6:
+                        return PositionSnapshot(
+                            symbol=sym,
+                            qty=float(pos_val),
+                            avg_entry_price=0.0,
+                            current_price=0.0,
+                            unrealized_pl=0.0,
+                        )
+                elif hasattr(pos_val, "qty") and abs(float(getattr(pos_val, "qty", 0.0) or 0.0)) > 1e-6:
+                    return PositionSnapshot(
+                        symbol=sym,
+                        qty=float(getattr(pos_val, "qty", 0.0) or 0.0),
+                        avg_entry_price=float(getattr(pos_val, "avg_entry_price", 0.0) or 0.0),
+                        current_price=float(getattr(pos_val, "current_price", 0.0) or 0.0),
+                        unrealized_pl=float(getattr(pos_val, "unrealized_pl", 0.0) or 0.0),
+                    )
+            except Exception as e:
+                logger.debug("get_position fallback for %s: %s", sym, e)
+            return None
+
+        inc_snap = _get_pos_snapshot(sym_inc)
+        rep_snap = _get_pos_snapshot(sym_rep)
 
         if protection_order_snap is None:
             prot_state = BrokerStopState.NOT_ACTIVE
@@ -6837,6 +6961,11 @@ class AlpacaBridge:
                 self.rotator._log_ratchet_summary(ratchet_results)
             except Exception as r_exc:
                 logger.error("[RATCHET EXECUTE ERROR] %s", r_exc)
+
+            if hasattr(self, "entry_gate") and getattr(self.entry_gate, "halted", False):
+                logger.info("[ROTATION GATE] Entry gate halted (%s) — stop ratchets completed; skipping new rotation entries",
+                            getattr(self.entry_gate, "halt_reason", "Halted"))
+                return
 
             conf_lookup = {
                 (s.symbol.upper() if hasattr(s, "symbol") else s["symbol"].upper()): (s.confidence if hasattr(s, "confidence") else s["confidence"])
@@ -6966,6 +7095,14 @@ class AlpacaBridge:
             )
 
             if opens_new:
+                if (hasattr(self, "entry_gate") and getattr(self.entry_gate, "halted", False)) or self._is_daily_loss_halted():
+                    h_reason = getattr(self.entry_gate, "halt_reason", "Halted") if hasattr(self, "entry_gate") else "Daily loss halted"
+                    logger.warning("[ENTRY GATE HALTED] Skipping new %s entry for %s: %s",
+                                   action, symbol, h_reason)
+                    skipped += 1
+                    rejections.append({"symbol": symbol, "reason": "ENTRY_GATE_HALTED"})
+                    continue
+
                 if self.mode == "swing":
                     from strategies.rotation_config import MAX_CONCURRENT_POSITIONS
                     max_open = int(MAX_CONCURRENT_POSITIONS)
