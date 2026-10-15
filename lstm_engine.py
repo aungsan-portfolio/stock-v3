@@ -114,6 +114,8 @@ else:
         def __init__(self, *args, **kwargs):
             raise ModelNotAvailableError("PyTorch not installed - LSTM models unavailable")
 
+LSTMModel = AttentionLSTM
+
 
 # ── Sequence building ──────────────────────────────────────────────────
 

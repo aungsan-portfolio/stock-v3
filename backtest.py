@@ -131,6 +131,7 @@ def _optional_lstm_scores_for_fold(
     y_all: np.ndarray,
     start: int,
     step: int,
+    purge_gap: int = 5,
 ) -> Tuple[np.ndarray, bool]:
     """
     Train a small fold-local LSTM without future leakage and score the test rows.
@@ -146,22 +147,29 @@ def _optional_lstm_scores_for_fold(
         return np.full(step, 0.5, dtype=float), False
 
     window = int(config.LSTM_WINDOW)
-    if start < window + 10 or len(np.unique(y_all[:start])) < 2:
+    train_end = max(0, start - purge_gap)
+    if train_end < window + 10 or len(np.unique(y_all[:train_end])) < 2:
         return np.full(step, 0.5, dtype=float), False
 
     try:
-        X_train = X_all[:start].astype(np.float32)
+        X_train = X_all[:train_end].astype(np.float32)
         mean = X_train.mean(axis=0)
         std = X_train.std(axis=0)
         std = np.where(std < 1e-8, 1.0, std).astype(np.float32)
         X_norm = ((X_all.astype(np.float32) - mean) / std).astype(np.float32)
 
-        X_seq, y_seq = _make_sequences(X_norm[:start], y_all[:start].astype(np.float32), window)
+        X_seq, y_seq = _make_sequences(X_norm[:train_end], y_all[:train_end].astype(np.float32), window)
         if len(X_seq) == 0 or len(np.unique(y_seq)) < 2:
             return np.full(step, 0.5, dtype=float), False
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = LSTMModel(len(FEATURE_COLS)).to(device)
+        model = LSTMModel(
+            input_size=len(FEATURE_COLS),
+            hidden_size=int(config.LSTM_HIDDEN),
+            num_layers=int(config.LSTM_LAYERS),
+            dropout=float(config.LSTM_DROPOUT),
+            bidirectional=bool(getattr(config, "LSTM_BIDIRECTIONAL", False)),
+        ).to(device)
         neg = float((y_seq == 0).sum())
         pos = float((y_seq == 1).sum())
         pos_weight = torch.tensor([neg / max(pos, 1.0)], dtype=torch.float32, device=device)
@@ -222,6 +230,7 @@ def run_backtest(
     allow_short = bool(cfg.ALLOW_SHORT)
     min_hold = int(cfg.MIN_HOLD_BARS)
     horizon = int(cfg.ML_HORIZON)
+    purge_gap = int(getattr(cfg, "BACKTEST_PURGE_GAP", horizon))
     cost_per_order = float(cfg.BACKTEST_TRANSACTION_COST_PCT) + float(getattr(cfg, 'BACKTEST_SLIPPAGE_FRAC', cfg.BACKTEST_SLIPPAGE_PCT))
 
     all_rows: list = []
@@ -243,8 +252,10 @@ def run_backtest(
             X_all = feat.loc[valid_idx, FEATURE_COLS].values.astype(np.float32)
             y_all = labels.loc[valid_idx].values.astype(int)
             next_ret_all = next_ret.loc[valid_idx].values.astype(float)
-            close_all = feat.loc[valid_idx, "Close"].values.astype(float)
+            open_all = feat.loc[valid_idx, "Open"].values.astype(float)
+            high_all = feat.loc[valid_idx, "High"].values.astype(float)
             low_all = feat.loc[valid_idx, "Low"].values.astype(float)
+            close_all = feat.loc[valid_idx, "Close"].values.astype(float)
             idx_all = list(valid_idx)
             tech_all = np.asarray(
                 [technical_score_from_feature_row(feat.loc[i]) for i in valid_idx],
@@ -265,25 +276,29 @@ def run_backtest(
             n_hard_stop_exits = 0
             n_lstm_folds = 0
             hard_stop_pct = float(cfg.HARD_STOP_LOSS_PCT)
+            prev_close = None
 
             train_window = int(getattr(cfg, "BACKTEST_TRAIN_WINDOW", 0))
             for start in range(train_min, len(X_all) - step + 1, step):
+                train_end = max(0, start - purge_gap)
                 if train_window > 0:
-                    tr_start = max(0, start - train_window)
-                    X_tr = X_all[tr_start:start]
-                    y_tr = y_all[tr_start:start]
+                    tr_start = max(0, train_end - train_window)
+                    X_tr = X_all[tr_start:train_end]
+                    y_tr = y_all[tr_start:train_end]
                 else:
-                    X_tr = X_all[:start]
-                    y_tr = y_all[:start]
+                    X_tr = X_all[:train_end]
+                    y_tr = y_all[:train_end]
                 X_te = X_all[start:start + step]
                 ret_te = next_ret_all[start:start + step]
                 idx_te = idx_all[start:start + step]
                 tech_te = tech_all[start:start + step]
-                close_te = close_all[start:start + step]
+                open_te = open_all[start:start + step]
+                high_te = high_all[start:start + step]
                 low_te = low_all[start:start + step]
+                close_te = close_all[start:start + step]
 
-                if len(np.unique(y_tr)) < 2:
-                    logger.debug("Only one class in train window: %s start=%d", symbol, start)
+                if len(X_tr) < 10 or len(np.unique(y_tr)) < 2:
+                    logger.debug("Only one class in train window: %s start=%d (train_end=%d)", symbol, start, train_end)
                     continue
 
                 # Decorrelate overlapping forward-horizon labels by striding the
@@ -298,15 +313,24 @@ def run_backtest(
                 rf_scores = _rf_scores_for_fold(X_tr_sub, y_tr_sub, X_te)
                 rf_ok = True
                 if include_lstm:
-                    lstm_scores, lstm_ok = _optional_lstm_scores_for_fold(X_all, y_all, start, len(X_te))
+                    lstm_scores, lstm_ok = _optional_lstm_scores_for_fold(
+                        X_all, y_all, start, len(X_te), purge_gap=purge_gap
+                    )
                     n_lstm_folds += int(lstm_ok)
                 else:
                     lstm_scores = np.full(len(X_te), 0.5, dtype=float)
                     lstm_ok = False
 
-                for dt, rf_score, lstm_score, tech_score, market_ret, close_px, low_px in zip(
-                    idx_te, rf_scores, lstm_scores, tech_te, ret_te, close_te, low_te
+                for dt, rf_score, lstm_score, tech_score, market_ret, open_px, high_px, low_px, close_px in zip(
+                    idx_te, rf_scores, lstm_scores, tech_te, ret_te, open_te, high_te, low_te, close_te
                 ):
+                    open_px = float(open_px)
+                    high_px = float(high_px)
+                    low_px = float(low_px)
+                    close_px = float(close_px)
+                    if prev_close is None:
+                        prev_close = float(close_all[start - 1]) if start > 0 else open_px
+
                     conf = weighted_blend(
                         float(rf_score), rf_ok,
                         float(lstm_score), lstm_ok,
@@ -314,74 +338,173 @@ def run_backtest(
                     )
                     signal = action_from_confidence(conf)
                     old_position = position
-
-                    # ── horizon-aware position update (shared helper) ──
-                    # entry_price/current_price/hard_stop_pct/low_price let the helper apply
-                    # the worst-case hard-stop backstop on open longs using intraday Low.
-                    position, executed, exec_note, bars_held = apply_position_rule_with_hold(
-                        position, signal, allow_short, bars_held, min_hold,
-                        entry_price=entry_price,
-                        current_price=float(close_px),
-                        hard_stop_pct=hard_stop_pct,
-                        low_price=float(low_px),
-                    )
-                    if executed:
-                        n_orders += 1
-                        if exec_note.startswith("hard-stop"):
-                            n_hard_stop_exits += 1
-
-                    # Track entry price across bars: set it when a long opens,
-                    # clear it whenever we return to flat.
-                    prev_entry_price = entry_price
-                    if position > 0 and old_position <= 0:
-                        entry_price = float(close_px)
-                    elif position == 0:
-                        entry_price = None
-
-                    # For the ledger row, preserve the prior entry price on a
-                    # hard-stop exit (the stop has just closed the long and
-                    # cleared entry_price) so the row that triggered the stop
-                    # still shows the price it was measured against.
-                    row_entry_price = (
-                        prev_entry_price
-                        if exec_note.startswith("hard-stop")
-                        else entry_price
-                    )
+                    row_entry_price = entry_price
                     stop_px = (
                         row_entry_price * (1.0 - abs(hard_stop_pct))
-                        if row_entry_price is not None
+                        if (row_entry_price is not None and hard_stop_pct and position > 0)
                         else None
                     )
 
-                    # Decision at close[t], position after the order earns close[t]→close[t+1].
-                    # On hard-stop exit, cap loss at stop price rather than close return.
-                    if exec_note.startswith("hard-stop") and row_entry_price and stop_px is not None:
-                        stop_ret = (stop_px - float(close_px)) / float(close_px)
-                        gross_pnl = float(stop_ret)
-                    else:
-                        gross_pnl = float(position) * float(market_ret)
+                    # ── Phase 1: Open-time Gap Check ──────────────────
+                    if position > 0 and stop_px is not None and open_px <= stop_px:
+                        executed = True
+                        n_orders += 1
+                        n_hard_stop_exits += 1
+                        gap_ret = (open_px / float(row_entry_price)) - 1.0
+                        exec_note = f"hard-stop-gap ({gap_ret:.4f})"
+                        exit_reason = exec_note
+                        exit_price = round(open_px, 6)
+                        gross_pnl = (open_px - prev_close) / prev_close
+                        cost = cost_per_order
+                        net_pnl = gross_pnl - cost
+                        position = 0
+                        entry_price = None
+                        bars_held = 0
 
-                    cost = cost_per_order if executed else 0.0
-                    net_pnl = gross_pnl - cost
+                    # ── Phase 2: Intrabar Stop Check ──────────────────
+                    elif position > 0 and stop_px is not None and low_px <= stop_px:
+                        executed = True
+                        n_orders += 1
+                        n_hard_stop_exits += 1
+                        stop_ret = (stop_px / float(row_entry_price)) - 1.0
+                        exec_note = f"hard-stop ({stop_ret:.4f})"
+                        exit_reason = exec_note
+                        exit_price = round(stop_px, 6)
+                        gross_pnl = (stop_px - prev_close) / prev_close
+                        cost = cost_per_order
+                        net_pnl = gross_pnl - cost
+                        position = 0
+                        entry_price = None
+                        bars_held = 0
+
+                    # ── Phase 3: Close-time Signal Evaluation ─────────
+                    else:
+                        gross_pnl = float(position) * ((close_px - prev_close) / prev_close)
+
+                        if position > 0:
+                            bars_held += 1
+                            if signal == "SELL":
+                                if bars_held >= min_hold:
+                                    executed = True
+                                    n_orders += 1
+                                    exec_note = "close-long"
+                                    exit_reason = "close-long"
+                                    exit_price = round(close_px, 6)
+                                    cost = cost_per_order
+                                    net_pnl = gross_pnl - cost
+                                    position = 0
+                                    entry_price = None
+                                    bars_held = 0
+                                else:
+                                    executed = False
+                                    exec_note = f"hold-long (min_hold {bars_held}/{min_hold})"
+                                    exit_reason = ""
+                                    exit_price = ""
+                                    cost = 0.0
+                                    net_pnl = gross_pnl
+                            elif signal == "BUY":
+                                executed = False
+                                exec_note = "hold-long (already long)"
+                                exit_reason = ""
+                                exit_price = ""
+                                cost = 0.0
+                                net_pnl = gross_pnl
+                            else:
+                                executed = False
+                                exec_note = "hold"
+                                exit_reason = ""
+                                exit_price = ""
+                                cost = 0.0
+                                net_pnl = gross_pnl
+
+                        elif position < 0:
+                            bars_held += 1
+                            if signal == "BUY":
+                                if bars_held >= min_hold:
+                                    executed = True
+                                    n_orders += 1
+                                    exec_note = "cover-short"
+                                    exit_reason = "cover-short"
+                                    exit_price = round(close_px, 6)
+                                    cost = cost_per_order
+                                    net_pnl = gross_pnl - cost
+                                    position = 0
+                                    entry_price = None
+                                    bars_held = 0
+                                else:
+                                    executed = False
+                                    exec_note = f"hold-short (min_hold {bars_held}/{min_hold})"
+                                    exit_reason = ""
+                                    exit_price = ""
+                                    cost = 0.0
+                                    net_pnl = gross_pnl
+                            elif signal == "SELL":
+                                executed = False
+                                exec_note = "hold-short (already short)"
+                                exit_reason = ""
+                                exit_price = ""
+                                cost = 0.0
+                                net_pnl = gross_pnl
+                            else:
+                                executed = False
+                                exec_note = "hold"
+                                exit_reason = ""
+                                exit_price = ""
+                                cost = 0.0
+                                net_pnl = gross_pnl
+
+                        else:  # position == 0 (flat)
+                            if signal == "BUY":
+                                executed = True
+                                n_orders += 1
+                                exec_note = "open-long"
+                                exit_reason = ""
+                                exit_price = ""
+                                position = 1
+                                entry_price = close_px
+                                row_entry_price = close_px
+                                bars_held = 1
+                                cost = cost_per_order
+                                net_pnl = 0.0 - cost
+                                stop_px = (
+                                    entry_price * (1.0 - abs(hard_stop_pct))
+                                    if hard_stop_pct
+                                    else None
+                                )
+                            elif signal == "SELL" and allow_short:
+                                executed = True
+                                n_orders += 1
+                                exec_note = "open-short"
+                                exit_reason = ""
+                                exit_price = ""
+                                position = -1
+                                entry_price = close_px
+                                row_entry_price = close_px
+                                bars_held = 1
+                                cost = cost_per_order
+                                net_pnl = 0.0 - cost
+                            else:
+                                executed = False
+                                exec_note = "skip-sell (flat, long-only)" if signal == "SELL" else "flat"
+                                exit_reason = ""
+                                exit_price = ""
+                                cost = 0.0
+                                net_pnl = 0.0
+
                     equity.append(equity[-1] * (1.0 + net_pnl))
                     daily_pnls.append(net_pnl)
+                    prev_close = close_px
 
                     initial_stop_price = (
                         round(float(stop_px), 6)
                         if stop_px is not None
-                        else None
+                        else ""
                     )
                     risk_per_share = (
                         round(float(row_entry_price) - float(initial_stop_price), 6)
-                        if (row_entry_price is not None and initial_stop_price is not None)
+                        if (row_entry_price is not None and initial_stop_price != "")
                         else ""
                     )
-                    exit_price = (
-                        round(float(stop_px), 6)
-                        if (exec_note.startswith("hard-stop") and stop_px is not None)
-                        else (round(float(close_px), 6) if (executed and position == 0) else "")
-                    )
-                    exit_reason = exec_note if (executed and position == 0) else ""
                     risk_source = "hard_stop" if (row_entry_price is not None and hard_stop_pct) else ""
 
                     rows.append({
@@ -402,7 +525,7 @@ def run_backtest(
                         "exit_reason": exit_reason,
                         "hard_stop_exit": bool(exec_note.startswith("hard-stop")),
                         "entry_price": round(float(row_entry_price), 6) if row_entry_price is not None else "",
-                        "initial_stop_price": initial_stop_price if initial_stop_price is not None else "",
+                        "initial_stop_price": initial_stop_price,
                         "risk_per_share": risk_per_share,
                         "risk_source": risk_source,
                         "close_price": round(float(close_px), 6),
@@ -483,6 +606,7 @@ def run_backtest(
     aggregate.update({
         "backtest_model": "RF_LSTM_TECHNICAL_WALK_FORWARD" if include_lstm else "RF_TECHNICAL_WALK_FORWARD",
         "include_lstm": bool(include_lstm),
+        "purge_gap": int(purge_gap),
         # Phase 1: record explicit backtest/live signal-construction parity.
         "signal_parity": check_signal_parity(),
         "allow_short": bool(allow_short),
@@ -493,7 +617,7 @@ def run_backtest(
         "note": (
             "Positions held >= MIN_HOLD_BARS to match ML_HORIZON forward-direction "
             "label and the live IBKR hold guard. Daily close-to-close returns used "
-            "for held positions."
+            "for held positions with purge gap and gap-down realistic stop fills."
         ),
     })
 

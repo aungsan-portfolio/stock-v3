@@ -381,6 +381,7 @@ BACKTEST_SLIPPAGE_PCT         = BACKTEST_SLIPPAGE_FRAC  # DEPRECATED alias: valu
 BACKTEST_INCLUDE_LSTM         = False
 BACKTEST_LSTM_EPOCHS          = 8
 BACKTEST_LSTM_BATCH           = 64
+BACKTEST_PURGE_GAP            = ML_HORIZON  # Purge gap between training cutoff and test start to eliminate forward label leakage
 
 # ── IBKR (Deprecated for compatibility) ──────────
 IBKR_HOST           = "127.0.0.1"
@@ -1158,6 +1159,7 @@ class Settings:
     BACKTEST_INCLUDE_LSTM: bool = BACKTEST_INCLUDE_LSTM
     BACKTEST_LSTM_EPOCHS: int = BACKTEST_LSTM_EPOCHS
     BACKTEST_LSTM_BATCH: int = BACKTEST_LSTM_BATCH
+    BACKTEST_PURGE_GAP: int = BACKTEST_PURGE_GAP
 
     # IBKR
     IBKR_HOST: str = IBKR_HOST

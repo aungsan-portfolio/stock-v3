@@ -449,7 +449,18 @@ def _add_market_relative_features(
         return
 
     # Align the benchmark to the symbol's trading dates; forward-fill any gaps.
-    mkt_close = market_df["Close"].reindex(f.index).ffill()
+    mkt_s = market_df["Close"].copy()
+    if getattr(mkt_s.index, "tz", None) is not None and getattr(f.index, "tz", None) is None:
+        mkt_s.index = mkt_s.index.tz_localize(None)
+    elif getattr(mkt_s.index, "tz", None) is None and getattr(f.index, "tz", None) is not None:
+        mkt_s.index = mkt_s.index.tz_localize(f.index.tz)
+
+    mkt_close = mkt_s.reindex(f.index).ffill()
+    min_required = max(int(getattr(cfg, "REL_RET_LONG", 20)), int(getattr(cfg, "MKT_TREND_SMA", 50)))
+    if mkt_close.dropna().shape[0] < min_required:
+        for col in _MARKET_REL_FEATURE_COLS:
+            f[col] = 0.0
+        return
     s_short = int(cfg.REL_RET_SHORT)
     s_long = int(cfg.REL_RET_LONG)
     f["rel_ret_short"] = close.pct_change(s_short) - mkt_close.pct_change(s_short)

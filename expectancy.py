@@ -180,8 +180,8 @@ def _build_long_trade(symbol: str, fold: str, entry: dict, exit_: dict) -> Close
     """
     entry_eq = _f(entry.get("equity"))
     exit_eq = _f(exit_.get("equity"))
-    entry_price = _f(entry.get("close_price")) or _f(entry.get("entry_price"))
-    exit_price = _f(exit_.get("close_price")) or _f(exit_.get("exit_price"))
+    entry_price = _f(entry.get("entry_price")) or _f(entry.get("close_price"))
+    exit_price = _f(exit_.get("exit_price")) or _f(exit_.get("close_price"))
     entry_date = (str(entry.get("date", "")).strip() or None)
     exit_date = (str(exit_.get("date", "")).strip() or None)
 
