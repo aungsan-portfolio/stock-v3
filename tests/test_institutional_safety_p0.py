@@ -580,3 +580,19 @@ def test_institutional_safety_config_validation():
     with patch.object(config, "DAYTRADE_BATCH_FETCH_MIN_COVERAGE", 1.05):
         with pytest.raises(ValueError, match="DAYTRADE_BATCH_FETCH_MIN_COVERAGE must be in"):
             config.validate_institutional_safety_config()
+
+
+def test_soxx_gate_fails_closed_when_benchmark_data_missing():
+    """Verify check_soxx_tech_long_gate fails closed by default when SOXX benchmark data returns None."""
+    from strategies.intraday_risk import check_soxx_tech_long_gate
+    import strategies.intraday_risk as ir
+    orig_fn = ir._get_soxx_realtime_pct_change
+    try:
+        ir._get_soxx_realtime_pct_change = lambda **kwargs: None
+        # Default behavior: must fail closed and block NVDA tech long
+        ok, reason = check_soxx_tech_long_gate("NVDA", side="BUY")
+        assert ok is False
+        assert "data unavailable (fail-closed)" in reason
+    finally:
+        ir._get_soxx_realtime_pct_change = orig_fn
+

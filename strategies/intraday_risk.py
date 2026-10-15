@@ -254,7 +254,7 @@ def check_soxx_tech_long_gate(
     else:
         soxx_pct = _get_soxx_realtime_pct_change()
     if soxx_pct is None:
-        fail_closed = getattr(config, "SOXX_GATE_FAIL_CLOSED", False)
+        fail_closed = getattr(config, "SOXX_GATE_FAIL_CLOSED", True)
         if fail_closed:
             logger.warning("[SOXX GATE] Could not fetch SOXX benchmark data. Failing closed (blocking %s entry).", symbol)
             return False, "SOXX gate: data unavailable (fail-closed)"
