@@ -15,6 +15,7 @@ Verifies:
 """
 
 import datetime
+import math
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 import pytest
@@ -250,3 +251,103 @@ def test_invalid_timestamp_handled(mock_bridge):
         decision = mock_bridge.get_order_quote("BAD")
         assert decision.ok is False
         assert "invalid_timestamp" in decision.reason
+
+
+def test_nan_bid_ask_rejected(mock_bridge):
+    """Test 10: NaN bid, ask, or both strictly rejected with 'invalid_bid_ask'."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    mock_bridge._data_client.get_stock_latest_trade.side_effect = Exception("No trades")
+    mock_bridge._data_client.get_stock_bars.side_effect = Exception("No bars")
+
+    nan_quotes = [
+        MockAlpacaQuote(float("nan"), 100.0, now_utc),
+        MockAlpacaQuote(100.0, float("nan"), now_utc),
+        MockAlpacaQuote(float("nan"), float("nan"), now_utc),
+    ]
+
+    with patch("yfinance.Ticker", side_effect=Exception("No yf")):
+        for q_nan in nan_quotes:
+            mock_bridge._data_client.get_stock_latest_quote.return_value = {"NAN_SYM": q_nan}
+            decision = mock_bridge.get_order_quote("NAN_SYM")
+            assert decision.ok is False
+            assert "invalid_bid_ask" in decision.reason
+
+
+def test_inf_bid_ask_rejected(mock_bridge):
+    """Test 11: +/- Infinity bid or ask strictly rejected with 'invalid_bid_ask'."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    mock_bridge._data_client.get_stock_latest_trade.side_effect = Exception("No trades")
+    mock_bridge._data_client.get_stock_bars.side_effect = Exception("No bars")
+
+    inf_quotes = [
+        MockAlpacaQuote(float("inf"), 100.0, now_utc),
+        MockAlpacaQuote(100.0, float("inf"), now_utc),
+        MockAlpacaQuote(float("-inf"), 100.0, now_utc),
+        MockAlpacaQuote(100.0, float("-inf"), now_utc),
+    ]
+
+    with patch("yfinance.Ticker", side_effect=Exception("No yf")):
+        for q_inf in inf_quotes:
+            mock_bridge._data_client.get_stock_latest_quote.return_value = {"INF_SYM": q_inf}
+            decision = mock_bridge.get_order_quote("INF_SYM")
+            assert decision.ok is False
+            assert "invalid_bid_ask" in decision.reason
+
+
+def test_nan_and_inf_trade_fallback_rejected(mock_bridge):
+    """Test 12: Trade/Bar/YF fallbacks with NaN/Inf prices are rejected, not admitted."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    # Stale quote triggers fallbacks
+    q_stale = MockAlpacaQuote(100.0, 100.04, now_utc - datetime.timedelta(seconds=20.0))
+    mock_bridge._data_client.get_stock_latest_quote.return_value = {"FALLBACK_SYM": q_stale}
+
+    # Trade fallback returns NaN
+    mock_bridge._data_client.get_stock_latest_trade.return_value = {"FALLBACK_SYM": SimpleNamespace(price=float("nan"))}
+    # Bar fallback returns Inf
+    mock_bridge._data_client.get_stock_bars.return_value = SimpleNamespace(data={"FALLBACK_SYM": [SimpleNamespace(close=float("inf"))]})
+
+    with patch("yfinance.Ticker") as mock_yf:
+        mock_yf.return_value.fast_info.get.return_value = float("nan")
+        decision = mock_bridge.get_order_quote("FALLBACK_SYM")
+        assert decision.ok is False
+        assert "fallback" not in decision.source
+        assert "Primary quote rejected: stale_quote" in decision.reason
+
+
+def test_invalid_tolerance_and_config_bounded(mock_bridge):
+    """Test 13: Non-finite or out-of-bounds config thresholds fall back defensively to safe defaults."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    q = MockAlpacaQuote(100.0, 100.04, now_utc)
+    mock_bridge._data_client.get_stock_latest_quote.return_value = {"BOUND_SYM": q}
+
+    # Config returns NaN for spread and age
+    mock_bridge._c = MagicMock(side_effect=lambda key, default: float("nan"))
+
+    with patch("config.QUOTE_FUTURE_TOLERANCE_SECONDS", float("nan")):
+        decision = mock_bridge.get_order_quote("BOUND_SYM")
+        assert decision.ok is True
+        assert decision.reason == "ok"
+        assert decision.source == "alpaca"
+
+
+def test_quote_future_tolerance_boundary_enforcement(mock_bridge):
+    """Test 14: Strict boundary check at QUOTE_FUTURE_TOLERANCE_SECONDS = 2.0s."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    mock_bridge._data_client.get_stock_latest_trade.side_effect = Exception("No trades")
+    mock_bridge._data_client.get_stock_bars.side_effect = Exception("No bars")
+
+    with patch("config.QUOTE_FUTURE_TOLERANCE_SECONDS", 2.0), patch("yfinance.Ticker", side_effect=Exception("No yf")):
+        # Within tolerance: 1.5s in future -> Accepted
+        q_pass = MockAlpacaQuote(100.0, 100.04, now_utc + datetime.timedelta(seconds=1.5))
+        mock_bridge._data_client.get_stock_latest_quote.return_value = {"TOL_SYM": q_pass}
+        decision_pass = mock_bridge.get_order_quote("TOL_SYM")
+        assert decision_pass.ok is True
+        assert decision_pass.reason == "ok"
+
+        # Beyond tolerance: 2.5s in future -> Rejected with future_timestamp
+        q_reject = MockAlpacaQuote(100.0, 100.04, now_utc + datetime.timedelta(seconds=2.5))
+        mock_bridge._data_client.get_stock_latest_quote.return_value = {"TOL_SYM": q_reject}
+        decision_reject = mock_bridge.get_order_quote("TOL_SYM")
+        assert decision_reject.ok is False
+        assert "future_timestamp" in decision_reject.reason
+

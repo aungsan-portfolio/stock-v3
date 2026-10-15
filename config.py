@@ -338,6 +338,7 @@ BAR_CLOSE_GRACE_SECONDS          = ENTRY_BAR_CLOSE_GRACE_SECONDS   # Backward-co
 POSITION_ATR_MAX_AGE_SECONDS     = 360.0  # 360s max age for active-position ATR updates during mid-bar polling
 PREFLIGHT_MAX_RECOVERABLE_DELAY_SECONDS = float(os.environ.get("PREFLIGHT_MAX_RECOVERABLE_DELAY_SECONDS", "360.0"))  # 360s (300s bar + 60s grace) max recoverable delay for preflight startup audit
 BAR_FUTURE_TOLERANCE_SECONDS     = 5.0    # 5s clock skew tolerance for completed bars
+QUOTE_FUTURE_TOLERANCE_SECONDS   = float(os.environ.get("QUOTE_FUTURE_TOLERANCE_SECONDS", "2.0"))  # 2s clock skew tolerance for real-time quotes
 INTRADAY_DATA_SOURCE_TIMEZONE    = "US/Eastern" # Default fallback timezone for naive bar feeds
 TRAILING_STOP_RECONCILE_TOLERANCE = None  # None defaults dynamically to tick_size / 2.0
 

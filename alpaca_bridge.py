@@ -3511,16 +3511,53 @@ class AlpacaBridge:
             resp_utc = _dt.datetime.now(_dt.timezone.utc)
             q = quotes.get(symbol) if isinstance(quotes, dict) else (getattr(quotes, symbol, None) or quotes)
 
-            bid = float(getattr(q, "bid_price", 0.0) or 0.0) if q else 0.0
-            ask = float(getattr(q, "ask_price", 0.0) or 0.0) if q else 0.0
-            mid = (bid + ask) / 2.0 if bid > 0.0 and ask > 0.0 else (ask or bid or 0.0)
+            try:
+                raw_bid = getattr(q, "bid_price", 0.0) if q else 0.0
+                bid = float(raw_bid) if raw_bid is not None else 0.0
+            except (TypeError, ValueError):
+                bid = 0.0
 
-            spread_pct = (ask - bid) / mid if mid > 0.0 else 0.0
-            max_spread = float(self._c("MAX_QUOTE_SPREAD_PCT", 0.02))
-            max_age = float(self._c("MAX_QUOTE_AGE_SECONDS", 10.0))
-            future_tolerance = float(
-                getattr(config_module, "QUOTE_FUTURE_TOLERANCE_SECONDS", getattr(config_module, "BAR_FUTURE_TOLERANCE_SECONDS", 5.0))
+            try:
+                raw_ask = getattr(q, "ask_price", 0.0) if q else 0.0
+                ask = float(raw_ask) if raw_ask is not None else 0.0
+            except (TypeError, ValueError):
+                ask = 0.0
+
+            is_valid_book = (
+                q is not None
+                and math.isfinite(bid)
+                and math.isfinite(ask)
+                and bid > 0.0
+                and ask > 0.0
+                and bid < ask
             )
+
+            if is_valid_book:
+                mid = (bid + ask) / 2.0
+                spread_pct = (ask - bid) / mid
+            else:
+                mid = 0.0
+                spread_pct = 0.0
+
+            # Defensive configuration bounds
+            try:
+                raw_max_spread = float(self._c("MAX_QUOTE_SPREAD_PCT", 0.02))
+                max_spread = raw_max_spread if (math.isfinite(raw_max_spread) and 0.0 < raw_max_spread <= 0.50) else 0.02
+            except (TypeError, ValueError):
+                max_spread = 0.02
+
+            try:
+                raw_max_age = float(self._c("MAX_QUOTE_AGE_SECONDS", 10.0))
+                max_age = raw_max_age if (math.isfinite(raw_max_age) and 0.0 < raw_max_age <= 120.0) else 10.0
+            except (TypeError, ValueError):
+                max_age = 10.0
+
+            try:
+                raw_fut_tol = getattr(config_module, "QUOTE_FUTURE_TOLERANCE_SECONDS", 2.0)
+                num_fut_tol = float(raw_fut_tol)
+                future_tolerance = num_fut_tol if (math.isfinite(num_fut_tol) and 0.0 <= num_fut_tol <= 15.0) else 2.0
+            except (TypeError, ValueError):
+                future_tolerance = 2.0
 
             raw_ts = getattr(q, "timestamp", None) if q else None
             ts_type = type(raw_ts).__name__ if raw_ts is not None else "NoneType"
@@ -3529,8 +3566,8 @@ class AlpacaBridge:
             primary_reason = ""
             age_sec = None
 
-            # 1. Evaluate top-of-book prices
-            if q is None or bid <= 0.0 or ask <= 0.0 or bid >= ask or mid <= 0.0:
+            # 1. Evaluate top-of-book prices with strict finite checks
+            if not is_valid_book or not math.isfinite(mid) or mid <= 0.0 or not math.isfinite(spread_pct) or spread_pct < 0.0:
                 primary_reason = "invalid_bid_ask"
             elif raw_ts is None:
                 primary_reason = "missing_timestamp"
@@ -3538,6 +3575,8 @@ class AlpacaBridge:
                 try:
                     if isinstance(raw_ts, (int, float)):
                         num_ts = float(raw_ts)
+                        if not math.isfinite(num_ts) or num_ts <= 0.0:
+                            raise ValueError(f"Non-finite or non-positive numeric timestamp: {num_ts}")
                         if num_ts > 1e14:
                             num_ts = num_ts / 1e9
                         elif num_ts > 1e11:
@@ -3560,6 +3599,8 @@ class AlpacaBridge:
 
                     q_ts_str = q_ts_utc.isoformat()
                     age_sec = (resp_utc - q_ts_utc).total_seconds()
+                    if not math.isfinite(age_sec):
+                        primary_reason = "invalid_timestamp"
                 except Exception as ts_err:
                     logger.debug("[QUOTE TIMESTAMP PARSE ERROR] %s: %s (raw=%r, type=%s)", symbol, ts_err, raw_ts, ts_type)
                     primary_reason = "invalid_timestamp"
@@ -3578,8 +3619,8 @@ class AlpacaBridge:
             # 3. If primary two-sided top-of-book quote is valid and fresh: accept immediately!
             if primary_reason == "ok":
                 logger.debug(
-                    "[ORDER QUOTE OK] %s: bid=%.2f ask=%.2f mid=%.2f spread=%.6f (limit=%.4f) | age=%.3fs (max=%.1fs) ts=%s (%s)",
-                    symbol, bid, ask, mid, spread_pct, max_spread, age_sec, max_age, q_ts_str, ts_type
+                    "[ORDER QUOTE OK] %s: bid=%.2f ask=%.2f mid=%.2f spread=%.6f (limit=%.4f) | age=%.3fs (max=%.1fs, fut_tol=%.1fs) ts=%s (%s)",
+                    symbol, bid, ask, mid, spread_pct, max_spread, age_sec, max_age, future_tolerance, q_ts_str, ts_type
                 )
                 return QuoteDecision(True, mid, "alpaca", "ok")
 
@@ -3589,7 +3630,7 @@ class AlpacaBridge:
                 "q_ts=%s (%s) req_utc=%s resp_utc=%s age=%.3fs (max=%.1fs, fut_tol=%.1fs)",
                 symbol, primary_reason, bid, ask, mid, spread_pct, max_spread,
                 q_ts_str, ts_type, req_utc.isoformat(), resp_utc.isoformat(),
-                age_sec if age_sec is not None else -999.0, max_age, future_tolerance
+                age_sec if (age_sec is not None and math.isfinite(age_sec)) else -999.0, max_age, future_tolerance
             )
 
             # Engage zero-budget fallback pricing sources for diagnostic / valuation fallback
@@ -3597,8 +3638,9 @@ class AlpacaBridge:
             try:
                 trades = self._call_with_retry(lambda: self._data_client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol, feed="iex")))
                 t = trades.get(symbol) if isinstance(trades, dict) else (getattr(trades, symbol, None) or trades)
-                t_price = float(getattr(t, "price", 0.0) or 0.0) if t else 0.0
-                if t_price > 0:
+                raw_t_price = getattr(t, "price", 0.0) if t else 0.0
+                t_price = float(raw_t_price) if raw_t_price is not None else 0.0
+                if math.isfinite(t_price) and t_price > 0.0:
                     logger.info("[IEX TRADE FALLBACK] %s primary quote failed (%s). Using latest trade price $%.2f",
                                 symbol, primary_reason, t_price)
                     return QuoteDecision(True, t_price, "alpaca_iex_trade_fallback", f"fallback_from_{primary_reason}")
@@ -3617,8 +3659,9 @@ class AlpacaBridge:
                 )))
                 bar_list = bars_res.data.get(symbol, []) if hasattr(bars_res, "data") else (bars_res.get(symbol, []) if isinstance(bars_res, dict) else [])
                 if bar_list:
-                    last_bar_close = float(getattr(bar_list[-1], "close", 0.0) or 0.0)
-                    if last_bar_close > 0:
+                    raw_bar_close = getattr(bar_list[-1], "close", 0.0)
+                    last_bar_close = float(raw_bar_close) if raw_bar_close is not None else 0.0
+                    if math.isfinite(last_bar_close) and last_bar_close > 0.0:
                         logger.info("[IEX BAR FALLBACK] %s primary quote failed (%s). Using latest 1m bar close $%.2f",
                                     symbol, primary_reason, last_bar_close)
                         return QuoteDecision(True, last_bar_close, "alpaca_iex_bar_fallback", f"fallback_from_{primary_reason}")
@@ -3628,18 +3671,19 @@ class AlpacaBridge:
             # Fallback 3: Yahoo Finance fast_info (real-time consolidated tape)
             try:
                 import yfinance as yf
-                yf_px = float(yf.Ticker(symbol).fast_info.get("last_price", 0.0) or 0.0)
-                if yf_px > 0:
+                raw_yf_px = yf.Ticker(symbol).fast_info.get("last_price", 0.0)
+                yf_px = float(raw_yf_px) if raw_yf_px is not None else 0.0
+                if math.isfinite(yf_px) and yf_px > 0.0:
                     logger.info("[YFINANCE FALLBACK] %s primary quote failed (%s). Using Yahoo Finance fast_info last_price $%.2f",
                                 symbol, primary_reason, yf_px)
                     return QuoteDecision(True, yf_px, "yfinance_fallback", f"fallback_from_{primary_reason}")
             except Exception as y_exc:
                 logger.debug("Yahoo Finance fallback failed for %s: %s", symbol, y_exc)
 
-            if mid <= 0:
-                return QuoteDecision(False, 0.0, "alpaca", f"Quote mid-price is zero ({primary_reason}) and fallbacks exhausted")
+            if not math.isfinite(mid) or mid <= 0:
+                return QuoteDecision(False, 0.0, "alpaca", f"Quote mid-price is non-positive or non-finite ({primary_reason}) and fallbacks exhausted")
 
-            return QuoteDecision(False, mid, "alpaca", f"Primary quote rejected: {primary_reason} (age={age_sec if age_sec is not None else -999.0:.2f}s, spread={spread_pct:.4f})")
+            return QuoteDecision(False, mid, "alpaca", f"Primary quote rejected: {primary_reason} (age={age_sec if (age_sec is not None and math.isfinite(age_sec)) else -999.0:.2f}s, spread={spread_pct if math.isfinite(spread_pct) else -1.0:.4f})")
         except Exception as exc:
             logger.error("get_order_quote failed for %s: %s", symbol, exc)
             return QuoteDecision(False, 0.0, "alpaca", str(exc))
