@@ -60,7 +60,7 @@ class MultiSourceDataProvider:
                     df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
                     if not df.empty:
                         logger.info("Loaded %s from local cache", symbol)
-                        return df
+                        return self._clean_and_validate(symbol, df)
                 except Exception as e:
                     logger.warning("Failed to read CSV cache for %s: %s", symbol, e)
 
@@ -77,7 +77,7 @@ class MultiSourceDataProvider:
             logger.warning("yfinance fetch failed for %s: %s", symbol, e)
 
         # Fallback to direct free Alpaca IEX daily bars
-        if df is None:
+        if df is None and interval in ("1d", "daily", None):
             try:
                 from strategies.intraday_data import fetch_daily_alpaca
                 days_map = {"5y": 1825, "2y": 730, "1y": 365, "6mo": 180, "3mo": 90, "1mo": 30}
@@ -229,7 +229,11 @@ class MultiSourceDataProvider:
         reasons = {}
 
         # Format index as UTC date-only/tz-naive timezone
-        df.index = pd.to_datetime(df.index, utc=True).tz_localize(None)
+        df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+        valid_idx = ~df.index.isna()
+        if not valid_idx.all():
+            df = df[valid_idx]
+        df.index = df.index.tz_localize(None)
 
         # 1. Deduplicate index keeping latest row
         dup_mask = df.index.duplicated(keep="last")
@@ -240,12 +244,13 @@ class MultiSourceDataProvider:
 
         df.sort_index(inplace=True)
 
-        # 2. Check for missing / NaN values in required OHLCV
-        nan_mask = df[required_cols].isna().any(axis=1)
-        nan_count = int(nan_mask.sum())
-        if nan_count > 0:
-            reasons["nan_values"] = nan_count
-            df = df[~nan_mask]
+        # 2. Coerce numeric and drop NaN / non-finite values
+        for c in required_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        finite_mask = np.isfinite(df[required_cols].to_numpy()).all(axis=1)
+        if not finite_mask.all():
+            reasons["non_finite_values"] = int((~finite_mask).sum())
+            df = df[finite_mask]
 
         # 3. Validate OHLC geometric consistency
         valid_ohlc = (

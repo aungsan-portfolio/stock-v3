@@ -192,13 +192,14 @@ def fetch_ohlcv(
             ticker = yf.Ticker(symbol)
             df = ticker.history(period=period, interval=interval, auto_adjust=True)
             if not df.empty:
+                df.attrs["volume_source"] = "yfinance_consolidated"
                 break
         except Exception:
             pass
         if attempt < 3:
             time.sleep(attempt * 1.5)
 
-    if df.empty:
+    if df.empty and interval in ("1d", "daily", None):
         # Zero-budget fallback: Fetch free Alpaca IEX daily bars
         try:
             from strategies.intraday_data import fetch_daily_alpaca
@@ -208,6 +209,7 @@ def fetch_ohlcv(
             if alpaca_df is not None and not alpaca_df.empty:
                 col_map = {c: c.capitalize() for c in alpaca_df.columns if c.lower() in ("open", "high", "low", "close", "volume")}
                 df = alpaca_df.rename(columns=col_map).copy()
+                df.attrs["volume_source"] = "alpaca_iex_daily"
                 logger.info("[FALLBACK] Fetched %s via free Alpaca IEX daily bars fallback", symbol)
         except Exception as alpaca_exc:
             logger.debug("[FALLBACK] Alpaca IEX daily bar fallback failed for %s: %s", symbol, alpaca_exc)
@@ -224,7 +226,11 @@ def fetch_ohlcv(
     rows_received = len(df)
     reasons = {}
 
-    df.index = pd.to_datetime(df.index, utc=True).tz_localize(None)
+    df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+    valid_idx = ~df.index.isna()
+    if not valid_idx.all():
+        df = df[valid_idx]
+    df.index = df.index.tz_localize(None)
 
     # 1. Deduplicate index
     dup_mask = df.index.duplicated(keep="last")
@@ -235,12 +241,13 @@ def fetch_ohlcv(
 
     df.sort_index(inplace=True)
 
-    # 2. Drop NaN
-    nan_mask = df[required_cols].isna().any(axis=1)
-    nan_count = int(nan_mask.sum())
-    if nan_count > 0:
-        reasons["nan_values"] = nan_count
-        df = df[~nan_mask]
+    # 2. Coerce numeric and drop NaN / non-finite values
+    for c in required_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    finite_mask = np.isfinite(df[required_cols].to_numpy()).all(axis=1)
+    if not finite_mask.all():
+        reasons["non_finite_values"] = int((~finite_mask).sum())
+        df = df[finite_mask]
 
     # 3. Geometric consistency
     valid_ohlc = (

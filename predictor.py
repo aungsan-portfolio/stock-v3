@@ -142,6 +142,7 @@ def get_macro_benchmark_indicators() -> Dict[str, Any]:
         "timestamp": now_eastern().isoformat(),
     }
 
+    spy_df = None
     try:
         spy_df = fetch_ohlcv("SPY")
         if spy_df is not None and len(spy_df) >= 50:
@@ -179,9 +180,15 @@ def get_macro_benchmark_indicators() -> Dict[str, Any]:
                 continue
 
         if vix_df is not None and not vix_df.empty:
-            res["vix"] = round(float(vix_df["Close"].iloc[-1]), 2)
-            res["vix_source"] = "CBOE_VIX"
-            res["vix_status"] = "VALID"
+            raw_vix = float(vix_df["Close"].iloc[-1])
+            if math.isfinite(raw_vix) and raw_vix > 0:
+                res["vix"] = round(raw_vix, 2)
+                res["vix_source"] = "CBOE_VIX"
+                res["vix_status"] = "VALID"
+            else:
+                res["vix"] = None
+                res["vix_source"] = None
+                res["vix_status"] = "UNAVAILABLE"
         else:
             res["vix"] = None
             res["vix_source"] = None

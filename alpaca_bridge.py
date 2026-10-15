@@ -1766,37 +1766,41 @@ class AlpacaBridge:
                 try:
                     raw_eq = self.get_net_liquidation()
                     if raw_eq is not None and not (hasattr(raw_eq, "_mock_name") or "Mock" in type(raw_eq).__name__):
-                        current_equity = float(raw_eq)
+                        current_equity = self._positive_finite_equity(raw_eq)
                 except Exception as eq_err:
                     logger.error("[FAIL-CLOSED] Error fetching current equity in _is_daily_loss_halted: %s", eq_err)
                     return True
 
-            import math
             # Strict Fail-Closed Check on Current Equity:
-            if not (isinstance(current_equity, (int, float)) and math.isfinite(current_equity) and current_equity > 0.0):
+            if current_equity <= 0.0:
                 logger.error("[FAIL-CLOSED] Invalid current equity in _is_daily_loss_halted: %r; failing closed to block entries/rotations.", current_equity)
                 return True
 
-            sod_equity = getattr(self, "_start_of_day_equity", 0.0)
-            if (not isinstance(sod_equity, (int, float)) or not math.isfinite(sod_equity) or sod_equity <= 0.0) and hasattr(self, "snapshot_start_of_day_equity"):
-                try:
-                    raw_sod = self.snapshot_start_of_day_equity()
-                    if raw_sod is not None and not (hasattr(raw_sod, "_mock_name") or "Mock" in type(raw_sod).__name__):
-                        sod_equity = float(raw_sod)
-                except Exception as sod_err:
-                    logger.error("[FAIL-CLOSED] Error fetching start of day equity in _is_daily_loss_halted: %s; failing closed.", sod_err)
-                    return True
+            from strategies.session import now_eastern
+            et_date = str(now_eastern().date())
+            acct_id = getattr(self, "_account_id", "default")
+
+            sod_date = getattr(self, "_start_of_day_equity_date", None)
+            sod_source = getattr(self, "_start_of_day_equity_source", "")
+            sod_equity = self._positive_finite_equity(getattr(self, "_start_of_day_equity", 0.0))
+
+            if sod_date != et_date or sod_source != "broker_last_equity" or sod_equity <= 0.0:
+                sod_equity = 0.0
+                if hasattr(self, "snapshot_start_of_day_equity"):
+                    try:
+                        raw_sod = self.snapshot_start_of_day_equity()
+                        sod_equity = self._positive_finite_equity(raw_sod)
+                    except Exception as sod_err:
+                        logger.error("[FAIL-CLOSED] Error fetching start of day equity in _is_daily_loss_halted: %s; failing closed.", sod_err)
+                        return True
 
             # If SOD baseline is still unavailable or <= 0 or non-finite: FAIL-CLOSED!
             # Never fallback to sod_equity = current_equity as that masks all prior session losses.
-            if not (isinstance(sod_equity, (int, float)) and math.isfinite(sod_equity) and sod_equity > 0.0):
+            if sod_equity <= 0.0:
                 logger.error("[FAIL-CLOSED] Valid session start-of-day equity baseline unavailable in _is_daily_loss_halted (got %r); failing closed to block entries/rotations.", sod_equity)
                 return True
 
             if gate is not None and hasattr(gate, "daily_loss_blocked") and mode == "swing":
-                from strategies.session import now_eastern
-                et_date = str(now_eastern().date())
-                acct_id = getattr(self, "_account_id", "default")
                 is_blocked, reason = gate.daily_loss_blocked(
                     account_id=acct_id,
                     session_date_et=et_date,
@@ -2048,39 +2052,7 @@ class AlpacaBridge:
                     self.entry_gate.halt("PERSISTED_STATE_INVALID")
                 raise
 
-            broker_last_eq = float(getattr(acct, "last_equity", 0.0) or 0.0)
-            if broker_last_eq <= 0.0:
-                broker_last_eq = float(acct.equity)
-
-            state_prov = state.get("provenance", {}) if isinstance(state, dict) else {}
-            state_source = state_prov.get("source", "") if isinstance(state_prov, dict) else ""
-            has_valid_stamp = (state_source == "broker_last_equity")
-
-            if state.get("date") == et_date and state.get("account_id") == self._account_id and has_valid_stamp:
-                self._start_of_day_equity = broker_last_eq
-                self._start_of_day_equity_date = et_date
-                self._start_of_day_equity_source = "broker_last_equity"
-                self._daytrade_suspended = bool(state.get("suspended", False))
-                logger.info("[%s] Restored verified start-of-day equity: $%.2f (source=%s), suspended: %s",
-                            self._account_id, self._start_of_day_equity, state_source, self._daytrade_suspended)
-            else:
-                self._start_of_day_equity = broker_last_eq
-                self._start_of_day_equity_date = et_date
-                self._start_of_day_equity_source = "broker_last_equity"
-                self._daytrade_suspended = False
-                self._save_daytrade_risk_state(
-                    et_date,
-                    self._start_of_day_equity,
-                    False,
-                    account_id=self._account_id,
-                    source="broker_last_equity"
-                )
-                if state and not has_valid_stamp:
-                    logger.warning("[%s] Legacy risk state without broker_last_equity provenance stamp rejected. Re-initialized from broker last_equity: $%.2f",
-                                   self._account_id, self._start_of_day_equity)
-                else:
-                    logger.info("[%s] Initialized new day start-of-day equity from broker last_equity: $%.2f",
-                                self._account_id, self._start_of_day_equity)
+            self._restore_session_baseline(acct, state, et_date, self._account_id)
 
             # Attach FlightRecorderHandler and restore persisted latch state if present
             try:
@@ -2133,6 +2105,62 @@ class AlpacaBridge:
             return float(value or 0.0)
         except (TypeError, ValueError):
             return 0.0
+
+    def _positive_finite_equity(self, val: Any) -> float:
+        try:
+            if val is None:
+                return 0.0
+            num = float(val)
+            if math.isfinite(num) and num > 0.0:
+                return num
+        except (TypeError, ValueError):
+            pass
+        return 0.0
+
+    def _restore_session_baseline(self, acct: Any, state: Any, et_date: str, account_id: str) -> float:
+        state = state if isinstance(state, dict) else {}
+        state_prov = state.get("provenance", {}) if isinstance(state.get("provenance"), dict) else {}
+        state_source = state_prov.get("source", "")
+        has_valid_stamp = (state_source == "broker_last_equity")
+        saved_equity = self._positive_finite_equity(state.get("start_of_day_equity", 0.0))
+
+        if state.get("date") == et_date and state.get("account_id") == account_id and has_valid_stamp and saved_equity > 0.0:
+            self._start_of_day_equity = saved_equity
+            self._start_of_day_equity_date = et_date
+            self._start_of_day_equity_source = "broker_last_equity"
+            self._daytrade_suspended = bool(state.get("suspended", False))
+            logger.info("[%s] Restored verified start-of-day equity: $%.2f (source=%s), suspended: %s",
+                        account_id, self._start_of_day_equity, state_source, self._daytrade_suspended)
+            return self._start_of_day_equity
+
+        broker_last_eq = self._positive_finite_equity(getattr(acct, "last_equity", 0.0))
+        if broker_last_eq > 0.0:
+            self._start_of_day_equity = broker_last_eq
+            self._start_of_day_equity_date = et_date
+            self._start_of_day_equity_source = "broker_last_equity"
+            self._daytrade_suspended = False
+            self._save_daytrade_risk_state(
+                et_date,
+                self._start_of_day_equity,
+                False,
+                account_id=account_id,
+                source="broker_last_equity"
+            )
+            if state and not has_valid_stamp:
+                logger.warning("[%s] Legacy risk state without broker_last_equity provenance stamp rejected. Re-initialized from broker last_equity: $%.2f",
+                               account_id, self._start_of_day_equity)
+            else:
+                logger.info("[%s] Initialized new day start-of-day equity from broker last_equity: $%.2f",
+                            account_id, self._start_of_day_equity)
+            return self._start_of_day_equity
+
+        self._start_of_day_equity = 0.0
+        self._start_of_day_equity_date = et_date
+        self._start_of_day_equity_source = "unverified"
+        self._daytrade_suspended = False
+        logger.error("[%s] Broker last_equity invalid or non-positive (got %r). Start-of-day baseline left unverified (0.0).",
+                     account_id, getattr(acct, "last_equity", None))
+        return 0.0
 
     def _remember_trade_update(self, key: str) -> bool:
         if not key:
@@ -3108,7 +3136,8 @@ class AlpacaBridge:
         state_prov = state.get("provenance", {}) if isinstance(state, dict) else {}
         state_source = state_prov.get("source", "") if isinstance(state_prov, dict) else ""
         has_valid_stamp = (state_source == "broker_last_equity")
-        is_legacy_nominal = (not has_valid_stamp) and (float(state.get("start_of_day_equity", 0.0) or 0.0) == 100000.0)
+        saved_sod = self._positive_finite_equity(state.get("start_of_day_equity", 0.0) if isinstance(state, dict) else 0.0)
+        is_legacy_nominal = (not has_valid_stamp) and (saved_sod == 100000.0)
 
         # 2. If valid state exists for today and this account: restore/preserve
         if (
@@ -3117,22 +3146,23 @@ class AlpacaBridge:
             and state.get("account_id") == acct_id
             and (not is_legacy_nominal)
             and has_valid_stamp
+            and saved_sod > 0.0
         ):
-            sod_equity = float(state.get("start_of_day_equity", 0.0) or 0.0)
-            if sod_equity > 0.0:
-                self._start_of_day_equity = sod_equity
-                self._start_of_day_equity_date = et_date
-                self._start_of_day_equity_source = "broker_last_equity"
-                self._daytrade_suspended = bool(state.get("suspended", False))
-                logger.info("[%s] Verified start-of-day equity: $%.2f for date %s (source=%s)", acct_id, self._start_of_day_equity, et_date, state_source or "persisted")
-                return self._start_of_day_equity
+            self._start_of_day_equity = saved_sod
+            self._start_of_day_equity_date = et_date
+            self._start_of_day_equity_source = "broker_last_equity"
+            self._daytrade_suspended = bool(state.get("suspended", False))
+            logger.info("[%s] Verified start-of-day equity: $%.2f for date %s (source=%s)", acct_id, self._start_of_day_equity, et_date, state_source or "persisted")
+            return self._start_of_day_equity
 
-        # Also preserve if in-memory already set for today with positive equity AND verified broker_last_equity provenance
+        # Also preserve if in-memory already set for today with positive finite equity AND verified broker_last_equity provenance
+        mem_sod = self._positive_finite_equity(getattr(self, "_start_of_day_equity", 0.0))
         if (
             getattr(self, "_start_of_day_equity_date", None) == et_date
-            and getattr(self, "_start_of_day_equity", 0.0) > 0.0
+            and mem_sod > 0.0
             and getattr(self, "_start_of_day_equity_source", "") == "broker_last_equity"
         ):
+            self._start_of_day_equity = mem_sod
             return self._start_of_day_equity
 
         # 3. New date or legacy nominal state -> query broker last_equity and save once
@@ -3144,7 +3174,7 @@ class AlpacaBridge:
                 acct = self._call_with_retry(lambda: self._client.get_account())
                 raw_last_eq = getattr(acct, "last_equity", None)
                 if raw_last_eq is not None and not (hasattr(raw_last_eq, "_mock_name") or "Mock" in type(raw_last_eq).__name__):
-                    broker_last_eq = float(raw_last_eq or 0.0)
+                    broker_last_eq = self._positive_finite_equity(raw_last_eq)
                     if broker_last_eq > 0.0:
                         current_equity = broker_last_eq
                         source = "broker_last_equity"
@@ -3239,7 +3269,23 @@ class AlpacaBridge:
             spread_pct = (ask - bid) / mid if mid > 0 else 0.0
             max_spread = float(self._c("MAX_QUOTE_SPREAD_PCT", 0.02))
 
-            if mid > 0 and 0.0 <= spread_pct <= max_spread:
+            q_ts = getattr(q, "timestamp", None) if q else None
+            is_fresh = False
+            if q_ts is not None:
+                try:
+                    if hasattr(q_ts, "to_pydatetime"):
+                        q_ts = q_ts.to_pydatetime()
+                    now_utc = _dt.datetime.now(_dt.timezone.utc)
+                    if getattr(q_ts, "tzinfo", None) is None:
+                        q_ts = q_ts.replace(tzinfo=_dt.timezone.utc)
+                    age_sec = (now_utc - q_ts).total_seconds()
+                    max_age = float(self._c("MAX_QUOTE_AGE_SECONDS", 10.0))
+                    if 0.0 <= age_sec <= max_age:
+                        is_fresh = True
+                except Exception:
+                    is_fresh = False
+
+            if is_fresh and mid > 0 and 0.0 <= spread_pct <= max_spread:
                 return QuoteDecision(True, mid, "alpaca", "ok")
 
             # IEX quote has wide spread (>2%) or missing top-of-book — engage zero-budget fallbacks
@@ -6383,6 +6429,11 @@ class AlpacaBridge:
             return False
 
         if action == "BUY":
+            if getattr(quote_decision, "source", "") != "alpaca":
+                logger.warning("[FALLBACK PRICE REJECTED FOR BUY] %s: Direct BUY requires fresh top-of-book quote, got source=%s",
+                               symbol, getattr(quote_decision, "source", "unknown"))
+                return False
+
             # Sector-level pre-trade SOXX veto check for semiconductor & tech cluster
             from strategies.intraday_risk import check_soxx_tech_long_gate, TECH_CORRELATED_CLUSTER
             if symbol in TECH_CORRELATED_CLUSTER:
@@ -6463,36 +6514,33 @@ class AlpacaBridge:
                     is_mock_account = hasattr(broker_account, "_mock_name") or "Mock" in type(broker_account).__name__
                     equity = 0.0
                     if broker_account and not is_mock_account:
-                        try:
-                            equity = float(getattr(broker_account, "equity", 0.0) or 0.0)
-                        except (ValueError, TypeError):
-                            equity = 0.0
+                        equity = self._positive_finite_equity(getattr(broker_account, "equity", 0.0))
                     if equity <= 0:
-                        equity = self.get_net_liquidation()
+                        equity = self._positive_finite_equity(self.get_net_liquidation())
                     if equity <= 0:
-                        equity = self.get_cash()
+                        equity = self._positive_finite_equity(self.get_cash())
                     if equity < min_cash:
                         logger.warning("Insufficient equity for BUY %s: $%.2f", symbol, equity)
                         return False
 
                     bp = 0.0
                     if broker_account and not is_mock_account:
-                        try:
-                            bp = float(getattr(broker_account, "buying_power", 0.0) or 0.0)
-                        except (ValueError, TypeError):
-                            bp = 0.0
+                        bp = self._positive_finite_equity(getattr(broker_account, "buying_power", 0.0))
                     if bp <= 0:
                         bp = equity
 
-                    sod_equity = getattr(self, "_start_of_day_equity", 0.0)
+                    sod_equity = self._positive_finite_equity(getattr(self, "_start_of_day_equity", 0.0))
+                    if sod_equity <= 0.0 and hasattr(self, "snapshot_start_of_day_equity"):
+                        try:
+                            sod_equity = self._positive_finite_equity(self.snapshot_start_of_day_equity())
+                        except Exception as s_err:
+                            logger.error("Failed to snapshot SOD equity: %s", s_err)
+                    if sod_equity <= 0.0 and broker_account:
+                        sod_equity = self._positive_finite_equity(getattr(broker_account, "last_equity", 0.0))
+
                     if sod_equity <= 0.0:
-                        if broker_account and hasattr(broker_account, "last_equity"):
-                            try:
-                                sod_equity = float(getattr(broker_account, "last_equity", 0.0) or 0.0)
-                            except (ValueError, TypeError):
-                                sod_equity = equity
-                        else:
-                            sod_equity = equity
+                        logger.error("[FAIL-CLOSED] Valid session start-of-day baseline unavailable for BUY %s; failing closed.", symbol)
+                        return False
 
                     if hasattr(self, "entry_gate") and hasattr(self.entry_gate, "daily_loss_blocked"):
                         dl_blocked, dl_reason = self.entry_gate.daily_loss_blocked(
@@ -6518,8 +6566,12 @@ class AlpacaBridge:
                             raw_pos = self._client.get_all_positions()
                             if isinstance(raw_pos, list):
                                 all_pos = raw_pos
+                            else:
+                                logger.error("[FAIL-CLOSED] get_all_positions returned non-list: %r", type(raw_pos))
+                                return False
                         except Exception as e:
-                            logger.warning("Failed to fetch positions: %s", e)
+                            logger.error("[FAIL-CLOSED] Failed to fetch positions: %s", e)
+                            return False
 
                     raw_open_orders = []
                     if self._client:
@@ -6527,8 +6579,12 @@ class AlpacaBridge:
                             raw_orders = self._get_active_orders()
                             if isinstance(raw_orders, list):
                                 raw_open_orders = raw_orders
+                            else:
+                                logger.error("[FAIL-CLOSED] _get_active_orders returned non-list: %r", type(raw_orders))
+                                return False
                         except Exception as e:
-                            logger.warning("Failed to fetch open orders: %s", e)
+                            logger.error("[FAIL-CLOSED] Failed to fetch open orders: %s", e)
+                            return False
 
                     from strategies.swing_sizing import (
                         calculate_swing_position_size,
