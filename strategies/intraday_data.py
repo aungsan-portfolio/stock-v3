@@ -8,6 +8,7 @@ import logging
 import asyncio
 import time
 import pickle
+import itertools
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional, Dict, List, Tuple, Any
 from dataclasses import dataclass
@@ -145,6 +146,7 @@ _alpaca_call_pool = ThreadPoolExecutor(
 _alpaca_call_slots = threading.BoundedSemaphore(
     ALPACA_CALL_WORKERS + ALPACA_CALL_QUEUE_SIZE
 )
+_call_counter = itertools.count(1)
 
 MARKET_DATA_METRICS = {
     "executor_active": 0,
@@ -153,6 +155,8 @@ MARKET_DATA_METRICS = {
     "soft_timeout_total": 0,
     "transport_timeout_total": 0,
     "late_completion_total": 0,
+    "in_flight_calls": 0,
+    "timed_out_in_flight": 0,
 }
 _metrics_lock = threading.Lock()
 
@@ -173,6 +177,9 @@ _feed_telemetry = {
     "consecutive_fetch_timeouts": 0,
     "last_batch_timestamp": 0.0,
     "total_bars_fetched": 0,
+    "last_batch_timeout_count": 0,
+    "last_batch_forming_count": 0,
+    "last_batch_reasons": {},
 }
 _feed_telemetry_lock = threading.Lock()
 _last_stale_bar_ts: Dict[str, Any] = {}
@@ -189,6 +196,9 @@ _breadth_telemetry = {
     "consecutive_fetch_timeouts": 0,
     "last_batch_timestamp": 0.0,
     "total_bars_fetched": 0,
+    "last_batch_timeout_count": 0,
+    "last_batch_forming_count": 0,
+    "last_batch_reasons": {},
 }
 _breadth_telemetry_lock = threading.Lock()
 _last_breadth_stale_bar_ts: Dict[str, Any] = {}
@@ -204,6 +214,9 @@ def get_intraday_feed_telemetry(purpose: Optional[str] = None) -> dict:
         data = dict(_feed_telemetry)
         data["last_stale_bar_ts"] = dict(_last_stale_bar_ts)
         return data
+
+
+get_feed_telemetry = get_intraday_feed_telemetry
 
 
 def reset_intraday_feed_telemetry(purpose: Optional[str] = None) -> None:
@@ -251,6 +264,10 @@ def get_feed_provenance() -> dict:
 
 
 def _sdk_get_stock_bars_soft_bounded(client, request, timeout: Optional[float] = None):
+    call_id = f"call_{next(_call_counter)}"
+    start_mono = time.monotonic()
+    start_utc = datetime.now(timezone.utc).isoformat()
+
     acquired = _alpaca_call_slots.acquire(blocking=False)
     if not acquired:
         with _metrics_lock:
@@ -259,6 +276,7 @@ def _sdk_get_stock_bars_soft_bounded(client, request, timeout: Optional[float] =
 
     with _metrics_lock:
         MARKET_DATA_METRICS["executor_active"] += 1
+        MARKET_DATA_METRICS["in_flight_calls"] += 1
 
     slot_released = [False]
     def _release_slot():
@@ -267,6 +285,7 @@ def _sdk_get_stock_bars_soft_bounded(client, request, timeout: Optional[float] =
             _alpaca_call_slots.release()
             with _metrics_lock:
                 MARKET_DATA_METRICS["executor_active"] = max(0, MARKET_DATA_METRICS["executor_active"] - 1)
+                MARKET_DATA_METRICS["in_flight_calls"] = max(0, MARKET_DATA_METRICS["in_flight_calls"] - 1)
 
     def invoke():
         try:
@@ -281,6 +300,12 @@ def _sdk_get_stock_bars_soft_bounded(client, request, timeout: Optional[float] =
         raise
 
     eff_timeout = timeout if timeout is not None else ALPACA_FUTURE_TIMEOUT_SECONDS
+    req_symbols = getattr(request, "symbol_or_symbols", None)
+    req_tf = getattr(request, "timeframe", None)
+    req_start = getattr(request, "start", None)
+    req_end = getattr(request, "end", None)
+    req_feed = getattr(request, "feed", None)
+
     try:
         return future.result(timeout=eff_timeout)
     except (TimeoutError, FutureTimeoutError) as ex:
@@ -290,17 +315,32 @@ def _sdk_get_stock_bars_soft_bounded(client, request, timeout: Optional[float] =
         if cancelled:
             _release_slot()
         else:
-            def _track_late():
-                try:
-                    future.result()
-                    with _metrics_lock:
+            with _metrics_lock:
+                MARKET_DATA_METRICS["timed_out_in_flight"] += 1
+
+            def _on_late_completion(f):
+                with _metrics_lock:
+                    MARKET_DATA_METRICS["timed_out_in_flight"] = max(0, MARKET_DATA_METRICS["timed_out_in_flight"] - 1)
+                    try:
+                        f.result()
                         MARKET_DATA_METRICS["late_completion_total"] += 1
-                except Exception:
-                    pass
-            threading.Thread(target=_track_late, daemon=True).start()
+                    except Exception:
+                        pass
+            future.add_done_callback(_on_late_completion)
+
+        elapsed = time.monotonic() - start_mono
+        end_utc = datetime.now(timezone.utc).isoformat()
+        with _metrics_lock:
+            in_flight = MARKET_DATA_METRICS["in_flight_calls"]
+            timed_out_flight = MARKET_DATA_METRICS["timed_out_in_flight"]
+
         logger.error(
-            "Alpaca SDK call exceeded soft deadline: timeout=%.2fs cancelled=%s",
-            eff_timeout, cancelled,
+            "[ALPACA SDK TIMEOUT] call_id=%s timeout=%.2fs elapsed=%.2fs cancelled=%s "
+            "in_flight=%d timed_out_in_flight=%d start_utc=%s end_utc=%s "
+            "symbols=%s timeframe=%s window=[%s -> %s] feed=%s",
+            call_id, eff_timeout, elapsed, cancelled,
+            in_flight, timed_out_flight, start_utc, end_utc,
+            req_symbols, req_tf, req_start, req_end, req_feed,
         )
         raise MarketDataTransportTimeout(
             f"Alpaca SDK call exceeded caller deadline ({eff_timeout:.2f}s)"
@@ -308,6 +348,14 @@ def _sdk_get_stock_bars_soft_bounded(client, request, timeout: Optional[float] =
     except (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout, requests.exceptions.Timeout) as rex:
         with _metrics_lock:
             MARKET_DATA_METRICS["transport_timeout_total"] += 1
+            in_flight = MARKET_DATA_METRICS["in_flight_calls"]
+        elapsed = time.monotonic() - start_mono
+        end_utc = datetime.now(timezone.utc).isoformat()
+        logger.error(
+            "[ALPACA TRANSPORT TIMEOUT] call_id=%s elapsed=%.2fs in_flight=%d "
+            "start_utc=%s end_utc=%s symbols=%s feed=%s exc=%s",
+            call_id, elapsed, in_flight, start_utc, end_utc, req_symbols, req_feed, rex,
+        )
         raise MarketDataTransportTimeout(f"Alpaca transport timeout: {rex}") from rex
 
 
@@ -974,9 +1022,12 @@ def _validate_intraday_data(
                 except ValueError as ve:
                     err_msg = str(ve)
                     if "No completed bars available" in err_msg:
-                        msg = f"Data validation failed for {symbol}: No completed bars available ({err_msg})."
-                        logger.warning("[FUTURE-BAR-GUARD] %s", msg)
-                        return _quarantine("future_dated_bar")
+                        msg = f"Data validation: {symbol} has no completed {interval} bars yet by {current_time.isoformat()} ({err_msg}). Candle still forming."
+                        if _in_market_open_transition():
+                            logger.debug("[FUTURE-BAR-GUARD] [MARKET-OPEN-FORMING-BAR] %s", msg)
+                        else:
+                            logger.info("[FUTURE-BAR-GUARD] [FORMING-BAR-WAIT] %s", msg)
+                        return pd.DataFrame()
                     else:
                         logger.warning("Data validation failed for %s: %s", symbol, err_msg)
                         return _quarantine("invalid_bar_data")
@@ -1311,12 +1362,21 @@ def fetch_batch_intraday_alpaca(
         target_telemetry = _breadth_telemetry if is_breadth else _feed_telemetry
         target_lock = _breadth_telemetry_lock if is_breadth else _feed_telemetry_lock
 
+        symbol_reasons: Dict[str, str] = {}
+        for sym in results:
+            symbol_reasons[sym] = "cached_valid"
+
         for chunk_idx, chunk_symbols in enumerate(chunks):
             rem_t = _rem()
             if total_timeout_seconds is not None and (rem_t is None or rem_t <= 0.05):
                 with target_lock:
                     target_telemetry["batch_timeout_count"] += 1
                     target_telemetry["consecutive_fetch_timeouts"] = target_telemetry.get("consecutive_fetch_timeouts", 0) + 1
+                for s in chunk_symbols:
+                    symbol_reasons[s] = "budget_exhausted"
+                for rem_chunk in chunks[chunk_idx + 1:]:
+                    for s in rem_chunk:
+                        symbol_reasons[s] = "budget_exhausted"
                 logger.warning(
                     "[BATCH FETCH TIMEOUT] Total budget exhausted (%.2fs remaining) before chunk %d/%d.",
                     rem_t or 0.0, chunk_idx + 1, num_chunks,
@@ -1328,6 +1388,8 @@ def fetch_batch_intraday_alpaca(
             try:
                 # 1. Fetch Primary Feed for this chunk
                 primary_bars = None
+                primary_status = "SUCCESS"
+                primary_err = None
                 try:
                     req = StockBarsRequest(
                         symbol_or_symbols=chunk_symbols,
@@ -1337,9 +1399,17 @@ def fetch_batch_intraday_alpaca(
                         adjustment=Adjustment.ALL,
                     )
                     primary_bars = _sdk_get_stock_bars_soft_bounded(client, req, timeout=this_timeout)
-                except Exception as primary_err:
+                except MarketDataTransportTimeout as tex:
+                    primary_status = "TIMEOUT"
+                    primary_err = tex
                     feed_name = getattr(primary_feed, "value", str(primary_feed)).upper()
-                    logger.debug("[BATCH FETCH] Alpaca %s feed error for chunk %s (%s).", feed_name, chunk_symbols, primary_err)
+                    logger.warning("[BATCH FETCH TIMEOUT] Alpaca %s feed timeout for chunk %d/%d (%s): %s",
+                                   feed_name, chunk_idx + 1, num_chunks, chunk_symbols, tex)
+                except Exception as primary_err_other:
+                    primary_status = "ERROR"
+                    primary_err = primary_err_other
+                    feed_name = getattr(primary_feed, "value", str(primary_feed)).upper()
+                    logger.debug("[BATCH FETCH] Alpaca %s feed error for chunk %s (%s).", feed_name, chunk_symbols, primary_err_other)
 
                 primary_raw_df = getattr(primary_bars, "df", None) if primary_bars is not None else None
                 stale_or_missing_symbols: List[str] = []
@@ -1348,8 +1418,25 @@ def fetch_batch_intraday_alpaca(
                     key = _cache_key(sym, interval, lookback_days, prepost, source="alpaca_api")
                     sym_df = _extract_symbol_df(primary_raw_df, sym) if primary_raw_df is not None else pd.DataFrame()
                     if sym_df.empty:
+                        if primary_status == "TIMEOUT":
+                            symbol_reasons[sym] = "sdk_timeout"
+                        elif primary_status == "ERROR":
+                            symbol_reasons[sym] = "transport_error"
+                        else:
+                            symbol_reasons[sym] = "no_bars_returned"
                         stale_or_missing_symbols.append(sym)
                         continue
+
+                    # Check whether candle is forming or completed
+                    int_sec = _parse_interval_seconds(interval)
+                    now_u = pd.Timestamp.now(tz="UTC")
+                    has_completed = True
+                    try:
+                        norm_idx = _normalize_utc_index(sym_df.index)
+                        closes = norm_idx + pd.Timedelta(seconds=int_sec)
+                        has_completed = bool((closes <= now_u).any())
+                    except Exception:
+                        has_completed = True
 
                     validated_df = _validate_intraday_data(
                         sym_df, sym, interval, validate_staleness=validate_staleness, purpose=purpose
@@ -1361,13 +1448,17 @@ def fetch_batch_intraday_alpaca(
                         validated_df.attrs["subscription_tier"] = tier
                         if hasattr(validated_df, "index") and len(validated_df.index) > 0:
                             last_idx = validated_df.index[-1]
-                            int_sec = _parse_interval_seconds(interval)
                             bar_end = last_idx + pd.Timedelta(seconds=int_sec)
                             validated_df.attrs["bar_start_utc"] = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
                             validated_df.attrs["bar_end_utc"] = bar_end.isoformat() if hasattr(bar_end, "isoformat") else str(bar_end)
                         _write_cache(key, validated_df.copy())
                         results[sym] = validated_df
+                        symbol_reasons[sym] = "valid"
                     else:
+                        if not has_completed:
+                            symbol_reasons[sym] = "no_completed_bars_yet"
+                        else:
+                            symbol_reasons[sym] = "stale_bar"
                         stale_or_missing_symbols.append(sym)
 
                 # 2. Fallback handling for stale or missing symbols
@@ -1406,6 +1497,16 @@ def fetch_batch_intraday_alpaca(
                                     logger.warning("[BATCH FETCH REJECTED] status=FALLBACK_UNAVAILABLE symbol=%s: No bars from %s feed.", sym, backup_name)
                                     continue
 
+                                int_sec = _parse_interval_seconds(interval)
+                                now_u = pd.Timestamp.now(tz="UTC")
+                                has_completed = True
+                                try:
+                                    norm_idx = _normalize_utc_index(fb_df.index)
+                                    closes = norm_idx + pd.Timedelta(seconds=int_sec)
+                                    has_completed = bool((closes <= now_u).any())
+                                except Exception:
+                                    has_completed = True
+
                                 fb_validated_df = _validate_intraday_data(
                                     fb_df, sym, interval, validate_staleness=validate_staleness, purpose=purpose
                                 )
@@ -1417,13 +1518,17 @@ def fetch_batch_intraday_alpaca(
                                     fb_validated_df.attrs["subscription_tier"] = tier
                                     if hasattr(fb_validated_df, "index") and len(fb_validated_df.index) > 0:
                                         last_idx = fb_validated_df.index[-1]
-                                        int_sec = _parse_interval_seconds(interval)
                                         bar_end = last_idx + pd.Timedelta(seconds=int_sec)
                                         fb_validated_df.attrs["bar_start_utc"] = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
                                         fb_validated_df.attrs["bar_end_utc"] = bar_end.isoformat() if hasattr(bar_end, "isoformat") else str(bar_end)
                                     _write_cache(key, fb_validated_df.copy())
                                     results[sym] = fb_validated_df
+                                    symbol_reasons[sym] = "valid_fallback"
                                 else:
+                                    if not has_completed:
+                                        symbol_reasons[sym] = "no_completed_bars_yet"
+                                    else:
+                                        symbol_reasons[sym] = "stale_bar"
                                     logger.warning(
                                         "[BATCH FETCH REJECTED] status=FALLBACK_STALE symbol=%s: Fallback %s bars also stale/invalid. Strictly excluded.",
                                         sym, backup_name,
@@ -1451,22 +1556,38 @@ def fetch_batch_intraday_alpaca(
                 time.sleep(chunk_delay_ms / 1000.0)
 
         elapsed = time.monotonic() - start_mono
+
+        sdk_timeout_count = sum(1 for r in symbol_reasons.values() if r in ("sdk_timeout", "budget_exhausted"))
+        forming_count = sum(1 for r in symbol_reasons.values() if r == "no_completed_bars_yet")
+        no_bars_count = sum(1 for r in symbol_reasons.values() if r == "no_bars_returned")
+        stale_count = sum(1 for r in symbol_reasons.values() if r == "stale_bar")
+        valid_count = len(results)
+
         with target_lock:
             target_telemetry["last_batch_duration_seconds"] = elapsed
             target_telemetry["last_batch_timestamp"] = time.time()
             target_telemetry["total_bars_fetched"] += len(results)
+            target_telemetry["last_batch_timeout_count"] = sdk_timeout_count
+            target_telemetry["last_batch_forming_count"] = forming_count
+            target_telemetry["last_batch_reasons"] = dict(symbol_reasons)
             if len(results) > 0:
                 target_telemetry["consecutive_fetch_timeouts"] = 0
+            elif sdk_timeout_count > 0:
+                target_telemetry["consecutive_fetch_timeouts"] = target_telemetry.get("consecutive_fetch_timeouts", 0) + 1
 
         coverage_pct = (len(results) / len(clean_symbols)) * 100.0 if clean_symbols else 100.0
         logger.info(
             f"[CHUNK FETCH DONE] Retrieved {len(results)}/{len(clean_symbols)} symbols "
-            f"across {num_chunks} chunks in {elapsed:.2f}s (coverage={coverage_pct:.1f}%)"
+            f"across {num_chunks} chunks in {elapsed:.2f}s (coverage={coverage_pct:.1f}% | "
+            f"valid={valid_count} sdk_timeout={sdk_timeout_count} forming={forming_count} "
+            f"no_bars={no_bars_count} stale={stale_count})"
         )
         min_coverage_pct = float(getattr(config, "DAYTRADE_BATCH_FETCH_MIN_COVERAGE", 0.95)) * 100.0
         if coverage_pct < min_coverage_pct:
             logger.warning(
-                f"[CHUNK FETCH WARNING] Batch coverage {coverage_pct:.1f}% below minimum {min_coverage_pct:.1f}%"
+                f"[CHUNK FETCH WARNING] Batch coverage {coverage_pct:.1f}% below minimum {min_coverage_pct:.1f}% "
+                f"(valid={valid_count}, sdk_timeout={sdk_timeout_count}, forming={forming_count}, "
+                f"no_bars={no_bars_count}, stale={stale_count})"
             )
 
         return results

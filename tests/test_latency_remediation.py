@@ -323,3 +323,121 @@ def test_timeout_storm_does_not_create_unbounded_threads():
     time.sleep(0.2)
     after_threads = count_recovery_threads()
     assert after_threads <= baseline + 8
+
+
+# ── 15. Bounded Soft Timeout In-Flight Metric & Zero Thread Leak ──
+def test_bounded_soft_timeout_tracks_in_flight_and_no_thread_spawn():
+    """Verify soft-bounded SDK calls track in-flight and timed-out metrics without spawning threading.Thread."""
+    from strategies.intraday_data import _sdk_get_stock_bars_soft_bounded, get_market_data_metrics, MarketDataTransportTimeout
+    from unittest.mock import MagicMock
+
+    block_event = threading.Event()
+    release_event = threading.Event()
+
+    def blocked_sdk(req):
+        block_event.set()
+        release_event.wait(timeout=2.0)
+        return MagicMock()
+
+    mock_client = MagicMock()
+    mock_client.get_stock_bars.side_effect = blocked_sdk
+    mock_req = MagicMock(symbol_or_symbols=["AAPL"], timeframe="5m", start="2026-10-15T09:30:00Z", end="2026-10-15T09:35:00Z", feed="iex")
+
+    threads_before = threading.active_count()
+    with patch("threading.Thread") as mock_thread_class:
+        # Run with short timeout
+        with pytest.raises(MarketDataTransportTimeout):
+            _sdk_get_stock_bars_soft_bounded(mock_client, mock_req, timeout=0.05)
+
+        # Thread class should NOT be called at all (eliminated in favor of add_done_callback)
+        assert mock_thread_class.call_count == 0
+
+    metrics_during = get_market_data_metrics()
+    assert metrics_during["timed_out_in_flight"] >= 1
+    assert metrics_during["in_flight_calls"] >= 1
+
+    # Unblock the worker thread and wait for completion callback
+    release_event.set()
+    time.sleep(0.1)
+
+    metrics_after = get_market_data_metrics()
+    assert metrics_after["timed_out_in_flight"] == 0
+    assert metrics_after["in_flight_calls"] == 0
+    assert metrics_after["late_completion_total"] >= 1
+
+
+# ── 16. Batch Fetch Reason Breakdown & Forming Bar Taxonomy ──
+def test_batch_fetch_categorizes_reasons_and_telemetry():
+    """Verify batch fetch populates telemetry with distinct reasons: sdk_timeout, no_completed_bars_yet, valid."""
+    from strategies.intraday_data import (
+        fetch_batch_intraday_alpaca,
+        get_feed_telemetry,
+        _feed_telemetry,
+        _feed_telemetry_lock,
+    )
+    from unittest.mock import patch, MagicMock
+
+    now_utc = pd.Timestamp("2026-10-15 13:32:00", tz="UTC")
+    ts_forming = pd.Timestamp("2026-10-15 13:30:00", tz="UTC") # Closes at 13:35:00 > now_utc (forming)
+    forming_df = pd.DataFrame({
+        "open": [100.0], "high": [101.0], "low": [99.0], "close": [100.5], "volume": [1000]
+    }, index=pd.DatetimeIndex([ts_forming]))
+
+    # Reset telemetry
+    with _feed_telemetry_lock:
+        _feed_telemetry["last_batch_timeout_count"] = 0
+        _feed_telemetry["last_batch_forming_count"] = 0
+        _feed_telemetry["last_batch_reasons"] = {}
+
+    with patch("strategies.intraday_data._get_alpaca_credentials", return_value=("key", "sec")), \
+         patch("strategies.intraday_data._get_alpaca_client"), \
+         patch("strategies.intraday_data._read_cache", return_value=None), \
+         patch("strategies.intraday_data._write_cache"), \
+         patch("strategies.session.is_market_open", return_value=True), \
+         patch("pandas.Timestamp.now", return_value=now_utc):
+
+        # Mock SDK: chunk 1 (AAPL) times out; chunk 2 (MSFT) returns forming bar
+        def mock_sdk(client, req, timeout=None):
+            syms = req.symbol_or_symbols
+            if "AAPL" in syms:
+                from strategies.intraday_data import MarketDataTransportTimeout
+                raise MarketDataTransportTimeout("Simulated timeout")
+            # MSFT has forming bar
+            mock_res = MagicMock()
+            forming_df_multi = forming_df.copy()
+            forming_df_multi["symbol"] = "MSFT"
+            forming_df_multi = forming_df_multi.set_index(["symbol", forming_df_multi.index])
+            mock_res.df = forming_df_multi
+            return mock_res
+
+        with patch("strategies.intraday_data._sdk_get_stock_bars_soft_bounded", side_effect=mock_sdk), \
+             patch("config.ALPACA_CHUNK_SIZE", 1):
+            results = fetch_batch_intraday_alpaca(["AAPL", "MSFT"], interval="5m", lookback_days=1)
+
+    telem = get_feed_telemetry()
+    assert telem["last_batch_timeout_count"] == 1
+    assert telem["last_batch_forming_count"] == 1
+    assert telem["last_batch_reasons"]["AAPL"] == "sdk_timeout"
+    assert telem["last_batch_reasons"]["MSFT"] == "no_completed_bars_yet"
+
+
+# ── 17. Forming Candle at Market Open Does Not Quarantine ──
+def test_forming_bar_market_open_no_quarantine():
+    """Verify that a forming bar at market open returns empty df without 30m quarantine."""
+    from strategies.intraday_data import _validate_intraday_data, is_quarantined
+    from strategies.scanner.premarket_scanner import clear_quarantine
+
+    clear_quarantine()
+    ts_forming = pd.Timestamp("2026-10-15 13:30:00", tz="UTC") # 5m candle closing at 13:35:00
+    df = pd.DataFrame({
+        "open": [150.0], "high": [151.0], "low": [149.5], "close": [150.2], "volume": [2000]
+    }, index=pd.DatetimeIndex([ts_forming]))
+
+    now_forming = pd.Timestamp("2026-10-15 13:32:00", tz="UTC")
+    with patch("strategies.session.is_market_open", return_value=True), \
+         patch("strategies.intraday_data._in_market_open_transition", return_value=True), \
+         patch("pandas.Timestamp.now", return_value=now_forming):
+        vdf = _validate_intraday_data(df, "NVDA", "5m", validate_staleness=True, purpose="ENTRY_SIGNAL")
+        assert vdf.empty, "Forming bar before close must fail closed for this cycle"
+        assert not is_quarantined("NVDA"), "Forming candle must NOT trigger 30-minute quarantine"
+
