@@ -221,11 +221,28 @@ def fetch_ohlcv(
         raise ValueError(f"{symbol} data missing required columns: {missing}")
 
     df = df[required_cols].copy()
-    df.index = pd.to_datetime(df.index, utc=True).tz_localize(None)
-    df = df[~df.index.duplicated(keep="last")]
-    df.sort_index(inplace=True)
-    df.dropna(subset=required_cols, inplace=True)
+    rows_received = len(df)
+    reasons = {}
 
+    df.index = pd.to_datetime(df.index, utc=True).tz_localize(None)
+
+    # 1. Deduplicate index
+    dup_mask = df.index.duplicated(keep="last")
+    dup_count = int(dup_mask.sum())
+    if dup_count > 0:
+        reasons["duplicate_timestamps"] = dup_count
+        df = df[~dup_mask]
+
+    df.sort_index(inplace=True)
+
+    # 2. Drop NaN
+    nan_mask = df[required_cols].isna().any(axis=1)
+    nan_count = int(nan_mask.sum())
+    if nan_count > 0:
+        reasons["nan_values"] = nan_count
+        df = df[~nan_mask]
+
+    # 3. Geometric consistency
     valid_ohlc = (
         (df["High"] >= df["Low"]) &
         (df["High"] >= df["Open"]) &
@@ -240,16 +257,30 @@ def fetch_ohlcv(
     )
     invalid_rows = len(df) - int(valid_ohlc.sum())
     if invalid_rows > 0:
+        reasons["geometric_inconsistency"] = invalid_rows
         logger.warning("Dropped %d inconsistent OHLC rows for %s", invalid_rows, symbol)
         df = df[valid_ohlc].copy()
 
+    rows_rejected = rows_received - len(df)
+    valid_coverage = (len(df) / rows_received) if rows_received > 0 else 0.0
+    vol_source = getattr(df, "attrs", {}).get("volume_source", "yfinance_consolidated")
+    df.attrs["volume_source"] = vol_source
+    df.attrs["rows_received"] = rows_received
+    df.attrs["rows_rejected"] = rows_rejected
+    df.attrs["valid_coverage"] = valid_coverage
+    df.attrs["rejection_reasons"] = reasons
+
+    logger.info(
+        "[DATA QUALITY AUDIT] %s: rows_received=%d, rows_rejected=%d, reasons=%s, valid_coverage=%.2f%%, volume_source=%s",
+        symbol, rows_received, rows_rejected, reasons, valid_coverage * 100.0, vol_source
+    )
+
     if len(df) < config.MIN_HISTORY_DAYS:
         raise ValueError(
-            f"{symbol} only {len(df)} days — need {config.MIN_HISTORY_DAYS}"
+            f"{symbol} only {len(df)} days after filtering (rows_received={rows_received}, rows_rejected={rows_rejected}) — need {config.MIN_HISTORY_DAYS}"
         )
 
     _cache[cache_key] = (time.time(), df.copy())
-    logger.info("Fetched %d rows for %s", len(df), symbol)
     return df.copy()
 
 

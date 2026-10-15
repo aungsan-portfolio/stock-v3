@@ -159,7 +159,9 @@ SOXX_TECH_LONG_VETO_THRESHOLD = -0.75  # SOXX -0.75% threshold
 
 
 def _get_soxx_realtime_pct_change(bridge=None) -> Optional[float]:
-    """Fetch real-time % change for SOXX semiconductor ETF relative to prior session close."""
+    """Fetch real-time % change for SOXX semiconductor ETF relative to prior session close.
+    Surfaces dual baselines (prior-day close including overnight gap vs session open) in telemetry.
+    """
     try:
         from strategies.regime_engine import get_soxx_pct_change
         cached = get_soxx_pct_change()
@@ -181,8 +183,15 @@ def _get_soxx_realtime_pct_change(bridge=None) -> Optional[float]:
         if fast_info:
             last = float(getattr(fast_info, "last_price", 0.0) or 0.0)
             prev = float(getattr(fast_info, "previous_close", 0.0) or 0.0)
+            open_px = float(getattr(fast_info, "open", 0.0) or 0.0)
             if last > 0 and prev > 0:
-                return round(((last - prev) / prev) * 100.0, 2)
+                pct_close = round(((last - prev) / prev) * 100.0, 2)
+                pct_open = round(((last - open_px) / open_px) * 100.0, 2) if open_px > 0 else None
+                logger.info(
+                    "[SOXX BASELINE TELEMETRY] yfinance fast_info: last=%.2f, prev_close=%.2f (pct_vs_close=%+.2f%%), open=%.2f (pct_vs_open=%s)",
+                    last, prev, pct_close, open_px, f"{pct_open:+.2f}%" if pct_open is not None else "N/A"
+                )
+                return pct_close
     except Exception as e:
         logger.debug("[SOXX GATE] yfinance fast_info fallback failed: %s", e)
     try:
@@ -192,8 +201,15 @@ def _get_soxx_realtime_pct_change(bridge=None) -> Optional[float]:
         if len(hist) >= 2:
             prev_close = float(hist["Close"].iloc[-2])
             last_price = float(hist["Close"].iloc[-1])
+            today_open = float(hist["Open"].iloc[-1]) if "Open" in hist.columns else 0.0
             if prev_close > 0 and last_price > 0:
-                return round(((last_price - prev_close) / prev_close) * 100.0, 2)
+                pct_close = round(((last_price - prev_close) / prev_close) * 100.0, 2)
+                pct_open = round(((last_price - today_open) / today_open) * 100.0, 2) if today_open > 0 else None
+                logger.info(
+                    "[SOXX BASELINE TELEMETRY] yfinance daily history: last=%.2f, prev_close=%.2f (pct_vs_close=%+.2f%%), open=%.2f (pct_vs_open=%s)",
+                    last_price, prev_close, pct_close, today_open, f"{pct_open:+.2f}%" if pct_open is not None else "N/A"
+                )
+                return pct_close
     except Exception as e:
         logger.debug("[SOXX GATE] Error fetching SOXX daily history: %s", e)
     return None

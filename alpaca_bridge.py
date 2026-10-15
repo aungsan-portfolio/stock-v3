@@ -1771,61 +1771,67 @@ class AlpacaBridge:
                     logger.error("[FAIL-CLOSED] Error fetching current equity in _is_daily_loss_halted: %s", eq_err)
                     return True
 
-            if current_equity > 0.0:
-                sod_equity = getattr(self, "_start_of_day_equity", 0.0)
-                if sod_equity <= 0.0 and hasattr(self, "snapshot_start_of_day_equity"):
-                    try:
-                        raw_sod = self.snapshot_start_of_day_equity()
-                        if raw_sod is not None and not (hasattr(raw_sod, "_mock_name") or "Mock" in type(raw_sod).__name__):
-                            sod_equity = float(raw_sod)
-                    except Exception:
-                        sod_equity = 0.0
-                if sod_equity <= 0.0:
-                    sod_equity = current_equity
+            import math
+            # Strict Fail-Closed Check on Current Equity:
+            if not (isinstance(current_equity, (int, float)) and math.isfinite(current_equity) and current_equity > 0.0):
+                logger.error("[FAIL-CLOSED] Invalid current equity in _is_daily_loss_halted: %r; failing closed to block entries/rotations.", current_equity)
+                return True
 
-                if sod_equity <= 0.0:
-                    logger.warning("[FAIL-CLOSED] Risk baseline equity unavailable in _is_daily_loss_halted; failing closed.")
+            sod_equity = getattr(self, "_start_of_day_equity", 0.0)
+            if (not isinstance(sod_equity, (int, float)) or not math.isfinite(sod_equity) or sod_equity <= 0.0) and hasattr(self, "snapshot_start_of_day_equity"):
+                try:
+                    raw_sod = self.snapshot_start_of_day_equity()
+                    if raw_sod is not None and not (hasattr(raw_sod, "_mock_name") or "Mock" in type(raw_sod).__name__):
+                        sod_equity = float(raw_sod)
+                except Exception as sod_err:
+                    logger.error("[FAIL-CLOSED] Error fetching start of day equity in _is_daily_loss_halted: %s; failing closed.", sod_err)
                     return True
 
-                if gate is not None and hasattr(gate, "daily_loss_blocked") and mode == "swing":
-                    from strategies.session import now_eastern
-                    et_date = str(now_eastern().date())
-                    acct_id = getattr(self, "_account_id", "default")
-                    is_blocked, reason = gate.daily_loss_blocked(
-                        account_id=acct_id,
-                        session_date_et=et_date,
-                        current_equity=current_equity,
-                        session_start_equity=sod_equity,
-                    )
-                    if is_blocked:
-                        logger.warning("[DAILY LOSS BREACH] gate.daily_loss_blocked: %s", reason)
-                        return True
-                else:
-                    daily_pnl = current_equity - sod_equity
-                    if mode == "swing":
-                        pct_limit = abs(sod_equity * float(getattr(config_module, "SWING_MAX_DAILY_LOSS_PCT", 0.01)))
-                        dollar_cap = float(getattr(config_module, "SWING_MAX_DAILY_LOSS_DOLLAR_CAP", 300.00))
-                        max_loss = min(pct_limit, dollar_cap) if dollar_cap > 0 else 300.00
-                    else:
-                        max_loss = float(getattr(config_module, "MAX_DAILY_LOSS_DAYTRADE", 300.0))
+            # If SOD baseline is still unavailable or <= 0 or non-finite: FAIL-CLOSED!
+            # Never fallback to sod_equity = current_equity as that masks all prior session losses.
+            if not (isinstance(sod_equity, (int, float)) and math.isfinite(sod_equity) and sod_equity > 0.0):
+                logger.error("[FAIL-CLOSED] Valid session start-of-day equity baseline unavailable in _is_daily_loss_halted (got %r); failing closed to block entries/rotations.", sod_equity)
+                return True
 
-                    if round(daily_pnl, 2) <= -round(abs(max_loss), 2):
-                        logger.warning(
-                            "[DAILY LOSS BREACH DETECTED] Fresh daily PnL $%.2f <= max loss -$%.2f. Triggering daily loss halt.",
-                            daily_pnl, max_loss
-                        )
-                        if gate is not None and hasattr(gate, "halt"):
-                            gate.halt("DAILY_LOSS_LIMIT")
-                            if hasattr(gate, "persist_daily_loss_halt"):
-                                try:
-                                    from strategies.session import now_eastern
-                                    from decimal import Decimal
-                                    et_date = str(now_eastern().date())
-                                    acct_id = getattr(self, "_account_id", "default")
-                                    gate.persist_daily_loss_halt(acct_id, et_date, Decimal(str(daily_pnl)), Decimal(str(max_loss)))
-                                except Exception as rec_err:
-                                    logger.error("Could not record daily loss halt state: %s", rec_err)
-                        return True
+            if gate is not None and hasattr(gate, "daily_loss_blocked") and mode == "swing":
+                from strategies.session import now_eastern
+                et_date = str(now_eastern().date())
+                acct_id = getattr(self, "_account_id", "default")
+                is_blocked, reason = gate.daily_loss_blocked(
+                    account_id=acct_id,
+                    session_date_et=et_date,
+                    current_equity=current_equity,
+                    session_start_equity=sod_equity,
+                )
+                if is_blocked:
+                    logger.warning("[DAILY LOSS BREACH] gate.daily_loss_blocked: %s", reason)
+                    return True
+            else:
+                daily_pnl = current_equity - sod_equity
+                if mode == "swing":
+                    pct_limit = abs(sod_equity * float(getattr(config_module, "SWING_MAX_DAILY_LOSS_PCT", 0.01)))
+                    dollar_cap = float(getattr(config_module, "SWING_MAX_DAILY_LOSS_DOLLAR_CAP", 300.00))
+                    max_loss = min(pct_limit, dollar_cap) if dollar_cap > 0 else 300.00
+                else:
+                    max_loss = float(getattr(config_module, "MAX_DAILY_LOSS_DAYTRADE", 300.0))
+
+                if round(daily_pnl, 2) <= -round(abs(max_loss), 2):
+                    logger.warning(
+                        "[DAILY LOSS BREACH DETECTED] Fresh daily PnL $%.2f <= max loss -$%.2f. Triggering daily loss halt.",
+                        daily_pnl, max_loss
+                    )
+                    if gate is not None and hasattr(gate, "halt"):
+                        gate.halt("DAILY_LOSS_LIMIT")
+                        if hasattr(gate, "persist_daily_loss_halt"):
+                            try:
+                                from strategies.session import now_eastern
+                                from decimal import Decimal
+                                et_date = str(now_eastern().date())
+                                acct_id = getattr(self, "_account_id", "default")
+                                gate.persist_daily_loss_halt(acct_id, et_date, Decimal(str(daily_pnl)), Decimal(str(max_loss)))
+                            except Exception as rec_err:
+                                logger.error("Could not record daily loss halt state: %s", rec_err)
+                    return True
             return False
         except Exception as e:
             logger.error("[FAIL-CLOSED] Error in _is_daily_loss_halted: %s (failing closed: blocking new entries/rotations)", e)

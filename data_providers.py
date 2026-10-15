@@ -225,15 +225,29 @@ class MultiSourceDataProvider:
             raise ValueError(f"Data missing required columns: {missing}")
 
         df = df[required_cols].copy()
+        rows_received = len(df)
+        reasons = {}
 
         # Format index as UTC date-only/tz-naive timezone
         df.index = pd.to_datetime(df.index, utc=True).tz_localize(None)
-        # Deduplicate index keeping latest row
-        df = df[~df.index.duplicated(keep="last")]
-        df.sort_index(inplace=True)
-        df.dropna(subset=required_cols, inplace=True)
 
-        # Validate OHLC geometric consistency
+        # 1. Deduplicate index keeping latest row
+        dup_mask = df.index.duplicated(keep="last")
+        dup_count = int(dup_mask.sum())
+        if dup_count > 0:
+            reasons["duplicate_timestamps"] = dup_count
+            df = df[~dup_mask]
+
+        df.sort_index(inplace=True)
+
+        # 2. Check for missing / NaN values in required OHLCV
+        nan_mask = df[required_cols].isna().any(axis=1)
+        nan_count = int(nan_mask.sum())
+        if nan_count > 0:
+            reasons["nan_values"] = nan_count
+            df = df[~nan_mask]
+
+        # 3. Validate OHLC geometric consistency
         valid_ohlc = (
             (df["High"] >= df["Low"]) &
             (df["High"] >= df["Open"]) &
@@ -248,10 +262,24 @@ class MultiSourceDataProvider:
         )
         invalid_rows = len(df) - int(valid_ohlc.sum())
         if invalid_rows > 0:
+            reasons["geometric_inconsistency"] = invalid_rows
             logger.warning("Dropped %d inconsistent OHLC rows for %s", invalid_rows, symbol)
             df = df[valid_ohlc].copy()
 
+        rows_rejected = rows_received - len(df)
+        valid_coverage = (len(df) / rows_received) if rows_received > 0 else 0.0
+
+        # Preserve metadata and provenance in attrs
         df.attrs["volume_source"] = vol_source
+        df.attrs["rows_received"] = rows_received
+        df.attrs["rows_rejected"] = rows_rejected
+        df.attrs["valid_coverage"] = valid_coverage
+        df.attrs["rejection_reasons"] = reasons
+
+        logger.info(
+            "[DATA QUALITY AUDIT] %s: rows_received=%d, rows_rejected=%d, reasons=%s, valid_coverage=%.2f%%, volume_source=%s",
+            symbol, rows_received, rows_rejected, reasons, valid_coverage * 100.0, vol_source
+        )
 
         # Validate against extreme prices / missing volumes / corporate action anomalies
         # An unadjusted split leaves a huge gap: e.g. Close drops 50% overnight with no matching volume ratio shift
@@ -262,16 +290,28 @@ class MultiSourceDataProvider:
         anomalies = pct_change[pct_change < -0.35]
         if not anomalies.empty:
             for date, change in anomalies.items():
-                # Check if it was an actual corporate split or bad data
                 logger.warning(
                     "Detected severe price gap (-%.2f%%) for %s on %s. Corporate action verification suggested.",
                     abs(change) * 100, symbol, date.strftime("%Y-%m-%d")
                 )
 
+        # Bar Freshness Check: Verify latest bar is not excessively stale
+        if not df.empty:
+            latest_bar_date = df.index[-1]
+            now_dt = pd.Timestamp.now(tz=None)
+            calendar_days_old = (now_dt - latest_bar_date).days
+            df.attrs["latest_bar_date"] = str(latest_bar_date)
+            df.attrs["calendar_days_old"] = calendar_days_old
+            if calendar_days_old > 10:
+                logger.warning(
+                    "[DATA FRESHNESS WARNING] %s latest bar is %d days old (%s). Check feed connection.",
+                    symbol, calendar_days_old, latest_bar_date.strftime("%Y-%m-%d")
+                )
+
         # Basic sanity validation
         if len(df) < config.MIN_HISTORY_DAYS:
             raise ValueError(
-                f"{symbol} only has {len(df)} bars, but engine requires MIN_HISTORY_DAYS={config.MIN_HISTORY_DAYS}."
+                f"{symbol} only has {len(df)} bars after filtering (rows_received={rows_received}, rows_rejected={rows_rejected}), but engine requires MIN_HISTORY_DAYS={config.MIN_HISTORY_DAYS}."
             )
 
         return df

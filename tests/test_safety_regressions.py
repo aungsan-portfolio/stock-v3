@@ -9,13 +9,24 @@ import time
 import pandas as pd
 import pytest
 
-from strategies.base import TradeSignal
+from strategies.base import TradeSignal, EntryReadiness
 from strategies.constants import StrategyName
 from strategies.execution_quote import BrokerQuote, validate_execution_quote
 from strategies.intraday_data import _read_cache, _write_cache
 from strategies.intraday_risk import check_soxx_tech_long_gate
 from strategies.order_idempotency import OrderIdempotencyManager
 from strategies.regime_engine import _get_premarket_pct_change, detect_market_texture, TEXTURE_VOLATILE
+
+
+def _make_entry_readiness(symbol: str, bar_ts: str = "2026-09-11T18:00:00+00:00") -> EntryReadiness:
+    return EntryReadiness(
+        entry_allowed=True,
+        suppression_reason=None,
+        cycle_id=f"cycle_{symbol}",
+        bar_ts=bar_ts,
+        created_at=time.time(),
+        expires_at=time.time() + 300.0,
+    )
 
 
 def test_c01_mean_reversion_signal_contract():
@@ -623,7 +634,7 @@ def test_psq_in_denylist_not_in_watchlist():
 
 def test_inverse_etf_nonzero_sizing_in_risk_off():
     """Verify SQQQ position sizing produces non-zero shares even with position_scale=0 in RISK_OFF."""
-    from strategies.base import TradeSignal, StrategyName
+    from strategies.base import TradeSignal, StrategyName, EntryReadiness
     from strategies.order_manager import execute_signal
     from strategies.regime_engine import MarketRegimeResult, MODE_RISK_OFF
 
@@ -653,8 +664,10 @@ def test_inverse_etf_nonzero_sizing_in_risk_off():
         confidence_boost=0.25,
         allow_inverse_etf_longs=True,
         halt_new_entries=True,
+        data={"SOXX": {"pct": -0.5, "status": "VALID", "timestamp": time.time()}},
     )
 
+    now_iso = "2026-09-11T18:00:00+00:00"
     sqqq_signal = TradeSignal(
         symbol="SQQQ",
         side="BUY",
@@ -667,6 +680,16 @@ def test_inverse_etf_nonzero_sizing_in_risk_off():
         reason="VWAP bounce setup",
         strategy=StrategyName.VWAP_BOUNCE,
         metadata={"atr": 0.80, "vwap": 34.20},
+        bar_timestamp=now_iso,
+    )
+
+    readiness = EntryReadiness(
+        entry_allowed=True,
+        suppression_reason=None,
+        cycle_id="cycle_sqqq",
+        bar_ts=now_iso,
+        created_at=time.time(),
+        expires_at=time.time() + 300.0,
     )
 
     order_res = execute_signal(
@@ -676,6 +699,7 @@ def test_inverse_etf_nonzero_sizing_in_risk_off():
         current_pnl=0.0,
         dry_run=True,
         regime_result=mock_risk_off,
+        entry_readiness=readiness,
     )
     assert order_res.get("reason") != "Position size = 0"
     assert order_res.get("status") in ("SUBMITTED", "PENDING_DRY_RUN", "DRY_RUN", "EXECUTED", "CONFIRMED") or order_res.get("shares", 0) > 0
@@ -715,8 +739,10 @@ def test_spy_trend_guard_inversion_for_inverse_etfs():
         confidence_boost=0.25,
         allow_inverse_etf_longs=True,
         halt_new_entries=True,
+        data={"SOXX": {"pct": -0.5, "status": "VALID", "timestamp": time.time()}},
     )
 
+    now_iso = "2026-09-11T18:00:00+00:00"
     soxs_signal = TradeSignal(
         symbol="SOXS",
         side="BUY",
@@ -729,11 +755,12 @@ def test_spy_trend_guard_inversion_for_inverse_etfs():
         reason="Momentum Scalp",
         strategy=StrategyName.MOMENTUM_SCALP,
         metadata={"atr": 1.00},
+        bar_timestamp=now_iso,
     )
 
     orig_fetch = idata_mod.fetch_intraday
     fetched_symbols = []
-    def mock_fetch(sym, bridge=None):
+    def mock_fetch(sym, *args, **kwargs):
         fetched_symbols.append(sym)
         return pd.DataFrame({
             "open": [505.0, 505.0],
@@ -754,6 +781,7 @@ def test_spy_trend_guard_inversion_for_inverse_etfs():
             current_pnl=0.0,
             dry_run=False,
             regime_result=mock_regime,
+            entry_readiness=_make_entry_readiness("SOXS", now_iso),
         )
         assert "SOXX" in fetched_symbols
         assert "Blocking" not in res_a.get("reason", "")
@@ -771,6 +799,7 @@ def test_spy_trend_guard_inversion_for_inverse_etfs():
             reason="VWAP bounce",
             strategy=StrategyName.VWAP_BOUNCE,
             metadata={"atr": 0.80},
+            bar_timestamp=now_iso,
         )
         res_sqqq = execute_signal(
             signal=sqqq_signal,
@@ -779,12 +808,13 @@ def test_spy_trend_guard_inversion_for_inverse_etfs():
             current_pnl=0.0,
             dry_run=False,
             regime_result=mock_regime,
+            entry_readiness=_make_entry_readiness("SQQQ", now_iso),
         )
         assert "QQQ" in fetched_symbols
         assert "Blocking" not in res_sqqq.get("reason", "")
 
         # Case C: Benchmark candle is BULLISH (Close 505 > Open 500) -> Should BLOCK
-        def mock_bullish_fetch(sym, bridge=None):
+        def mock_bullish_fetch(sym, *args, **kwargs):
             return pd.DataFrame({
                 "open": [500.0, 500.0],
                 "close": [505.0, 505.0],
@@ -801,6 +831,7 @@ def test_spy_trend_guard_inversion_for_inverse_etfs():
             current_pnl=0.0,
             dry_run=False,
             regime_result=mock_regime,
+            entry_readiness=_make_entry_readiness("SOXS", now_iso),
         )
         assert "Trend Guard" in res_c.get("reason", "") and "Blocking" in res_c.get("reason", "")
     finally:
@@ -841,8 +872,10 @@ def test_benchmark_fetch_failure_blocks_entry():
         confidence_boost=0.25,
         allow_inverse_etf_longs=True,
         halt_new_entries=True,
+        data={"SOXX": {"pct": -0.5, "status": "VALID", "timestamp": time.time()}},
     )
 
+    now_iso = "2026-09-11T18:00:00+00:00"
     soxs_signal = TradeSignal(
         symbol="SOXS",
         side="BUY",
@@ -855,6 +888,7 @@ def test_benchmark_fetch_failure_blocks_entry():
         reason="Momentum Scalp",
         strategy=StrategyName.MOMENTUM_SCALP,
         metadata={"atr": 1.00},
+        bar_timestamp=now_iso,
     )
 
     orig_fetch = idata_mod.fetch_intraday
@@ -869,6 +903,7 @@ def test_benchmark_fetch_failure_blocks_entry():
             current_pnl=0.0,
             dry_run=False,
             regime_result=mock_regime,
+            entry_readiness=_make_entry_readiness("SOXS", now_iso),
         )
         assert res.get("status") in ("SKIPPED", "REJECTED")
         assert "unavailable" in res.get("reason", "") or "safety" in res.get("reason", "")
@@ -911,12 +946,14 @@ def test_unknown_inverse_etf_fallback():
         confidence_boost=0.25,
         allow_inverse_etf_longs=True,
         halt_new_entries=True,
+        data={"SOXX": {"pct": -0.5, "status": "VALID", "timestamp": time.time()}},
     )
 
     # UNKNOWN_BEAR is in INVERSE_ETF_SYMBOLS but not explicitly in INVERSE_ETF_BENCHMARK_MAP
     orig_syms = set(config.INVERSE_ETF_SYMBOLS)
     config.INVERSE_ETF_SYMBOLS.add("UNKNOWN_BEAR")
 
+    now_iso = "2026-09-11T18:00:00+00:00"
     custom_signal = TradeSignal(
         symbol="UNKNOWN_BEAR",
         side="BUY",
@@ -929,11 +966,12 @@ def test_unknown_inverse_etf_fallback():
         reason="VWAP bounce",
         strategy=StrategyName.VWAP_BOUNCE,
         metadata={"atr": 0.50},
+        bar_timestamp=now_iso,
     )
 
     orig_fetch = idata_mod.fetch_intraday
     fetched_symbols = []
-    def mock_fetch(sym, bridge=None):
+    def mock_fetch(sym, *args, **kwargs):
         fetched_symbols.append(sym)
         return pd.DataFrame({
             "open": [505.0, 505.0],
@@ -952,6 +990,7 @@ def test_unknown_inverse_etf_fallback():
             current_pnl=0.0,
             dry_run=False,
             regime_result=mock_regime,
+            entry_readiness=_make_entry_readiness("UNKNOWN_BEAR", now_iso),
         )
         assert "SPY" in fetched_symbols  # Graceful fallback to SPY
         assert res.get("reason") != "Position size = 0"
@@ -967,6 +1006,7 @@ def test_inverse_etf_short_signal_blocked():
     import numpy as np
 
     # 1. Order Manager rejects inverse short
+    now_iso = "2026-09-11T18:00:00+00:00"
     short_sqqq = TradeSignal(
         symbol="SQQQ",
         side="SELL",
@@ -978,8 +1018,16 @@ def test_inverse_etf_short_signal_blocked():
         confidence=0.79,
         reason="Momentum scalp SHORT",
         strategy=StrategyName.MOMENTUM_SCALP,
+        bar_timestamp=now_iso,
     )
-    res = execute_signal(short_sqqq, bridge=None, equity=100000.0, current_pnl=0.0, dry_run=True)
+    res = execute_signal(
+        short_sqqq,
+        bridge=None,
+        equity=100000.0,
+        current_pnl=0.0,
+        dry_run=True,
+        entry_readiness=_make_entry_readiness("SQQQ", now_iso),
+    )
     assert res.get("status") in ("SKIPPED", "REJECTED")
     assert "cannot be sold short" in res.get("reason", "")
 
@@ -1054,6 +1102,7 @@ def test_fault_injection_daily_loss_halt():
     bridge._connected = True
     bridge._daytrade_suspended = True  # Injected state: daily loss circuit breaker triggered
 
+    now_iso = "2026-09-11T18:00:00+00:00"
     sig = TradeSignal(
         symbol="SPY",
         side="BUY",
@@ -1065,10 +1114,18 @@ def test_fault_injection_daily_loss_halt():
         confidence=0.85,
         reason="Momentum scalp LONG",
         strategy=StrategyName.MOMENTUM_SCALP,
+        bar_timestamp=now_iso,
     )
     # Entry gate must block when suspended
     bridge.entry_gate.halted = True
-    res = execute_signal(sig, bridge=bridge, equity=100000.0, current_pnl=-2500.0, dry_run=False)
+    res = execute_signal(
+        sig,
+        bridge=bridge,
+        equity=100000.0,
+        current_pnl=-2500.0,
+        dry_run=False,
+        entry_readiness=_make_entry_readiness("SPY", now_iso),
+    )
     assert res.get("status") in ("REJECTED", "VETOED", "SKIPPED")
     assert "halted" in res.get("reason", "").lower() or "suspended" in res.get("reason", "").lower()
 

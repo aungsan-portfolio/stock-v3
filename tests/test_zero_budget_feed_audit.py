@@ -202,6 +202,11 @@ class TestZeroBudgetFeedAudit(unittest.TestCase):
         self.assertEqual(len(cleaned), 249)
         self.assertTrue((cleaned["High"] >= cleaned["Low"]).all())
         self.assertFalse(cleaned.index.duplicated().any())
+        self.assertEqual(cleaned.attrs.get("rows_received"), 251)
+        self.assertEqual(cleaned.attrs.get("rows_rejected"), 2)
+        self.assertIn("duplicate_timestamps", cleaned.attrs.get("rejection_reasons", {}))
+        self.assertIn("geometric_inconsistency", cleaned.attrs.get("rejection_reasons", {}))
+        self.assertAlmostEqual(cleaned.attrs.get("valid_coverage"), 249 / 251, places=3)
 
     # ── 5. Safe VIX Handling & Fail-Closed Regime ─────────────────────────────
 
