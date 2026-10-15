@@ -3506,45 +3506,102 @@ class AlpacaBridge:
         self._require_connection()
         symbol = symbol.upper().strip()
         try:
+            req_utc = _dt.datetime.now(_dt.timezone.utc)
             quotes = self._call_with_retry(lambda: self._data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol, feed="iex")))
+            resp_utc = _dt.datetime.now(_dt.timezone.utc)
             q = quotes.get(symbol) if isinstance(quotes, dict) else (getattr(quotes, symbol, None) or quotes)
 
-            bid = float(getattr(q, "bid_price", 0) or 0) if q else 0.0
-            ask = float(getattr(q, "ask_price", 0) or 0) if q else 0.0
-            mid = (bid + ask) / 2 if bid > 0 and ask > 0 else (ask or bid or 0.0)
+            bid = float(getattr(q, "bid_price", 0.0) or 0.0) if q else 0.0
+            ask = float(getattr(q, "ask_price", 0.0) or 0.0) if q else 0.0
+            mid = (bid + ask) / 2.0 if bid > 0.0 and ask > 0.0 else (ask or bid or 0.0)
 
-            spread_pct = (ask - bid) / mid if mid > 0 else 0.0
+            spread_pct = (ask - bid) / mid if mid > 0.0 else 0.0
             max_spread = float(self._c("MAX_QUOTE_SPREAD_PCT", 0.02))
+            max_age = float(self._c("MAX_QUOTE_AGE_SECONDS", 10.0))
+            future_tolerance = float(
+                getattr(config_module, "QUOTE_FUTURE_TOLERANCE_SECONDS", getattr(config_module, "BAR_FUTURE_TOLERANCE_SECONDS", 5.0))
+            )
 
-            q_ts = getattr(q, "timestamp", None) if q else None
-            is_fresh = False
-            if q_ts is not None:
+            raw_ts = getattr(q, "timestamp", None) if q else None
+            ts_type = type(raw_ts).__name__ if raw_ts is not None else "NoneType"
+            q_ts_utc = None
+            q_ts_str = "None"
+            primary_reason = ""
+            age_sec = None
+
+            # 1. Evaluate top-of-book prices
+            if q is None or bid <= 0.0 or ask <= 0.0 or bid >= ask or mid <= 0.0:
+                primary_reason = "invalid_bid_ask"
+            elif raw_ts is None:
+                primary_reason = "missing_timestamp"
+            else:
                 try:
-                    if hasattr(q_ts, "to_pydatetime"):
-                        q_ts = q_ts.to_pydatetime()
-                    now_utc = _dt.datetime.now(_dt.timezone.utc)
-                    if getattr(q_ts, "tzinfo", None) is None:
-                        q_ts = q_ts.replace(tzinfo=_dt.timezone.utc)
-                    age_sec = (now_utc - q_ts).total_seconds()
-                    max_age = float(self._c("MAX_QUOTE_AGE_SECONDS", 10.0))
-                    if 0.0 <= age_sec <= max_age:
-                        is_fresh = True
-                except Exception:
-                    is_fresh = False
+                    if isinstance(raw_ts, (int, float)):
+                        num_ts = float(raw_ts)
+                        if num_ts > 1e14:
+                            num_ts = num_ts / 1e9
+                        elif num_ts > 1e11:
+                            num_ts = num_ts / 1e3
+                        q_ts_utc = _dt.datetime.fromtimestamp(num_ts, tz=_dt.timezone.utc)
+                    elif hasattr(raw_ts, "to_pydatetime"):
+                        q_ts_utc = raw_ts.to_pydatetime()
+                    elif isinstance(raw_ts, str):
+                        q_ts_utc = _dt.datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+                    elif isinstance(raw_ts, _dt.datetime):
+                        q_ts_utc = raw_ts
+                    else:
+                        raise ValueError(f"Unsupported quote timestamp type: {type(raw_ts)}")
 
-            if is_fresh and mid > 0 and 0.0 <= spread_pct <= max_spread:
+                    # Ensure timezone-aware UTC
+                    if getattr(q_ts_utc, "tzinfo", None) is None:
+                        q_ts_utc = q_ts_utc.replace(tzinfo=_dt.timezone.utc)
+                    else:
+                        q_ts_utc = q_ts_utc.astimezone(_dt.timezone.utc)
+
+                    q_ts_str = q_ts_utc.isoformat()
+                    age_sec = (resp_utc - q_ts_utc).total_seconds()
+                except Exception as ts_err:
+                    logger.debug("[QUOTE TIMESTAMP PARSE ERROR] %s: %s (raw=%r, type=%s)", symbol, ts_err, raw_ts, ts_type)
+                    primary_reason = "invalid_timestamp"
+
+            # 2. Evaluate age and spread limits
+            if not primary_reason:
+                if age_sec < -future_tolerance:
+                    primary_reason = "future_timestamp"
+                elif age_sec > max_age:
+                    primary_reason = "stale_quote"
+                elif spread_pct > max_spread:
+                    primary_reason = "spread_too_wide"
+                else:
+                    primary_reason = "ok"
+
+            # 3. If primary two-sided top-of-book quote is valid and fresh: accept immediately!
+            if primary_reason == "ok":
+                logger.debug(
+                    "[ORDER QUOTE OK] %s: bid=%.2f ask=%.2f mid=%.2f spread=%.6f (limit=%.4f) | age=%.3fs (max=%.1fs) ts=%s (%s)",
+                    symbol, bid, ask, mid, spread_pct, max_spread, age_sec, max_age, q_ts_str, ts_type
+                )
                 return QuoteDecision(True, mid, "alpaca", "ok")
 
-            # IEX quote has wide spread (>2%) or missing top-of-book — engage zero-budget fallbacks
+            # 4. Primary quote failed — log specific reason with full diagnostic telemetry
+            logger.warning(
+                "[PRIMARY QUOTE REJECTED] %s: reason=%s | bid=%.2f ask=%.2f mid=%.2f spread=%.6f (limit=%.4f) | "
+                "q_ts=%s (%s) req_utc=%s resp_utc=%s age=%.3fs (max=%.1fs, fut_tol=%.1fs)",
+                symbol, primary_reason, bid, ask, mid, spread_pct, max_spread,
+                q_ts_str, ts_type, req_utc.isoformat(), resp_utc.isoformat(),
+                age_sec if age_sec is not None else -999.0, max_age, future_tolerance
+            )
+
+            # Engage zero-budget fallback pricing sources for diagnostic / valuation fallback
             # Fallback 1: Latest executed trade on Alpaca (feed="iex")
             try:
                 trades = self._call_with_retry(lambda: self._data_client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol, feed="iex")))
                 t = trades.get(symbol) if isinstance(trades, dict) else (getattr(trades, symbol, None) or trades)
                 t_price = float(getattr(t, "price", 0.0) or 0.0) if t else 0.0
                 if t_price > 0:
-                    logger.info("[IEX SPREAD FALLBACK] %s IEX spread %.4f exceeds %.4f (bid=%.2f, ask=%.2f). Using latest trade price $%.2f",
-                                symbol, spread_pct, max_spread, bid, ask, t_price)
-                    return QuoteDecision(True, t_price, "alpaca_iex_trade_fallback", "ok_fallback_from_wide_iex_spread")
+                    logger.info("[IEX TRADE FALLBACK] %s primary quote failed (%s). Using latest trade price $%.2f",
+                                symbol, primary_reason, t_price)
+                    return QuoteDecision(True, t_price, "alpaca_iex_trade_fallback", f"fallback_from_{primary_reason}")
             except Exception as t_exc:
                 logger.debug("Latest trade fallback failed for %s: %s", symbol, t_exc)
 
@@ -3562,8 +3619,9 @@ class AlpacaBridge:
                 if bar_list:
                     last_bar_close = float(getattr(bar_list[-1], "close", 0.0) or 0.0)
                     if last_bar_close > 0:
-                        logger.info("[IEX SPREAD FALLBACK] %s using latest 1m bar close $%.2f", symbol, last_bar_close)
-                        return QuoteDecision(True, last_bar_close, "alpaca_iex_bar_fallback", "ok_fallback_from_wide_iex_spread")
+                        logger.info("[IEX BAR FALLBACK] %s primary quote failed (%s). Using latest 1m bar close $%.2f",
+                                    symbol, primary_reason, last_bar_close)
+                        return QuoteDecision(True, last_bar_close, "alpaca_iex_bar_fallback", f"fallback_from_{primary_reason}")
             except Exception as b_exc:
                 logger.debug("Latest 1m bar fallback failed for %s: %s", symbol, b_exc)
 
@@ -3572,15 +3630,16 @@ class AlpacaBridge:
                 import yfinance as yf
                 yf_px = float(yf.Ticker(symbol).fast_info.get("last_price", 0.0) or 0.0)
                 if yf_px > 0:
-                    logger.info("[IEX SPREAD FALLBACK] %s using Yahoo Finance fast_info last_price $%.2f", symbol, yf_px)
-                    return QuoteDecision(True, yf_px, "yfinance_fallback", "ok_fallback_from_wide_iex_spread")
+                    logger.info("[YFINANCE FALLBACK] %s primary quote failed (%s). Using Yahoo Finance fast_info last_price $%.2f",
+                                symbol, primary_reason, yf_px)
+                    return QuoteDecision(True, yf_px, "yfinance_fallback", f"fallback_from_{primary_reason}")
             except Exception as y_exc:
                 logger.debug("Yahoo Finance fallback failed for %s: %s", symbol, y_exc)
 
             if mid <= 0:
-                return QuoteDecision(False, 0.0, "alpaca", "Quote mid-price is zero and fallbacks exhausted")
+                return QuoteDecision(False, 0.0, "alpaca", f"Quote mid-price is zero ({primary_reason}) and fallbacks exhausted")
 
-            return QuoteDecision(False, mid, "alpaca", f"Spread {spread_pct:.4f} exceeds max {max_spread:.4f}")
+            return QuoteDecision(False, mid, "alpaca", f"Primary quote rejected: {primary_reason} (age={age_sec if age_sec is not None else -999.0:.2f}s, spread={spread_pct:.4f})")
         except Exception as exc:
             logger.error("get_order_quote failed for %s: %s", symbol, exc)
             return QuoteDecision(False, 0.0, "alpaca", str(exc))
@@ -3599,7 +3658,7 @@ class AlpacaBridge:
             return (
                 False,
                 decision.price,
-                f"Two-sided top-of-book quote required for execution; fallback price source ({getattr(decision, 'source', 'unknown')}) rejected for entry",
+                f"Two-sided top-of-book quote required for execution; fallback price source ({getattr(decision, 'source', 'unknown')}) rejected for entry (primary: {decision.reason})",
             )
         return (True, decision.price, decision.reason)
 
