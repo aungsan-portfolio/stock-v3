@@ -14,6 +14,7 @@ import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
 from dataclasses import FrozenInstanceError
+from zoneinfo import ZoneInfo
 
 import config
 from preflight import (
@@ -27,6 +28,23 @@ from strategies.base import TradeSignal, EntryReadiness
 from strategies.constants import StrategyName, OrderIntent, EXIT_INTENTS
 import strategies.orchestrator as orch
 import strategies.order_manager as om
+
+
+def _make_mock_regime():
+    from strategies.regime_engine import MarketRegimeResult, MODE_RISK_ON
+    return MarketRegimeResult(
+        mode=MODE_RISK_ON,
+        score=0,
+        allow_new_longs=True,
+        allow_new_shorts=False,
+        halt_new_entries=False,
+        requires_opening_buffer=False,
+        position_scale=1.0,
+        confidence_boost=0.0,
+        market_texture="TRENDING",
+        reasons=["Deterministic test regime"],
+    )
+
 
 
 # ==============================================================================
@@ -162,7 +180,9 @@ def test_raw_precision_confidence_gating():
         reasons=["Deterministic test regime"],
     )
 
-    with patch("strategies.orchestrator.datetime") as mock_dt, \
+    with patch.object(config, "MOMENTUM_SCALP_ENABLED", True), \
+         patch.object(config, "STRATEGY_MOMENTUM_SCALP_ENABLED", True), \
+         patch("strategies.orchestrator.datetime") as mock_dt, \
          patch("strategies.regime_engine.evaluate_market_regime", return_value=mock_regime), \
          patch("strategies.orchestrator.evaluate_symbols_parallel", return_value=eval_result), \
          patch("strategies.orchestrator._min_confidence_for", return_value=0.6000000), \
@@ -425,10 +445,28 @@ def test_bar_publication_timeout_adds_to_skipped_bars():
     mock_bridge.get_open_positions.return_value = []
     mock_bridge.get_working_orders.return_value = []
 
+    from zoneinfo import ZoneInfo
+    from strategies.regime_engine import MarketRegimeResult, MODE_RISK_ON
+    mock_regime = MarketRegimeResult(
+        mode=MODE_RISK_ON,
+        score=0,
+        allow_new_longs=True,
+        allow_new_shorts=False,
+        halt_new_entries=False,
+        requires_opening_buffer=False,
+        position_scale=1.0,
+        confidence_boost=0.0,
+        market_texture="TRENDING",
+        reasons=["Deterministic test regime"],
+    )
+    late_now_et = late_now.astimezone(ZoneInfo("America/New_York"))
+
     with patch("strategies.orchestrator.datetime") as mock_dt, \
+         patch("strategies.regime_engine.evaluate_market_regime", return_value=mock_regime), \
          patch("strategies.orchestrator.evaluate_symbols_parallel") as mock_eval, \
          patch("strategies.session.is_market_open", return_value=True), \
          patch("strategies.session.is_past_opening_buffer", return_value=True), \
+         patch("strategies.session.now_eastern", return_value=late_now_et), \
          patch.object(config, "DAYTRADE_BAR_PUBLICATION_TIMEOUT_S", 90.0):
 
         mock_dt.now.return_value = late_now
@@ -456,10 +494,15 @@ def test_late_arriving_bar_rejected_by_skipped_bar_ids():
     mock_bridge.get_open_positions.return_value = []
     mock_bridge.get_working_orders.return_value = []
 
+    mock_regime = _make_mock_regime()
+    now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
+
     with patch("strategies.orchestrator.datetime") as mock_dt, \
+         patch("strategies.regime_engine.evaluate_market_regime", return_value=mock_regime), \
          patch("strategies.orchestrator.evaluate_symbols_parallel") as mock_eval, \
          patch("strategies.session.is_market_open", return_value=True), \
-         patch("strategies.session.is_past_opening_buffer", return_value=True):
+         patch("strategies.session.is_past_opening_buffer", return_value=True), \
+         patch("strategies.session.now_eastern", return_value=now_et):
 
         mock_dt.now.return_value = now_utc
         mock_dt.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
@@ -467,6 +510,11 @@ def test_late_arriving_bar_rejected_by_skipped_bar_ids():
         orch.evaluate_and_execute(["AAPL"], bridge=mock_bridge)
 
         mock_eval.assert_not_called()
+
+    # Clean up test state isolation
+    orch._skipped_bar_ids.clear()
+    from strategies.halt_manager import halt_manager
+    halt_manager._active_halts.clear()
 
 
 # ==============================================================================

@@ -271,6 +271,8 @@ class MultiSourceDataProvider:
 
         # Preserve metadata and provenance in attrs
         df.attrs["volume_source"] = vol_source
+        df.attrs["provider_rows_received"] = rows_received
+        df.attrs["provider_rows_rejected"] = rows_rejected
         df.attrs["rows_received"] = rows_received
         df.attrs["rows_rejected"] = rows_rejected
         df.attrs["valid_coverage"] = valid_coverage

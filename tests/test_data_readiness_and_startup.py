@@ -22,8 +22,26 @@ from strategies.constants import StrategyName
 from strategies.scoring import RiskAdjustedSignalScorer, ConfidenceBreakdown
 from strategies.execution_quote import BrokerQuote, QuoteValidationResult
 from strategies.session import EASTERN_TZ
+from zoneinfo import ZoneInfo
 import strategies.orchestrator as orch
 import strategies.order_manager as om
+
+
+def _make_mock_regime():
+    from strategies.regime_engine import MarketRegimeResult, MODE_RISK_ON
+    return MarketRegimeResult(
+        mode=MODE_RISK_ON,
+        score=0,
+        allow_new_longs=True,
+        allow_new_shorts=False,
+        halt_new_entries=False,
+        requires_opening_buffer=False,
+        position_scale=1.0,
+        confidence_boost=0.0,
+        market_texture="TRENDING",
+        reasons=["Deterministic test regime"],
+    )
+
 
 
 # =====================================================================
@@ -81,7 +99,7 @@ def test_preflight_intraday_entry_hold_mid_bar():
         assert res.passed is True
         assert res.status == "ENTRY_HOLD"
         assert "Mid-bar startup" in res.message
-        assert "SPY:120s" in res.message
+        assert "SPY:120.0s" in res.message
 
 
 def test_preflight_intraday_stale_anchor_bar():
@@ -102,7 +120,7 @@ def test_preflight_intraday_stale_anchor_bar():
         assert res.passed is False
         assert res.status == "FAIL"
         assert "Stale anchor bars" in res.message
-        assert "SPY:400s > 360s" in res.message
+        assert "SPY:400.0s > 360.0s" in res.message
 
 
 # =====================================================================
@@ -111,17 +129,23 @@ def test_preflight_intraday_stale_anchor_bar():
 
 def test_startup_cadence_sync_mid_bar_skips_evaluation():
     """Booting mid-bar (e.g. bar age 195s > grace 60s): orchestrator synchronizes and suppresses evaluation."""
+    from strategies.halt_manager import halt_manager
+    halt_manager._active_halts.clear()
     orch._last_evaluated_5m_bar_str = None
     orch._skipped_bar_ids.clear()
 
     # 17:58:15 UTC -> current open bar started at 17:55:00 UTC.
     # Completed bar closed at 17:55:00 UTC. Bar age = 195s (> 60s).
     boot_time = datetime(2026, 9, 11, 17, 58, 15, tzinfo=timezone.utc)
+    mock_regime = _make_mock_regime()
+    boot_time_et = boot_time.astimezone(ZoneInfo("America/New_York"))
 
     with patch("strategies.orchestrator.datetime") as mock_dt, \
+         patch("strategies.regime_engine.evaluate_market_regime", return_value=mock_regime), \
          patch("strategies.orchestrator.evaluate_symbols_parallel") as mock_eval, \
          patch("strategies.session.is_market_open", return_value=True), \
          patch("strategies.session.is_past_opening_buffer", return_value=True), \
+         patch("strategies.session.now_eastern", return_value=boot_time_et), \
          patch.object(config, "DAYTRADE_STARTUP_CADENCE_GRACE_S", 60.0):
         mock_dt.now.return_value = boot_time
         mock_dt.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
@@ -143,16 +167,22 @@ def test_startup_cadence_sync_mid_bar_skips_evaluation():
 
 def test_startup_cadence_fresh_bar_runs_evaluation():
     """Booting freshly at bar boundary (e.g. bar age 20s <= grace 60s): orchestrator evaluates immediately."""
+    from strategies.halt_manager import halt_manager
+    halt_manager._active_halts.clear()
     orch._last_evaluated_5m_bar_str = None
     orch._skipped_bar_ids.clear()
 
     # 17:55:20 UTC -> completed bar closed at 17:55:00 UTC. Bar age = 20s (<= 60s).
     boot_time = datetime(2026, 9, 11, 17, 55, 20, tzinfo=timezone.utc)
+    mock_regime = _make_mock_regime()
+    boot_time_et = boot_time.astimezone(ZoneInfo("America/New_York"))
 
     with patch("strategies.orchestrator.datetime") as mock_dt, \
+         patch("strategies.regime_engine.evaluate_market_regime", return_value=mock_regime), \
          patch("strategies.orchestrator.evaluate_symbols_parallel", return_value=[]) as mock_eval, \
          patch("strategies.session.is_market_open", return_value=True), \
          patch("strategies.session.is_past_opening_buffer", return_value=True), \
+         patch("strategies.session.now_eastern", return_value=boot_time_et), \
          patch.object(config, "DAYTRADE_STARTUP_CADENCE_GRACE_S", 60.0):
         mock_dt.now.return_value = boot_time
         mock_dt.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
@@ -261,7 +291,10 @@ def test_confidence_breakdown_metadata_attachment():
 
 def test_near_miss_logging_triggered(caplog):
     """When confidence is just under min_conf (by <= 0.005), [NEAR-MISS] log is emitted."""
+    from strategies.halt_manager import halt_manager
+    halt_manager._active_halts.clear()
     orch._last_evaluated_5m_bar_str = "prev_bar"
+    orch._skipped_bar_ids.clear()
 
     sig = TradeSignal(
         symbol="NVDA",
@@ -285,10 +318,13 @@ def test_near_miss_logging_triggered(caplog):
 
     now_utc = datetime(2026, 9, 11, 18, 0, 10, tzinfo=timezone.utc)
 
-    from zoneinfo import ZoneInfo
+    mock_regime = _make_mock_regime()
     now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
 
-    with patch("strategies.orchestrator.datetime") as mock_dt, \
+    with patch.object(config, "VWAP_BOUNCE_ENABLED", True), \
+         patch.object(config, "STRATEGY_VWAP_BOUNCE_ENABLED", True), \
+         patch("strategies.orchestrator.datetime") as mock_dt, \
+         patch("strategies.regime_engine.evaluate_market_regime", return_value=mock_regime), \
          patch("strategies.orchestrator.evaluate_symbols_parallel", return_value=[sig]), \
          patch("strategies.session.is_market_open", return_value=True), \
          patch("strategies.session.is_past_opening_buffer", return_value=True), \

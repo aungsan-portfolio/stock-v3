@@ -261,18 +261,28 @@ def fetch_ohlcv(
         logger.warning("Dropped %d inconsistent OHLC rows for %s", invalid_rows, symbol)
         df = df[valid_ohlc].copy()
 
-    rows_rejected = rows_received - len(df)
-    valid_coverage = (len(df) / rows_received) if rows_received > 0 else 0.0
-    vol_source = getattr(df, "attrs", {}).get("volume_source", "yfinance_consolidated")
+    manager_rows_rejected = rows_received - len(df)
+    vol_source = getattr(df, "attrs", {}).get("volume_source", "unknown")
+    provider_rows_received = getattr(df, "attrs", {}).get("provider_rows_received", getattr(df, "attrs", {}).get("rows_received", rows_received))
+    provider_rows_rejected = getattr(df, "attrs", {}).get("provider_rows_rejected", getattr(df, "attrs", {}).get("rows_rejected", 0))
+
+    total_rows_received = max(rows_received, provider_rows_received)
+    total_rows_rejected = provider_rows_rejected + manager_rows_rejected
+    valid_coverage = (len(df) / total_rows_received) if total_rows_received > 0 else 0.0
+
     df.attrs["volume_source"] = vol_source
-    df.attrs["rows_received"] = rows_received
-    df.attrs["rows_rejected"] = rows_rejected
+    df.attrs["provider_rows_received"] = provider_rows_received
+    df.attrs["provider_rows_rejected"] = provider_rows_rejected
+    df.attrs["manager_rows_received"] = rows_received
+    df.attrs["manager_rows_rejected"] = manager_rows_rejected
+    df.attrs["rows_received"] = total_rows_received
+    df.attrs["rows_rejected"] = total_rows_rejected
     df.attrs["valid_coverage"] = valid_coverage
     df.attrs["rejection_reasons"] = reasons
 
     logger.info(
         "[DATA QUALITY AUDIT] %s: rows_received=%d, rows_rejected=%d, reasons=%s, valid_coverage=%.2f%%, volume_source=%s",
-        symbol, rows_received, rows_rejected, reasons, valid_coverage * 100.0, vol_source
+        symbol, total_rows_received, total_rows_rejected, reasons, valid_coverage * 100.0, vol_source
     )
 
     if len(df) < config.MIN_HISTORY_DAYS:

@@ -562,14 +562,14 @@ class AtomicRotationEngine:
                 try:
                     quote_ok, q_price, reason = bridge.validate_quote(enter_sym, require_two_sided=True)
                 except TypeError:
-                    quote_ok, q_price, reason = bridge.validate_quote(enter_sym)
+                    return False, f"Quote validator does not support require_two_sided enforcement for {enter_sym}"
                 if not quote_ok:
                     return False, f"Replacement {enter_sym} failed quote spread validation: {reason}"
             elif hasattr(bridge, "get_order_quote"):
                 q_dec = bridge.get_order_quote(enter_sym)
                 if hasattr(q_dec, "ok") and not bool(q_dec.ok):
                     return False, f"Replacement {enter_sym} failed quote spread validation: {q_dec.reason}"
-                if getattr(q_dec, "source", "alpaca") != "alpaca":
+                if getattr(q_dec, "source", "unknown") != "alpaca":
                     return False, f"Replacement {enter_sym} rejected fallback quote source ({getattr(q_dec, 'source', 'unknown')}); two-sided quote required for rotation entry"
         except Exception as exc:
             return False, f"Quote spread validation exception for {enter_sym}: {exc}"

@@ -374,3 +374,83 @@ def test_is_daily_loss_halted_fail_closed_on_invalid_equity_and_sod(tmp_path):
             bridge._start_of_day_equity = 10000.0
             # Loss is $350 >= $300 limit
             assert bridge._is_daily_loss_halted() is True
+
+
+def test_snapshot_start_of_day_equity_fail_closed_without_broker_last_equity(tmp_path):
+    """snapshot_start_of_day_equity() strictly requires broker_last_equity and rejects falling back to current equity."""
+    import config
+    from unittest.mock import MagicMock
+    with patch.object(config, "DATA_DIR", tmp_path):
+        bridge = AlpacaBridge(mode="swing", dry_run=True)
+        bridge._connected = True
+        bridge._risk_state_dir = str(tmp_path)
+        bridge._start_of_day_equity = 0.0
+        bridge._start_of_day_equity_date = None
+
+        # Case A: Client get_account returns no last_equity or last_equity <= 0 -> fails closed (returns 0.0)
+        mock_client = MagicMock()
+        mock_acct = MagicMock()
+        mock_acct.last_equity = 0.0
+        mock_acct.equity = 9800.0
+        mock_client.get_account.return_value = mock_acct
+        bridge._client = mock_client
+        with patch.object(bridge, "get_net_liquidation", return_value=9800.0):
+            sod = bridge.snapshot_start_of_day_equity()
+            assert sod == 0.0
+
+        # Case B: Client returns verified last_equity -> accepted and persisted with provenance
+        mock_acct.last_equity = 10000.0
+        sod = bridge.snapshot_start_of_day_equity()
+        assert sod == 10000.0
+        saved_state = bridge._load_daytrade_risk_state(bridge._account_id)
+        assert saved_state["start_of_day_equity"] == 10000.0
+        assert saved_state["provenance"]["source"] == "broker_last_equity"
+
+        # Case C: Same-day positive in-memory SOD exists but provenance is unverified -> NOT preserved
+        import os
+        state_file = os.path.join(str(tmp_path), f"daytrade_risk_state_{bridge._account_id}.json")
+        if os.path.exists(state_file):
+            os.remove(state_file)
+
+        from strategies.session import now_eastern
+        today_str = str(now_eastern().date())
+        bridge._start_of_day_equity = 10000.0
+        bridge._start_of_day_equity_date = today_str
+        bridge._start_of_day_equity_source = "unverified_nominal"
+        mock_acct.last_equity = 0.0  # Broker unavailable
+        sod = bridge.snapshot_start_of_day_equity()
+        assert sod == 0.0, "In-memory SOD without verified broker_last_equity source must not be preserved"
+
+
+def test_validate_quote_fails_closed_when_source_attribute_missing():
+    """validate_quote() defaults missing source to 'unknown' and fails closed when require_two_sided=True."""
+    bridge = AlpacaBridge(mode="swing", dry_run=True)
+    bridge._connected = True
+
+    class DummyQuoteDecision:
+        ok = True
+        price = 150.0
+        reason = "ok"
+        # Notice: source attribute is intentionally missing!
+
+    with patch.object(bridge, "get_order_quote", return_value=DummyQuoteDecision()):
+        ok, px, reason = bridge.validate_quote("AAPL", require_two_sided=True)
+        assert ok is False
+        assert "fallback price source (unknown) rejected" in reason
+
+
+def test_atomic_rotation_fails_closed_on_unsupported_require_two_sided():
+    """AtomicRotationEngine fails closed if bridge.validate_quote raises TypeError on require_two_sided."""
+    from strategies.atomic_rotation import AtomicRotationEngine
+    engine = AtomicRotationEngine()
+    mock_bridge = MagicMock()
+    mock_bridge._is_daily_loss_halted.return_value = False
+    mock_bridge.validate_quote.side_effect = TypeError("validate_quote() got an unexpected keyword argument 'require_two_sided'")
+
+    mock_decision = MagicMock()
+    mock_decision.enter_signal.symbol = "AAPL"
+    mock_decision.exit_position.symbol = "MSFT"
+
+    ok, reason = engine.check_feasibility(mock_decision, mock_bridge, [])
+    assert ok is False
+    assert "does not support require_two_sided enforcement" in reason
