@@ -229,27 +229,34 @@ def _make_rotation_decision(
 
 def test_fresh_unpersisted_daily_loss_breach_vetoes_precheck_and_preserves_incumbent():
     """P0 Gap 1: Fresh live daily loss breach halts engine and vetoes rotation before close."""
-    engine = AtomicRotationEngine()
-    bridge = AlpacaBridge(mode="swing", dry_run=True)
-    bridge._connected = True
-    bridge._client = MagicMock()
-    bridge._account_id = "PA3R71I7JFDZ"
-    # Starting equity $100,000, current equity $99,690 (loss = $310 > $300 cap)
-    bridge._start_of_day_equity = 100000.0
-    bridge.get_net_liquidation = MagicMock(return_value=99690.0)
+    import tempfile
+    from pathlib import Path
+    import config as config_mod
 
-    decision = _make_rotation_decision(exit_symbol="AMZN", enter_symbol="JPM", unrealized_r=0.5)
+    with tempfile.TemporaryDirectory() as td:
+        tmp_path = Path(td)
+        with patch.object(config_mod, "DATA_DIR", tmp_path):
+            engine = AtomicRotationEngine()
+            bridge = AlpacaBridge(mode="swing", dry_run=True)
+            bridge._connected = True
+            bridge._client = MagicMock()
+            bridge._account_id = "PA3R71I7JFDZ"
+            # Starting equity $100,000, current equity $99,690 (loss = $310 > $300 cap)
+            bridge._start_of_day_equity = 100000.0
+            bridge.get_net_liquidation = MagicMock(return_value=99690.0)
 
-    feasible, reason = engine.check_feasibility(decision, bridge, [])
-    assert feasible is False
-    assert "daily loss" in reason.lower()
+            decision = _make_rotation_decision(exit_symbol="AMZN", enter_symbol="JPM", unrealized_r=0.5)
 
-    # Full execution aborts cleanly without closing incumbent
-    bridge.close_position_verified = MagicMock()
-    summary = engine.rotate(decision, bridge, [])
-    assert summary.rotation_completed is False
-    assert summary.replacement_entered is False
-    bridge.close_position_verified.assert_not_called()
+            feasible, reason = engine.check_feasibility(decision, bridge, [])
+            assert feasible is False
+            assert "daily loss" in reason.lower()
+
+            # Full execution aborts cleanly without closing incumbent
+            bridge.close_position_verified = MagicMock()
+            summary = engine.rotate(decision, bridge, [])
+            assert summary.rotation_completed is False
+            assert summary.replacement_entered is False
+            bridge.close_position_verified.assert_not_called()
 
 
 def test_daily_loss_verification_exception_fails_closed():

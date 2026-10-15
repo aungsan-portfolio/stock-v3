@@ -944,7 +944,7 @@ def test_behavioral_production_path_and_concurrency():
             bridge._connected = True
             bridge._client = MagicMock()
             bridge._client.get_account.return_value = MagicMock(account_number="PA3R71I7JFDZ", equity=100_000.0, buying_power=100_000.0)
-            bridge.get_order_quote = MagicMock(return_value=MagicMock(ok=True, price=100.0))
+            bridge.get_order_quote = MagicMock(return_value=MagicMock(ok=True, price=100.0, source="alpaca"))
             bridge.get_net_liquidation = MagicMock(return_value=100_000.0)
             bridge._client.get_all_positions.return_value = []
             bridge._client.get_orders.return_value = []
@@ -1010,7 +1010,7 @@ def test_execute_signal_daily_loss_gate_behavioral():
             bridge = AlpacaBridge(mode="swing", dry_run=False)
             bridge._connected = True
             bridge._client = MagicMock()
-            bridge.get_order_quote = MagicMock(return_value=MagicMock(ok=True, price=100.0))
+            bridge.get_order_quote = MagicMock(return_value=MagicMock(ok=True, price=100.0, source="alpaca"))
             bridge._client.get_all_positions.return_value = []
             bridge._client.get_orders.return_value = []
 
@@ -1316,3 +1316,85 @@ def test_durable_daily_loss_halt_persistence_and_rollover():
             is_halted_mismatch, reason_mismatch = gate.check_daily_loss_halt_state(acct, session_2)
             assert is_halted_mismatch is True
             assert "HALT_STATE_ACCOUNT_MISMATCH" in reason_mismatch
+
+
+def test_rollover_reconciliation_clears_phantom_halt_and_preserves_genuine_breach():
+    """Verify that when a stale pre-settlement baseline is reconciled to the true broker last_equity,
+    a phantom halt is cleared if actual P&L is within limits, but genuinely breached halts are strictly maintained."""
+    import json
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import MagicMock, patch
+    import config as config_mod
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        with patch.object(config_mod, "DATA_DIR", tmp_path):
+            acct_id = "PA3R71I7JFDZ"
+            session_date = "2026-10-15"
+
+            # 1. Simulate stale pre-settlement baseline captured early in morning (Oct 13 close)
+            stale_state = {
+                "account_id": acct_id,
+                "date": session_date,
+                "start_of_day_equity": 100607.73,
+                "suspended": False,
+                "provenance": {
+                    "source": "broker_last_equity",
+                    "captured_at": "2026-10-15T07:35:49.000000+00:00"
+                }
+            }
+
+            # Simulate phantom halt file triggered against stale baseline
+            halt_file = tmp_path / f"swing_daily_loss_halt_{acct_id}.json"
+            halt_file.write_text(json.dumps({
+                "account_id": acct_id,
+                "session_date_et": session_date,
+                "daily_pnl": "-310.0",
+                "daily_loss_limit": "300.0",
+                "halted": True,
+                "reason": "DAILY_LOSS_LIMIT",
+            }), encoding="utf-8")
+
+            bridge = AlpacaBridge(mode="swing", dry_run=True)
+            bridge._account_id = acct_id
+            bridge._risk_state_dir = str(tmp_path)
+            bridge.entry_gate.halt("DAILY_LOSS_LIMIT")
+
+            # Broker now has settled Oct 14 close ($99,745.55) and current equity ($99,600.62) -> loss is only -$144.93
+            mock_acct = MagicMock(
+                account_number=acct_id,
+                last_equity="99745.55",
+                equity="99600.62"
+            )
+
+            # Reconcile baseline
+            new_sod = bridge._restore_session_baseline(mock_acct, stale_state, session_date, acct_id)
+            assert new_sod == 99745.55
+            assert bridge._start_of_day_equity == 99745.55
+
+            # Phantom halt must be cleared because actual loss (-$144.93) is within the $300 limit
+            assert not halt_file.exists()
+            assert not bridge.entry_gate.halted
+            assert "DAILY_LOSS_LIMIT" not in bridge.entry_gate.reasons
+
+            # Case B: If actual live equity was $99,400.00 (loss = -$345.55 > $300 limit), halt must be maintained!
+            halt_file.write_text(json.dumps({
+                "account_id": acct_id,
+                "session_date_et": session_date,
+                "daily_pnl": "-345.55",
+                "daily_loss_limit": "300.0",
+                "halted": True,
+                "reason": "DAILY_LOSS_LIMIT",
+            }), encoding="utf-8")
+            mock_breach_acct = MagicMock(
+                account_number=acct_id,
+                last_equity="99745.55",
+                equity="99400.00"
+            )
+            bridge._restore_session_baseline(mock_breach_acct, stale_state, session_date, acct_id)
+            # Must remain halted!
+            assert halt_file.exists()
+            assert bridge.entry_gate.halted
+            assert "DAILY_LOSS_LIMIT" in bridge.entry_gate.reasons
+

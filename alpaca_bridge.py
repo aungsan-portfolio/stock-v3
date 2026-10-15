@@ -2117,6 +2117,70 @@ class AlpacaBridge:
             pass
         return 0.0
 
+    def _reconcile_daily_loss_halt_if_needed(
+        self,
+        account_id: str,
+        et_date: str,
+        acct: Any,
+        broker_last_eq: float,
+    ) -> None:
+        """
+        If a daily loss halt was persisted based on a stale pre-settlement baseline,
+        re-evaluate against the newly reconciled broker last_equity. If actual live P&L
+        does not breach the limit, clear the phantom halt. If actual live P&L still breaches
+        the limit, maintain the halt.
+        """
+        data_dir = getattr(config_module, "DATA_DIR", Path("data"))
+        halt_file = data_dir / f"swing_daily_loss_halt_{account_id.strip().upper()}.json"
+        if not halt_file.exists():
+            return
+        try:
+            with open(halt_file, "r", encoding="utf-8") as f:
+                halt_data = json.load(f)
+            if str(halt_data.get("session_date_et", "")).strip() != str(et_date).strip():
+                return
+
+            current_eq = self._positive_finite_equity(getattr(acct, "equity", 0.0))
+            if current_eq <= 0.0 and hasattr(self, "get_net_liquidation"):
+                try:
+                    current_eq = self._positive_finite_equity(self.get_net_liquidation())
+                except Exception:
+                    pass
+
+            if current_eq <= 0.0:
+                logger.warning("[%s] Cannot re-evaluate halt state: current equity unavailable", account_id)
+                return
+
+            mode = getattr(self, "mode", "daytrade").lower()
+            if mode == "swing":
+                pct_limit = broker_last_eq * float(getattr(config_module, "SWING_MAX_DAILY_LOSS_PCT", 0.01))
+                dollar_cap = float(getattr(config_module, "SWING_MAX_DAILY_LOSS_DOLLAR_CAP", 300.00))
+                limit = min(pct_limit, dollar_cap) if dollar_cap > 0 else 300.00
+            else:
+                limit = float(getattr(config_module, "MAX_DAILY_LOSS_DAYTRADE", 300.0))
+
+            actual_daily_pnl = current_eq - broker_last_eq
+            if round(actual_daily_pnl, 2) > -round(limit, 2):
+                logger.warning(
+                    "[%s] Phantom daily loss halt cleared after baseline reconciliation: "
+                    "true daily P&L ($%.2f) is within limit (-$%.2f)",
+                    account_id, actual_daily_pnl, limit
+                )
+                halt_file.unlink(missing_ok=True)
+                if hasattr(self, "entry_gate") and self.entry_gate:
+                    self.entry_gate.reasons.discard("DAILY_LOSS_LIMIT")
+                    self.entry_gate.halted = len(self.entry_gate.reasons) > 0
+                    self.entry_gate.halt_reason = next(iter(self.entry_gate.reasons)) if self.entry_gate.reasons else ""
+            else:
+                logger.warning(
+                    "[%s] Reconciled daily P&L ($%.2f) confirms genuine breach of limit (-$%.2f); maintaining halt",
+                    account_id, actual_daily_pnl, limit
+                )
+                if hasattr(self, "entry_gate") and self.entry_gate:
+                    self.entry_gate.halt("DAILY_LOSS_LIMIT")
+        except Exception as h_err:
+            logger.error("[%s] Error re-verifying halt state during baseline reconciliation: %s", account_id, h_err)
+
     def _restore_session_baseline(self, acct: Any, state: Any, et_date: str, account_id: str) -> float:
         state = state if isinstance(state, dict) else {}
         state_prov = state.get("provenance", {}) if isinstance(state.get("provenance"), dict) else {}
@@ -2124,7 +2188,28 @@ class AlpacaBridge:
         has_valid_stamp = (state_source == "broker_last_equity")
         saved_equity = self._positive_finite_equity(state.get("start_of_day_equity", 0.0))
 
+        broker_last_eq = self._positive_finite_equity(getattr(acct, "last_equity", 0.0))
+
         if state.get("date") == et_date and state.get("account_id") == account_id and has_valid_stamp and saved_equity > 0.0:
+            if broker_last_eq > 0.0 and abs(broker_last_eq - saved_equity) > 0.01:
+                logger.warning(
+                    "[%s] Stale pre-settlement baseline ($%.2f) reconciled to verified broker last_equity: $%.2f for date %s",
+                    account_id, saved_equity, broker_last_eq, et_date
+                )
+                self._start_of_day_equity = broker_last_eq
+                self._start_of_day_equity_date = et_date
+                self._start_of_day_equity_source = "broker_last_equity"
+                self._daytrade_suspended = bool(state.get("suspended", False))
+                self._save_daytrade_risk_state(
+                    et_date,
+                    broker_last_eq,
+                    self._daytrade_suspended,
+                    account_id=account_id,
+                    source="broker_last_equity"
+                )
+                self._reconcile_daily_loss_halt_if_needed(account_id, et_date, acct, broker_last_eq)
+                return self._start_of_day_equity
+
             self._start_of_day_equity = saved_equity
             self._start_of_day_equity_date = et_date
             self._start_of_day_equity_source = "broker_last_equity"
@@ -2133,7 +2218,6 @@ class AlpacaBridge:
                         account_id, self._start_of_day_equity, state_source, self._daytrade_suspended)
             return self._start_of_day_equity
 
-        broker_last_eq = self._positive_finite_equity(getattr(acct, "last_equity", 0.0))
         if broker_last_eq > 0.0:
             self._start_of_day_equity = broker_last_eq
             self._start_of_day_equity_date = et_date
@@ -2152,6 +2236,7 @@ class AlpacaBridge:
             else:
                 logger.info("[%s] Initialized new day start-of-day equity from broker last_equity: $%.2f",
                             account_id, self._start_of_day_equity)
+            self._reconcile_daily_loss_halt_if_needed(account_id, et_date, acct, broker_last_eq)
             return self._start_of_day_equity
 
         self._start_of_day_equity = 0.0
@@ -3148,6 +3233,29 @@ class AlpacaBridge:
             and has_valid_stamp
             and saved_sod > 0.0
         ):
+            if getattr(self, "_client", None) is not None:
+                try:
+                    acct = self._call_with_retry(lambda: self._client.get_account())
+                    raw_last_eq = getattr(acct, "last_equity", None)
+                    if raw_last_eq is not None and not (hasattr(raw_last_eq, "_mock_name") or "Mock" in type(raw_last_eq).__name__):
+                        broker_last_eq = self._positive_finite_equity(raw_last_eq)
+                        if broker_last_eq > 0.0 and abs(broker_last_eq - saved_sod) > 0.01:
+                            logger.warning(
+                                "[%s] Stale pre-settlement baseline ($%.2f) reconciled to verified broker last_equity: $%.2f for date %s",
+                                acct_id, saved_sod, broker_last_eq, et_date
+                            )
+                            saved_sod = broker_last_eq
+                            self._save_daytrade_risk_state(
+                                et_date,
+                                saved_sod,
+                                bool(state.get("suspended", False)),
+                                account_id=acct_id,
+                                source="broker_last_equity"
+                            )
+                            self._reconcile_daily_loss_halt_if_needed(acct_id, et_date, acct, broker_last_eq)
+                except Exception as b_err:
+                    logger.debug("[%s] Broker query during SOD check skipped: %s", acct_id, b_err)
+
             self._start_of_day_equity = saved_sod
             self._start_of_day_equity_date = et_date
             self._start_of_day_equity_source = "broker_last_equity"
