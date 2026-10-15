@@ -3542,21 +3542,36 @@ class AlpacaBridge:
             # Defensive configuration bounds
             try:
                 raw_max_spread = float(self._c("MAX_QUOTE_SPREAD_PCT", 0.02))
-                max_spread = raw_max_spread if (math.isfinite(raw_max_spread) and 0.0 < raw_max_spread <= 0.50) else 0.02
+                if math.isfinite(raw_max_spread) and 0.0 < raw_max_spread <= 0.50:
+                    max_spread = raw_max_spread
+                else:
+                    logger.warning("[QUOTE CONFIG WARN] MAX_QUOTE_SPREAD_PCT=%r invalid or out-of-bounds (0, 0.50]; defaulting to 0.02", raw_max_spread)
+                    max_spread = 0.02
             except (TypeError, ValueError):
+                logger.warning("[QUOTE CONFIG WARN] MAX_QUOTE_SPREAD_PCT unparseable; defaulting to 0.02")
                 max_spread = 0.02
 
             try:
                 raw_max_age = float(self._c("MAX_QUOTE_AGE_SECONDS", 10.0))
-                max_age = raw_max_age if (math.isfinite(raw_max_age) and 0.0 < raw_max_age <= 120.0) else 10.0
+                if math.isfinite(raw_max_age) and 0.0 < raw_max_age <= 120.0:
+                    max_age = raw_max_age
+                else:
+                    logger.warning("[QUOTE CONFIG WARN] MAX_QUOTE_AGE_SECONDS=%r invalid or out-of-bounds (0, 120]; defaulting to 10.0", raw_max_age)
+                    max_age = 10.0
             except (TypeError, ValueError):
+                logger.warning("[QUOTE CONFIG WARN] MAX_QUOTE_AGE_SECONDS unparseable; defaulting to 10.0")
                 max_age = 10.0
 
             try:
                 raw_fut_tol = getattr(config_module, "QUOTE_FUTURE_TOLERANCE_SECONDS", 2.0)
                 num_fut_tol = float(raw_fut_tol)
-                future_tolerance = num_fut_tol if (math.isfinite(num_fut_tol) and 0.0 <= num_fut_tol <= 15.0) else 2.0
+                if math.isfinite(num_fut_tol) and 0.0 <= num_fut_tol <= 15.0:
+                    future_tolerance = num_fut_tol
+                else:
+                    logger.warning("[QUOTE CONFIG WARN] QUOTE_FUTURE_TOLERANCE_SECONDS=%r invalid or out-of-bounds [0, 15]; defaulting to 2.0", raw_fut_tol)
+                    future_tolerance = 2.0
             except (TypeError, ValueError):
+                logger.warning("[QUOTE CONFIG WARN] QUOTE_FUTURE_TOLERANCE_SECONDS unparseable; defaulting to 2.0")
                 future_tolerance = 2.0
 
             raw_ts = getattr(q, "timestamp", None) if q else None
