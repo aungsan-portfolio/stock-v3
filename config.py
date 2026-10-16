@@ -56,6 +56,9 @@ def init_isolated_test_env(root: Path | str) -> Path:
     global DAYTRADE_LOG_FILE, DAYTRADE_TRADE_JOURNAL_FILE, DAYTRADE_ML_MODEL_PATH
     global SHADOW_BASE_DIR
 
+    global EXPECTANCY_BACKTEST_TRADES, EXPECTANCY_REPORT_JSON, EXPECTANCY_REPORT_MD
+    global FORWARD_TEST_JOURNAL, FORWARD_TEST_REPORT_JSON, FORWARD_TEST_REPORT_MD
+
     root_path = Path(root).resolve()
     os.environ["STOCK_ENGINE_TEST_ROOT"] = str(root_path)
     DATA_DIR = root_path / "data"
@@ -83,7 +86,263 @@ def init_isolated_test_env(root: Path | str) -> Path:
     DAYTRADE_LOG_FILE = LOG_DIR / "daytrading.log"
     DAYTRADE_TRADE_JOURNAL_FILE = REPORTS_DIR / "trade_journal.jsonl"
     DAYTRADE_ML_MODEL_PATH = DATA_DIR / "models" / "signal_predictor.pkl"
+    EXPECTANCY_BACKTEST_TRADES = REPORTS_DIR / "backtest_trades.csv"
+    EXPECTANCY_REPORT_JSON = REPORTS_DIR / "expectancy_metrics.json"
+    EXPECTANCY_REPORT_MD = REPORTS_DIR / "expectancy_report.md"
+    FORWARD_TEST_JOURNAL = REPORTS_DIR / "paper_trades.jsonl"
+    FORWARD_TEST_REPORT_JSON = REPORTS_DIR / "forward_test_metrics.json"
+    FORWARD_TEST_REPORT_MD = REPORTS_DIR / "forward_test_report.md"
     return root_path
+
+
+# ── Production Write-Protection Tripwire ─────────────────────────────────────
+class TestIsolationViolationError(BaseException):
+    """Raised when test code attempts unauthorized write/mutation on protected production directories."""
+    __test__ = False
+
+
+
+SESSION_VIOLATIONS: List[dict] = []
+_GUARD_INSTALLED: bool = False
+
+_orig_builtins_open = None
+_orig_os_open = None
+_orig_os_replace = None
+_orig_os_rename = None
+_orig_os_remove = None
+_orig_os_unlink = None
+_orig_os_mkdir = None
+_orig_os_makedirs = None
+_orig_os_rmdir = None
+_orig_path_open = None
+_orig_path_write_text = None
+_orig_path_write_bytes = None
+_orig_path_unlink = None
+_orig_path_mkdir = None
+_orig_path_rmdir = None
+
+_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | getattr(os, "O_APPEND", 0) | getattr(os, "O_TRUNC", 0)
+
+
+def _is_protected_target(target) -> bool:
+    if target is None or isinstance(target, int):
+        return False
+    try:
+        resolved = Path(target).resolve()
+    except Exception:
+        return False
+
+    test_root = os.environ.get("STOCK_ENGINE_TEST_ROOT")
+    if test_root:
+        try:
+            resolved_test_root = Path(test_root).resolve()
+            if resolved == resolved_test_root or resolved_test_root in resolved.parents:
+                return False
+        except Exception:
+            pass
+
+    for pdir in [BASE_DIR / "data", BASE_DIR / "logs", BASE_DIR / "reports"]:
+        pdir_resolved = pdir.resolve()
+        if resolved == pdir_resolved or pdir_resolved in resolved.parents:
+            return True
+    return False
+
+
+def _record_and_raise_violation(op: str, target, details: str = ""):
+    record = {
+        "operation": op,
+        "target": str(target),
+        "details": details,
+        "pid": os.getpid(),
+    }
+    SESSION_VIOLATIONS.append(record)
+    msg = f"TEST ISOLATION VIOLATION [{op}]: Attempted unauthorized write/mutation on protected production path '{target}'. {details}".strip()
+    raise TestIsolationViolationError(msg)
+
+
+def _guarded_builtins_open(file, mode="r", *args, **kwargs):
+    mode_str = str(mode)
+    if any(c in mode_str for c in ("w", "a", "+", "x")):
+        if _is_protected_target(file):
+            _record_and_raise_violation("builtins.open", file, f"mode='{mode}'")
+    return _orig_builtins_open(file, mode, *args, **kwargs)
+
+
+def _guarded_path_open(self, mode="r", *args, **kwargs):
+    mode_str = str(mode)
+    if any(c in mode_str for c in ("w", "a", "+", "x")):
+        if _is_protected_target(self):
+            _record_and_raise_violation("Path.open", self, f"mode='{mode}'")
+    return _orig_path_open(self, mode, *args, **kwargs)
+
+
+def _guarded_path_write_text(self, data, *args, **kwargs):
+    if _is_protected_target(self):
+        _record_and_raise_violation("Path.write_text", self)
+    return _orig_path_write_text(self, data, *args, **kwargs)
+
+
+def _guarded_path_write_bytes(self, data, *args, **kwargs):
+    if _is_protected_target(self):
+        _record_and_raise_violation("Path.write_bytes", self)
+    return _orig_path_write_bytes(self, data, *args, **kwargs)
+
+
+def _guarded_path_unlink(self, *args, **kwargs):
+    if _is_protected_target(self):
+        _record_and_raise_violation("Path.unlink", self)
+    try:
+        return _orig_path_unlink(self, *args, **kwargs)
+    except PermissionError:
+        if "pytest" in str(self).lower():
+            return
+        raise
+
+
+def _guarded_path_mkdir(self, *args, **kwargs):
+    if _is_protected_target(self):
+        _record_and_raise_violation("Path.mkdir", self)
+    return _orig_path_mkdir(self, *args, **kwargs)
+
+
+def _guarded_path_rmdir(self, *args, **kwargs):
+    if _is_protected_target(self):
+        _record_and_raise_violation("Path.rmdir", self)
+    return _orig_path_rmdir(self, *args, **kwargs)
+
+
+def _guarded_os_open(path, flags, *args, **kwargs):
+    if (flags & _WRITE_FLAGS) != 0:
+        if _is_protected_target(path):
+            _record_and_raise_violation("os.open", path, f"flags={flags}")
+    return _orig_os_open(path, flags, *args, **kwargs)
+
+
+def _guarded_os_replace(src, dst, *args, **kwargs):
+    if _is_protected_target(dst):
+        _record_and_raise_violation("os.replace", dst, f"src='{src}'")
+    return _orig_os_replace(src, dst, *args, **kwargs)
+
+
+def _guarded_os_rename(src, dst, *args, **kwargs):
+    if _is_protected_target(dst):
+        _record_and_raise_violation("os.rename", dst, f"src='{src}'")
+    return _orig_os_rename(src, dst, *args, **kwargs)
+
+
+def _guarded_os_remove(path, *args, **kwargs):
+    if _is_protected_target(path):
+        _record_and_raise_violation("os.remove", path)
+    try:
+        return _orig_os_remove(path, *args, **kwargs)
+    except PermissionError:
+        if "pytest" in str(path).lower():
+            return
+        raise
+
+
+def _guarded_os_unlink(path, *args, **kwargs):
+    if _is_protected_target(path):
+        _record_and_raise_violation("os.unlink", path)
+    try:
+        return _orig_os_unlink(path, *args, **kwargs)
+    except PermissionError:
+        if "pytest" in str(path).lower():
+            return
+        raise
+
+
+def _guarded_os_mkdir(path, *args, **kwargs):
+    if _is_protected_target(path):
+        _record_and_raise_violation("os.mkdir", path)
+    return _orig_os_mkdir(path, *args, **kwargs)
+
+
+def _guarded_os_makedirs(name, *args, **kwargs):
+    if _is_protected_target(name):
+        _record_and_raise_violation("os.makedirs", name)
+    return _orig_os_makedirs(name, *args, **kwargs)
+
+
+def _guarded_os_rmdir(path, *args, **kwargs):
+    if _is_protected_target(path):
+        _record_and_raise_violation("os.rmdir", path)
+    return _orig_os_rmdir(path, *args, **kwargs)
+
+
+def install_production_write_guard() -> None:
+    """Installs fail-closed monkeypatches blocking any write/mutation to production data/, logs/, reports/."""
+    global _GUARD_INSTALLED, _orig_builtins_open, _orig_os_open, _orig_os_replace
+    global _orig_os_rename, _orig_os_remove, _orig_os_unlink, _orig_os_mkdir, _orig_os_makedirs
+    global _orig_os_rmdir, _orig_path_open, _orig_path_write_text, _orig_path_write_bytes
+    global _orig_path_unlink, _orig_path_mkdir, _orig_path_rmdir
+
+    if _GUARD_INSTALLED:
+        return
+    import builtins
+    _orig_builtins_open = builtins.open
+    _orig_os_open = os.open
+    _orig_os_replace = os.replace
+    _orig_os_rename = os.rename
+    _orig_os_remove = os.remove
+    _orig_os_unlink = getattr(os, "unlink", os.remove)
+    _orig_os_mkdir = os.mkdir
+    _orig_os_makedirs = os.makedirs
+    _orig_os_rmdir = os.rmdir
+    _orig_path_open = Path.open
+    _orig_path_write_text = Path.write_text
+    _orig_path_write_bytes = Path.write_bytes
+    _orig_path_unlink = Path.unlink
+    _orig_path_mkdir = Path.mkdir
+    _orig_path_rmdir = Path.rmdir
+
+    builtins.open = _guarded_builtins_open
+    Path.open = _guarded_path_open
+    Path.write_text = _guarded_path_write_text
+    Path.write_bytes = _guarded_path_write_bytes
+    Path.unlink = _guarded_path_unlink
+    Path.mkdir = _guarded_path_mkdir
+    Path.rmdir = _guarded_path_rmdir
+    os.open = _guarded_os_open
+    os.replace = _guarded_os_replace
+    os.rename = _guarded_os_rename
+    os.remove = _guarded_os_remove
+    os.unlink = _guarded_os_unlink
+    os.mkdir = _guarded_os_mkdir
+    os.makedirs = _guarded_os_makedirs
+    os.rmdir = _guarded_os_rmdir
+
+    _GUARD_INSTALLED = True
+
+
+def uninstall_production_write_guard() -> None:
+    """Removes production write-protection monkeypatches (used for cleanup or testing)."""
+    global _GUARD_INSTALLED
+    if not _GUARD_INSTALLED:
+        return
+    import builtins
+    builtins.open = _orig_builtins_open
+    Path.open = _orig_path_open
+    Path.write_text = _orig_path_write_text
+    Path.write_bytes = _orig_path_write_bytes
+    Path.unlink = _orig_path_unlink
+    Path.mkdir = _orig_path_mkdir
+    Path.rmdir = _orig_path_rmdir
+    os.open = _orig_os_open
+    os.replace = _orig_os_replace
+    os.rename = _orig_os_rename
+    os.remove = _orig_os_remove
+    os.unlink = _orig_os_unlink
+    os.mkdir = _orig_os_mkdir
+    os.makedirs = _orig_os_makedirs
+    os.rmdir = _orig_os_rmdir
+    _GUARD_INSTALLED = False
+
+
+# Auto-initialize and guard child processes or test executions inheriting STOCK_ENGINE_TEST_ROOT
+if _TEST_ROOT_ENV:
+    init_isolated_test_env(_TEST_ROOT_ENV)
+    install_production_write_guard()
 
 # ── Stock Universe ───────────────────────────────
 WATCHLIST = [

@@ -10,12 +10,24 @@ Verifies:
 6. log_trade appends exclusively to isolated reports/trade_journal.jsonl.
 7. log_validation_record appends exclusively to isolated data/paper_validation_trades.jsonl.
 8. risk_state.record_trade writes exclusively to isolated logs/daily_risk_state.json.
-9. Guard tripwire fails closed with AssertionError when write operations target production directories.
+9. Guard tripwire raises TestIsolationViolationError (BaseException) when write operations target production directories.
+10. Guard tripwire CANNOT be swallowed by generic `except Exception:`.
+11. Subprocesses automatically inherit STOCK_ENGINE_TEST_ROOT and the fail-closed write guard.
+12. Clean subprocess without STOCK_ENGINE_TEST_ROOT preserves 100% of runtime default production paths.
+13. Concurrent thread operations write safely to isolated stores without lock/state contention.
 """
+from __future__ import annotations
+
+from contextlib import contextmanager
+import os
 from pathlib import Path
+import subprocess
+import sys
+import threading
 import pytest
 
 import config
+from config import TestIsolationViolationError, SESSION_VIOLATIONS
 import order_audit
 from strategies.order_idempotency import EntryIdempotencyStore, OrderReservation
 from strategies.trailing_stop import DynamicTrailingStopManager
@@ -23,6 +35,20 @@ from strategies.gate_ledger import log_gate_decision
 from strategies.trade_journal import log_trade
 from strategies.validation_lane import ValidationTradeRecord, log_validation_record
 import risk_state
+
+
+@contextmanager
+def capture_expected_violation():
+    """Captures and clears an expected TestIsolationViolationError during guard testing."""
+    initial = len(config.SESSION_VIOLATIONS)
+    caught = False
+    try:
+        yield
+    except TestIsolationViolationError:
+        caught = True
+    if not caught:
+        raise AssertionError("Expected TestIsolationViolationError was not raised!")
+    del config.SESSION_VIOLATIONS[initial:]
 
 
 def test_isolated_config_paths(test_isolation_root):
@@ -141,14 +167,166 @@ def test_risk_state_isolation(test_isolation_root):
     assert "2099-01-01" in content
 
 
-def test_write_guard_fails_closed_on_production_directory():
-    """Verify write-protection tripwire immediately raises AssertionError on production target."""
+def test_write_guard_fails_closed_base_exception():
+    """Verify write-protection tripwire is a BaseException and catches all write methods."""
+    assert issubclass(TestIsolationViolationError, BaseException)
+    assert not issubclass(TestIsolationViolationError, Exception)
+
     repo_root = Path(__file__).resolve().parent.parent
     prod_test_file = repo_root / "logs" / "illegal_test_write.tmp"
+    prod_test_dir = repo_root / "logs" / "illegal_dir"
 
-    with pytest.raises(AssertionError, match="TEST ISOLATION VIOLATION"):
+    with capture_expected_violation():
         with open(prod_test_file, "w") as f:
             f.write("should_fail")
 
-    with pytest.raises(AssertionError, match="TEST ISOLATION VIOLATION"):
+    with capture_expected_violation():
         prod_test_file.write_text("should_fail")
+
+    with capture_expected_violation():
+        prod_test_file.unlink()
+
+    with capture_expected_violation():
+        os.open(str(prod_test_file), os.O_WRONLY | os.O_CREAT)
+
+    with capture_expected_violation():
+        os.remove(str(prod_test_file))
+
+    with capture_expected_violation():
+        os.mkdir(str(prod_test_dir))
+
+
+def test_write_guard_cannot_be_swallowed_by_generic_except_exception():
+    """Verify generic `except Exception:` CANNOT swallow TestIsolationViolationError."""
+    repo_root = Path(__file__).resolve().parent.parent
+    prod_test_file = repo_root / "logs" / "swallow_test.tmp"
+    swallowed = False
+
+    with capture_expected_violation():
+        try:
+            with open(prod_test_file, "w") as f:
+                f.write("should_fail")
+        except Exception:
+            swallowed = True
+
+    assert not swallowed, "Write guard error was swallowed by `except Exception:`!"
+
+
+def test_subprocess_inherits_isolation_and_write_guard(test_isolation_root):
+    """Verify child processes inherit STOCK_ENGINE_TEST_ROOT and the write protection guard."""
+    code = """
+import os, sys
+from pathlib import Path
+import config
+
+test_root = Path(os.environ["STOCK_ENGINE_TEST_ROOT"]).resolve()
+assert Path(config.DATA_DIR).is_relative_to(test_root), f"DATA_DIR {config.DATA_DIR} not in {test_root}"
+assert Path(config.LOG_DIR).is_relative_to(test_root), f"LOG_DIR {config.LOG_DIR} not in {test_root}"
+assert Path(config.REPORTS_DIR).is_relative_to(test_root), f"REPORTS_DIR {config.REPORTS_DIR} not in {test_root}"
+
+# Attempting to write to production logs must raise TestIsolationViolationError
+prod_target = Path(config.BASE_DIR) / "logs" / "subprocess_leak.tmp"
+caught = False
+try:
+    with open(prod_target, "w") as f:
+        f.write("leak")
+except config.TestIsolationViolationError:
+    caught = True
+
+assert caught, "Subprocess did not enforce TestIsolationViolationError!"
+sys.exit(0)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+    )
+    assert result.returncode == 0, f"Child process failed: {result.stderr}\n{result.stdout}"
+
+
+def test_runtime_default_paths_invariance_clean_subprocess():
+    """Verify that in a clean environment without STOCK_ENGINE_TEST_ROOT, all runtime paths are unchanged."""
+    clean_env = os.environ.copy()
+    clean_env.pop("STOCK_ENGINE_TEST_ROOT", None)
+    clean_env.pop("TEST_RUNNING", None)
+    clean_env.pop("PYTEST_CURRENT_TEST", None)
+
+    code = """
+import logging
+logging.disable(logging.CRITICAL)
+import sys
+from pathlib import Path
+import config
+import order_audit
+import strategies.order_idempotency as idempotency
+import strategies.trailing_stop as trailing
+import strategies.gate_ledger as gate
+import strategies.validation_lane as val
+import risk_state
+import alpaca_bridge
+import main
+
+base = Path(config.BASE_DIR).resolve()
+assert Path(config.DATA_DIR).resolve() == base / "data", f"DATA_DIR mismatch: {config.DATA_DIR}"
+assert Path(config.LOG_DIR).resolve() == base / "logs", f"LOG_DIR mismatch: {config.LOG_DIR}"
+assert Path(config.REPORTS_DIR).resolve() == base / "reports", f"REPORTS_DIR mismatch: {config.REPORTS_DIR}"
+assert Path(config.HALT_LOCK_FILE).resolve() == base / "data" / "HALT.lock"
+assert Path(config.FLATTEN_LOCK_FILE).resolve() == base / "data" / "FLATTEN.lock"
+
+# Module default stores
+assert Path(order_audit.get_audit_file()).resolve() == base / "logs" / "order_audit.jsonl"
+store = idempotency.EntryIdempotencyStore()
+assert Path(store.storage_path).resolve() == base / "data" / "order_idempotency_state.json"
+mgr = trailing.DynamicTrailingStopManager()
+assert Path(mgr.STATE_FILE).resolve() == base / "data" / "trailing_state.json"
+assert Path(gate.get_gate_ledger_path()).resolve() == base / "data" / "trade_gate_decision.jsonl"
+assert Path(val.get_validation_ledger_path()).resolve() == base / "data" / "paper_validation_trades.jsonl"
+assert Path(risk_state._get_state_path()).resolve() == base / "logs" / "daily_risk_state.json"
+assert Path(config.BROKER_EVENTS_PATH).resolve() == base / "logs" / "broker_events.jsonl"
+assert Path(alpaca_bridge.AlpacaBridge.get_broker_events_path(None)).resolve() == base / "logs" / "broker_events.jsonl"
+
+# Write guard must NOT be active in standard production runtime
+assert config._GUARD_INSTALLED is False, "Production write guard must be inactive in clean runtime"
+sys.exit(0)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env=clean_env,
+    )
+    assert result.returncode == 0, f"Clean runtime regression detected: {result.stderr}\n{result.stdout}"
+
+
+def test_concurrent_workers_isolation(test_isolation_root):
+    """Verify concurrent thread execution writes safely to isolated paths without contention."""
+    errors = []
+    store = EntryIdempotencyStore()
+
+    def worker_action(thread_id: int):
+        try:
+            reserved, reason = store.reserve(f"TH_{thread_id}", side="BUY")
+            assert reserved, f"Failed to reserve slot: {reason}"
+            order_audit.log_event("thread_audit", symbol=f"TH_{thread_id}", order_id=f"cid_th_{thread_id}")
+            log_gate_decision(
+                evaluation_id=f"eval_th_{thread_id}",
+                symbol=f"TH_{thread_id}",
+                bar="5m",
+                stage="STAGE_CONFIDENCE",
+                decision="PASS",
+                human_message="concurrent test",
+            )
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker_action, args=(i,)) for i in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(errors) == 0, f"Concurrent workers experienced errors: {errors}"
+    assert (test_isolation_root / "data" / "order_idempotency_state.json").exists()
+    assert (test_isolation_root / "logs" / "order_audit.jsonl").exists()
+    assert (test_isolation_root / "data" / "trade_gate_decision.jsonl").exists()

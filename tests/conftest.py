@@ -9,13 +9,17 @@ Guarantees:
    are strictly isolated during automated pytest runs.
 2. An isolated temporary test root is allocated before application test modules
    are executed, re-pointing config.DATA_DIR, config.LOG_DIR, and config.REPORTS_DIR.
-3. A strict write-protection guard fails closed with an AssertionError if any test
-   attempts to write, modify, append, or delete files inside the real production
-   directories (data/, logs/, reports/).
+3. A strict write-protection guard fails closed with TestIsolationViolationError
+   (a BaseException subclass that cannot be swallowed by `except Exception:`)
+   if any test or runtime component attempts to write, modify, append, or delete
+   files inside real production directories.
+4. Concurrent and subprocess isolation: worker-isolated directories support
+   xdist, and child processes automatically inherit write protection.
+5. All violations are tracked in a session ledger, unconditionally failing
+   individual tests in teardown and the entire test run in sessionfinish.
 """
 from __future__ import annotations
 
-import builtins
 import os
 from pathlib import Path
 import shutil
@@ -27,15 +31,11 @@ import pytest
 # Determine the absolute workspace root
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 
-# Define the production directories that tests MUST NEVER mutate
-PROTECTED_DIRS = {
-    (WORKSPACE_ROOT / "data").resolve(),
-    (WORKSPACE_ROOT / "logs").resolve(),
-    (WORKSPACE_ROOT / "reports").resolve(),
-}
+# Create an isolated temporary test root for this test session / worker
+_worker_id = os.environ.get("PYTEST_XDIST_WORKER", "")
+_prefix = f"se_test_isolation_{_worker_id}_" if _worker_id else "se_test_isolation_"
+_SESSION_TEST_ROOT = Path(tempfile.mkdtemp(prefix=_prefix)).resolve()
 
-# Create an isolated temporary test root for this test session
-_SESSION_TEST_ROOT = Path(tempfile.mkdtemp(prefix="se_test_isolation_")).resolve()
 os.environ["STOCK_ENGINE_TEST_ROOT"] = str(_SESSION_TEST_ROOT)
 os.environ["TEST_RUNNING"] = "1"
 
@@ -55,154 +55,12 @@ for static_name in ["symbol_universe.csv"]:
         except Exception:
             pass
 
-# Import config and initialize the isolated test environment
+# Import config, initialize the isolated test environment, and install the write guard
 import config
+from config import TestIsolationViolationError, SESSION_VIOLATIONS
+
 config.init_isolated_test_env(_SESSION_TEST_ROOT)
-
-
-def _is_protected_target(target: os.PathLike | str | int) -> bool:
-    """Check if target resolves inside any of the production protected directories."""
-    if isinstance(target, int):
-        return False
-    try:
-        resolved = Path(target).resolve()
-    except Exception:
-        return False
-
-    for pdir in PROTECTED_DIRS:
-        if resolved == pdir or pdir in resolved.parents:
-            return True
-    return False
-
-
-# ── Install Production Write-Protection Tripwire ──
-
-_orig_builtins_open = builtins.open
-_orig_os_open = os.open
-_orig_os_replace = os.replace
-_orig_os_rename = os.rename
-_orig_os_remove = os.remove
-_orig_os_unlink = getattr(os, "unlink", os.remove)
-_orig_path_open = Path.open
-_orig_path_write_text = Path.write_text
-_orig_path_write_bytes = Path.write_bytes
-_orig_path_unlink = Path.unlink
-
-
-def _guarded_builtins_open(file, mode="r", *args, **kwargs):
-    mode_str = str(mode)
-    if any(c in mode_str for c in ("w", "a", "+", "x")):
-        if _is_protected_target(file):
-            raise AssertionError(
-                f"TEST ISOLATION VIOLATION: Test code attempted write open on production file '{file}' with mode='{mode}'"
-            )
-    return _orig_builtins_open(file, mode, *args, **kwargs)
-
-
-def _guarded_path_open(self, mode="r", *args, **kwargs):
-    mode_str = str(mode)
-    if any(c in mode_str for c in ("w", "a", "+", "x")):
-        if _is_protected_target(self):
-            raise AssertionError(
-                f"TEST ISOLATION VIOLATION: Test code attempted Path.open write on production file '{self}' with mode='{mode}'"
-            )
-    return _orig_path_open(self, mode, *args, **kwargs)
-
-
-def _guarded_path_write_text(self, data, *args, **kwargs):
-    if _is_protected_target(self):
-        raise AssertionError(
-            f"TEST ISOLATION VIOLATION: Test code attempted Path.write_text on production file '{self}'"
-        )
-    return _orig_path_write_text(self, data, *args, **kwargs)
-
-
-def _guarded_path_write_bytes(self, data, *args, **kwargs):
-    if _is_protected_target(self):
-        raise AssertionError(
-            f"TEST ISOLATION VIOLATION: Test code attempted Path.write_bytes on production file '{self}'"
-        )
-    return _orig_path_write_bytes(self, data, *args, **kwargs)
-
-
-def _guarded_path_unlink(self, *args, **kwargs):
-    if _is_protected_target(self):
-        raise AssertionError(
-            f"TEST ISOLATION VIOLATION: Test code attempted Path.unlink on production file '{self}'"
-        )
-    try:
-        return _orig_path_unlink(self, *args, **kwargs)
-    except PermissionError:
-        if "pytest" in str(self).lower():
-            return
-        raise
-
-
-_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | getattr(os, "O_APPEND", 0) | getattr(os, "O_TRUNC", 0)
-
-
-def _guarded_os_open(path, flags, *args, **kwargs):
-    if (flags & _WRITE_FLAGS) != 0:
-        if _is_protected_target(path):
-            raise AssertionError(
-                f"TEST ISOLATION VIOLATION: Test code attempted os.open with write flags on production file '{path}'"
-            )
-    return _orig_os_open(path, flags, *args, **kwargs)
-
-
-def _guarded_os_replace(src, dst, *args, **kwargs):
-    if _is_protected_target(dst):
-        raise AssertionError(
-            f"TEST ISOLATION VIOLATION: Test code attempted os.replace into production destination '{dst}'"
-        )
-    return _orig_os_replace(src, dst, *args, **kwargs)
-
-
-def _guarded_os_rename(src, dst, *args, **kwargs):
-    if _is_protected_target(dst):
-        raise AssertionError(
-            f"TEST ISOLATION VIOLATION: Test code attempted os.rename into production destination '{dst}'"
-        )
-    return _orig_os_rename(src, dst, *args, **kwargs)
-
-
-def _guarded_os_remove(path, *args, **kwargs):
-    if _is_protected_target(path):
-        raise AssertionError(
-            f"TEST ISOLATION VIOLATION: Test code attempted os.remove on production file '{path}'"
-        )
-    try:
-        return _orig_os_remove(path, *args, **kwargs)
-    except PermissionError:
-        if "pytest" in str(path).lower():
-            return
-        raise
-
-
-def _guarded_os_unlink(path, *args, **kwargs):
-    if _is_protected_target(path):
-        raise AssertionError(
-            f"TEST ISOLATION VIOLATION: Test code attempted os.unlink on production file '{path}'"
-        )
-    try:
-        return _orig_os_unlink(path, *args, **kwargs)
-    except PermissionError:
-        if "pytest" in str(path).lower():
-            return
-        raise
-
-
-# Apply the monkey patches to guard production directories
-builtins.open = _guarded_builtins_open
-Path.open = _guarded_path_open
-Path.write_text = _guarded_path_write_text
-Path.write_bytes = _guarded_path_write_bytes
-Path.unlink = _guarded_path_unlink
-os.open = _guarded_os_open
-os.replace = _guarded_os_replace
-os.rename = _guarded_os_rename
-os.remove = _guarded_os_remove
-os.unlink = _guarded_os_unlink
+config.install_production_write_guard()
 
 
 @pytest.fixture(scope="session")
@@ -215,3 +73,22 @@ def test_isolation_root() -> Path:
 def enforce_test_isolation_roots(monkeypatch):
     """Autouse fixture ensuring config paths remain pinned to isolated test root."""
     config.init_isolated_test_env(_SESSION_TEST_ROOT)
+
+
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    """Fail test unconditionally if any unauthorized production write occurred."""
+    outcome = yield
+    if config.SESSION_VIOLATIONS:
+        violations = list(config.SESSION_VIOLATIONS)
+        config.SESSION_VIOLATIONS.clear()
+        pytest.fail(
+            f"TEST ISOLATION VIOLATION: Test '{item.name}' attempted unauthorized "
+            f"mutation on protected production path: {violations}"
+        )
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Fail the session if any unhandled production write violations remain recorded."""
+    if config.SESSION_VIOLATIONS:
+        session.exitstatus = 1
