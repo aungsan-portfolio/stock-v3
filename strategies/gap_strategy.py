@@ -164,6 +164,7 @@ class GapAndGoStrategy(BaseStrategy):
             hold_bars = config.GAP_CONTINUATION_MIN_HOLD_BARS
             recent = df.tail(hold_bars)
             if len(recent) < hold_bars:
+                logger.info("[GAP CONTINUATION VETO] %s reason=insufficient_hold_bars actual=%d required=%d", symbol, len(recent), hold_bars)
                 return None
 
             held_above_vwap = all(
@@ -173,12 +174,14 @@ class GapAndGoStrategy(BaseStrategy):
             )
 
             if not held_above_vwap:
+                logger.info("[GAP CONTINUATION VETO] %s reason=unheld_vwap hold_bars=%d", symbol, hold_bars)
                 return None
 
             first_bar_low = float(df["low"].iloc[0])
             stop = max(first_bar_low, vwap) - 0.02
             risk = price - stop
             if risk <= 0:
+                logger.info("[GAP CONTINUATION VETO] %s reason=nonpositive_risk price=%.4f stop=%.4f risk=%.4f", symbol, price, stop, risk)
                 return None
 
             target = price + risk * config.DEFAULT_TARGET_RR_RATIO
@@ -198,6 +201,7 @@ class GapAndGoStrategy(BaseStrategy):
             else:
                 bar_ts = str(last.get("timestamp", ""))
 
+            logger.info("[GAP SIGNAL EMITTED] %s strategy=GAP_AND_GO gap_pct=%.4f price=%.4f vwap=%.4f open=%.4f risk=%.4f", symbol, gap_pct, price, vwap, open_price, risk)
             return TradeSignal(
                 symbol=symbol,
                 strategy=self.name,
@@ -220,4 +224,9 @@ class GapAndGoStrategy(BaseStrategy):
                 bar_timestamp=bar_ts,
             )
 
+        reason = "nonpositive_gap" if gap_pct <= 0 else ("not_above_vwap" if price <= vwap else "below_open_price")
+        logger.info(
+            "[GAP CONTINUATION VETO] %s reason=%s gap_pct=%.4f price=%.4f vwap=%.4f open=%.4f",
+            symbol, reason, gap_pct, price, vwap, open_price,
+        )
         return None

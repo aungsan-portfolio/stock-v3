@@ -32,6 +32,7 @@ def test_stale_bar_skips_without_quarantine():
     # 70s post-close (grace_seconds is 45s)
     now_utc = pd.Timestamp("2026-09-04 15:26:10", tz="UTC")
     with patch("strategies.session.is_market_open", return_value=True), \
+         patch.object(config, "ENTRY_BAR_CLOSE_GRACE_SECONDS", 45.0), \
          patch("pandas.Timestamp.now", return_value=now_utc):
         result = _validate_intraday_data(df, symbol="JPM", interval="5m", validate_staleness=True, purpose="ENTRY_SIGNAL")
         assert result.empty, "Stale bar must return empty DataFrame for this cycle"
