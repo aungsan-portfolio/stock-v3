@@ -226,6 +226,8 @@ test_root = Path(os.environ["STOCK_ENGINE_TEST_ROOT"]).resolve()
 assert Path(config.DATA_DIR).is_relative_to(test_root), f"DATA_DIR {config.DATA_DIR} not in {test_root}"
 assert Path(config.LOG_DIR).is_relative_to(test_root), f"LOG_DIR {config.LOG_DIR} not in {test_root}"
 assert Path(config.REPORTS_DIR).is_relative_to(test_root), f"REPORTS_DIR {config.REPORTS_DIR} not in {test_root}"
+assert Path(config.SHADOW_BASE_DIR).resolve().is_relative_to(test_root), f"SHADOW_BASE_DIR {config.SHADOW_BASE_DIR} not in {test_root}"
+assert Path(config.BROKER_EVENTS_PATH).resolve().is_relative_to(test_root), f"BROKER_EVENTS_PATH {config.BROKER_EVENTS_PATH} not in {test_root}"
 
 # Attempting to write to production logs must raise TestIsolationViolationError
 prod_target = Path(config.BASE_DIR) / "logs" / "subprocess_leak.tmp"
@@ -254,6 +256,8 @@ def test_runtime_default_paths_invariance_clean_subprocess():
     clean_env.pop("STOCK_ENGINE_TEST_ROOT", None)
     clean_env.pop("TEST_RUNNING", None)
     clean_env.pop("PYTEST_CURRENT_TEST", None)
+    clean_env.pop("BROKER_EVENTS_PATH", None)
+    clean_env.pop("SHADOW_BASE_DIR", None)
 
     code = """
 import logging
@@ -538,4 +542,35 @@ def test_compare_manifests_rejects_error_tokens_and_malformed_hashes(tmp_path):
     m5.write_text(json.dumps(neg_size_manifest), encoding="utf-8")
     m6.write_text(json.dumps(neg_size_manifest), encoding="utf-8")
     assert compare_manifests(m5, m6) is False
+
+
+def test_regime_breadth_bounded_batch_path_and_timeout_invariance():
+    """Verify compute_vwap_breadth routes through bounded fetch_intraday_batch with 10.0s timeout and no serial leaks."""
+    from unittest.mock import patch, MagicMock
+    import strategies.regime_engine as re
+
+    old_batch = os.environ.get("REGIME_BREADTH_BATCH_ENABLED")
+    os.environ["REGIME_BREADTH_BATCH_ENABLED"] = "true"
+    try:
+        with patch("strategies.intraday_data.fetch_intraday_batch") as mock_batch, \
+             patch("strategies.intraday_data.fetch_intraday") as mock_serial:
+
+            mock_batch.return_value = ({}, {"coverage": 0.0})
+            symbols = ["AAPL", "MSFT", "NVDA"]
+            mock_bridge = MagicMock()
+            mock_bridge.is_connected = True
+
+            breadth_pct, mode, details = re.compute_vwap_breadth(symbols=symbols, bridge=mock_bridge)
+
+            assert mock_batch.called, "Batch fetch must be called when REGIME_BREADTH_BATCH_ENABLED is active"
+            _, kwargs = mock_batch.call_args
+            assert kwargs.get("total_timeout_seconds") == 10.0, "Timeout budget must strictly be 10.0s"
+            assert kwargs.get("purpose") == "REGIME_BREADTH", "Purpose must strictly be REGIME_BREADTH"
+            assert not mock_serial.called, "Serial fetch_intraday must NOT be called when use_batch is active (zero leak invariant)"
+    finally:
+        if old_batch is None:
+            os.environ.pop("REGIME_BREADTH_BATCH_ENABLED", None)
+        else:
+            os.environ["REGIME_BREADTH_BATCH_ENABLED"] = old_batch
+
 

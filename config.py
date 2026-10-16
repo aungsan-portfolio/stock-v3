@@ -485,11 +485,6 @@ def uninstall_production_write_guard() -> None:
     _GUARD_INSTALLED = False
 
 
-# Auto-initialize and guard child processes or test executions inheriting STOCK_ENGINE_TEST_ROOT
-if _TEST_ROOT_ENV:
-    init_isolated_test_env(_TEST_ROOT_ENV)
-    install_production_write_guard()
-
 # ── Stock Universe ───────────────────────────────
 WATCHLIST = [
     "SPY", "QQQ", "VTI",
@@ -938,7 +933,10 @@ LOG_BACKUP_COUNT    = 5
 INCIDENT_DIR            = LOG_DIR / "incidents"
 FLIGHT_RECORDER_CAPACITY = 500
 LATCH_HEARTBEAT_SECONDS = 300
-BROKER_EVENTS_PATH      = Path(os.environ.get("BROKER_EVENTS_PATH", str(LOG_DIR / "broker_events.jsonl")))
+if _TEST_ROOT_ENV:
+    BROKER_EVENTS_PATH = LOG_DIR / "broker_events.jsonl"
+else:
+    BROKER_EVENTS_PATH = Path(os.environ.get("BROKER_EVENTS_PATH", str(LOG_DIR / "broker_events.jsonl")))
 
 
 # ── Coach ────────────────────────────────────────
@@ -1142,7 +1140,7 @@ SHADOW_QUOTE_MAX_AGE_SECONDS = 5.0
 SHADOW_SLIPPAGE_BPS = 5.0
 SHADOW_STRATEGY_VERSION = "ORB_CONFIRMED_V1_FIXED_2R"
 
-SHADOW_BASE_DIR = "data/shadow"
+SHADOW_BASE_DIR = str(DATA_DIR / "shadow")
 SHADOW_ENGINE_ROLE = "daytrade"
 
 # ── D2 Shadow Experiment Flag (Strictly Default 1.2, Zero Production Change) ──
@@ -1945,3 +1943,10 @@ def get_effective_daytrade_config() -> dict:
         "VALIDATION_LANE_ENABLED": bool(_g("VALIDATION_LANE_ENABLED", True)),
         "VALIDATION_LANE_SHARES": int(_g("VALIDATION_LANE_SHARES", 1)),
     }
+
+
+# Auto-initialize and guard child processes or test executions inheriting STOCK_ENGINE_TEST_ROOT
+if _TEST_ROOT_ENV:
+    init_isolated_test_env(_TEST_ROOT_ENV)
+    install_production_write_guard()
+
