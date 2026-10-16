@@ -19,6 +19,8 @@ Verifies:
 from __future__ import annotations
 
 from contextlib import contextmanager
+import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -30,11 +32,12 @@ import config
 from config import TestIsolationViolationError, SESSION_VIOLATIONS
 import order_audit
 from strategies.order_idempotency import EntryIdempotencyStore, OrderReservation
-from strategies.trailing_stop import DynamicTrailingStopManager
+from strategies.trailing_stop import DynamicTrailingStopManager, _classify_held_order
 from strategies.gate_ledger import log_gate_decision
 from strategies.trade_journal import log_trade
 from strategies.validation_lane import ValidationTradeRecord, log_validation_record
 import risk_state
+from tools.compare_manifests import compare_manifests
 
 
 @contextmanager
@@ -330,3 +333,209 @@ def test_concurrent_workers_isolation(test_isolation_root):
     assert (test_isolation_root / "data" / "order_idempotency_state.json").exists()
     assert (test_isolation_root / "logs" / "order_audit.jsonl").exists()
     assert (test_isolation_root / "data" / "trade_gate_decision.jsonl").exists()
+
+
+def test_guard_blocks_rename_source(test_isolation_root):
+    """Verify os.rename fails closed when the source is inside a protected production directory."""
+    repo_root = Path(config.BASE_DIR).resolve()
+    fake_prod_source = repo_root / "logs" / "audit_rename_source.tmp"
+    iso_dest = test_isolation_root / "logs" / "moved.tmp"
+    with capture_expected_violation():
+        os.rename(fake_prod_source, iso_dest)
+
+
+def test_guard_blocks_replace_source(test_isolation_root):
+    """Verify os.replace fails closed when the source is inside a protected production directory."""
+    repo_root = Path(config.BASE_DIR).resolve()
+    fake_prod_source = repo_root / "logs" / "audit_replace_source.tmp"
+    iso_dest = test_isolation_root / "logs" / "moved.tmp"
+    with capture_expected_violation():
+        os.replace(fake_prod_source, iso_dest)
+
+
+def test_guard_blocks_path_rename_and_replace_source(test_isolation_root):
+    """Verify Path.rename and Path.replace fail closed when source is a protected production path."""
+    repo_root = Path(config.BASE_DIR).resolve()
+    fake_prod_source = repo_root / "logs" / "path_rename_source.tmp"
+    iso_dest = test_isolation_root / "logs" / "moved.tmp"
+    with capture_expected_violation():
+        fake_prod_source.rename(iso_dest)
+    with capture_expected_violation():
+        fake_prod_source.replace(iso_dest)
+
+
+def test_guard_blocks_io_open():
+    """Verify io.open fails closed on protected production paths."""
+    repo_root = Path(config.BASE_DIR).resolve()
+    fake_prod_file = repo_root / "logs" / "io_open_probe.tmp"
+    with capture_expected_violation():
+        with io.open(fake_prod_file, "w") as f:
+            f.write("probe")
+
+
+def test_guard_blocks_bytes_path():
+    """Verify builtins.open fails closed when given a bytes production path."""
+    repo_root = Path(config.BASE_DIR).resolve()
+    fake_prod_bytes = os.fsencode(str(repo_root / "logs" / "bytes_probe.tmp"))
+    with capture_expected_violation():
+        with open(fake_prod_bytes, "w") as f:
+            f.write("probe")
+
+
+def test_guard_rejects_overlapping_production_roots(tmp_path):
+    """Verify validate_test_isolation_root rejects production trees in both directions (ancestor, descendant, equal)."""
+    repo_root = Path(config.BASE_DIR).resolve()
+
+    # Equal to BASE_DIR or ancestor
+    with pytest.raises(ValueError, match="INVALID_TEST_ROOT"):
+        config.validate_test_isolation_root(repo_root)
+    with pytest.raises(ValueError, match="INVALID_TEST_ROOT"):
+        config.validate_test_isolation_root(repo_root.parent)
+
+    # Protected subdirectories and descendants
+    for sub in ["data", "logs", "reports"]:
+        prod_sub = repo_root / sub
+        with pytest.raises(ValueError, match="INVALID_TEST_ROOT"):
+            config.validate_test_isolation_root(prod_sub)
+        with pytest.raises(ValueError, match="INVALID_TEST_ROOT"):
+            config.validate_test_isolation_root(prod_sub / "nested_test_dir")
+        # Bytes format
+        with pytest.raises(ValueError, match="INVALID_TEST_ROOT"):
+            config.validate_test_isolation_root(os.fsencode(str(prod_sub / "bytes_test")))
+
+    # Valid disposable root passes cleanly
+    valid_root = tmp_path / "disposable_root"
+    validated = config.validate_test_isolation_root(valid_root)
+    assert validated == valid_root.resolve()
+
+
+def test_classify_held_order_regression():
+    """Verify _classify_held_order returns 'unrelated' for unmatched orders, None, and arbitrary orderRefs."""
+    class DummyOrder:
+        def __init__(self, order_type="", client_order_id=""):
+            self.order_type = order_type
+            self.client_order_id = client_order_id
+
+    # None and empty
+    assert _classify_held_order(None) == "unrelated"
+    assert _classify_held_order(DummyOrder()) == "unrelated"
+
+    # Stop orders
+    assert _classify_held_order(DummyOrder(order_type="stop")) == "stop"
+    assert _classify_held_order(DummyOrder(order_type="stop_limit")) == "stop"
+    assert _classify_held_order(DummyOrder(order_type="trailing_stop")) == "stop"
+
+    # In-flight exit orders
+    assert _classify_held_order(DummyOrder(order_type="market", client_order_id="dt_exit_001")) == "exit"
+    assert _classify_held_order(DummyOrder(order_type="limit", client_order_id="val_exit_002")) == "exit"
+    assert _classify_held_order(DummyOrder(order_type="market", client_order_id="parent:child_exit")) == "exit"
+
+    # Unmatched / unrelated orders MUST return "unrelated" (not None)
+    assert _classify_held_order(DummyOrder(order_type="limit", client_order_id="arbitrary_unrelated_order")) == "unrelated"
+    assert _classify_held_order(DummyOrder(order_type="market", client_order_id="swing_unrelated_123")) == "unrelated"
+
+
+def test_multiprocess_workers_distinct_isolated_roots(tmp_path):
+    """Verify distinct worker subprocesses operate in isolated roots without collision or contention."""
+    worker_0_root = tmp_path / "worker_0"
+    worker_1_root = tmp_path / "worker_1"
+
+    worker_code = """
+import os, sys
+from pathlib import Path
+import config
+from strategies.order_idempotency import EntryIdempotencyStore
+import order_audit
+
+worker_id = sys.argv[1]
+root_dir = Path(os.environ["STOCK_ENGINE_TEST_ROOT"]).resolve()
+assert Path(config.DATA_DIR).resolve().is_relative_to(root_dir)
+
+store = EntryIdempotencyStore()
+reserved, reason = store.reserve(f"SYM_W{worker_id}", side="BUY")
+assert reserved, f"Worker {worker_id} reservation failed: {reason}"
+order_audit.log_event("worker_event", symbol=f"SYM_W{worker_id}", order_id=f"cid_w{worker_id}")
+
+assert (root_dir / "data" / "order_idempotency_state.json").exists()
+assert (root_dir / "logs" / "order_audit.jsonl").exists()
+sys.exit(0)
+"""
+    env0 = os.environ.copy()
+    env0["STOCK_ENGINE_TEST_ROOT"] = str(worker_0_root)
+    env1 = os.environ.copy()
+    env1["STOCK_ENGINE_TEST_ROOT"] = str(worker_1_root)
+
+    p0 = subprocess.Popen([sys.executable, "-c", worker_code, "0"], env=env0, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p1 = subprocess.Popen([sys.executable, "-c", worker_code, "1"], env=env1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    out0, err0 = p0.communicate(timeout=15)
+    out1, err1 = p1.communicate(timeout=15)
+
+    assert p0.returncode == 0, f"Worker 0 failed: {err0}\n{out0}"
+    assert p1.returncode == 0, f"Worker 1 failed: {err1}\n{out1}"
+
+    # Verify worker 0 artifacts
+    w0_idemp = (worker_0_root / "data" / "order_idempotency_state.json").read_text(encoding="utf-8")
+    assert "SYM_W0" in w0_idemp
+    assert "SYM_W1" not in w0_idemp
+
+    # Verify worker 1 artifacts
+    w1_idemp = (worker_1_root / "data" / "order_idempotency_state.json").read_text(encoding="utf-8")
+    assert "SYM_W1" in w1_idemp
+    assert "SYM_W0" not in w1_idemp
+
+
+def test_subprocess_unexpected_violation_propagates_and_fails(tmp_path):
+    """Verify unhandled guard violation in a child process crashes child with non-zero exit code and propagates error."""
+    child_root = tmp_path / "child_fail_test"
+    child_code = """
+import os, sys
+from pathlib import Path
+import config
+
+# Unhandled attempt to write to production logs must crash child process
+prod_target = Path(config.BASE_DIR) / "logs" / "unhandled_child_leak.log"
+with open(prod_target, "w") as f:
+    f.write("unhandled leak")
+sys.exit(0)
+"""
+    child_env = os.environ.copy()
+    child_env["STOCK_ENGINE_TEST_ROOT"] = str(child_root)
+
+    result = subprocess.run(
+        [sys.executable, "-c", child_code],
+        capture_output=True,
+        text=True,
+        env=child_env,
+    )
+    # The child process must FAIL (non-zero return code)
+    assert result.returncode != 0, "Child process unexpectedly succeeded despite illegal write!"
+    assert "TestIsolationViolationError" in result.stderr, f"Violation error not in stderr: {result.stderr}"
+
+
+def test_compare_manifests_rejects_error_tokens_and_malformed_hashes(tmp_path):
+    """Verify compare_manifests fails closed and records integrity errors for ERROR strings and invalid digests."""
+    # Case 1: Matching ERROR strings
+    err_manifest = {"files": {"logs/unreadable.log": {"size_bytes": 10, "sha256": "ERROR: Permission denied"}}}
+    m1 = tmp_path / "m1_before.json"
+    m2 = tmp_path / "m1_after.json"
+    m1.write_text(json.dumps(err_manifest), encoding="utf-8")
+    m2.write_text(json.dumps(err_manifest), encoding="utf-8")
+    assert compare_manifests(m1, m2) is False
+
+    # Case 2: Malformed digest (not 64 hex characters)
+    bad_hash_manifest = {"files": {"logs/bad.log": {"size_bytes": 10, "sha256": "invalid_sha256_too_short"}}}
+    m3 = tmp_path / "m2_before.json"
+    m4 = tmp_path / "m2_after.json"
+    m3.write_text(json.dumps(bad_hash_manifest), encoding="utf-8")
+    m4.write_text(json.dumps(bad_hash_manifest), encoding="utf-8")
+    assert compare_manifests(m3, m4) is False
+
+    # Case 3: Invalid negative size
+    neg_size_manifest = {"files": {"logs/neg.log": {"size_bytes": -5, "sha256": "a" * 64}}}
+    m5 = tmp_path / "m3_before.json"
+    m6 = tmp_path / "m3_after.json"
+    m5.write_text(json.dumps(neg_size_manifest), encoding="utf-8")
+    m6.write_text(json.dumps(neg_size_manifest), encoding="utf-8")
+    assert compare_manifests(m5, m6) is False
+

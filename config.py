@@ -47,6 +47,50 @@ HALT_LOCK_FILE    = DATA_DIR / "HALT.lock"
 FLATTEN_LOCK_FILE = DATA_DIR / "FLATTEN.lock"
 
 
+def validate_test_isolation_root(root: Any) -> Path:
+    """
+    Validates that a candidate test isolation root does NOT overlap with
+    production directories in either direction (ancestor, descendant, or equal).
+    Raises ValueError on any violation BEFORE creating directories or modifying environment.
+    """
+    if root is None:
+        raise ValueError("INVALID_TEST_ROOT: Root path cannot be None")
+
+    if isinstance(root, (bytes, bytearray)):
+        root_str = os.fsdecode(root)
+    elif hasattr(root, "__fspath__"):
+        fsp = root.__fspath__()
+        root_str = os.fsdecode(fsp) if isinstance(fsp, (bytes, bytearray)) else str(fsp)
+    else:
+        root_str = str(root)
+
+    resolved_root = Path(root_str).resolve()
+    base_resolved = Path(BASE_DIR).resolve()
+
+    # Reject if candidate equals or is ancestor of BASE_DIR
+    if resolved_root == base_resolved or resolved_root in base_resolved.parents:
+        raise ValueError(
+            f"INVALID_TEST_ROOT: Candidate test root '{resolved_root}' equals or contains workspace base directory '{base_resolved}'"
+        )
+
+    # Check each protected production directory
+    for pdir in [(base_resolved / "data").resolve(), (base_resolved / "logs").resolve(), (base_resolved / "reports").resolve()]:
+        if resolved_root == pdir:
+            raise ValueError(
+                f"INVALID_TEST_ROOT: Candidate test root '{resolved_root}' equals protected production directory '{pdir}'"
+            )
+        if pdir in resolved_root.parents:
+            raise ValueError(
+                f"INVALID_TEST_ROOT: Candidate test root '{resolved_root}' is nested inside protected production directory '{pdir}'"
+            )
+        if resolved_root in pdir.parents:
+            raise ValueError(
+                f"INVALID_TEST_ROOT: Candidate test root '{resolved_root}' contains protected production directory '{pdir}'"
+            )
+
+    return resolved_root
+
+
 def init_isolated_test_env(root: Path | str) -> Path:
     """Redirects all mutable runtime state, logs, and reports to an isolated test root."""
     global DATA_DIR, REPORTS_DIR, LOG_DIR, HALT_LOCK_FILE, FLATTEN_LOCK_FILE
@@ -59,7 +103,7 @@ def init_isolated_test_env(root: Path | str) -> Path:
     global EXPECTANCY_BACKTEST_TRADES, EXPECTANCY_REPORT_JSON, EXPECTANCY_REPORT_MD
     global FORWARD_TEST_JOURNAL, FORWARD_TEST_REPORT_JSON, FORWARD_TEST_REPORT_MD
 
-    root_path = Path(root).resolve()
+    root_path = validate_test_isolation_root(root)
     os.environ["STOCK_ENGINE_TEST_ROOT"] = str(root_path)
     DATA_DIR = root_path / "data"
     REPORTS_DIR = root_path / "reports"
@@ -101,11 +145,11 @@ class TestIsolationViolationError(BaseException):
     __test__ = False
 
 
-
 SESSION_VIOLATIONS: List[dict] = []
 _GUARD_INSTALLED: bool = False
 
 _orig_builtins_open = None
+_orig_io_open = None
 _orig_os_open = None
 _orig_os_replace = None
 _orig_os_rename = None
@@ -120,35 +164,82 @@ _orig_path_write_bytes = None
 _orig_path_unlink = None
 _orig_path_mkdir = None
 _orig_path_rmdir = None
+_orig_path_rename = None
+_orig_path_replace = None
 
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | getattr(os, "O_APPEND", 0) | getattr(os, "O_TRUNC", 0)
 
 
-def _is_protected_target(target) -> bool:
+def _normalize_target_path(target: Any) -> Optional[Path]:
+    """Coerce str, bytes, Path, or os.PathLike to resolved Path. Returns None for int (file descriptors)."""
+    if target is None or isinstance(target, int):
+        return None
+    try:
+        if isinstance(target, (bytes, bytearray)):
+            target = os.fsdecode(target)
+        elif hasattr(target, "__fspath__"):
+            fsp = target.__fspath__()
+            target = os.fsdecode(fsp) if isinstance(fsp, (bytes, bytearray)) else str(fsp)
+        else:
+            target = str(target)
+        return Path(target).resolve()
+    except Exception:
+        return None
+
+
+def _is_protected_target(target: Any) -> bool:
+    """
+    Returns True if target resolves inside any protected production directory
+    (data/, logs/, reports/). Coerces bytes, Path, str, PathLike.
+    Fail-closed on any unresolvable target matching protected directory markers.
+    """
     if target is None or isinstance(target, int):
         return False
-    try:
-        resolved = Path(target).resolve()
-    except Exception:
-        return False
 
+    base_resolved = Path(BASE_DIR).resolve()
+    protected_dirs = [
+        (base_resolved / "data").resolve(),
+        (base_resolved / "logs").resolve(),
+        (base_resolved / "reports").resolve(),
+    ]
+
+    resolved = _normalize_target_path(target)
+    if resolved is None:
+        try:
+            raw = os.fsdecode(target) if isinstance(target, (bytes, bytearray)) else str(target)
+            raw_norm = raw.replace("\\", "/").lower()
+            for seg in ("/data/", "/logs/", "/reports/", "data/", "logs/", "reports/"):
+                if seg in raw_norm:
+                    return True
+        except Exception:
+            return True
+        return True  # Fail closed for unresolvable paths
+
+    # Check active test root exemption (only if candidate root does NOT overlap production trees)
     test_root = os.environ.get("STOCK_ENGINE_TEST_ROOT")
     if test_root:
         try:
-            resolved_test_root = Path(test_root).resolve()
-            if resolved == resolved_test_root or resolved_test_root in resolved.parents:
-                return False
+            resolved_test_root = _normalize_target_path(test_root)
+            if resolved_test_root:
+                overlaps = (resolved_test_root == base_resolved or resolved_test_root in base_resolved.parents)
+                if not overlaps:
+                    for pdir in protected_dirs:
+                        if resolved_test_root == pdir or pdir in resolved_test_root.parents or resolved_test_root in pdir.parents:
+                            overlaps = True
+                            break
+                if not overlaps:
+                    if resolved == resolved_test_root or resolved_test_root in resolved.parents:
+                        return False
         except Exception:
             pass
 
-    for pdir in [BASE_DIR / "data", BASE_DIR / "logs", BASE_DIR / "reports"]:
-        pdir_resolved = pdir.resolve()
-        if resolved == pdir_resolved or pdir_resolved in resolved.parents:
+    for pdir in protected_dirs:
+        if resolved == pdir or pdir in resolved.parents:
             return True
     return False
 
 
-def _record_and_raise_violation(op: str, target, details: str = ""):
+def _record_and_raise_violation(op: str, target: Any, details: str = ""):
     record = {
         "operation": op,
         "target": str(target),
@@ -166,6 +257,14 @@ def _guarded_builtins_open(file, mode="r", *args, **kwargs):
         if _is_protected_target(file):
             _record_and_raise_violation("builtins.open", file, f"mode='{mode}'")
     return _orig_builtins_open(file, mode, *args, **kwargs)
+
+
+def _guarded_io_open(file, mode="r", *args, **kwargs):
+    mode_str = str(mode)
+    if any(c in mode_str for c in ("w", "a", "+", "x")):
+        if _is_protected_target(file):
+            _record_and_raise_violation("io.open", file, f"mode='{mode}'")
+    return _orig_io_open(file, mode, *args, **kwargs)
 
 
 def _guarded_path_open(self, mode="r", *args, **kwargs):
@@ -211,6 +310,22 @@ def _guarded_path_rmdir(self, *args, **kwargs):
     return _orig_path_rmdir(self, *args, **kwargs)
 
 
+def _guarded_path_rename(self, target, *args, **kwargs):
+    if _is_protected_target(self):
+        _record_and_raise_violation("Path.rename[src]", self, f"target='{target}'")
+    if _is_protected_target(target):
+        _record_and_raise_violation("Path.rename[dst]", target, f"src='{self}'")
+    return _orig_path_rename(self, target, *args, **kwargs)
+
+
+def _guarded_path_replace(self, target, *args, **kwargs):
+    if _is_protected_target(self):
+        _record_and_raise_violation("Path.replace[src]", self, f"target='{target}'")
+    if _is_protected_target(target):
+        _record_and_raise_violation("Path.replace[dst]", target, f"src='{self}'")
+    return _orig_path_replace(self, target, *args, **kwargs)
+
+
 def _guarded_os_open(path, flags, *args, **kwargs):
     if (flags & _WRITE_FLAGS) != 0:
         if _is_protected_target(path):
@@ -219,14 +334,18 @@ def _guarded_os_open(path, flags, *args, **kwargs):
 
 
 def _guarded_os_replace(src, dst, *args, **kwargs):
+    if _is_protected_target(src):
+        _record_and_raise_violation("os.replace[src]", src, f"dst='{dst}'")
     if _is_protected_target(dst):
-        _record_and_raise_violation("os.replace", dst, f"src='{src}'")
+        _record_and_raise_violation("os.replace[dst]", dst, f"src='{src}'")
     return _orig_os_replace(src, dst, *args, **kwargs)
 
 
 def _guarded_os_rename(src, dst, *args, **kwargs):
+    if _is_protected_target(src):
+        _record_and_raise_violation("os.rename[src]", src, f"dst='{dst}'")
     if _is_protected_target(dst):
-        _record_and_raise_violation("os.rename", dst, f"src='{src}'")
+        _record_and_raise_violation("os.rename[dst]", dst, f"src='{src}'")
     return _orig_os_rename(src, dst, *args, **kwargs)
 
 
@@ -272,15 +391,19 @@ def _guarded_os_rmdir(path, *args, **kwargs):
 
 def install_production_write_guard() -> None:
     """Installs fail-closed monkeypatches blocking any write/mutation to production data/, logs/, reports/."""
-    global _GUARD_INSTALLED, _orig_builtins_open, _orig_os_open, _orig_os_replace
-    global _orig_os_rename, _orig_os_remove, _orig_os_unlink, _orig_os_mkdir, _orig_os_makedirs
-    global _orig_os_rmdir, _orig_path_open, _orig_path_write_text, _orig_path_write_bytes
-    global _orig_path_unlink, _orig_path_mkdir, _orig_path_rmdir
+    global _GUARD_INSTALLED, _orig_builtins_open, _orig_io_open, _orig_os_open
+    global _orig_os_replace, _orig_os_rename, _orig_os_remove, _orig_os_unlink
+    global _orig_os_mkdir, _orig_os_makedirs, _orig_os_rmdir, _orig_path_open
+    global _orig_path_write_text, _orig_path_write_bytes, _orig_path_unlink
+    global _orig_path_mkdir, _orig_path_rmdir, _orig_path_rename, _orig_path_replace
 
     if _GUARD_INSTALLED:
         return
     import builtins
+    import io
+
     _orig_builtins_open = builtins.open
+    _orig_io_open = io.open
     _orig_os_open = os.open
     _orig_os_replace = os.replace
     _orig_os_rename = os.rename
@@ -295,14 +418,26 @@ def install_production_write_guard() -> None:
     _orig_path_unlink = Path.unlink
     _orig_path_mkdir = Path.mkdir
     _orig_path_rmdir = Path.rmdir
+    _orig_path_rename = Path.rename
+    _orig_path_replace = Path.replace
 
     builtins.open = _guarded_builtins_open
+    io.open = _guarded_io_open
+    try:
+        import _io
+        _io.open = _guarded_io_open
+    except Exception:
+        pass
+
     Path.open = _guarded_path_open
     Path.write_text = _guarded_path_write_text
     Path.write_bytes = _guarded_path_write_bytes
     Path.unlink = _guarded_path_unlink
     Path.mkdir = _guarded_path_mkdir
     Path.rmdir = _guarded_path_rmdir
+    Path.rename = _guarded_path_rename
+    Path.replace = _guarded_path_replace
+
     os.open = _guarded_os_open
     os.replace = _guarded_os_replace
     os.rename = _guarded_os_rename
@@ -321,13 +456,24 @@ def uninstall_production_write_guard() -> None:
     if not _GUARD_INSTALLED:
         return
     import builtins
+    import io
     builtins.open = _orig_builtins_open
+    io.open = _orig_io_open
+    try:
+        import _io
+        _io.open = _orig_io_open
+    except Exception:
+        pass
+
     Path.open = _orig_path_open
     Path.write_text = _orig_path_write_text
     Path.write_bytes = _orig_path_write_bytes
     Path.unlink = _orig_path_unlink
     Path.mkdir = _orig_path_mkdir
     Path.rmdir = _orig_path_rmdir
+    Path.rename = _orig_path_rename
+    Path.replace = _orig_path_replace
+
     os.open = _orig_os_open
     os.replace = _orig_os_replace
     os.rename = _orig_os_rename

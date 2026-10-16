@@ -348,6 +348,9 @@ def _classify_held_order(order) -> str:
     ):
         return "exit"
 
+    return "unrelated"
+
+
 def get_trailing_state_file() -> Path:
     """Dynamically resolve trailing stop state file against config.DATA_DIR."""
     override = globals().get("_trailing_state_override")
@@ -555,11 +558,16 @@ def _extract_order_info(o: object) -> dict:
 
 
 class DynamicTrailingStopManager:
+    STATE_FILE: str = str(get_trailing_state_file())
+    consecutive_persistence_failures: int = 0
+    persistence_healthy: bool = True
+    last_persistence_error: Optional[str] = None
+    last_persistence_error_time: float = 0.0
+
     def __init__(self, state_file: Optional[object] = None):
         self._lock = threading.RLock()
-        self.STATE_FILE: str = os.path.abspath(
-            os.fspath(get_trailing_state_file() if state_file is None else state_file)
-        )
+        target = state_file if state_file is not None else globals().get("STATE_FILE", get_trailing_state_file())
+        self.STATE_FILE: str = os.path.abspath(os.fspath(target))
         self.persistence_healthy: bool = True
         self.last_persistence_error: Optional[str] = None
         self.last_persistence_error_time: float = 0.0
