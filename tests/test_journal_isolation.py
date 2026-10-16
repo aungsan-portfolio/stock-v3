@@ -15,6 +15,7 @@ import hashlib
 import json
 from pathlib import Path
 import pytest
+import config
 
 from strategies.order_idempotency import (
     STRATEGY_PREFIX_MAP,
@@ -283,9 +284,8 @@ class TestJournalIsolationTripwire:
         assert mgr2.states["RESTART_TEST"].qty == 5.0
 
     def test_trailing_state_default_constructor_preserves_canonical_path(self):
-        """Regression: verify default constructor points to canonical production trailing_state.json."""
-        repo_root = Path(__file__).resolve().parent.parent
-        expected_path = str((repo_root / "data" / "trailing_state.json").resolve())
+        """Regression: verify default constructor points to canonical configured trailing_state.json."""
+        expected_path = str((Path(config.DATA_DIR) / "trailing_state.json").resolve())
         mgr = DynamicTrailingStopManager()
         assert mgr.STATE_FILE == expected_path
 

@@ -15,7 +15,16 @@ from typing import List, Optional
 
 # ── Paths ────────────────────────────────────────
 BASE_DIR        = Path(__file__).parent
-DATA_DIR        = BASE_DIR / "data"
+_TEST_ROOT_ENV  = os.environ.get("STOCK_ENGINE_TEST_ROOT")
+if _TEST_ROOT_ENV:
+    _TEST_ROOT_PATH = Path(_TEST_ROOT_ENV).resolve()
+    DATA_DIR        = _TEST_ROOT_PATH / "data"
+    REPORTS_DIR     = _TEST_ROOT_PATH / "reports"
+    LOG_DIR         = _TEST_ROOT_PATH / "logs"
+else:
+    DATA_DIR        = BASE_DIR / "data"
+    REPORTS_DIR     = BASE_DIR / "reports"
+    LOG_DIR         = BASE_DIR / "logs"
 
 # Auto-load .env into os.environ if present (skipped during automated pytest runs)
 if (BASE_DIR / ".env").exists() and not os.environ.get("PYTEST_CURRENT_TEST"):
@@ -29,8 +38,6 @@ if (BASE_DIR / ".env").exists() and not os.environ.get("PYTEST_CURRENT_TEST"):
     except Exception:
         pass
 MODELS_DIR      = BASE_DIR / "models"
-REPORTS_DIR     = BASE_DIR / "reports"
-LOG_DIR         = BASE_DIR / "logs"
 
 ML_MODELS_FILE  = MODELS_DIR / "rf_models.joblib"
 LSTM_CKPT_FILE  = MODELS_DIR / "lstm_checkpoint.pt"
@@ -38,6 +45,45 @@ LSTM_CKPT_FILE  = MODELS_DIR / "lstm_checkpoint.pt"
 # ── Kill Switch File Flags ────────────────────────
 HALT_LOCK_FILE    = DATA_DIR / "HALT.lock"
 FLATTEN_LOCK_FILE = DATA_DIR / "FLATTEN.lock"
+
+
+def init_isolated_test_env(root: Path | str) -> Path:
+    """Redirects all mutable runtime state, logs, and reports to an isolated test root."""
+    global DATA_DIR, REPORTS_DIR, LOG_DIR, HALT_LOCK_FILE, FLATTEN_LOCK_FILE
+    global FULL_MARKET_ROTATION_STATE_FILE, SYMBOL_UNIVERSE_FILE, HOT_CANDIDATES_FILE
+    global SELECTED_SCAN_SYMBOLS_FILE, LOG_FILE, INCIDENT_DIR, BROKER_EVENTS_PATH
+    global COACH_REPORT_FILE, SCAN_RESULTS_FILE, VALIDATION_LANE_LEDGER_PATH
+    global DAYTRADE_LOG_FILE, DAYTRADE_TRADE_JOURNAL_FILE, DAYTRADE_ML_MODEL_PATH
+    global SHADOW_BASE_DIR
+
+    root_path = Path(root).resolve()
+    os.environ["STOCK_ENGINE_TEST_ROOT"] = str(root_path)
+    DATA_DIR = root_path / "data"
+    REPORTS_DIR = root_path / "reports"
+    LOG_DIR = root_path / "logs"
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    (LOG_DIR / "incidents").mkdir(parents=True, exist_ok=True)
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    HALT_LOCK_FILE = DATA_DIR / "HALT.lock"
+    FLATTEN_LOCK_FILE = DATA_DIR / "FLATTEN.lock"
+    FULL_MARKET_ROTATION_STATE_FILE = DATA_DIR / "scan_rotation_state.json"
+    SYMBOL_UNIVERSE_FILE = DATA_DIR / "symbol_universe.csv"
+    HOT_CANDIDATES_FILE = REPORTS_DIR / "hot_candidates.csv"
+    SELECTED_SCAN_SYMBOLS_FILE = REPORTS_DIR / "selected_scan_symbols.csv"
+    LOG_FILE = LOG_DIR / "stock_engine.log"
+    INCIDENT_DIR = LOG_DIR / "incidents"
+    BROKER_EVENTS_PATH = LOG_DIR / "broker_events.jsonl"
+    COACH_REPORT_FILE = REPORTS_DIR / "trade_coach_report.md"
+    SCAN_RESULTS_FILE = REPORTS_DIR / "scan_results.csv"
+    SHADOW_BASE_DIR = str(DATA_DIR / "shadow")
+    VALIDATION_LANE_LEDGER_PATH = DATA_DIR / "paper_validation_trades.jsonl"
+    DAYTRADE_LOG_FILE = LOG_DIR / "daytrading.log"
+    DAYTRADE_TRADE_JOURNAL_FILE = REPORTS_DIR / "trade_journal.jsonl"
+    DAYTRADE_ML_MODEL_PATH = DATA_DIR / "models" / "signal_predictor.pkl"
+    return root_path
 
 # ── Stock Universe ───────────────────────────────
 WATCHLIST = [

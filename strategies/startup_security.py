@@ -186,6 +186,15 @@ def acquire_atomic_process_lock(
     Returns file descriptor on success; raises StartupSafetyRejected on duplicate active instance.
     """
     lock_file = Path(lock_path)
+    if not lock_file.is_absolute():
+        try:
+            import config
+            if len(lock_file.parts) > 1 and lock_file.parts[0] == "data":
+                lock_file = Path(config.DATA_DIR) / Path(*lock_file.parts[1:])
+            else:
+                lock_file = Path(config.DATA_DIR) / lock_file
+        except Exception:
+            pass
     lock_file.parent.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -244,6 +253,15 @@ def release_atomic_process_lock(lock_path: Path, fd: Optional[int] = None) -> No
         except Exception:
             pass
     lock_file = Path(lock_path)
+    if not lock_file.is_absolute():
+        try:
+            import config
+            if len(lock_file.parts) > 1 and lock_file.parts[0] == "data":
+                lock_file = Path(config.DATA_DIR) / Path(*lock_file.parts[1:])
+            else:
+                lock_file = Path(config.DATA_DIR) / lock_file
+        except Exception:
+            pass
     if lock_file.exists():
         try:
             lock_file.unlink()

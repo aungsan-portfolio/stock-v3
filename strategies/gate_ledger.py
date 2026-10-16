@@ -7,6 +7,7 @@ import os
 import json
 import threading
 import logging
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from strategies.veto_reasons import VetoReason
@@ -14,7 +15,19 @@ from strategies.veto_reasons import VetoReason
 logger = logging.getLogger(__name__)
 
 _ledger_lock = threading.Lock()
-DEFAULT_LEDGER_PATH = os.path.join("data", "trade_gate_decision.jsonl")
+
+def get_gate_ledger_path() -> str:
+    """Dynamically resolve gate decision ledger path against config.DATA_DIR."""
+    override = globals().get("_ledger_path_override")
+    if override is not None:
+        return str(override)
+    try:
+        import config
+        return str(Path(config.DATA_DIR) / "trade_gate_decision.jsonl")
+    except Exception:
+        return os.path.join("data", "trade_gate_decision.jsonl")
+
+DEFAULT_LEDGER_PATH = get_gate_ledger_path()
 
 # Canonical single source of truth for the engine's sequential gating hierarchy
 CANONICAL_PIPELINE_STAGES = (
@@ -57,10 +70,11 @@ def log_gate_decision(
     final_conf: Optional[float] = None,
     required_conf: Optional[float] = None,
     metadata: Optional[Dict[str, Any]] = None,
-    filepath: str = DEFAULT_LEDGER_PATH,
+    filepath: Optional[str] = None,
 ) -> dict:
     """Record a structured gate decision event into the append-only JSONL ledger."""
     code_str = reason_code.value if isinstance(reason_code, VetoReason) else str(reason_code or "")
+    target_path = filepath if filepath is not None else get_gate_ledger_path()
 
     record = {
         "evaluation_id": str(evaluation_id),
@@ -81,13 +95,13 @@ def log_gate_decision(
     }
 
     try:
-        dir_name = os.path.dirname(filepath)
+        dir_name = os.path.dirname(target_path)
         if dir_name and not os.path.exists(dir_name):
             os.makedirs(dir_name, exist_ok=True)
 
         line = json.dumps(record, default=str) + "\n"
         with _ledger_lock:
-            with open(filepath, "a", encoding="utf-8") as f:
+            with open(target_path, "a", encoding="utf-8") as f:
                 f.write(line)
     except Exception as e:
         logger.warning("[GATE LEDGER ERROR] Failed to write gate decision: %s", e)
@@ -95,8 +109,9 @@ def log_gate_decision(
     return record
 
 
-def summarize_gate_decisions(date_str: Optional[str] = None, filepath: str = DEFAULT_LEDGER_PATH) -> dict:
+def summarize_gate_decisions(date_str: Optional[str] = None, filepath: Optional[str] = None) -> dict:
     """Summarizes first-order decisive blockers from the ledger."""
+    target_path = filepath if filepath is not None else get_gate_ledger_path()
     summary = {
         "total_evaluations": 0,
         "terminal_rejections": 0,
@@ -105,12 +120,12 @@ def summarize_gate_decisions(date_str: Optional[str] = None, filepath: str = DEF
         "reason_code_counts": {},
     }
 
-    if not os.path.exists(filepath):
+    if not os.path.exists(target_path):
         return summary
 
     with _ledger_lock:
         try:
-            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            with open(target_path, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
                     if not line.strip():
                         continue

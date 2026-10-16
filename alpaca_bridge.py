@@ -191,8 +191,9 @@ def record_account_mode_violation_snapshot(
 
 def log_reconciliation_anomaly(anomaly_data: dict) -> None:
     """Durably records reconciliation price or quantity anomalies for operator review."""
-    os.makedirs("reports", exist_ok=True)
-    path = os.path.join("reports", "reconciliation_anomalies.jsonl")
+    reports_dir = Path(getattr(config_module, "REPORTS_DIR", "reports"))
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    path = reports_dir / "reconciliation_anomalies.jsonl"
     anomaly_data["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
     line = json.dumps(anomaly_data, default=str) + "\n"
     with open(path, "a", encoding="utf-8") as f:
@@ -1519,7 +1520,8 @@ class AlpacaBridge:
         Multi-process safety between Daytrade and Swing relies on strict file-path separation.
         """
         configured_path = getattr(config_module, "BROKER_EVENTS_PATH", None) or os.environ.get("BROKER_EVENTS_PATH")
-        p = Path(configured_path or "logs/broker_events.jsonl")
+        default_log_dir = Path(getattr(config_module, "LOG_DIR", "logs"))
+        p = Path(configured_path or (default_log_dir / "broker_events.jsonl"))
 
         if p.name == "broker_events.jsonl" and os.environ.get("MULTI_PROCESS_CANARY"):
             raise RuntimeError(
@@ -1533,7 +1535,8 @@ class AlpacaBridge:
             broker_ev_path = self.get_broker_events_path()
             return broker_ev_path.with_name(f"{broker_ev_path.stem}_order_roles.json")
         except Exception:
-            return Path("logs/broker_events_order_roles.json")
+            default_log_dir = Path(getattr(config_module, "LOG_DIR", "logs"))
+            return default_log_dir / "broker_events_order_roles.json"
 
     def _apply_role_entry(
         self,
@@ -3114,7 +3117,7 @@ class AlpacaBridge:
             os.makedirs(test_dir, exist_ok=True)
             return test_dir
 
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+        return str(getattr(config_module, "DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')))
 
     def _save_daytrade_risk_state(
         self,

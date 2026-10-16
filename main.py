@@ -396,7 +396,7 @@ def cmd_paper(args) -> int:
         from strategies.session import now_eastern
 
         target_acct = os.environ.get("SWING_ACCOUNT_ID", "PA3R71I7JFDZ").strip().upper()
-        lock_path = Path("data") / f"swing_bot_{target_acct}.lock"
+        lock_path = Path(getattr(config, "DATA_DIR", "data")) / f"swing_bot_{target_acct}.lock"
         try:
             lock_meta = ProcessLockMetadata(
                 pid=os.getpid(),
@@ -2888,7 +2888,7 @@ def cmd_daytrade_bot(args) -> int:
     from strategies.session import now_eastern
 
     target_acct = str(getattr(config, "EXPECTED_PAPER_ACCOUNT_ID", None) or "PA3UODIC5JTA").strip().upper()
-    lock_path = Path("data") / f"daytrade_bot_{target_acct}.lock"
+    lock_path = Path(getattr(config, "DATA_DIR", "data")) / f"daytrade_bot_{target_acct}.lock"
     lock_fd = None
     try:
         lock_meta = ProcessLockMetadata(

@@ -318,7 +318,7 @@ def export_candidate_signals(
     signals: list,
     regime: Optional[object] = None,
     market_texture: str = "TRENDING",
-    export_dir: str = "data/exports",
+    export_dir: Optional[str] = None,
 ) -> None:
     """
     Write candidate signals to daily CSV for ML training (daytrade-train).
@@ -332,8 +332,11 @@ def export_candidate_signals(
         import csv
         import pytz
         from datetime import timezone
+        import config
         _ET = pytz.timezone("America/New_York")
 
+        if export_dir is None:
+            export_dir = os.path.join(getattr(config, "DATA_DIR", "data"), "exports")
         Path(export_dir).mkdir(parents=True, exist_ok=True)
         now_utc = datetime.now(timezone.utc)
         today_str = datetime.now(_ET).strftime("%Y%m%d")

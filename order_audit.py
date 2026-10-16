@@ -31,9 +31,14 @@ logger = logging.getLogger(__name__)
 PROCESS_INSTANCE_ID = uuid.uuid4().hex
 HOST_ID = socket.gethostname()
 
-# One line per event. Lives next to the rotating text log but stays
-# machine-readable (one JSON object per line) for later assertions.
-AUDIT_FILE = Path(config.LOG_DIR) / "order_audit.jsonl"
+def get_audit_file() -> Path:
+    """Dynamically resolve order audit file against config.LOG_DIR."""
+    override = globals().get("_audit_file_override")
+    if override is not None:
+        return Path(override)
+    return Path(config.LOG_DIR) / "order_audit.jsonl"
+
+AUDIT_FILE = get_audit_file()
 
 # Canonical lifecycle stages, ordered. A healthy live entry should progress all
 # the way to `stop_confirmed`; today (Phase 0) the path stops at `accepted`.
@@ -1036,10 +1041,11 @@ lifecycle_tracker = OrderLifecycleTracker()
 
 
 def _write_audit_line(payload: dict) -> None:
-    """Safely append one JSON line to AUDIT_FILE."""
+    """Safely append one JSON line to audit file."""
     try:
-        AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with AUDIT_FILE.open("a", encoding="utf-8") as fh:
+        audit_file = get_audit_file()
+        audit_file.parent.mkdir(parents=True, exist_ok=True)
+        with audit_file.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, default=_safe, sort_keys=True) + "\n")
     except Exception:
         try:
@@ -1079,9 +1085,10 @@ def _safe(value):
 def read_events(limit: int | None = None) -> list:
     """Read back audit events (most-recent-last). Returns [] if no file yet."""
     try:
-        if not AUDIT_FILE.exists():
+        audit_file = get_audit_file()
+        if not audit_file.exists():
             return []
-        lines = AUDIT_FILE.read_text(encoding="utf-8").splitlines()
+        lines = audit_file.read_text(encoding="utf-8").splitlines()
         if limit is not None and limit >= 0:
             lines = lines[-limit:]
         events = []

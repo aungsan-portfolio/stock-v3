@@ -13,6 +13,7 @@ import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional, Tuple, Union, Any
+from pathlib import Path
 
 import config
 from strategies.base import TradeSignal
@@ -347,10 +348,19 @@ def _classify_held_order(order) -> str:
     ):
         return "exit"
 
-    return "unrelated"
+def get_trailing_state_file() -> Path:
+    """Dynamically resolve trailing stop state file against config.DATA_DIR."""
+    override = globals().get("_trailing_state_override")
+    if override is not None:
+        return Path(override)
+    try:
+        import config
+        return Path(config.DATA_DIR) / "trailing_state.json"
+    except Exception:
+        return Path(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'trailing_state.json'))
 
 
-STATE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'trailing_state.json')
+STATE_FILE = str(get_trailing_state_file())
 
 @dataclass
 class TrailingStopState:
@@ -548,7 +558,7 @@ class DynamicTrailingStopManager:
     def __init__(self, state_file: Optional[object] = None):
         self._lock = threading.RLock()
         self.STATE_FILE: str = os.path.abspath(
-            os.fspath(STATE_FILE if state_file is None else state_file)
+            os.fspath(get_trailing_state_file() if state_file is None else state_file)
         )
         self.persistence_healthy: bool = True
         self.last_persistence_error: Optional[str] = None

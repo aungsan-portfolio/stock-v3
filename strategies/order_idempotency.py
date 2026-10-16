@@ -17,13 +17,20 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Set, Tuple
 
-from config import DATA_DIR
+import config
 
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-IDEMPOTENCY_FILE = DATA_DIR / "order_idempotency_state.json"
+def get_idempotency_file() -> Path:
+    """Dynamically resolve idempotency storage path against config.DATA_DIR."""
+    override = globals().get("_idempotency_file_override")
+    if override is not None:
+        return Path(override)
+    return Path(config.DATA_DIR) / "order_idempotency_state.json"
+
+IDEMPOTENCY_FILE = get_idempotency_file()
 
 STATUS_PENDING = "PENDING"
 STATUS_ACKNOWLEDGED = "ACKNOWLEDGED"
@@ -189,8 +196,8 @@ class OrderReservation:
 class EntryIdempotencyStore:
     """Thread-safe persistent order idempotency reservation store enforcing fail-closed invariants."""
 
-    def __init__(self, storage_path: Path = IDEMPOTENCY_FILE):
-        self.storage_path = Path(storage_path)
+    def __init__(self, storage_path: Optional[Path] = None):
+        self.storage_path = Path(storage_path) if storage_path is not None else get_idempotency_file()
         self._lock = threading.RLock()
         self.reservations: Dict[str, OrderReservation] = {}
         self.is_healthy: bool = True

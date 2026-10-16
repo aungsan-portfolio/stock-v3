@@ -32,12 +32,25 @@ from typing import Optional, Dict, Any, Tuple
 import config
 from strategies.base import TradeSignal, StrategyName, OrderIntent
 from strategies.execution_quote import validate_execution_quote, BrokerQuote
+from pathlib import Path
 from strategies.position_sizer import validate_executable_geometry
 
 logger = logging.getLogger(__name__)
 
 _validation_lock = threading.Lock()
-DEFAULT_VALIDATION_LEDGER_PATH = os.path.join("data", "paper_validation_trades.jsonl")
+
+def get_validation_ledger_path() -> str:
+    """Dynamically resolve paper validation trades ledger path against config."""
+    override = globals().get("_ledger_path_override")
+    if override is not None:
+        return str(override)
+    try:
+        import config
+        return str(getattr(config, "VALIDATION_LANE_LEDGER_PATH", Path(config.DATA_DIR) / "paper_validation_trades.jsonl"))
+    except Exception:
+        return os.path.join("data", "paper_validation_trades.jsonl")
+
+DEFAULT_VALIDATION_LEDGER_PATH = get_validation_ledger_path()
 
 # Non-bypassable hard safety veto codes
 HARD_SAFETY_VETO_CODES = {
@@ -108,9 +121,10 @@ class ValidationTradeRecord:
 
 def log_validation_record(
     record: ValidationTradeRecord,
-    filepath: str = DEFAULT_VALIDATION_LEDGER_PATH,
+    filepath: Optional[str] = None,
 ) -> None:
-    """Append a validation trade record to data/paper_validation_trades.jsonl."""
+    """Append a validation trade record to paper validation trades ledger."""
+    filepath = filepath or get_validation_ledger_path()
     dir_name = os.path.dirname(filepath)
     if dir_name and not os.path.exists(dir_name):
         os.makedirs(dir_name, exist_ok=True)

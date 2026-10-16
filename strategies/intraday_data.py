@@ -32,9 +32,21 @@ _cache_lock = threading.RLock()
 
 logger = logging.getLogger(__name__)
 
-_cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'cache')
-os.makedirs(_cache_dir, exist_ok=True)
-os.environ['YFINANCE_DATA'] = _cache_dir
+def _get_cache_dir() -> str:
+    try:
+        import config
+        cdir = os.path.join(config.DATA_DIR, "cache")
+    except Exception:
+        cdir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'cache')
+    os.makedirs(cdir, exist_ok=True)
+    return cdir
+
+def __getattr__(name: str):
+    if name == "_cache_dir":
+        return _get_cache_dir()
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
+os.environ['YFINANCE_DATA'] = _get_cache_dir()
 
 
 class DataProvider(str, Enum):
@@ -221,6 +233,16 @@ get_feed_telemetry = get_intraday_feed_telemetry
 
 def reset_intraday_feed_telemetry(purpose: Optional[str] = None) -> None:
     global _last_stale_cycle_bar_id
+    for lane, lock, enabled in (
+        (_breadth_telemetry, _breadth_telemetry_lock, purpose is None or str(purpose).upper() == "REGIME_BREADTH"),
+        (_feed_telemetry, _feed_telemetry_lock, purpose is None or str(purpose).upper() != "REGIME_BREADTH"),
+    ):
+        if enabled:
+            with lock:
+                lane.update(last_batch_timeout_count=0, last_batch_forming_count=0,
+                            last_batch_reasons={}, last_batch_requested=0,
+                            last_batch_received=0, last_batch_coverage=0.0,
+                            consecutive_fetch_timeouts=0)
     if purpose is None or str(purpose).upper() == "REGIME_BREADTH":
         with _breadth_telemetry_lock:
             for k in _breadth_telemetry:
@@ -503,14 +525,14 @@ def _cache_key(
 
 
 def _get_cache_file(key: str) -> str:
-    return os.path.join(_cache_dir, f"{key}.json")
+    return os.path.join(_get_cache_dir(), f"{key}.json")
 
 
 def _read_cache(key: str, ttl: int = None) -> Optional[pd.DataFrame]:
     with _cache_lock:
         cache_file = _get_cache_file(key)
         # Delete legacy .pkl if present for security
-        legacy_pkl = os.path.join(_cache_dir, f"{key}.pkl")
+        legacy_pkl = os.path.join(_get_cache_dir(), f"{key}.pkl")
         if os.path.exists(legacy_pkl):
             try:
                 os.remove(legacy_pkl)
@@ -1260,6 +1282,12 @@ def fetch_batch_intraday_alpaca(
     if not clean_symbols:
         return {}
 
+    start_mono = time.monotonic()
+    def _rem():
+        if total_timeout_seconds is None:
+            return None
+        return max(0.0, total_timeout_seconds - (time.monotonic() - start_mono))
+
     # Check cache first for any freshly cached symbols
     results: Dict[str, pd.DataFrame] = {}
     pending_symbols: List[str] = []
@@ -1282,13 +1310,18 @@ def fetch_batch_intraday_alpaca(
         pending_symbols.append(sym)
 
     if not pending_symbols:
+        is_breadth = str(purpose or "").upper() == "REGIME_BREADTH"
+        telemetry = _breadth_telemetry if is_breadth else _feed_telemetry
+        lock = _breadth_telemetry_lock if is_breadth else _feed_telemetry_lock
+        with lock:
+            telemetry.update(last_batch_duration_seconds=time.monotonic() - start_mono,
+                             last_batch_timestamp=time.time(), last_batch_timeout_count=0,
+                             last_batch_forming_count=0,
+                             last_batch_reasons={s: "cached_valid" for s in results},
+                             last_batch_requested=len(clean_symbols), last_batch_received=len(results),
+                             last_batch_coverage=len(results) / len(clean_symbols),
+                             consecutive_fetch_timeouts=0)
         return results
-
-    start_mono = time.monotonic()
-    def _rem():
-        if total_timeout_seconds is None:
-            return None
-        return max(0.01, total_timeout_seconds - (time.monotonic() - start_mono))
 
 
     try:
@@ -1371,7 +1404,6 @@ def fetch_batch_intraday_alpaca(
             if total_timeout_seconds is not None and (rem_t is None or rem_t <= 0.05):
                 with target_lock:
                     target_telemetry["batch_timeout_count"] += 1
-                    target_telemetry["consecutive_fetch_timeouts"] = target_telemetry.get("consecutive_fetch_timeouts", 0) + 1
                 for s in chunk_symbols:
                     symbol_reasons[s] = "budget_exhausted"
                 for rem_chunk in chunks[chunk_idx + 1:]:
@@ -1551,9 +1583,11 @@ def fetch_batch_intraday_alpaca(
                     chunk_idx + 1, num_chunks, chunk_symbols, chunk_exc,
                 )
 
-            # Apply delay between chunks (not after the final chunk)
+            # Delay consumes the same total budget; never sleep beyond it.
             if chunk_idx < num_chunks - 1 and chunk_delay_ms > 0:
-                time.sleep(chunk_delay_ms / 1000.0)
+                remaining = _rem()
+                delay = chunk_delay_ms / 1000.0
+                time.sleep(min(delay, remaining) if remaining is not None else delay)
 
         elapsed = time.monotonic() - start_mono
 
@@ -1570,6 +1604,9 @@ def fetch_batch_intraday_alpaca(
             target_telemetry["last_batch_timeout_count"] = sdk_timeout_count
             target_telemetry["last_batch_forming_count"] = forming_count
             target_telemetry["last_batch_reasons"] = dict(symbol_reasons)
+            target_telemetry["last_batch_requested"] = len(clean_symbols)
+            target_telemetry["last_batch_received"] = len(results)
+            target_telemetry["last_batch_coverage"] = len(results) / len(clean_symbols)
             if len(results) > 0:
                 target_telemetry["consecutive_fetch_timeouts"] = 0
             elif sdk_timeout_count > 0:
@@ -1578,7 +1615,7 @@ def fetch_batch_intraday_alpaca(
         coverage_pct = (len(results) / len(clean_symbols)) * 100.0 if clean_symbols else 100.0
         logger.info(
             f"[CHUNK FETCH DONE] Retrieved {len(results)}/{len(clean_symbols)} symbols "
-            f"across {num_chunks} chunks in {elapsed:.2f}s (coverage={coverage_pct:.1f}% | "
+            f"across {num_chunks} chunks in {elapsed:.2f}s (purpose={purpose} scope=rest_subset coverage={coverage_pct:.1f}% | "
             f"valid={valid_count} sdk_timeout={sdk_timeout_count} forming={forming_count} "
             f"no_bars={no_bars_count} stale={stale_count})"
         )
@@ -1784,13 +1821,20 @@ def fetch_intraday_batch(
     interval = interval or config.INTRADAY_INTERVAL
     lookback_days = lookback_days or config.INTRADAY_LOOKBACK_DAYS
 
-    # Exclude quarantined symbols
-    valid_symbols = [s for s in symbols if not is_quarantined(s)]
-    total_requested = len(symbols)
+    # Denominator is the full, unique requested universe, not the retry subset.
+    requested_symbols = list(dict.fromkeys(str(s).upper().strip() for s in symbols if str(s).strip()))
+    valid_symbols = [s for s in requested_symbols if not is_quarantined(s)]
+    total_requested = len(requested_symbols)
+    is_breadth = str(purpose or "").upper() == "REGIME_BREADTH"
+    def remaining_budget():
+        if total_timeout_seconds is None:
+            return None
+        return max(0.0, total_timeout_seconds - (time.perf_counter() - t_start))
     results: Dict[str, pd.DataFrame] = {}
 
     # 1. If bridge is connected and supports batch historical data, use broker-native batch fetch
-    if bridge is not None and getattr(bridge, "is_connected", False) and hasattr(bridge, "fetch_batch_historical_data"):
+    if (not is_breadth and bridge is not None and getattr(bridge, "is_connected", False)
+            and hasattr(bridge, "fetch_batch_historical_data")):
         try:
             bar_size = _interval_to_alpaca(interval)
             raw_batches = bridge.fetch_batch_historical_data(
@@ -1814,7 +1858,9 @@ def fetch_intraday_batch(
 
     # 2. Check for missing symbols and fetch via direct Alpaca REST client batch
     missing_from_bridge = [s for s in valid_symbols if s not in results or results[s].empty]
-    if missing_from_bridge:
+    rest_requested = len(missing_from_bridge)
+    budget_left = remaining_budget()
+    if missing_from_bridge and (budget_left is None or budget_left > 0):
         try:
             alpaca_batch = fetch_batch_intraday_alpaca(
                 missing_from_bridge,
@@ -1822,7 +1868,7 @@ def fetch_intraday_batch(
                 lookback_days=lookback_days,
                 prepost=prepost,
                 purpose=purpose,
-                total_timeout_seconds=total_timeout_seconds,
+                total_timeout_seconds=budget_left,
             )
             results.update(alpaca_batch)
         except Exception as a_exc:
@@ -1841,6 +1887,8 @@ def fetch_intraday_batch(
 
     t_end = time.perf_counter()
     duration_ms = (t_end - t_start) * 1000.0
+    results = {sym: results[sym] for sym in requested_symbols
+               if sym in results and results[sym] is not None and not results[sym].empty}
     received_count = len(results)
     coverage = (received_count / total_requested) if total_requested > 0 else 0.0
 
@@ -1849,7 +1897,18 @@ def fetch_intraday_batch(
         "received": received_count,
         "coverage": round(coverage, 4),
         "duration_ms": round(duration_ms, 2),
+        "purpose": str(purpose or "ENTRY_SIGNAL").upper(),
+        "rest_subset_requested": rest_requested,
+        "quarantined": total_requested - len(valid_symbols),
+        "missing_symbols": [sym for sym in requested_symbols if sym not in results],
+        "budget_exhausted": remaining_budget() == 0.0,
     }
+    logger.info(
+        "[BATCH COVERAGE] purpose=%s universe_received=%d universe_requested=%d "
+        "coverage=%.1f%% rest_subset_requested=%d quarantined=%d budget_exhausted=%s",
+        telemetry["purpose"], received_count, total_requested, coverage * 100.0,
+        rest_requested, telemetry["quarantined"], telemetry["budget_exhausted"],
+    )
 
     return results, telemetry
 
@@ -2212,7 +2271,7 @@ def _index_dates(index: pd.Index):
 
 def clear_cache():
     import glob
-    files = glob.glob(os.path.join(_cache_dir, "*.pkl"))
+    files = glob.glob(os.path.join(_get_cache_dir(), "*.pkl"))
     for f in files:
         try:
             os.remove(f)

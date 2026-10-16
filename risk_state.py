@@ -15,7 +15,14 @@ import config
 
 logger = logging.getLogger(__name__)
 
-_STATE_PATH = Path(config.LOG_DIR) / "daily_risk_state.json"
+def _get_state_path() -> Path:
+    """Dynamically resolve daily risk state file against config.LOG_DIR."""
+    override = globals().get("_STATE_PATH_OVERRIDE")
+    if override is not None:
+        return Path(override)
+    return Path(config.LOG_DIR) / "daily_risk_state.json"
+
+_STATE_PATH = _get_state_path()
 
 
 def _today() -> str:
@@ -24,17 +31,19 @@ def _today() -> str:
 
 def _load() -> dict:
     try:
-        if not _STATE_PATH.exists():
+        path = _get_state_path()
+        if not path.exists():
             return {}
-        return json.loads(_STATE_PATH.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         logger.warning("Could not read daily risk state; starting fresh", exc_info=True)
         return {}
 
 
 def _save(state: dict) -> None:
-    _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    path = _get_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def trades_today(day: str | None = None) -> int:

@@ -21,7 +21,7 @@ def get_default_risk_store_path() -> Path:
         return Path("data/swing_position_risk.json")
 
 
-DEFAULT_RISK_STORE_PATH = Path("data/swing_position_risk.json")
+DEFAULT_RISK_STORE_PATH = get_default_risk_store_path()
 
 
 @dataclass

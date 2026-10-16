@@ -82,14 +82,23 @@ from collections import defaultdict
 import json
 from pathlib import Path
 
-NEWS_FAIL_PERSIST_PATH = Path("data/news_fail_counts.json")
+def get_news_fail_persist_path() -> Path:
+    """Dynamically resolve news fail counts path against config.DATA_DIR."""
+    try:
+        import config
+        return Path(config.DATA_DIR) / "news_fail_counts.json"
+    except Exception:
+        return Path("data/news_fail_counts.json")
+
+NEWS_FAIL_PERSIST_PATH = get_news_fail_persist_path()
 
 
 def _load_news_fail_counts() -> defaultdict:
     """Loads news fail counts from disk if date matches today."""
-    if NEWS_FAIL_PERSIST_PATH.exists():
+    path = get_news_fail_persist_path()
+    if path.exists():
         try:
-            with open(NEWS_FAIL_PERSIST_PATH, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 saved_date = data.get("date", "")
                 today_str = date.today().strftime("%Y-%m-%d")
@@ -105,12 +114,13 @@ def _load_news_fail_counts() -> defaultdict:
 def _save_news_fail_counts():
     """Saves news fail counts to disk."""
     try:
-        NEWS_FAIL_PERSIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        path = get_news_fail_persist_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "date": date.today().strftime("%Y-%m-%d"),
             "counts": dict(_news_fail_counts)
         }
-        with open(NEWS_FAIL_PERSIST_PATH, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
         logger.debug("[NEWS PERSIST] Save failed: %s", e)
