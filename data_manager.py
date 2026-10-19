@@ -294,7 +294,7 @@ def fetch_ohlcv(
 
     if len(df) < config.MIN_HISTORY_DAYS:
         raise ValueError(
-            f"{symbol} only {len(df)} days after filtering (rows_received={rows_received}, rows_rejected={rows_rejected}) — need {config.MIN_HISTORY_DAYS}"
+            f"{symbol} only {len(df)} days after filtering (rows_received={rows_received}, rows_rejected={total_rows_rejected}) — need {config.MIN_HISTORY_DAYS}"
         )
 
     _cache[cache_key] = (time.time(), df.copy())
