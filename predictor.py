@@ -393,13 +393,14 @@ class Predictor:
 
         # Market Close Buffer Guard: Avoid running swing rebalances in final 15 mins (stale/unstable data)
         try:
-            import zoneinfo
-            now_et = datetime.now(zoneinfo.ZoneInfo("US/Eastern"))
+            from strategies.session import now_eastern
+            now_et = now_eastern()
             if now_et.hour == 15 and now_et.minute >= 45:
                 logger.info("[MARKET CLOSE BUFFER] Within 15 mins of market close (> 15:45 EDT). Skipping swing rebalancing cycle.")
                 return []
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("[MARKET CLOSE BUFFER] Guard evaluation failed (%s). Failing closed: skipping swing rebalance.", exc)
+            return []
 
         failed_count = 0
         macro_info = get_macro_benchmark_indicators()
