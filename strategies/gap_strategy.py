@@ -81,6 +81,86 @@ def _safe_atr(
     return (0.0, "UNAVAILABLE") if return_source else 0.0
 
 
+def _compute_raw_volume_ma(series: pd.Series, period: int = 20) -> float:
+    """Compute the simple moving average from raw volume data across exactly `period` completed bars."""
+    if series is None or len(series) < period:
+        return 0.0
+    vol_tail = series.iloc[-period:]
+    numeric_vol = pd.to_numeric(vol_tail, errors="coerce")
+    if numeric_vol.isna().any() or (numeric_vol < 0).any():
+        return 0.0
+    val = float(numeric_vol.mean())
+    return val if math.isfinite(val) and val > 0 else 0.0
+
+
+# Backward compatibility alias
+_compute_volume_ma = _compute_raw_volume_ma
+
+
+def _validate_session_history_alignment(
+    intraday_df: Optional[pd.DataFrame],
+    full_df: Optional[pd.DataFrame],
+) -> bool:
+    """Validate that intraday_df and full_df are sorted by timestamp, contain no duplicates,
+    and end at the identical latest completed bar.
+    """
+    if intraday_df is None or intraday_df.empty:
+        return False
+    if not isinstance(intraday_df.index, pd.DatetimeIndex):
+        return False
+    if not intraday_df.index.is_monotonic_increasing or intraday_df.index.has_duplicates:
+        return False
+
+    if full_df is not None and not full_df.empty:
+        if not isinstance(full_df.index, pd.DatetimeIndex):
+            return False
+        if not full_df.index.is_monotonic_increasing or full_df.index.has_duplicates:
+            return False
+        if intraday_df.index[-1] != full_df.index[-1]:
+            return False
+
+    return True
+
+
+def _safe_volume_ma(
+    intraday_df: pd.DataFrame,
+    full_df: Optional[pd.DataFrame] = None,
+    period: int = 20,
+    return_source: bool = False,
+):
+    """Resolve volume moving average strictly from raw volume data with provenance tracking.
+
+    Reviewer Implementation Contract:
+    1. Provenance alignment: intraday_df and full_df must be timestamp-sorted, non-duplicated,
+       and end at the identical latest completed bar.
+    2. Current session >= period bars: compute strictly from the last `period` current-session bars
+       -> 'INTRADAY_CURRENT'. Invalid current-session volume data fails closed (no silent fallback).
+    3. Current session < period bars: compute strictly from the last `period` completed bars of full_df
+       -> 'FULL_HISTORY_FALLBACK'.
+    4. Full history < period bars or non-finite volume: fail closed -> 'UNAVAILABLE' / 0.0.
+    """
+    if not _validate_session_history_alignment(intraday_df, full_df):
+        logger.debug("[VOLUME_MA PROVENANCE VETO] Session and history timestamp alignment validation failed.")
+        return (0.0, "UNAVAILABLE") if return_source else 0.0
+
+    # 1. Current session check: Requires >= period bars within today's session
+    if "volume" in intraday_df.columns and len(intraday_df) >= period:
+        cur_vol_ma = _compute_raw_volume_ma(intraday_df["volume"], period=period)
+        if cur_vol_ma > 0:
+            return (cur_vol_ma, "INTRADAY_CURRENT") if return_source else cur_vol_ma
+        # Invalid current-session volume data must fail closed without silent fallback
+        return (0.0, "UNAVAILABLE") if return_source else 0.0
+
+    # 2. Historical fallback: When current session < period bars, use trailing full history
+    if full_df is not None and "volume" in full_df.columns and len(full_df) >= period:
+        fallback_vol_ma = _compute_raw_volume_ma(full_df["volume"], period=period)
+        if fallback_vol_ma > 0:
+            return (fallback_vol_ma, "FULL_HISTORY_FALLBACK") if return_source else fallback_vol_ma
+
+    # 3. Fail-Closed
+    return (0.0, "UNAVAILABLE") if return_source else 0.0
+
+
 def _latest_session(df: pd.DataFrame) -> pd.DataFrame:
     """Return rows for the latest trading date in a multi-day intraday frame."""
     if df.empty or not isinstance(df.index, pd.DatetimeIndex):
@@ -135,13 +215,39 @@ class GapAndGoStrategy(BaseStrategy):
         )
         rsi = float(last.get("rsi", 50))
         volume = float(last.get("volume", 0))
-        vol_ma = float(last.get("volume_ma", 1))
 
         if atr < 0.01 or not math.isfinite(atr):
             logger.warning("[GAP QUALITY FAIL] %s: ATR=%.4f invalid (< $0.01 threshold). Rejecting.", symbol, atr)
             return None
 
-        rel_vol = volume / vol_ma if vol_ma > 0 else 0
+        # ── Fail-Closed Volume Baseline Check with Isolated Fallback ──────────
+        vol_ma, vol_ma_source = _safe_volume_ma(
+            intraday_df=df,
+            full_df=full_df,
+            period=getattr(config, "VOLUME_MA_PERIOD", 20),
+            return_source=True,
+        )
+        logger.info(
+            "[VOLUME_MA RESOLUTION] %s volume_ma=%.2f source=%s session_bars=%d history_bars=%d",
+            symbol,
+            vol_ma,
+            vol_ma_source,
+            len(df),
+            len(full_df) if full_df is not None else 0,
+        )
+
+        if not math.isfinite(vol_ma) or vol_ma <= 0:
+            logger.debug(
+                "[GAP QUALITY VETO] %s: volume_ma baseline is missing or invalid (%s). Rejecting (Fail-Closed).",
+                symbol, vol_ma,
+            )
+            return None
+
+        if not math.isfinite(volume) or volume < 0:
+            logger.debug("[GAP QUALITY VETO] %s: volume is invalid (%s). Rejecting (Fail-Closed).", symbol, volume)
+            return None
+
+        rel_vol = volume / vol_ma
 
         # ── Gap Quality Filter (Wall-Street Institutional Conviction Gates) ──
         # 1. RVOL Gate: Require relative volume >= config.GAP_MIN_RVOL (default 1.5x)
