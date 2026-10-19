@@ -1077,6 +1077,44 @@ def get_symbol_cluster(symbol: str) -> str:
     return f"SECTOR_{sym}"
 
 
+_Q_FIELDS = (
+    "q_risk", "q_notional", "q_liquidity",
+    "q_portfolio", "q_broker",
+)
+
+
+def _log_sizing_diag(symbol, sizing, entry_price, rejection_reason=None):
+    if sizing is None:
+        return
+    caps = {name: getattr(sizing, name, "MISSING") for name in _Q_FIELDS}
+
+    # Early input rejection မှာ q_* အားလုံးက placeholder zeros ပါ။
+    valid_caps = {k: v for k, v in caps.items() if isinstance(v, (int, float))}
+    evaluated = (
+        getattr(sizing, "binding_constraint", None) != "REJECTED"
+        and len(valid_caps) == len(_Q_FIELDS)
+    )
+    min_q = min(valid_caps.values()) if evaluated and valid_caps else None
+    limiting = (
+        [name for name, value in valid_caps.items() if value == min_q]
+        if evaluated and min_q is not None else []
+    )
+
+    logger.info(
+        "[SIZING DIAG] symbol=%s caps=%s final_qty=%s "
+        "min_q=%s matches_min=%s limiting_constraints=%s "
+        "entry_price=%s gross_notional=%s "
+        "sizing_rejected=%s sizing_reason=%s stage_reason=%s",
+        symbol, caps, getattr(sizing, "shares", 0),
+        min_q,
+        getattr(sizing, "shares", 0) == min_q if evaluated else "NOT_EVALUATED",
+        limiting,
+        entry_price, getattr(sizing, "gross_notional", 0.0),
+        getattr(sizing, "rejected", False), getattr(sizing, "rejection_reason", None) or "NONE",
+        rejection_reason or "NONE",
+    )
+
+
 class AlpacaBridge:
     def __init__(self, cfg=None, mode: str = "daytrade", dry_run: bool = False) -> None:
         self.mode = str(mode or "daytrade").lower()
@@ -6768,6 +6806,12 @@ class AlpacaBridge:
             logger.info("[SHADOW GATE] Hard-blocking execution for shadow symbol %s (zero mutation)", symbol)
             return False
 
+        # Layer 3b: Hard-stop execution-deny guard for non-tradable observation benchmark ETFs (zero mutation)
+        non_tradable_benchmarks = {str(s).upper().strip() for s in getattr(config_module, "NON_TRADABLE_BENCHMARKS", ())}
+        if symbol in non_tradable_benchmarks:
+            logger.warning("[BENCHMARK EXECUTION DENIED] Symbol %s is an observation-only benchmark ETF (not in tradable watchlist). Order submission strictly blocked.", symbol)
+            return False
+
         action = signal.action.upper().strip()
         allow_short = bool(self._c("ALLOW_SHORT", False))
         min_cash = float(self._c("MIN_TRADE_CASH", 100.0))
@@ -7061,6 +7105,7 @@ class AlpacaBridge:
                             "[SWING SIZING REJECTED] %s: %s (shares=%d, constraint=%s)",
                             symbol, sizing.rejection_reason or "Below min_shares", sizing.shares, sizing.binding_constraint
                         )
+                        _log_sizing_diag(symbol, sizing, price, rejection_reason=sizing.rejection_reason or "Below min_shares")
                         return False
 
                     qty = sizing.shares
@@ -7122,6 +7167,7 @@ class AlpacaBridge:
                         )
                     except SwingSizingRejected as val_err:
                         logger.warning("[SWING SAFETY VALIDATION REJECTED] %s: %s", symbol, val_err)
+                        _log_sizing_diag(symbol, sizing, price, rejection_reason=str(val_err))
                         return False
                     except Exception as ex:
                         logger.error("[SWING SAFETY VALIDATION ERROR] %s: %s", symbol, ex)
@@ -7131,6 +7177,7 @@ class AlpacaBridge:
                         "[SWING SIZING ACCEPTED] %s: shares=%d (constraint=%s, risk=$%.2f, notional=$%.2f, stop=$%.2f)",
                         symbol, qty, sizing.binding_constraint, sizing.estimated_risk, sizing.gross_notional, stop_price
                     )
+                    _log_sizing_diag(symbol, sizing, price, rejection_reason="SAFETY_VALIDATED")
 
                     result = self._place_open_bracket(
                         symbol, "BUY", qty, price, getattr(signal, "confidence", 1.0),
@@ -7548,10 +7595,11 @@ class AlpacaBridge:
 
             incoming = []
             shadow_symbols = {str(s).upper().strip() for s in getattr(config_module, "SHADOW_MONITOR", [])}
+            non_tradable_benchmarks = {str(s).upper().strip() for s in getattr(config_module, "NON_TRADABLE_BENCHMARKS", ())}
             for s in signals:
                 sym = s.symbol.upper() if hasattr(s, "symbol") else s["symbol"].upper()
-                if getattr(s, "shadow_mode", False) or sym in shadow_symbols:
-                    logger.info("[SHADOW GATE] Excluding %s from rotation candidate eligibility", sym)
+                if getattr(s, "shadow_mode", False) or sym in shadow_symbols or sym in non_tradable_benchmarks:
+                    logger.info("[BENCHMARK/SHADOW GATE] Excluding %s from rotation candidate eligibility", sym)
                     continue
                 action = s.action.upper() if hasattr(s, "action") else s["action"].upper()
                 conf = s.confidence if hasattr(s, "confidence") else s["confidence"]

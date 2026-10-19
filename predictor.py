@@ -415,6 +415,13 @@ class Predictor:
             macro_info.get("allows_new_entries", False),
         )
 
+        # Sector Rotation Observe-Only Telemetry (isolated, zero order mutation)
+        try:
+            from strategies.sector_rotation_monitor import SectorRotationMonitor
+            SectorRotationMonitor().scan_all_benchmarks()
+        except Exception as sec_exc:
+            logger.warning("[SECTOR ROTATION MONITOR] Scan cycle execution failed: %s", sec_exc)
+
         for symbol in symbols:
             try:
                 df = fetch_ohlcv(symbol)

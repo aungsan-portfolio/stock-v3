@@ -1415,6 +1415,15 @@ SECTOR_MAPPINGS: dict = {
     "ORCL": {"sector": "INFORMATION_TECHNOLOGY", "source": "STATIC_CONFIG", "mapping_version": "2026-09-28"},
 }
 
+# ── Observation-Only Sector Benchmarks (Strictly Non-Tradable) ────────────────
+SECTOR_BENCHMARKS: tuple[str, ...] = (
+    "SPY", "XLV", "XLP", "XLE", "XLK", "XLF", "XLU", "SOXX"
+)
+# Pure observation ETFs not present in the active tradable universe (preserves SPY & XLV eligibility)
+NON_TRADABLE_BENCHMARKS: tuple[str, ...] = tuple(
+    s for s in SECTOR_BENCHMARKS if s not in WATCHLIST
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Dataclass-based Settings (dependency-injection friendly)
