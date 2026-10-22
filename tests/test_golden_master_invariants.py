@@ -28,6 +28,7 @@ def _create_mock_bridge():
     bridge.get_open_positions.return_value = []
     bridge.get_working_orders.return_value = []
     bridge.paper = True
+    bridge.get_quote.return_value = None
     return bridge
 
 

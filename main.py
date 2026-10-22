@@ -239,6 +239,15 @@ def _connect_bridge():
     return bridge, 0
 
 
+def _extract_signal_action(sig: Any) -> str:
+    """Safely extract uppercase action string ('BUY', 'SELL', 'HOLD') from object or dict signal."""
+    if sig is None:
+        return ""
+    if isinstance(sig, dict):
+        return str(sig.get("action", "")).upper().strip()
+    return str(getattr(sig, "action", "")).upper().strip()
+
+
 def _run_paper_startup_checks(bridge) -> dict:
     """Shared PAPER startup checks before connected paper commands use orders.
 
@@ -299,27 +308,16 @@ def _place_paper_orders(signals, broker: str = "ibkr", bridge=None, dry_run: boo
                 recon = bridge.reconcile_startup_state(manage_stream_state=False, allow_policy_side_effects=False)
                 _print_startup_reconciliation(recon)
 
-            raw_buy_count = sum(
-                1 for s in signals
-                if (hasattr(s, "action") and str(s.action).upper() == "BUY")
-                or (isinstance(s, dict) and str(s.get("action", "")).upper() == "BUY")
-            )
-            raw_sell_count = sum(
-                1 for s in signals
-                if (hasattr(s, "action") and str(s.action).upper() == "SELL")
-                or (isinstance(s, dict) and str(s.get("action", "")).upper() == "SELL")
-            )
+            raw_buy_count = sum(1 for s in signals if _extract_signal_action(s) == "BUY")
+            raw_sell_count = sum(1 for s in signals if _extract_signal_action(s) == "SELL")
+            raw_hold_count = sum(1 for s in signals if _extract_signal_action(s) == "HOLD")
             blocked_by_gate = 0
             is_entry_halted = bool(getattr(bridge.entry_gate, "halted", False))
             halt_msg = getattr(bridge.entry_gate, "halt_reason", "Risk gate active") if is_entry_halted else "None"
             if is_entry_halted:
                 blocked_by_gate = raw_buy_count
                 print(f"⚠️ Entry gate halted ({halt_msg}). Skipping new BUY entries and rotations; processing protective stops and SELL exits.")
-                signals = [
-                    s for s in signals
-                    if (hasattr(s, "action") and s.action.upper() == "SELL")
-                    or (isinstance(s, dict) and s.get("action", "").upper() == "SELL")
-                ]
+                signals = [s for s in signals if _extract_signal_action(s) == "SELL"]
 
             result = bridge.execute_all(signals)
             eligible_count = len(signals)
@@ -329,6 +327,7 @@ def _place_paper_orders(signals, broker: str = "ibkr", bridge=None, dry_run: boo
             print("\n📊 --- CYCLE SIGNAL & EXECUTION TELEMETRY ---")
             print(f"   Raw AI BUY signals         : {raw_buy_count}")
             print(f"   Raw AI SELL signals        : {raw_sell_count}")
+            print(f"   Raw AI HOLD signals        : {raw_hold_count}")
             print(f"   Blocked by Risk Gates      : {blocked_by_gate} ({halt_msg})")
             print(f"   Execution-eligible signals : {eligible_count}")
             print(f"   Orders accepted / submitted: {placed_count}")
@@ -405,8 +404,12 @@ def _print_paper_signals_table(signals):
     print(f"\n{'Symbol':<8} {'Action':<6} {'Conf':>6} {'Price':>10}")
     print("─" * 40)
     for s in signals:
-        icon = "🟢" if s.action == "BUY" else "🔴" if s.action == "SELL" else "⚪"
-        print(f"{icon} {s.symbol:<6}  {s.action:<6}  {s.confidence:>5.2f}  ${s.price:>9.2f}")
+        act = _extract_signal_action(s)
+        sym = s.get("symbol", "") if isinstance(s, dict) else getattr(s, "symbol", "")
+        conf = s.get("confidence", 0.0) if isinstance(s, dict) else getattr(s, "confidence", 0.0)
+        price = s.get("price", 0.0) if isinstance(s, dict) else getattr(s, "price", 0.0)
+        icon = "🟢" if act == "BUY" else "🔴" if act == "SELL" else "⚪"
+        print(f"{icon} {sym:<6}  {act:<6}  {conf:>5.2f}  ${price:>9.2f}")
 
 
 def cmd_paper(args) -> int:

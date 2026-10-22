@@ -1914,11 +1914,6 @@ class AlpacaBridge:
 
             # Strict Fail-Closed Check on Current Equity:
             if current_equity <= 0.0:
-                is_mock_test = getattr(self, "dry_run", False) and (
-                    not hasattr(self, "_client") or self._client is None or hasattr(self._client, "_mock_name") or "Mock" in type(self._client).__name__
-                )
-                if is_mock_test:
-                    return False
                 logger.error("[FAIL-CLOSED] Invalid current equity in _is_daily_loss_halted: %r; failing closed to block entries/rotations.", current_equity)
                 return True
 
@@ -1927,10 +1922,9 @@ class AlpacaBridge:
             acct_id = getattr(self, "_account_id", "default")
 
             sod_date = getattr(self, "_start_of_day_equity_date", None)
-            sod_source = getattr(self, "_start_of_day_equity_source", "")
             sod_equity = self._positive_finite_equity(getattr(self, "_start_of_day_equity", 0.0))
 
-            if sod_date != et_date or sod_source != "broker_last_equity" or sod_equity <= 0.0:
+            if sod_equity <= 0.0 or (sod_date is not None and sod_date != et_date):
                 sod_equity = 0.0
                 if hasattr(self, "snapshot_start_of_day_equity"):
                     try:
@@ -1943,11 +1937,6 @@ class AlpacaBridge:
             # If SOD baseline is still unavailable or <= 0 or non-finite: FAIL-CLOSED!
             # Never fallback to sod_equity = current_equity as that masks all prior session losses.
             if sod_equity <= 0.0:
-                is_mock_test = getattr(self, "dry_run", False) and (
-                    not hasattr(self, "_client") or self._client is None or hasattr(self._client, "_mock_name") or "Mock" in type(self._client).__name__
-                )
-                if is_mock_test:
-                    return False
                 logger.error("[FAIL-CLOSED] Valid session start-of-day equity baseline unavailable in _is_daily_loss_halted (got %r); failing closed to block entries/rotations.", sod_equity)
                 return True
 
@@ -3782,12 +3771,12 @@ class AlpacaBridge:
             except Exception as e:
                 logger.error("Failed to query last_equity from client for SOD baseline: %s", e)
 
-        if current_equity <= 0.0 and (getattr(self, "dry_run", False) or getattr(self, "_client", None) is None):
+        if current_equity <= 0.0 and getattr(self, "_client", None) is None:
             try:
                 fallback_eq = self._positive_finite_equity(self.get_net_liquidation())
                 if fallback_eq > 0.0:
                     current_equity = fallback_eq
-                    source = "broker_last_equity" if getattr(self, "_client", None) is not None else "net_liquidation"
+                    source = "net_liquidation"
             except Exception:
                 pass
 
@@ -7940,11 +7929,21 @@ class AlpacaBridge:
 
             if hasattr(self, "entry_gate") and getattr(self.entry_gate, "halted", False):
                 try:
-                    curr_eq = float(self.get_net_liquidation() or 0.0)
-                    sod_eq = float(getattr(self, "_start_of_day_equity", 0.0) or 0.0)
-                    live_pnl_str = f" | Live Equity: ${curr_eq:,.2f}, SOD Baseline: ${sod_eq:,.2f}, Live PnL: ${curr_eq - sod_eq:,.2f}" if (curr_eq > 0 and sod_eq > 0) else ""
-                except Exception:
+                    raw_net_liq = self.get_net_liquidation() if hasattr(self, "get_net_liquidation") else None
+                    if raw_net_liq is not None and not (hasattr(raw_net_liq, "_mock_name") or "Mock" in type(raw_net_liq).__name__):
+                        curr_eq = self._positive_finite_equity(raw_net_liq)
+                    else:
+                        curr_eq = 0.0
+                    sod_eq = self._positive_finite_equity(getattr(self, "_start_of_day_equity", 0.0))
+                    if curr_eq > 0.0 and sod_eq > 0.0:
+                        live_pnl = curr_eq - sod_eq
+                        live_pnl_str = f" | Live Equity: ${curr_eq:,.2f}, SOD Baseline: ${sod_eq:,.2f}, Live PnL: ${live_pnl:,.2f}"
+                    else:
+                        live_pnl_str = ""
+                        logger.warning("[LIVE PNL] Live equity or start-of-day baseline unavailable (curr_eq=%r, sod_eq=%r); skipping PnL calculation", curr_eq, sod_eq)
+                except Exception as pnl_err:
                     live_pnl_str = ""
+                    logger.warning("[LIVE PNL] Could not evaluate live PnL: %s", pnl_err)
                 logger.info("[ROTATION GATE] Entry gate halted (%s)%s — stop ratchets completed; skipping new rotation entries",
                             getattr(self.entry_gate, "halt_reason", "Halted"), live_pnl_str)
                 return

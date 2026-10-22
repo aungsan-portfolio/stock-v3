@@ -146,22 +146,24 @@ def get_macro_benchmark_indicators() -> Dict[str, Any]:
     try:
         spy_df = fetch_ohlcv("SPY")
         if spy_df is not None and len(spy_df) >= 50:
-            # Validate SPY completed bar freshness against current trading session
+            # Validate SPY completed bar freshness against current NYSE trading calendar
+            from strategies.session import get_previous_market_day
             curr_session_date = now_eastern().date()
+            expected_spy_date = get_previous_market_day(curr_session_date)
+
             latest_spy_bar_date = pd.to_datetime(spy_df.index[-1]).date()
             if latest_spy_bar_date >= curr_session_date and len(spy_df) > 1:
                 completed_spy_date = pd.to_datetime(spy_df.index[-2]).date()
             else:
                 completed_spy_date = latest_spy_bar_date
-            
-            max_allowed_gap = 4 if curr_session_date.weekday() in (0, 1) else 2
-            if (curr_session_date - completed_spy_date).days >= max_allowed_gap:
+
+            if completed_spy_date < expected_spy_date:
                 logger.warning(
-                    "[MACRO BENCHMARK VETO] SPY completed bar (%s) is stale vs current session (%s); failing closed",
-                    completed_spy_date, curr_session_date
+                    "[MACRO BENCHMARK VETO] SPY completed bar (%s) is stale vs expected NYSE session (%s); failing closed",
+                    completed_spy_date, expected_spy_date
                 )
                 res["regime"] = MarketRegime.DATA_INVALID.value
-                res["regime_reason"] = f"SPY benchmark bar stale ({completed_spy_date} vs {curr_session_date})"
+                res["regime_reason"] = f"SPY benchmark bar stale ({completed_spy_date} < {expected_spy_date})"
                 res["allows_new_entries"] = False
                 return res
 
