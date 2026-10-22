@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Confidence Threshold Configuration ───────────────────────────────────────
 MIN_SWING_CONFIDENCE = 0.45   # Below this → force HOLD regardless of signal
-MIN_SELL_CONFIDENCE  = 0.45   # Separate floor for SELL signals (can tune independently)
+MIN_SELL_CONFIDENCE  = 0.45   # Bearish conviction floor (1.0 - score) for SELL signals
 MIN_BUY_CONFIDENCE   = 0.55   # Stricter floor for BUY/LONG entries
 
 
@@ -38,29 +38,44 @@ def apply_confidence_filter(action: str, confidence: float, symbol: str) -> tupl
     """
     Noise-filter layer applied AFTER ensemble aggregation.
 
-    Rules:
-        BUY  signal  with conf < MIN_BUY_CONFIDENCE   → demoted to HOLD
-        SELL signal  with conf < MIN_SELL_CONFIDENCE   → demoted to HOLD
-        Any  signal  with conf < MIN_SWING_CONFIDENCE  → demoted to HOLD
+    Direction-aware rules:
+        BUY  signal: requires score >= MIN_BUY_CONFIDENCE (bullish conviction floor)
+        SELL signal: requires bearish_conviction (1.0 - score) >= MIN_SELL_CONFIDENCE
+        Generic/unclassified: requires score >= MIN_SWING_CONFIDENCE
+        Invalid/non-finite score: demoted to HOLD
     """
-    original = action
+    original = str(action).upper()
+    try:
+        score = float(confidence)
+    except (TypeError, ValueError):
+        return "HOLD", confidence
 
-    # Global floor (catches everything below baseline)
-    if confidence < MIN_SWING_CONFIDENCE:
-        action = "HOLD"
-    elif action == "BUY" and confidence < MIN_BUY_CONFIDENCE:
-        action = "HOLD"
-    elif action == "SELL" and confidence < MIN_SELL_CONFIDENCE:
-        action = "HOLD"
+    if not math.isfinite(score) or not (0.0 <= score <= 1.0):
+        return "HOLD", confidence
 
-    if action != original:
+    final_action = original
+    demote_threshold = 0.0
+
+    if original == "BUY":
+        if score < MIN_BUY_CONFIDENCE:
+            final_action = "HOLD"
+            demote_threshold = MIN_BUY_CONFIDENCE
+    elif original == "SELL":
+        bearish_conviction = 1.0 - score
+        if bearish_conviction < MIN_SELL_CONFIDENCE:
+            final_action = "HOLD"
+            demote_threshold = MIN_SELL_CONFIDENCE
+    elif score < MIN_SWING_CONFIDENCE:
+        final_action = "HOLD"
+        demote_threshold = MIN_SWING_CONFIDENCE
+
+    if final_action != original:
         logger.info(
             "[CONF FILTER] %s %s→HOLD conf=%.2f (threshold=%.2f)",
-            symbol, original, confidence,
-            MIN_BUY_CONFIDENCE if original == "BUY" else MIN_SELL_CONFIDENCE
+            symbol, original, score, demote_threshold
         )
 
-    return action, confidence
+    return final_action, confidence
 
 
 @dataclass

@@ -41,9 +41,17 @@ class TestEngineSuite(unittest.TestCase):
         self.assertEqual(attempts, 3)
 
     def test_enhancement_2_confidence_filter(self):
-        """Enhancement 2: Noise-filter demotes low-confidence signals to HOLD."""
-        # SPY SELL 0.36 -> HOLD (below 0.45 floor)
+        """Enhancement 2: Noise-filter demotes low-confidence signals to HOLD with direction awareness."""
+        # SPY SELL 0.36 -> SELL (bearish conviction 1 - 0.36 = 0.64 >= 0.45 floor passes)
         sig, conf = apply_confidence_filter("SELL", 0.36, "SPY")
+        self.assertEqual(sig, "SELL")
+
+        # SPY SELL 0.40 -> SELL (bearish conviction 1 - 0.40 = 0.60 >= 0.45 floor passes)
+        sig, conf = apply_confidence_filter("SELL", 0.40, "SPY")
+        self.assertEqual(sig, "SELL")
+
+        # Weak/invalid SELL 0.60 -> HOLD (bearish conviction 1 - 0.60 = 0.40 < 0.45 floor demoted)
+        sig, conf = apply_confidence_filter("SELL", 0.60, "SPY")
         self.assertEqual(sig, "HOLD")
 
         # MSFT BUY 0.52 -> HOLD (below 0.55 BUY floor)
@@ -53,6 +61,14 @@ class TestEngineSuite(unittest.TestCase):
         # TSLA BUY 0.65 -> BUY (passes 0.55 BUY floor)
         sig, conf = apply_confidence_filter("BUY", 0.65, "TSLA")
         self.assertEqual(sig, "BUY")
+
+        # Generic HOLD 0.50 -> HOLD
+        sig, conf = apply_confidence_filter("HOLD", 0.50, "SPY")
+        self.assertEqual(sig, "HOLD")
+
+        # Non-finite score -> HOLD
+        sig, conf = apply_confidence_filter("BUY", float("nan"), "AAPL")
+        self.assertEqual(sig, "HOLD")
 
     def test_enhancement_3_position_rotator(self):
         """Enhancement 3: Rotator protects winners (>=8%) and rotates out weak positions for strong incoming signals."""
