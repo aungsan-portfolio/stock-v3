@@ -32,6 +32,8 @@ class TestAccountModeSafety(unittest.TestCase):
         self.env_backup = dict(os.environ)
         os.environ["APCA_API_KEY_ID"] = "test_paper_key"
         os.environ["APCA_API_SECRET_KEY"] = "test_paper_secret"
+        os.environ["DAYTRADE_APCA_API_KEY_ID"] = "test_paper_key"
+        os.environ["DAYTRADE_APCA_API_SECRET_KEY"] = "test_paper_secret"
         os.environ["APCA_API_BASE_URL"] = "https://paper-api.alpaca.markets"
         os.environ["EXPECTED_PAPER_ACCOUNT_ID"] = "PA3UODIC5JTA"
 
@@ -290,21 +292,25 @@ class TestAccountModeSafety(unittest.TestCase):
 
     def test_diagnostic_snapshot_and_anomaly_logging(self):
         """Diagnostic snapshot and reconciliation anomaly logging write valid durable records."""
+        import tempfile
         from alpaca_bridge import record_account_mode_violation_snapshot, log_reconciliation_anomaly
 
-        # Test snapshot
-        snapshot_path = record_account_mode_violation_snapshot(
-            expected_account_id="PA3UODIC5JTA",
-            observed_account_id="LIVE_ACCOUNT_123",
-            endpoint_url="https://api.alpaca.markets",
-            failure_reason="Live base URL detected",
-        )
-        self.assertTrue(os.path.exists(snapshot_path))
-        with open(snapshot_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        self.assertEqual(data["exit_code"], 6)
-        self.assertEqual(data["failure_type"], "ACCOUNT_MODE_VIOLATION")
-        self.assertFalse(data["order_submission_attempted"])
+        # Test snapshot in isolated temp directory to prevent production log pollution
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            snapshot_path = record_account_mode_violation_snapshot(
+                expected_account_id="PA3UODIC5JTA",
+                observed_account_id="LIVE_ACCOUNT_123",
+                endpoint_url="https://api.alpaca.markets",
+                failure_reason="Live base URL detected",
+                output_dir=tmp_dir,
+            )
+            self.assertTrue(os.path.exists(snapshot_path))
+            self.assertTrue(snapshot_path.startswith(tmp_dir))
+            with open(snapshot_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(data["exit_code"], 6)
+            self.assertEqual(data["failure_type"], "ACCOUNT_MODE_VIOLATION")
+            self.assertFalse(data["order_submission_attempted"])
 
         # Test anomaly logging
         anomaly_file = os.path.join("reports", "reconciliation_anomalies.jsonl")

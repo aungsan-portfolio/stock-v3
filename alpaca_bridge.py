@@ -158,11 +158,13 @@ def record_account_mode_violation_snapshot(
     observed_account_id: str,
     endpoint_url: str,
     failure_reason: str,
+    output_dir: Optional[str] = None,
 ) -> str:
     """Record fail-closed diagnostic snapshot for Exit Code 6 (ACCOUNT_MODE_VIOLATION)."""
-    os.makedirs("logs", exist_ok=True)
+    target_dir = output_dir if output_dir is not None else "logs"
+    os.makedirs(target_dir, exist_ok=True)
     ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
-    snapshot_path = os.path.join("logs", f"account_mode_violation_{ts_str}.json")
+    snapshot_path = os.path.join(target_dir, f"account_mode_violation_{ts_str}.json")
     parsed_host = "unknown"
     if endpoint_url:
         try:
@@ -688,25 +690,43 @@ class MockIB:
                 mkt_val = float(p.market_value)
                 upnl = float(p.unrealized_pl)
                 res.append(MockPosition(p.symbol, qty, avg_cost, mkt_val, upnl))
+
+            # Update fast lookup cached positions
+            try:
+                lock = getattr(self.bridge, "_positions_cache_lock", None)
+                if lock is not None and not getattr(self.bridge, "_cache_requires_reconciliation", False):
+                    with lock:
+                        self.bridge._cached_position_symbols = {p.symbol.upper().strip() for p in res if abs(p.position) > 0}
+                        self.bridge._cached_positions_ts = time.time()
+            except Exception:
+                pass
+
+            # If connection health was marked unhealthy (e.g. from prior timeout) or entry gate
+            # is halted with BROKER_RECONCILIATION_PENDING, delegate to the single recovery owner!
+            conn_health = getattr(self.bridge, "_conn_health", None)
+            is_unhealthy = conn_health is not None and not getattr(conn_health, "is_healthy", True)
+            entry_gate = getattr(self.bridge, "entry_gate", None)
+            has_recon_halt = entry_gate is not None and "BROKER_RECONCILIATION_PENDING" in getattr(entry_gate, "reasons", set())
+            if is_unhealthy or has_recon_halt:
+                logger.info("[MockIB.positions] Broker positions query restored; initiating full broker reconciliation via single recovery owner")
+                self.bridge._run_post_reconnect_reconciliation()
+
             return res
         except Exception as exc:
             logger.error("MockIB.positions() failed: %s", exc)
+            self.bridge.invalidate_broker_caches(reason=f"MockIB.positions_error:{exc}")
+            self.bridge._cache_requires_reconciliation = True
             self.bridge._conn_health.mark_unhealthy(f"MockIB.positions error: {exc}")
+            if hasattr(self.bridge, "entry_gate") and self.bridge.entry_gate:
+                self.bridge.entry_gate.halt("BROKER_RECONCILIATION_PENDING")
             raise RuntimeError(f"Alpaca API outage while fetching positions: {exc}")
 
     def openTrades(self) -> List[MockOrder]:
         try:
+            # Canonical order flattening: _get_active_orders() already expands bracket legs into
+            # individual orders while deduplicating by ID. Do not re-append o.legs here.
             raw_orders = self.bridge._get_active_orders()
-            al_orders = []
-            for o in raw_orders:
-                al_orders.append(o)
-                legs = getattr(o, "legs", []) or []
-                for leg in legs:
-                    if getattr(leg, "symbol", None) is None:
-                        leg.symbol = getattr(o, "symbol", "")
-                    if getattr(leg, "qty", None) is None or str(getattr(leg, "qty", "")).strip() in ("0", "0.0", ""):
-                        leg.qty = getattr(o, "qty", None) or getattr(o, "filled_qty", 0.0)
-                    al_orders.append(leg)
+            al_orders = raw_orders
 
             res = []
             active_statuses = {"new", "partially_filled", "submitted", "queued", "held", "accepted", "pending_new", "accepted_for_bidding", "stopped", "suspended", "calculated"}
@@ -799,6 +819,13 @@ class EntryGateMock:
         self.halt_reason = str(reason or "")
         if reason:
             self.reasons.add(str(reason))
+        acct = getattr(self.bridge, "account_id", "UNKNOWN") if self.bridge else "NO_BRIDGE"
+        logger.warning(
+            "[ENTRY GATE HALT] [%s] Added reason: '%s' | Current active reasons: %s | halted=True",
+            acct,
+            reason,
+            sorted(self.reasons),
+        )
 
     def clear(self, reason: str = ""):
         if reason:
@@ -806,21 +833,45 @@ class EntryGateMock:
         if not self.reasons:
             self.halted = False
             self.halt_reason = ""
+        acct = getattr(self.bridge, "account_id", "UNKNOWN") if self.bridge else "NO_BRIDGE"
+        logger.info(
+            "[ENTRY GATE CLEAR] [%s] Removed reason: '%s' | Remaining active reasons: %s | halted=%s",
+            acct,
+            reason,
+            sorted(self.reasons),
+            self.halted,
+        )
 
     def clear_recovery_halts(self):
-        self.reasons.discard("TRADE_STREAM_DISCONNECTED")
-        self.reasons.discard("BROKER_RECONCILIATION_PENDING")
-        self.reasons.discard("STREAM_RECOVERY_REQUIRED")
-        self.reasons.discard("STREAM_DEGRADED_OR_DESYNC")
-        self.reasons.discard("OFF_MARKET_STANDBY")
+        recovery_reasons = {
+            "TRADE_STREAM_DISCONNECTED",
+            "BROKER_RECONCILIATION_PENDING",
+            "STREAM_RECOVERY_REQUIRED",
+            "STREAM_DEGRADED_OR_DESYNC",
+            "OFF_MARKET_STANDBY",
+            "STARTUP_HEALTH_GATE_HELD",
+            "DATA_FEED_DEGRADED",
+        }
+        cleared = sorted(self.reasons.intersection(recovery_reasons))
+        self.reasons.difference_update(recovery_reasons)
         if not self.reasons:
             self.halted = False
             self.halt_reason = ""
+        acct = getattr(self.bridge, "account_id", "UNKNOWN") if self.bridge else "NO_BRIDGE"
+        logger.info(
+            "[ENTRY GATE RECOVERY CLEAR] [%s] Cleared recovery reasons: %s | Remaining active reasons: %s | halted=%s",
+            acct,
+            cleared,
+            sorted(self.reasons),
+            self.halted,
+        )
 
     def resume(self):
         self.reasons.clear()
         self.halted = False
         self.halt_reason = ""
+        acct = getattr(self.bridge, "account_id", "UNKNOWN") if self.bridge else "NO_BRIDGE"
+        logger.info("[ENTRY GATE RESUME] [%s] Resumed all entry gates | reasons=[] | halted=False", acct)
 
     def risk_sized_qty(self, symbol, signal, price, qty):
         if self.halted:
@@ -1118,6 +1169,11 @@ def _log_sizing_diag(symbol, sizing, entry_price, rejection_reason=None):
 class AlpacaBridge:
     def __init__(self, cfg=None, mode: str = "daytrade", dry_run: bool = False) -> None:
         self.mode = str(mode or "daytrade").lower()
+        try:
+            from logging_setup import set_log_context
+            set_log_context(process_tag=self.mode.upper())
+        except Exception:
+            pass
         self.dry_run = bool(dry_run)
         self.mutation_counters = MutationCounters()
         self._cfg = cfg or config_module.get_settings()
@@ -1134,6 +1190,8 @@ class AlpacaBridge:
         #
         # Never acquire _reconcile_lock while already holding the journal lock.
         self._reconcile_lock = threading.Lock()
+        self._reconcile_scheduling_lock = threading.Lock()
+        self._reconcile_in_progress = False
         self._stream_generation = 0
         # Daemon thread owns SDK websocket event loop
         self._trade_stream: Optional[TradingStream] = None
@@ -1157,9 +1215,15 @@ class AlpacaBridge:
         self._order_role_lock = threading.Lock()
         self._load_order_role_registry()
         self._account_id: str = "default"
-        self._risk_state_dir: Optional[str] = None
         self.principal_release_granted: bool = False
         self.validation_release_token: Optional[ValidationReleaseToken] = None
+        self._positions_cache_lock = threading.Lock()
+        self._cached_position_symbols: Optional[Set[str]] = None
+        self._cached_positions_ts: float = 0.0
+        self._active_orders_lock = threading.Lock()
+        self._cached_active_orders: Optional[List[Any]] = None
+        self._cached_active_orders_ts: float = 0.0
+        self._cache_requires_reconciliation: bool = False
 
     @property
     def account_id(self) -> str:
@@ -1168,6 +1232,13 @@ class AlpacaBridge:
     @account_id.setter
     def account_id(self, value: str):
         self._account_id = str(value)
+        try:
+            from logging_setup import set_log_context
+            clean_tag = str(value).strip().upper()
+            if clean_tag and clean_tag not in ("DEFAULT", "UNKNOWN", "NONE"):
+                set_log_context(account_tag=clean_tag)
+        except Exception:
+            pass
 
     @property
     def is_paper(self) -> bool:
@@ -1804,6 +1875,8 @@ class AlpacaBridge:
                 gate.clear("STREAM_RECOVERY_REQUIRED")
                 gate.clear("STREAM_DEGRADED_OR_DESYNC")
                 gate.clear("OFF_MARKET_STANDBY")
+                gate.clear("STARTUP_HEALTH_GATE_HELD")
+                gate.clear("DATA_FEED_DEGRADED")
             else:
                 gate.halted = False
 
@@ -2117,9 +2190,12 @@ class AlpacaBridge:
                     authenticated_api_account_id=self._account_id,
                     permitted_account_id="PA3R71I7JFDZ",
                 )
-            logger.info("Connected to Alpaca Paper Account (%s) | Status: %s | Equity: %s", self._account_id, acct.status, acct.equity)
+            bp_val = float(getattr(acct, "buying_power", 0.0) or 0.0)
+            logger.info("Connected to Alpaca Paper Account (%s) | Status: %s | TradingBlocked: %s | BuyingPower: $%.2f (broker ceiling) | Equity: %s", self._account_id, acct.status, getattr(acct, "trading_blocked", False), bp_val, acct.equity)
             from observability import get_build_provenance
-            logger.info(get_build_provenance().marker_string())
+            prov = get_build_provenance()
+            logger.info(prov.marker_string())
+            logger.info(prov.source_hash_report())
             from strategies.session import now_eastern
             et_date = str(now_eastern().date())
             try:
@@ -2413,11 +2489,23 @@ class AlpacaBridge:
             order = getattr(update, "order", None)
             parent_order_id = str(getattr(order, "id", "") if order else getattr(update, "order_id", "") or "").strip()
             if not parent_order_id:
+                self.invalidate_broker_caches(reason="unparseable_update:missing_parent_order_id")
+                self._cache_requires_reconciliation = True
+                if hasattr(self, "entry_gate") and self.entry_gate:
+                    self.entry_gate.halt("TRADE_STREAM_DISPATCH_ERROR")
+                logger.warning(
+                    "[TRADE STREAM] Trade update could not be parsed (missing order id); "
+                    "caches invalidated, entry gate halted (fail-closed), forcing fresh broker reconciliation"
+                )
+                self._schedule_forced_reconciliation(reason="missing_parent_order_id")
                 return
 
-            event_name = self._string_value(getattr(update, "event", ""))
-            order_status = self._string_value(getattr(order, "status", "") if order else getattr(update, "order_status", ""))
+            event_name = self._string_value(getattr(update, "event", "")).lower().strip()
+            order_status = self._string_value(getattr(order, "status", "") if order else getattr(update, "order_status", "")).lower().strip()
             status_from_event = {
+                "new": "new",
+                "accepted": "accepted",
+                "held": "held",
                 "fill": "filled",
                 "partial_fill": "partially_filled",
                 "canceled": "canceled",
@@ -2426,8 +2514,45 @@ class AlpacaBridge:
                 "expired": "expired",
                 "done_for_day": "done_for_day",
                 "replaced": "replaced",
+                "pending_new": "pending_new",
+                "pending_cancel": "pending_cancel",
+                "pending_replace": "pending_replace",
+                "stopped": "stopped",
+                "suspended": "suspended",
+                "calculated": "calculated",
             }
             status = order_status or status_from_event.get(event_name, event_name)
+
+            # Invalidate caches on every broker trade update and relevant order lifecycle event
+            self.invalidate_broker_caches(reason=f"trade_update:{event_name}:{status}")
+
+            # Alpaca WebSocket trade update events (TradeEvent stream schema)
+            known_trade_events = {
+                "new", "fill", "partial_fill", "canceled", "cancelled", "expired",
+                "done_for_day", "replaced", "rejected", "pending_new", "stopped",
+                "pending_cancel", "pending_replace", "calculated", "suspended",
+                "order_cancel_rejected", "order_replace_rejected", "held", "accepted", "restated"
+            }
+            # Alpaca REST/WebSocket Order statuses (OrderStatus model schema)
+            known_order_statuses = {
+                "new", "partially_filled", "filled", "done_for_day", "canceled", "cancelled",
+                "expired", "replaced", "pending_cancel", "pending_replace", "pending_review",
+                "accepted", "pending_new", "accepted_for_bidding", "stopped", "rejected",
+                "suspended", "calculated", "held"
+            }
+            event_invalid = bool(event_name and event_name not in known_trade_events)
+            status_invalid = bool(order_status and order_status not in known_order_statuses)
+            if event_invalid or status_invalid or (not event_name and not order_status):
+                self._cache_requires_reconciliation = True
+                if hasattr(self, "entry_gate") and self.entry_gate:
+                    self.entry_gate.halt("TRADE_STREAM_DISPATCH_ERROR")
+                logger.warning(
+                    "[TRADE STREAM] Uncertain trade update event '%s' (order_status='%s', status='%s') for order %s; "
+                    "caches invalidated, entry gate halted (fail-closed), forcing fresh broker reconciliation",
+                    event_name, order_status, status, parent_order_id
+                )
+                self._schedule_forced_reconciliation(reason=f"uncertain_event:{event_name}")
+                return
             cumulative_filled_qty = self._float_value(getattr(order, "filled_qty", None) if order else getattr(update, "position_qty", None))
             average_fill_price = self._float_value(getattr(order, "filled_avg_price", None) if order else getattr(update, "price", None))
             execution_id = str(getattr(update, "execution_id", "") or "").strip() or None
@@ -2475,7 +2600,7 @@ class AlpacaBridge:
                     ev_ts = getattr(update, "timestamp", None)
                     ev_ts_str = ev_ts.isoformat() if hasattr(ev_ts, "isoformat") else None
 
-                if status in ("new", "accepted") or event_name in ("new", "accepted"):
+                if status in ("new", "accepted", "held") or event_name in ("new", "accepted", "held"):
                     order_audit.lifecycle_tracker.record_stream_ack(
                         broker_order_id=parent_order_id,
                         broker_event_time_utc=ev_ts_str,
@@ -2528,9 +2653,16 @@ class AlpacaBridge:
                         parent_order_id,
                     )
         except Exception as exc:
+            try:
+                self.invalidate_broker_caches(reason=f"dispatch_exception:{exc}")
+            except Exception:
+                pass
+            self._cache_requires_reconciliation = True
             self._conn_health.mark_unhealthy(f"Trade-update dispatch error: {exc}")
-            self.entry_gate.halt("TRADE_STREAM_DISPATCH_ERROR")
-            logger.exception("[TRADE STREAM] Lifecycle dispatch failed; new entries halted")
+            if hasattr(self, "entry_gate") and self.entry_gate:
+                self.entry_gate.halt("TRADE_STREAM_DISPATCH_ERROR")
+            logger.exception("[TRADE STREAM] Lifecycle dispatch failed; caches invalidated, entry gate halted, forcing fresh reconciliation")
+            self._schedule_forced_reconciliation(reason=f"dispatch_exception:{exc}")
 
     def on_entry_order_update(self, parent_order_id: str, cumulative_filled_qty: float, average_fill_price: float, execution_id: Optional[str] = None, status: str = ""):
         """Route entry parent order fill updates into entry_lifecycle."""
@@ -2560,6 +2692,8 @@ class AlpacaBridge:
             logger.error("on_entry_order_update terminal processing failed for order %s: %s", parent_order_id, term_err)
 
     def _mark_trade_stream_unavailable(self, reason: str) -> None:
+        self.invalidate_broker_caches(reason=f"stream_unavailable:{reason}")
+        self._cache_requires_reconciliation = True
         with self._trade_stream_lock:
             self._trade_stream_ready = False
             self._trade_stream_recovery_required = True
@@ -2637,9 +2771,20 @@ class AlpacaBridge:
                     logger.info("[TRADE STREAM] Reconnected and authenticated on attempt %d; executing broker reconciliation handshake", attempt)
                     recon_ok = self._run_post_reconnect_reconciliation()
                     if recon_ok:
-                        logger.info("[TRADE STREAM] Post-reconnect reconciliation clean; stream fully restored to HEALTHY on attempt %d", attempt)
+                        if not getattr(self.entry_gate, "halted", False):
+                            logger.info("[TRADE STREAM] Post-reconnect reconciliation clean and entry gate released; stream fully restored to HEALTHY on attempt %d", attempt)
+                        else:
+                            logger.warning(
+                                "[TRADE STREAM] Post-reconnect reconciliation clean, but gate remains halted due to non-recovery reasons: %s",
+                                sorted(getattr(self.entry_gate, "reasons", [])),
+                            )
                     else:
-                        logger.warning("[TRADE STREAM] Post-reconnect reconciliation dirty; stream latched / entry gate remains halted on attempt %d", attempt)
+                        logger.warning(
+                            "[TRADE STREAM] Post-reconnect reconciliation dirty or timed out; stream state=%s, gate halted=%s, reasons=%s",
+                            self.stream_state.value if hasattr(self.stream_state, "value") else str(self.stream_state),
+                            getattr(self.entry_gate, "halted", False),
+                            sorted(getattr(self.entry_gate, "reasons", [])),
+                        )
                     return
                 except AccountModeViolation as amv:
                     logger.critical("🚨 [ACCOUNT_MODE_VIOLATION] Trade stream reconnect aborted: %s", amv)
@@ -2905,18 +3050,84 @@ class AlpacaBridge:
             return False
 
     def _run_post_reconnect_reconciliation(self) -> bool:
-        if not self._reconcile_lock.acquire(blocking=False):
-            logger.info("[RECONCILIATION] already_in_progress=True")
-            return False
+        sched_lock = getattr(self, "_reconcile_scheduling_lock", None)
+        if sched_lock is not None:
+            with sched_lock:
+                if not self._reconcile_lock.acquire(blocking=False):
+                    logger.info("[RECONCILIATION] already_in_progress=True")
+                    return False
+                self._reconcile_in_progress = True
+        else:
+            if not self._reconcile_lock.acquire(blocking=False):
+                logger.info("[RECONCILIATION] already_in_progress=True")
+                return False
 
         try:
+            self.invalidate_broker_caches(reason="post_reconnect_reconciliation_start")
+            self._cache_requires_reconciliation = True
             self._transition_stream_state(
-                expected={StreamState.AUTHENTICATED_UNRECONCILED, StreamState.RECONNECTING, StreamState.DEGRADED, StreamState.LATCHED_DESYNC},
+                expected={
+                    StreamState.HEALTHY,
+                    StreamState.AUTHENTICATED_UNRECONCILED,
+                    StreamState.RECONNECTING,
+                    StreamState.DEGRADED,
+                    StreamState.LATCHED_DESYNC,
+                },
                 new_state=StreamState.RECONCILING,
-                reason="Executing post-reconnect broker truth check",
+                reason="Executing broker truth reconciliation check",
             )
 
-            recon = self.reconcile_startup_state(manage_stream_state=False, allow_policy_side_effects=False)
+            # Hardened Retry Loop for Transient Network / HTTP / Timeout Errors
+            # Semantics: POST_RECONNECT_RECONCILE_MAX_ATTEMPTS = 3 total attempts
+            # (1 initial attempt + 2 exponential backoff retries: delays 1.5s, 3.0s).
+            max_attempts = int(self._c("POST_RECONNECT_RECONCILE_MAX_ATTEMPTS", self._c("POST_RECONNECT_RECONCILE_MAX_RETRIES", 3)))
+            base_retry_delay = float(self._c("POST_RECONNECT_RECONCILE_RETRY_DELAY_SECONDS", 1.5))
+            recon = None
+            last_recon_err = None
+
+            for attempt_idx in range(1, max_attempts + 1):
+                try:
+                    recon = self.reconcile_startup_state(manage_stream_state=False, allow_policy_side_effects=False)
+                    last_recon_err = None
+                    break
+                except Exception as r_err:
+                    last_recon_err = r_err
+                    retry_num = attempt_idx - 1
+                    max_retries = max(0, max_attempts - 1)
+                    logger.warning(
+                        "[POST_RECONNECT_RECONCILIATION] Attempt %d/%d (retry %d/%d) encountered transient broker error: %s",
+                        attempt_idx,
+                        max_attempts,
+                        retry_num,
+                        max_retries,
+                        r_err,
+                    )
+                    if attempt_idx < max_attempts:
+                        delay = base_retry_delay * (2 ** (attempt_idx - 1))
+                        time.sleep(delay)
+
+            # If all attempts failed due to timeout/network error
+            if last_recon_err is not None or recon is None:
+                self._cache_requires_reconciliation = True
+                self.invalidate_broker_caches(reason="post_reconnect_reconciliation_timeout")
+                acct = getattr(self, "account_id", "UNKNOWN")
+                active_reasons = sorted(getattr(self.entry_gate, "reasons", []))
+                retries_exhausted = max(0, max_attempts - 1)
+                logger.critical(
+                    "🚨 [OPERATOR ALARM] [POST_RECONNECT_TIMEOUT] [%s] Broker reconciliation failed after %d total attempts (1 initial + %d retries): %s | Entry gate remains HALTED with reasons: %s",
+                    acct,
+                    max_attempts,
+                    retries_exhausted,
+                    last_recon_err,
+                    active_reasons,
+                )
+                self._transition_stream_state(
+                    expected={StreamState.RECONCILING, StreamState.AUTHENTICATED_UNRECONCILED},
+                    new_state=StreamState.DEGRADED,
+                    reason=f"Post-reconnect reconciliation timed out after {max_attempts} attempts (1 initial + {retries_exhausted} retries): {last_recon_err}",
+                )
+                return False
+
             is_clean = recon.get("clean", False) if isinstance(recon, dict) else getattr(recon, "clean", False)
             protect_info = recon.get("protect", {}) if isinstance(recon, dict) else getattr(recon, "protect", {})
             protect_failed = protect_info.get("failed", []) if isinstance(protect_info, dict) else getattr(protect_info, "failed", [])
@@ -2924,6 +3135,7 @@ class AlpacaBridge:
             protection_clean = (len(protect_failed) == 0 and len(unprotected_longs) == 0)
 
             if is_clean and protection_clean:
+                self._cache_requires_reconciliation = False
                 self._transition_stream_state(
                     expected={StreamState.RECONCILING},
                     new_state=StreamState.HEALTHY,
@@ -2934,9 +3146,21 @@ class AlpacaBridge:
                     self._trade_stream_ready = True
                 self._conn_health.mark_healthy("Trade stream reconnected and broker truth reconciled clean")
                 self._clear_recovery_halts()
-                logger.info("[RECONNECT RECOVERY] Full broker reconciliation clean; recovery_required=False, conn_health=HEALTHY, entry halts cleared.")
+
+                # Diagnostic check: Did the gate successfully open, or do non-recovery reasons remain?
+                gate_halted = getattr(self.entry_gate, "halted", False)
+                active_reasons = sorted(getattr(self.entry_gate, "reasons", []))
+                if gate_halted:
+                    logger.warning(
+                        "[RECONNECT RECOVERY] Full broker reconciliation clean; recovery halts cleared, but entry gate remains HALTED due to non-recovery reasons: %s",
+                        active_reasons,
+                    )
+                else:
+                    logger.info("[RECONNECT RECOVERY] Full broker reconciliation clean; recovery_required=False, conn_health=HEALTHY, entry halts cleared.")
                 return True
             else:
+                self._cache_requires_reconciliation = True
+                self.invalidate_broker_caches(reason="post_reconnect_reconciliation_dirty")
                 self._transition_stream_state(
                     expected={StreamState.RECONCILING},
                     new_state=StreamState.LATCHED_DESYNC,
@@ -2944,6 +3168,16 @@ class AlpacaBridge:
                 )
                 with self._trade_stream_lock:
                     self._trade_stream_recovery_required = True
+                acct = getattr(self, "account_id", "UNKNOWN")
+                active_reasons = sorted(getattr(self.entry_gate, "reasons", []))
+                logger.critical(
+                    "🚨 [OPERATOR ALARM] [POST_RECONNECT_HALT_PERSISTED] [%s] Broker reconciliation dirty (is_clean=%s, protect_failed=%s, unprotected=%s); gate remains halted with reasons: %s",
+                    acct,
+                    is_clean,
+                    protect_failed,
+                    unprotected_longs,
+                    active_reasons,
+                )
                 try:
                     from observability import get_latch_state_machine, LatchTrigger
                     get_latch_state_machine().latch(
@@ -2961,8 +3195,12 @@ class AlpacaBridge:
                 reason=f"Post-reconnect reconciliation crashed: {exc}",
             )
             logger.exception("[TRADE STREAM RECONCILIATION FAILED] %s", exc)
-            raise
+            return False
         finally:
+            sched_lock = getattr(self, "_reconcile_scheduling_lock", None)
+            if sched_lock is not None:
+                with sched_lock:
+                    self._reconcile_in_progress = False
             self._reconcile_lock.release()
 
     def _on_sdk_stream_reconnect_start(self) -> None:
@@ -2974,6 +3212,9 @@ class AlpacaBridge:
         if not self._is_reconnect_allowed():
             logger.info("[TRADE STREAM] SDK reconnect start ignored: bridge is shutting down or stopped")
             return
+
+        self.invalidate_broker_caches(reason="sdk_stream_reconnect_start")
+        self._cache_requires_reconciliation = True
 
         logger.warning(
             "[TRADE STREAM] SDK internal reconnect initiated; fail-closing entry gate (STREAM_RECOVERY_REQUIRED)"
@@ -3010,6 +3251,17 @@ class AlpacaBridge:
             logger.info("[TRADE STREAM] SDK reconnect success ignored: bridge is shutting down or stopped")
             return False
 
+        self.invalidate_broker_caches(reason="sdk_stream_reconnect_success")
+
+        current_st = self.stream_state
+        if current_st == StreamState.RECONCILING:
+            logger.info("[TRADE STREAM] SDK reconnect authenticated while reconciliation already in-flight; letting active reconciliation complete")
+            return True
+
+        if current_st == StreamState.HEALTHY and not self._trade_stream_recovery_required:
+            logger.info("[TRADE STREAM] SDK reconnect authenticated but stream is already HEALTHY and clean; skipping redundant transition")
+            return True
+
         logger.info(
             "[TRADE STREAM] SDK internal reconnect authenticated; initiating broker truth reconciliation"
         )
@@ -3020,6 +3272,7 @@ class AlpacaBridge:
 
         self._transition_stream_state(
             expected={
+                StreamState.HEALTHY,
                 StreamState.RECONNECTING,
                 StreamState.DISCONNECTED,
                 StreamState.AUTHENTICATED_UNRECONCILED,
@@ -3224,8 +3477,17 @@ class AlpacaBridge:
                 else:
                     raise
 
-    def _get_active_orders(self) -> list:
+    def _get_active_orders(self, force_refresh: bool = False) -> list:
         self._require_connection()
+        now_t = time.time()
+        if not force_refresh and not getattr(self, "_cache_requires_reconciliation", False):
+            lock = getattr(self, "_active_orders_lock", None)
+            if lock is not None:
+                with lock:
+                    cached_orders = getattr(self, "_cached_active_orders", None)
+                    cached_ts = getattr(self, "_cached_active_orders_ts", 0.0)
+                    if cached_orders is not None and (now_t - cached_ts) < 3.0:
+                        return list(cached_orders)
         try:
             # 1. Query OPEN orders (guarantees all currently working open orders)
             open_orders = self._call_with_retry(lambda: self._client.get_orders(filter=GetOrdersRequest(
@@ -3288,11 +3550,87 @@ class AlpacaBridge:
             except Exception as all_err:
                 logger.debug("Non-fatal: could not query QueryOrderStatus.ALL orders: %s", all_err)
 
-            return list(orders_map.values())
+            orders_list = list(orders_map.values())
+            lock = getattr(self, "_active_orders_lock", None)
+            if lock is not None and not getattr(self, "_cache_requires_reconciliation", False):
+                with lock:
+                    self._cached_active_orders = orders_list
+                    self._cached_active_orders_ts = time.time()
+            return orders_list
         except Exception as exc:
             logger.error("Failed to query active orders from broker: %s", exc)
             self._conn_health.mark_unhealthy(str(exc))
             raise RuntimeError(f"Failed to query active orders from broker (fail-closed): {exc}")
+
+    def _invalidate_position_cache(self) -> None:
+        lock = getattr(self, "_positions_cache_lock", None)
+        if lock is not None:
+            with lock:
+                self._cached_positions_ts = 0.0
+                self._cached_position_symbols = None
+
+    def _invalidate_order_cache(self) -> None:
+        lock = getattr(self, "_active_orders_lock", None)
+        if lock is not None:
+            with lock:
+                self._cached_active_orders_ts = 0.0
+                self._cached_active_orders = None
+
+    def invalidate_broker_caches(self, reason: str = "") -> None:
+        """Invalidate both active order and position caches safely."""
+        self._invalidate_position_cache()
+        self._invalidate_order_cache()
+        if reason:
+            logger.debug("[CACHE INVALIDATION] Broker caches invalidated: %s", reason)
+
+    def _schedule_forced_reconciliation(self, reason: str = "") -> str:
+        """
+        Schedule a forced broker reconciliation with atomic single-flight semantics.
+        Sets pre-start flag assignment under dedicated scheduling guard.
+        Returns 'ALREADY_IN_PROGRESS' if reconciliation is already active/scheduled,
+        or 'SCHEDULED' if a new worker thread was spawned.
+        """
+        sched_lock = getattr(self, "_reconcile_scheduling_lock", None)
+        if sched_lock is not None:
+            with sched_lock:
+                is_locked = getattr(self, "_reconcile_lock", None) is not None and self._reconcile_lock.locked()
+                if getattr(self, "_reconcile_in_progress", False) or is_locked:
+                    logger.info("[FORCED RECONCILIATION] already_in_progress=True (%s); skipping duplicate trigger", reason)
+                    return "ALREADY_IN_PROGRESS"
+                self._reconcile_in_progress = True
+        else:
+            if getattr(self, "_reconcile_lock", None) is not None and self._reconcile_lock.locked():
+                logger.info("[FORCED RECONCILIATION] already_in_progress=True (%s); skipping duplicate trigger", reason)
+                return "ALREADY_IN_PROGRESS"
+
+        def _recon_worker():
+            try:
+                logger.info("[FORCED RECONCILIATION] Running fresh broker reconciliation: %s", reason)
+                self._run_post_reconnect_reconciliation()
+            except Exception as e:
+                logger.error("[FORCED RECONCILIATION] Reconciliation worker error: %s", e)
+            finally:
+                if sched_lock is not None:
+                    with sched_lock:
+                        self._reconcile_in_progress = False
+
+        try:
+            t = threading.Thread(target=_recon_worker, name=f"forced-recon-{int(time.time()*1000)}", daemon=True)
+            t.start()
+            return "SCHEDULED"
+        except Exception as t_err:
+            logger.critical("[FORCED RECONCILIATION] Thread startup failed (%s): %s; recording halt before resetting in_progress flag", reason, t_err)
+            gate = getattr(self, "entry_gate", None)
+            if sched_lock is not None:
+                with sched_lock:
+                    if gate is not None and hasattr(gate, "halt"):
+                        gate.halt("STREAM_RECOVERY_REQUIRED")
+                    self._reconcile_in_progress = False
+            else:
+                if gate is not None and hasattr(gate, "halt"):
+                    gate.halt("STREAM_RECOVERY_REQUIRED")
+                self._reconcile_in_progress = False
+            return "THREAD_START_FAILED"
 
     # ── Account Services ─────────────────────────────────────────
     def get_cash(self) -> float:
@@ -4411,17 +4749,10 @@ class AlpacaBridge:
 
     def working_orders_plain(self) -> list:
         try:
+            # Canonical order flattening: _get_active_orders() already expands bracket legs into
+            # individual orders while deduplicating by ID. Do not re-append o.legs here.
             raw_orders = self._get_active_orders()
-            al_orders = []
-            for o in raw_orders:
-                al_orders.append(o)
-                legs = getattr(o, "legs", []) or []
-                for leg in legs:
-                    if getattr(leg, "symbol", None) is None:
-                        leg.symbol = getattr(o, "symbol", "")
-                    if getattr(leg, "qty", None) is None or str(getattr(leg, "qty", "")).strip() in ("0", "0.0", ""):
-                        leg.qty = getattr(o, "qty", None) or getattr(o, "filled_qty", 0.0)
-                    al_orders.append(leg)
+            al_orders = raw_orders
 
             active_statuses = {"new", "partially_filled", "submitted", "queued", "held", "accepted", "pending_new", "accepted_for_bidding", "stopped", "suspended", "calculated", "pending_cancel"}
             res = []
@@ -4499,6 +4830,7 @@ class AlpacaBridge:
         manage_stream_state: bool = True,
         allow_policy_side_effects: bool = True,
     ) -> dict:
+        self.invalidate_broker_caches(reason="reconcile_startup_state_start")
         positions = self.positions_plain()
         working = self.working_orders_plain()
         snapshot = reconciliation.build_snapshot(positions, working)
@@ -4643,6 +4975,12 @@ class AlpacaBridge:
                             )
             except Exception as st_exc:
                 logger.debug("[STARTUP RECONCILE] Stream state transition non-fatal: %s", st_exc)
+
+        if snapshot.get("clean"):
+            self._cache_requires_reconciliation = False
+        else:
+            self._cache_requires_reconciliation = True
+            self.invalidate_broker_caches(reason="reconcile_startup_state_dirty")
 
         return {
             "snapshot": snapshot,
@@ -5229,12 +5567,14 @@ class AlpacaBridge:
         )
         try:
             order = self._client.submit_order(LimitOrderRequest(**request_kwargs))
+            self.invalidate_broker_caches(reason=f"submit_order:{symbol}")
             parent_id = str(order.id)
             rel_token = getattr(self, "validation_release_token", None)
             if rel_token:
                 rel_token.authorized_parent_order_id = parent_id
                 rel_token.submission_outcome = "SUBMITTED"
         except Exception as submit_exc:
+            self.invalidate_broker_caches(reason=f"submit_order_error:{symbol}")
             rel_token = getattr(self, "validation_release_token", None)
             if rel_token:
                 rel_token.submission_outcome = "UNKNOWN"
@@ -5512,6 +5852,7 @@ class AlpacaBridge:
         try:
             new_order = self._client.replace_order_by_id(pred_id, req)
         except Exception as exc:
+            self.invalidate_broker_caches(reason=f"modify_stop_order_error:{pred_id}")
             exc_msg = str(exc)
             exc_lower = exc_msg.lower()
             if any(k in exc_lower for k in ("422", "not cancelable", "cannot be replaced", "already filled")):
@@ -5533,6 +5874,7 @@ class AlpacaBridge:
                 return None
 
         new_id = str(getattr(new_order, "id", pred_id))
+        self.invalidate_broker_caches(reason=f"modify_stop_order:{pred_id}->{new_id}")
         self.mutation_counters.record("modify_stop_order", False)
 
         # Atomic Lineage & Role Propagation
@@ -5645,6 +5987,7 @@ class AlpacaBridge:
             return CancelResult(success=True, is_already_terminal=True, terminal_status="canceled")
         try:
             self._client.cancel_order_by_id(clean_id)
+            self.invalidate_broker_caches(reason=f"cancel_order:{clean_id}")
             logger.info("Cancelled order %s", clean_id)
             term_status = None
             try:
@@ -5656,6 +5999,7 @@ class AlpacaBridge:
             is_term = str(term_status).lower() in {"canceled", "cancelled", "expired", "rejected", "filled"}
             return CancelResult(success=True, is_already_terminal=is_term, terminal_status=term_status)
         except Exception as exc:
+            self.invalidate_broker_caches(reason=f"cancel_order_error:{clean_id}")
             exc_msg = str(exc)
             exc_lower = exc_msg.lower()
             # Handle HTTP 422: order is not cancelable (may have filled or reached terminal state)
@@ -6441,6 +6785,15 @@ class AlpacaBridge:
     def has_position(self, symbol: str) -> bool:
         self._require_connection()
         try:
+            now_t = time.time()
+            if not getattr(self, "_cache_requires_reconciliation", False):
+                lock = getattr(self, "_positions_cache_lock", None)
+                if lock is not None:
+                    with lock:
+                        cached_syms = getattr(self, "_cached_position_symbols", None)
+                        cached_ts = getattr(self, "_cached_positions_ts", 0.0)
+                        if cached_syms is not None and (now_t - cached_ts) < 3.0:
+                            return symbol.upper().strip() in cached_syms
             qty = self.get_position(symbol)
             return abs(qty) > 0
         except Exception:
@@ -6465,6 +6818,8 @@ class AlpacaBridge:
                         logger.debug("Failed cancelling order %s for %s: %s", o_id, sym_upper, c_err)
         except Exception as err:
             logger.debug("Error cancelling orders for %s: %s", symbol, err)
+        finally:
+            self.invalidate_broker_caches(reason=f"_cancel_all_orders_for_symbol:{symbol}")
 
     def close_position_verified(self, symbol: str) -> PositionCloseResult:
         """
@@ -6515,6 +6870,9 @@ class AlpacaBridge:
             )
 
         # 2. Cancel existing working orders for this symbol first
+        cancel_req_utc = datetime.now(timezone.utc).isoformat()
+        cancel_start_mono = time.monotonic()
+        logger.info("[EOD TELEMETRY 1/5] [CANCEL_REQUEST] %s cancel request initiated at %s", sym_upper, cancel_req_utc)
         self._cancel_all_orders_for_symbol(sym_upper)
 
         # Amendment 2: Pre-Close Working Order Cancellation Convergence Check (up to 3.0s bounded window)
@@ -6535,6 +6893,15 @@ class AlpacaBridge:
                 break
             time.sleep(0.2)
 
+        convergence_ms = (time.monotonic() - cancel_start_mono) * 1000.0
+        cancel_ack_utc = datetime.now(timezone.utc).isoformat()
+
+        if cancelled_converged:
+            logger.info(
+                "[EOD TELEMETRY 2/5] [CANCEL_CONFIRMED] %s resting bracket orders confirmed cancelled by broker at %s (convergence_ms=%.1fms)",
+                sym_upper, cancel_ack_utc, convergence_ms
+            )
+
         if not cancelled_converged:
             try:
                 active_orders = [
@@ -6545,8 +6912,8 @@ class AlpacaBridge:
                 active_orders = []
             if active_orders:
                 logger.error(
-                    "[CLOSE VERIFIED CANCEL TIMEOUT] %s still has %d working orders after %.1fs. Failing closed without submitting close.",
-                    sym_upper, len(active_orders), convergence_timeout
+                    "[CLOSE VERIFIED CANCEL TIMEOUT] %s still has %d working orders after %.1fs (convergence_ms=%.1fms). Failing closed without submitting close.",
+                    sym_upper, len(active_orders), convergence_timeout, convergence_ms
                 )
                 return PositionCloseResult(
                     outcome=CloseOutcome.UNKNOWN,
@@ -6561,19 +6928,29 @@ class AlpacaBridge:
         order_id = None
         filled_qty = 0.0
         is_mock_client = hasattr(self, "_client") and type(self._client).__name__ in ("MagicMock", "Mock")
+        close_submit_utc = datetime.now(timezone.utc).isoformat()
+        logger.info("[EOD TELEMETRY 3/5] [CLOSE_SUBMIT] %s close_position order submission started at %s", sym_upper, close_submit_utc)
         try:
             close_order = self._client.close_position(sym_upper)
+            self.invalidate_broker_caches(reason=f"close_position_submit:{sym_upper}")
             order_id = getattr(close_order, "id", None)
+            logger.info(
+                "[EOD TELEMETRY 4/5] [CLOSE_ACK] %s close order submitted (order_id=%s, client_order_id=%s, submit_time=%s)",
+                sym_upper, order_id, getattr(close_order, "client_order_id", ""), close_submit_utc
+            )
             is_mock_order = is_mock_client or type(order_id).__name__ in ("MagicMock", "Mock") or str(order_id).startswith("<MagicMock")
             if order_id and not is_mock_order and hasattr(self, "_await_order_outcome"):
                 try:
                     res = self._await_order_outcome(str(order_id), timeout=15.0)
                     filled_qty = float(getattr(res, "filled", 0.0) or 0.0)
-                    logger.info("Close order for %s: outcome=%s, filled=%.0f, remaining=%.0f",
-                                sym_upper, getattr(res, "outcome", ""), filled_qty, getattr(res, "remaining", 0.0))
+                    logger.info(
+                        "[EOD TELEMETRY 5/5] [CLOSE_FILL] %s close order completed: outcome=%s, filled_qty=%.0f, remaining_qty=%.0f, fill_time=%s",
+                        sym_upper, getattr(res, "outcome", ""), filled_qty, getattr(res, "remaining", 0.0), datetime.now(timezone.utc).isoformat()
+                    )
                 except Exception as await_err:
                     logger.warning("[CLOSE VERIFIED] Error polling outcome for order %s (%s): %s", order_id, sym_upper, await_err)
         except Exception as exc:
+            self.invalidate_broker_caches(reason=f"close_position_submit_error:{sym_upper}")
             logger.error("[CLOSE VERIFIED] Broker close_position submission error for %s: %s", sym_upper, exc)
             return PositionCloseResult(
                 outcome=CloseOutcome.REJECTED,
@@ -6639,6 +7016,7 @@ class AlpacaBridge:
         retry_id = None
         try:
             retry_order = self._client.close_position(sym_upper)
+            self.invalidate_broker_caches(reason=f"close_position_retry_submit:{sym_upper}")
             retry_id = getattr(retry_order, "id", None)
             is_mock_retry = is_mock_client or type(retry_id).__name__ in ("MagicMock", "Mock") or str(retry_id).startswith("<MagicMock")
             if retry_id and not is_mock_retry and hasattr(self, "_await_order_outcome"):
@@ -6647,6 +7025,7 @@ class AlpacaBridge:
                 except Exception as retry_await_err:
                     logger.warning("[CLOSE VERIFIED RETRY] Error polling retry order %s: %s", retry_id, retry_await_err)
         except Exception as retry_exc:
+            self.invalidate_broker_caches(reason=f"close_position_retry_submit_error:{sym_upper}")
             logger.warning("[CLOSE VERIFIED RETRY] Close retry failed for %s: %s", sym_upper, retry_exc)
 
         time.sleep(0.5)
