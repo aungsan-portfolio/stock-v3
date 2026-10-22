@@ -73,6 +73,7 @@ pytest_*.txt
 *.bak*
 temp_pytest/
 temp_pytest*/
+_maintenance_backups/
 archive_bundles/
 backups/
 *.patch
