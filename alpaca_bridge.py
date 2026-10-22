@@ -6876,21 +6876,32 @@ class AlpacaBridge:
         self._cancel_all_orders_for_symbol(sym_upper)
 
         # Amendment 2: Pre-Close Working Order Cancellation Convergence Check (up to 3.0s bounded window)
+        # Strictly FAIL-CLOSED: query exceptions must NEVER be treated as converged empty list.
         convergence_timeout = 3.0
-        start_poll = time.time()
+        start_poll = time.monotonic()
         cancelled_converged = False
-        while time.time() - start_poll < convergence_timeout:
+        last_query_error = None
+        remaining_working_ids = []
+        while time.monotonic() - start_poll < convergence_timeout:
+            query_success = False
             try:
                 active_orders = [
                     o for o in self._get_active_orders()
                     if getattr(o, "symbol", "").upper().strip() == sym_upper
                 ]
+                query_success = True
+                last_query_error = None
             except Exception as act_err:
-                logger.debug("Active order check during cancel convergence: %s", act_err)
-                active_orders = []
-            if not active_orders:
-                cancelled_converged = True
-                break
+                logger.debug("Active order check during cancel convergence for %s: %s", sym_upper, act_err)
+                last_query_error = str(act_err)
+                active_orders = None
+                query_success = False
+
+            if query_success and active_orders is not None:
+                if len(active_orders) == 0:
+                    cancelled_converged = True
+                    break
+                remaining_working_ids = [str(getattr(o, "id", "")) for o in active_orders]
             time.sleep(0.2)
 
         convergence_ms = (time.monotonic() - cancel_start_mono) * 1000.0
@@ -6901,28 +6912,26 @@ class AlpacaBridge:
                 "[EOD TELEMETRY 2/5] [CANCEL_CONFIRMED] %s resting bracket orders confirmed cancelled by broker at %s (convergence_ms=%.1fms)",
                 sym_upper, cancel_ack_utc, convergence_ms
             )
-
-        if not cancelled_converged:
-            try:
-                active_orders = [
-                    o for o in self._get_active_orders()
-                    if getattr(o, "symbol", "").upper().strip() == sym_upper
-                ]
-            except Exception:
-                active_orders = []
-            if active_orders:
-                logger.error(
-                    "[CLOSE VERIFIED CANCEL TIMEOUT] %s still has %d working orders after %.1fs (convergence_ms=%.1fms). Failing closed without submitting close.",
-                    sym_upper, len(active_orders), convergence_timeout, convergence_ms
-                )
-                return PositionCloseResult(
-                    outcome=CloseOutcome.UNKNOWN,
-                    symbol=sym_upper,
-                    initial_qty=initial_qty,
-                    remaining_qty=initial_qty,
-                    filled_qty=0.0,
-                    error=f"Order cancel convergence timeout ({len(active_orders)} orders still active)",
-                )
+        else:
+            # FAIL-CLOSED: If cancel did not converge OR broker query failed, NEVER submit close order!
+            failure_reason = (
+                f"Broker order-query failed during cancel convergence: {last_query_error}"
+                if last_query_error is not None
+                else f"Order cancel convergence timeout ({len(remaining_working_ids)} orders still active: {remaining_working_ids})"
+            )
+            logger.error(
+                "[CLOSE VERIFIED CANCEL FAIL-CLOSED] %s cancellation could not be verified converged after %.1fs (convergence_ms=%.1fms). "
+                "Failing closed without submitting close order to prevent duplicate fills/accidental shorts: %s",
+                sym_upper, convergence_timeout, convergence_ms, failure_reason
+            )
+            return PositionCloseResult(
+                outcome=CloseOutcome.UNKNOWN,
+                symbol=sym_upper,
+                initial_qty=initial_qty,
+                remaining_qty=initial_qty,
+                filled_qty=0.0,
+                error=failure_reason,
+            )
 
         # 3. Submit broker close order
         order_id = None
