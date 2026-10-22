@@ -2195,7 +2195,8 @@ class AlpacaBridge:
             from observability import get_build_provenance
             prov = get_build_provenance()
             logger.info(prov.marker_string())
-            logger.info(prov.source_hash_report())
+            if hasattr(prov, "source_hash_report"):
+                logger.info(prov.source_hash_report())
             from strategies.session import now_eastern
             et_date = str(now_eastern().date())
             try:
@@ -2540,17 +2541,9 @@ class AlpacaBridge:
                 "accepted", "pending_new", "accepted_for_bidding", "stopped", "rejected",
                 "suspended", "calculated", "held"
             }
-            is_mock_test = bool(
-                os.environ.get("PYTEST_CURRENT_TEST")
-                or getattr(self, "_test_mode", False)
-                or type(getattr(update, "event", None)).__name__ in ("MagicMock", "Mock")
-                or type(getattr(order, "status", None)).__name__ in ("MagicMock", "Mock")
-                or "<magicmock" in event_name
-                or "<magicmock" in order_status
-            )
-            event_invalid = bool(event_name and event_name not in known_trade_events and not is_mock_test)
-            status_invalid = bool(order_status and order_status not in known_order_statuses and not is_mock_test)
-            if (event_invalid or status_invalid) and not is_mock_test:
+            event_invalid = bool(event_name and event_name not in known_trade_events)
+            status_invalid = bool(order_status and order_status not in known_order_statuses)
+            if event_invalid or status_invalid or (not event_name and not order_status):
                 self._cache_requires_reconciliation = True
                 if hasattr(self, "entry_gate") and self.entry_gate:
                     self.entry_gate.halt("TRADE_STREAM_DISPATCH_ERROR")

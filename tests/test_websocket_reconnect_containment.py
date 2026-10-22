@@ -152,7 +152,8 @@ class TestWebSocketReconnectContainment:
 
         # Callback from stale generation (gen 4) must be rejected
         stale_update = MagicMock()
-        stale_update.order = MagicMock(id="order_1")
+        stale_update.event = "new"
+        stale_update.order = MagicMock(id="order_1", status="new", filled_qty=0.0, filled_avg_price=0.0)
         accepted = bridge._dispatch_trade_update_with_generation(stale_update, generation=4)
         assert accepted is False, "Stale stream generation callback was erroneously processed!"
 
