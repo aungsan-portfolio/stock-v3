@@ -1335,7 +1335,16 @@ def fetch_batch_intraday_alpaca(
         if client is None:
             return results
 
-        start = datetime.now(timezone.utc) - timedelta(days=lookback_days or 1)
+        is_breadth = str(purpose or "").upper() == "REGIME_BREADTH"
+        if is_breadth and (lookback_days is None or lookback_days <= 1):
+            from strategies.session import now_eastern
+            et_now = now_eastern()
+            today_et = et_now.date()
+            et_midnight = datetime(today_et.year, today_et.month, today_et.day, 0, 0, 0, tzinfo=et_now.tzinfo)
+            start = et_midnight.astimezone(timezone.utc)
+        else:
+            start = datetime.now(timezone.utc) - timedelta(days=lookback_days or 1)
+
         tf = TimeFrame.Minute
         if interval == "5m":
             tf = TimeFrame(5, TimeFrameUnit.Minute)
@@ -1347,6 +1356,9 @@ def fetch_batch_intraday_alpaca(
         chunk_size = max(1, int(getattr(config, "ALPACA_CHUNK_SIZE", 5)))
         chunk_delay_ms = max(0, int(getattr(config, "ALPACA_CHUNK_DELAY_MS", 200)))
         chunk_timeout_s = float(getattr(config, "ALPACA_CHUNK_TIMEOUT_SECONDS", 2.0))
+        if is_breadth:
+            chunk_size = max(chunk_size, 10)
+            chunk_timeout_s = max(chunk_timeout_s, 3.5)
         tier = str(getattr(config, "ALPACA_SUBSCRIPTION_TIER", "free")).lower().strip()
         is_free_tier = (tier == "free")
 

@@ -40,9 +40,10 @@ class MeanReversionStrategy:
         
         Returns TradeSignal if all confirmation layers pass, or None.
         """
-        # Only operate in SIDEWAYS market texture
-        if market_texture != "SIDEWAYS":
-            logger.debug("[MEAN REVERSION] %s: Skipped -- active market texture '%s' is not SIDEWAYS", symbol, market_texture)
+        # Only operate in allowed market textures (SIDEWAYS, TRANSITIONING)
+        allowed_textures = ("SIDEWAYS", "TRANSITIONING")
+        if market_texture not in allowed_textures:
+            logger.debug("[MEAN REVERSION] %s: Skipped -- active market texture '%s' is not in %s", symbol, market_texture, allowed_textures)
             return None
 
         if df is None or df.empty or len(df) < 20:

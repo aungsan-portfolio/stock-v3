@@ -113,7 +113,8 @@ def run_deterministic_scenarios():
 
     results = []
     with patch("strategies.order_manager.pre_trade_check", return_value=None), \
-         patch("strategies.order_manager._min_confidence_for", return_value=0.6000000):
+         patch("strategies.order_manager._min_confidence_for", return_value=0.6000000), \
+         patch("config.VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED", False):
 
         for sig in test_signals:
             res = om.execute_signal(
@@ -161,3 +162,169 @@ def test_golden_master_behavior_hash_invariance():
     assert results1[4]["status"] == "REJECTED"
     assert "ENTRY_READINESS_BAR_INVALID" in results1[4]["reason"]
     assert hash1 == "8a35d1e08ef09e17532ef2fe1debdcb23a732a73137af86f80129ca1cd126030"
+
+
+def test_golden_master_production_gate_fail_closed_without_regime():
+    """Verify that when VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED=True, missing regime context fails closed."""
+    bridge = _create_mock_bridge()
+    cycle_bar_ts = "2026-09-15T14:15:00+00:00"
+    readiness = EntryReadiness(
+        entry_allowed=True,
+        suppression_reason=None,
+        cycle_id="golden_master_cycle",
+        bar_ts=cycle_bar_ts,
+        created_at=time.time(),
+        expires_at=time.time() + 300.0,
+    )
+    sig = TradeSignal(
+        symbol="AAPL",
+        strategy=StrategyName.VWAP_BOUNCE,
+        side="BUY",
+        confidence=0.720,
+        entry_price=220.50,
+        stop_price=219.00,
+        target_price=223.50,
+        atr=1.80,
+        risk_per_share=1.50,
+        reason="VWAP bounce",
+        bar_timestamp="2026-09-15 14:15:00+00:00",
+    )
+
+    with patch("strategies.order_manager.pre_trade_check", return_value=None), \
+         patch("strategies.order_manager._min_confidence_for", return_value=0.60), \
+         patch("config.VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED", True):
+
+        # Execute with regime_result=None -> must fail-closed
+        res = om.execute_signal(
+            signal=sig,
+            bridge=bridge,
+            equity=100000.0,
+            current_pnl=0.0,
+            dry_run=True,
+            entry_readiness=readiness,
+            regime_result=None,
+        )
+
+        assert res["status"] == "REJECTED"
+        assert "Regime/SOXX Gate VETO: Missing regime context for VWAP_BOUNCE (fail-closed)" in res["reason"]
+
+
+class _MockRegime:
+    def __init__(self, mode="RISK_ON", allow_new_shorts=False, data=None, confidence_boost=0.0):
+        self.mode = mode
+        self.allow_new_shorts = allow_new_shorts
+        self.data = data or {}
+        self.confidence_boost = confidence_boost
+
+
+def test_golden_master_production_gate_fail_closed_on_invalid_or_breached_soxx():
+    """Verify fail-closed rejection when regime is RISK_OFF and SOXX is invalid or breached."""
+    bridge = _create_mock_bridge()
+    cycle_bar_ts = "2026-09-15T14:15:00+00:00"
+    readiness = EntryReadiness(
+        entry_allowed=True,
+        suppression_reason=None,
+        cycle_id="golden_master_cycle",
+        bar_ts=cycle_bar_ts,
+        created_at=time.time(),
+        expires_at=time.time() + 300.0,
+    )
+    sig = TradeSignal(
+        symbol="AAPL",
+        strategy=StrategyName.VWAP_BOUNCE,
+        side="BUY",
+        confidence=0.720,
+        entry_price=220.50,
+        stop_price=219.00,
+        target_price=223.50,
+        atr=1.80,
+        risk_per_share=1.50,
+        reason="VWAP bounce",
+        bar_timestamp="2026-09-15 14:15:00+00:00",
+    )
+
+    with patch("strategies.order_manager.pre_trade_check", return_value=None), \
+         patch("strategies.order_manager._min_confidence_for", return_value=0.60), \
+         patch("config.VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED", True):
+
+        # Case A: Regime is RISK_OFF but SOXX data is missing
+        regime_missing_soxx = _MockRegime(mode="RISK_OFF", data={})
+        res_a = om.execute_signal(
+            signal=sig,
+            bridge=bridge,
+            equity=100000.0,
+            current_pnl=0.0,
+            dry_run=True,
+            entry_readiness=readiness,
+            regime_result=regime_missing_soxx,
+        )
+        assert res_a["status"] == "REJECTED"
+        assert "SOXX benchmark data unavailable or invalid" in res_a["reason"]
+
+        # Case B: Regime is RISK_OFF and SOXX is breached (-2.50% <= -1.50%)
+        regime_breached_soxx = _MockRegime(
+            mode="RISK_OFF",
+            data={"SOXX": {"pct": -2.50, "status": "VALID"}},
+        )
+        res_b = om.execute_signal(
+            signal=sig,
+            bridge=bridge,
+            equity=100000.0,
+            current_pnl=0.0,
+            dry_run=True,
+            entry_readiness=readiness,
+            regime_result=regime_breached_soxx,
+        )
+        assert res_b["status"] == "REJECTED"
+        assert "SOXX -2.50% (<= -1.50%)" in res_b["reason"]
+
+
+def test_golden_master_production_gate_allows_valid_signal():
+    """Verify that with VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED=True and valid regime input, signal proceeds."""
+    bridge = _create_mock_bridge()
+    cycle_bar_ts = "2026-09-15T14:15:00+00:00"
+    readiness = EntryReadiness(
+        entry_allowed=True,
+        suppression_reason=None,
+        cycle_id="golden_master_cycle",
+        bar_ts=cycle_bar_ts,
+        created_at=time.time(),
+        expires_at=time.time() + 300.0,
+    )
+    sig = TradeSignal(
+        symbol="AAPL",
+        strategy=StrategyName.VWAP_BOUNCE,
+        side="BUY",
+        confidence=0.720,
+        entry_price=220.50,
+        stop_price=219.00,
+        target_price=223.50,
+        atr=1.80,
+        risk_per_share=1.50,
+        reason="VWAP bounce",
+        bar_timestamp="2026-09-15 14:15:00+00:00",
+    )
+
+    # Valid RISK_ON regime with positive SOXX benchmark
+    valid_regime = _MockRegime(
+        mode="RISK_ON",
+        allow_new_shorts=False,
+        data={"SOXX": {"pct": 0.85, "status": "VALID"}},
+    )
+
+    with patch("strategies.order_manager.pre_trade_check", return_value=None), \
+         patch("strategies.order_manager._min_confidence_for", return_value=0.60), \
+         patch("config.VWAP_BOUNCE_REGIME_SOXX_GATE_ENABLED", True):
+
+        res = om.execute_signal(
+            signal=sig,
+            bridge=bridge,
+            equity=100000.0,
+            current_pnl=0.0,
+            dry_run=True,
+            entry_readiness=readiness,
+            regime_result=valid_regime,
+        )
+        assert res["status"] == "DRY_RUN", f"Expected DRY_RUN but got: {res}"
+        assert res["shares"] > 0
+        assert res["symbol"] == "AAPL"

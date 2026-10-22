@@ -212,6 +212,7 @@ class TestPhaseAEntryTTLAndHealthGate:
                     "qty": 6.0,
                     "stop_price": 118.0,
                     "status": "new",
+                    "type": "stop",
                 }
             ],
         ]
@@ -293,6 +294,7 @@ class TestPhaseAEntryTTLAndHealthGate:
                 "qty": 5.0,
                 "stop_price": 345.0,
                 "status": "new",
+                "type": "stop",
             }
         ]
 

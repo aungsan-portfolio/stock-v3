@@ -28,6 +28,7 @@ if exist .env (
         if "!KEY_NAME!"=="DAYTRADE_RECOVERY_MAX_CANDIDATES" set "DAYTRADE_RECOVERY_MAX_CANDIDATES=!KEY_VAL!"
         if "!KEY_NAME!"=="ALPACA_DATA_CONNECT_TIMEOUT" set "ALPACA_DATA_CONNECT_TIMEOUT=!KEY_VAL!"
         if "!KEY_NAME!"=="ALPACA_DATA_READ_TIMEOUT" set "ALPACA_DATA_READ_TIMEOUT=!KEY_VAL!"
+        if "!KEY_NAME!"=="DAYTRADE_PAPER_EXECUTION_ENABLED" set "DAYTRADE_PAPER_EXECUTION_ENABLED=!KEY_VAL!"
     )
 ) else (
     echo [ERROR] .env file not found. Please create .env from .env.example.

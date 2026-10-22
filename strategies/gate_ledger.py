@@ -71,13 +71,24 @@ def log_gate_decision(
     required_conf: Optional[float] = None,
     metadata: Optional[Dict[str, Any]] = None,
     filepath: Optional[str] = None,
+    setup_id: Optional[str] = None,
 ) -> dict:
     """Record a structured gate decision event into the append-only JSONL ledger."""
     code_str = reason_code.value if isinstance(reason_code, VetoReason) else str(reason_code or "")
     target_path = filepath if filepath is not None else get_gate_ledger_path()
 
+    meta = dict(metadata or {})
+    resolved_setup_id = str(setup_id or meta.get("setup_id", "") or "")
+    if not resolved_setup_id and evaluation_id.startswith("stp_"):
+        resolved_setup_id = evaluation_id
+    if not resolved_setup_id and symbol and strategy:
+        strat_str = getattr(strategy, "value", str(strategy))
+        bar_ts = str(bar or "").replace(":", "").replace("-", "")
+        resolved_setup_id = f"stp_{str(symbol).upper().strip()}_{strat_str.upper().strip()}_{bar_ts}"
+
     record = {
         "evaluation_id": str(evaluation_id),
+        "setup_id": resolved_setup_id or None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "symbol": str(symbol).upper().strip(),
         "bar": str(bar or ""),

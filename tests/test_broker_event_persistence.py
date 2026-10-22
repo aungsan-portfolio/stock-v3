@@ -69,6 +69,7 @@ def test_default_path_persistence(tmp_path, monkeypatch):
     default_target = tmp_path / "logs" / "broker_events.jsonl"
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(config_module, "BROKER_EVENTS_PATH", None, raising=False)
+    monkeypatch.setattr(config_module, "LOG_DIR", "logs", raising=False)
 
     bridge = _create_mock_bridge()
     u = MockUpdate(order_id="ord_default", execution_id="ex_default", symbol="AAPL", filled_qty=10.0, price=180.00)
@@ -332,5 +333,57 @@ def test_shared_broker_event_path_rejected_in_multi_process_canary(monkeypatch):
     bridge = AlpacaBridge.__new__(AlpacaBridge)
     with pytest.raises(RuntimeError, match="Shared broker event path is not permitted"):
         bridge.get_broker_events_path()
+
+
+def test_alpaca_held_trade_update_event_handled_cleanly(tmp_path, monkeypatch):
+    """Verify Alpaca WebSocket 'held' trade update payload handling.
+
+    Alpaca Trade Events documentation / WebSocket feed emits 'held' for bracket conditional
+    legs or orders held for review/conditional execution. Verify:
+    1. 'held' is recognized in known_trade_events and known_order_statuses.
+    2. Does NOT trigger false dispatch errors or TRADE_STREAM_DISPATCH_ERROR entry gate halts.
+    3. Invalidates broker cache and records stream ack.
+    4. Persists the event cleanly to broker_events.jsonl.
+    """
+    events_log = tmp_path / "logs" / "broker_events.jsonl"
+    monkeypatch.setattr(config_module, "BROKER_EVENTS_PATH", str(events_log), raising=False)
+
+    bridge = _create_mock_bridge()
+    bridge.invalidate_broker_caches = MagicMock()
+    bridge._schedule_forced_reconciliation = MagicMock()
+    bridge.entry_gate = MagicMock()
+
+    held_update = MockUpdate(
+        event="held",
+        order_id="ord_held_999",
+        execution_id="exec_held_999",
+        order_status="held",
+        filled_qty=0.0,
+        price=215.50,
+        symbol="MSFT",
+    )
+
+    bridge._dispatch_trade_update(held_update)
+
+    # Invariants verification
+    bridge.entry_gate.halt.assert_not_called()
+    bridge._schedule_forced_reconciliation.assert_not_called()
+    bridge.invalidate_broker_caches.assert_called_with(reason="trade_update:held:held")
+    bridge.on_entry_order_update.assert_called_once_with(
+        parent_order_id="ord_held_999",
+        cumulative_filled_qty=0.0,
+        average_fill_price=215.50,
+        execution_id="exec_held_999",
+        status="held",
+    )
+
+    assert events_log.exists()
+    lines = events_log.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["order_id"] == "ord_held_999"
+    assert rec["symbol"] == "MSFT"
+    assert rec["event"] == "held"
+    assert rec["status"] == "held"
 
 

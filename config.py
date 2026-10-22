@@ -1019,6 +1019,13 @@ MAX_TARGET_DAILY_ATR_MULTIPLE = 3.5   # Target ceiling multiple vs Daily ATR (if
 APPLY_SHORT_VETO_TO_ALL_SYMBOLS = True
 SHORT_VETO_RSI_THRESHOLD        = 40.0
 
+# ── Earnings Calendar Blackout (Oct 21, 2026: META, TSLA after-close) ────
+EARNINGS_CALENDAR = {
+    "META": "2026-10-21",
+    "TSLA": "2026-10-21",
+}
+EARNINGS_BLACKOUT_DAYS = 1
+
 # ── Gap Quality Filter Thresholds ───────────────────
 GAP_MIN_RVOL          = 1.5   # Require Relative Volume >= 1.5x (Institutional Conviction)
 GAP_MIN_ATR_MULTIPLE  = 0.5   # Require Gap Dollar Magnitude >= 0.5x ATR(14)

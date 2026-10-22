@@ -51,7 +51,7 @@ class TestGapThroughProtection(unittest.TestCase):
         state = self._make_state(qty=8.0)
         mgr.states["META"] = state
 
-        mgr._reconcile_broker_order = MagicMock(side_effect=lambda st, orders: setattr(st, 'order_id', 'test-id') or True)
+        mgr._reconcile_broker_order = MagicMock(side_effect=lambda st, orders, **kwargs: setattr(st, 'order_id', 'test-id') or True)
         mgr.emergency_flatten = MagicMock()
 
         mgr.handle_naked_position("META", position_qty=4.0, bridge=bridge)

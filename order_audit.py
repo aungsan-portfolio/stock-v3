@@ -188,11 +188,13 @@ class _TrackedOrderLifecycle:
         feed_source: str = "IEX",
         session_id: str | None = None,
         max_quote_age_ms: float | None = None,
+        setup_id: str | None = None,
     ):
         self.client_order_id = client_order_id
         self.broker_order_id = broker_order_id
         self.signal_id = signal_id
         self.signal_family_id = signal_family_id
+        self.setup_id = setup_id
         self.symbol = symbol
         self.side = side.lower() if side else ""
         self.order_type = order_type.lower() if order_type else "limit"
@@ -322,6 +324,7 @@ class OrderLifecycleTracker:
         feed_source: str = "IEX",
         session_id: str | None = None,
         max_quote_age_ms: float | None = None,
+        setup_id: str | None = None,
         t2_decision_utc: str | None = None,
         t2_decision_mono_ns: int | None = None,
         t2_proc: str | None = None,
@@ -342,6 +345,7 @@ class OrderLifecycleTracker:
                 feed_source=feed_source,
                 session_id=session_id,
                 max_quote_age_ms=max_quote_age_ms,
+                setup_id=setup_id,
             )
             ord_obj.t2_decision_utc = t2_decision_utc
             ord_obj.t2_decision_mono_ns = t2_decision_mono_ns
@@ -381,6 +385,7 @@ class OrderLifecycleTracker:
         signal_family_id: str | None = None,
         feed_source: str = "IEX",
         broker_order_id: str | None = None,
+        setup_id: str | None = None,
     ) -> _TrackedOrderLifecycle:
         clock = capture_local_clock()
         effective_max_quote_age_ms = max_quote_age_ms or DEFAULT_MAX_QUOTE_AGE_MS
@@ -408,7 +413,10 @@ class OrderLifecycleTracker:
                     broker_order_id=broker_order_id,
                     feed_source=feed_source,
                     max_quote_age_ms=effective_max_quote_age_ms,
+                    setup_id=setup_id,
                 )
+            if getattr(ord_obj, "setup_id", None) is None and setup_id:
+                ord_obj.setup_id = setup_id
             ord_obj.t3_submit_utc = clock["observed_time_utc"]
             ord_obj.t3_submit_mono_ns = clock["observed_mono_ns"]
             ord_obj.t3_proc = clock["process_instance_id"]
@@ -820,6 +828,7 @@ class OrderLifecycleTracker:
             "session_id": ord_obj.session_id,
             "signal_id": ord_obj.signal_id,
             "signal_family_id": ord_obj.signal_family_id,
+            "setup_id": getattr(ord_obj, "setup_id", None),
             "client_order_id": ord_obj.client_order_id,
             "broker_order_id": ord_obj.broker_order_id,
             "symbol": ord_obj.symbol,
@@ -966,6 +975,7 @@ class OrderLifecycleTracker:
             "session_id": ord_obj.session_id,
             "signal_id": ord_obj.signal_id,
             "signal_family_id": ord_obj.signal_family_id,
+            "setup_id": getattr(ord_obj, "setup_id", None),
             "client_order_id": ord_obj.client_order_id,
             "broker_order_id": ord_obj.broker_order_id,
             "symbol": ord_obj.symbol,

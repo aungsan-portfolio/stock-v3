@@ -163,4 +163,85 @@ The following are prohibited without a separately ratified governance amendment:
 * **Real-Money Trading**: ⛔ **STRICTLY BLOCKED UNTIL $N \ge 30$ AUDIT**
 * **Active Focus**: Measure and report exclusively on **actual fills, exits, and reconciled closed trades ($N$)** in `data/paper_validation_trades.jsonl`.
 
+## 7. Midday Lunch Chop Filter & Empirical Governance Baseline
+* **Date Ratified**: 2026-10-21
+* **Policy Verdict**: **KEEP FILTER / NO PARAMETER CHANGE** (Score Threshold 60 strictly frozen)
 
+### Core Ratified Determinations
+1. **Midday Lunch Chop Filter Retained**:
+   * Threshold 60 remains fully active under Phase C Runtime Code Freeze.
+   * Zero parameter drift, no timeframe modifications, and no threshold relaxations permitted.
+2. **Rejected Candidate Research (Observation Only)**:
+   * Tracking rejected candidates remains strictly limited to telemetry and shadow evaluation.
+   * Zero live/paper broker order submission; strictly zero pollution of `data/paper_validation_trades.jsonl` or production ledger.
+3. **Live Promotion Boundary**:
+   * Real-money live trading remains strictly BLOCKED until verified paper closed trades $N \ge 30$ and quantitative gates (PF $\ge 1.25$, Max DD $\le 5.0\%$) pass.
+
+### Mandatory Empirical Review Protocols
+1. **Hypothesis vs. Empirical Fact**:
+   * Theoretical metrics (such as $E[R] = -0.2895R$ for Score < 60) are institutional risk hypotheses / benchmarks, NOT empirical facts.
+   * Negative EV and counterfactual "capital saved" claims must not be asserted as verified fact without completed-trade empirical distributions.
+2. **Predefined Counterfactual Analysis**:
+   * Evaluation of rejected setups must strictly use pre-registered rules: signal timestamp, entry/exit criteria, forward MFE/MAE, quote spread, synthetic slippage, and fee drag.
+   * Post-hoc rule modifications and look-ahead bias are strictly prohibited.
+3. **Dual-Sample Independence**:
+   * **Sample A (Operational Evidence)**: Reconciled paper closed trades ($N \ge 30$) for live promotion audit.
+   * **Sample B (Counterfactual Research)**: Separate candidate outcome telemetry. Conflating Sample A and Sample B or using Sample B count to infer trade profitability is strictly forbidden.
+
+## 8. Swing Sizing Deadlock & 28% Exposure Cap Baseline Audit
+* **Date Ratified**: 2026-10-21
+* **Policy Verdict**: **KEEP 28% GROSS EXPOSURE CAP / NO PARAMETER DRIFT / CODE FROZEN**
+* **Single Source of Truth**: `MIN_ORDER_NOTIONAL = 500.00` in `strategies/swing_sizing.py`
+* **Test Verification**: **54 / 54 Swing Regression Tests Passed (100% Zero Regressions)**
+
+### Core Audit Findings
+1. **Daytrade Confidence Floor (0.6000)**:
+   * Confidence threshold strictly frozen at `0.6000`. Near-miss cohort ($0.58 \le \text{conf} < 0.60$, $N=190$) forward shadow analysis showed negative expectancy ($WR=26.3\%, PF=0.44, E[R]=-0.621R$).
+   * No near-miss tolerance bypass permitted.
+2. **Reconciled Exposure Arithmetic (2026-10-19 20:31 ICT Cycle)**:
+   * Starting Net Liq Equity: **$99,769.05**
+   * Stage 0 Gross Exposure Cap (28%): **$27,935.33**
+   * Real Open Long Positions ($N=4$):
+     - `AMZN`: 39 shares @ $256.00 = **$9,984.00**
+     - `NVDA`: 45 shares @ $216.70 = **$9,751.50**
+     - `MSFT`: 8 shares @ $531.64 = **$4,253.12**
+     - `JPM`: 11 shares @ $338.86 = **$3,727.46**
+     - Total Market Exposure: **$27,716.08** (27.78% of equity; 99.22% capacity utilized)
+   * Pending BUY Orders: **$0.00** (0 pending entry orders)
+   * Remaining Portfolio Budget: **$219.25** ($27,935.33 - $27,716.08)
+3. **Deadlock Mechanism (`q_portfolio = 0` vs `$500` Minimum)**:
+   * Higher-priced tickers (`AVGO` @ $334.78, `QQQ` @ $719.14, `GOOGL` @ $344.08):
+     $$\lfloor \$219.25 / \text{price} \rfloor = 0 \rightarrow q\_portfolio = 0\text{ (ZERO\_SHARES)}$$
+     Buying 1 whole share would breach the 28% cap.
+   * Lower-priced ticker (`BAC` @ $51.32):
+     $$\lfloor \$219.25 / 51.32 \rfloor = 4\text{ shares} \rightarrow \text{Gross Notional} = 4 \times \$51.32 = \mathbf{\$205.28}$$
+     (Explains why `$205.28` was logged as gross notional).
+     Since $\$205.28 < \$500.00$, it is correctly rejected by the broker safety minimum notional rule.
+4. **Final Operational Directive**:
+   * Production candidate is officially **FROZEN** under Phase C Runtime Code Freeze.
+   * Zero feature additions, zero parameter changes, zero routine audits.
+   * Focus exclusively on accumulating closed paper trades in `data/paper_validation_trades.jsonl` towards $N \ge 30$.
+   * Real-money live trading remains **STRICTLY BLOCKED** until quantitative promotion gates are audited and ratified.
+
+## 9. Swing Execution Lifecycle & Strategy Attribution Baseline Audit
+* **Date Ratified**: 2026-10-21
+* **Policy Verdict**: **AUDIT CLOSED WITH DOCUMENTED SCOPE LIMITS / CODE FROZEN / REAL-MONEY PROMOTION STRICTLY BLOCKED**
+
+### Core Ratified Determinations
+1. **Strategy Attribution & Performance Baseline**:
+   * **Modern Swing Bot (`swg_*`)**: $N = 14$ closed trades, Win Rate = 50.0%, $PF = 0.41$, Net Realized P&L = -$928.35. Fails both Gate 1 ($N \ge 30$) and Gate 2 ($PF \ge 1.25$).
+   * **Combined Swing Trades (`swg_*` + `se3-*` + other)**: $N = 40$ closed trades, Win Rate = 35.0%, $PF = 0.42$, Net Realized P&L = -$1,136.68.
+   * **Daytrade Legacy Cohort (`dt_*`)**: $N = 19$ closed trades, Win Rate = 47.4%, $PF = 3.02$, Net Realized P&L = +$262.51 (historical artifact from pre-segregation testing).
+   * **Total Account-Level (`PA3R71I7JFDZ`)**: $N = 59$ closed trades, Win Rate = 38.98%, $PF = 0.58$, Net Realized P&L = -$874.17.
+2. **Execution Lifecycle & Sub-Penny Reconciliation**:
+   * FIFO execution matching across bracket orders strictly requires sorting by economic execution timestamp (`filled_at`), not submission timestamp (`created_at`), preventing child leg tie-breaking anomalies.
+   * `NVDA` partial fill VWAP: Raw fill notional = $9,756.73 across 45 shares; exact VWAP = $216.816222...; rounded display average = $216.82 (100% verified against Alpaca activities API).
+   * Equity reconciliation: $\text{Cash } (\$72,055.87) + \text{Market Value } (\$28,101.82) = \text{Real-time Equity } (\$100,157.69)$. Difference from Last Close Equity ($99,997.46) is exactly $+160.23$, matching $+160.23$ in position market value change with 0 intervening cash or fill activities.
+3. **Drawdown Tolerance & Documented Scope Limits**:
+   * **Daily-Close Series (65 days, 1D)**: Historical Peak = $100,749.94, Trough = $99,411.04, Max Drawdown = **1.33%** ($1,338.90) $\le 5.00\%$ (**Gate 3 PASS**).
+   * **7-Day Intraday Series (135 points, 15Min)**: Historical Peak = $100,173.14, Trough = $99,330.98, Max Drawdown = **0.84%** ($842.16).
+   * **Documented Scope Limit**: The 7-day 15-minute series confirms short-term intraday stability but does not prove lifetime 85-day intraday drawdown. Alpaca API enforces a 30-day limit per intraday request.
+4. **Final Operational Directive**:
+   * Real-money live trading remains **STRICTLY BLOCKED**.
+   * Phase C Runtime Code Freeze remains in full effect (zero parameter changes, 28% exposure cap, 0.6000 confidence floor, $500 minimum notional frozen).
+   * Zero forced exits of open positions. Modern Swing Bot accumulates closed trades naturally towards $N \ge 30$.

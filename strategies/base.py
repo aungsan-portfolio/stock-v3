@@ -29,9 +29,20 @@ class TradeSignal:
     intent: OrderIntent = OrderIntent.ENTRY
     metadata: dict = field(default_factory=dict)
     signal_id: str = field(default_factory=lambda: uuid4().hex)
+    setup_id: Optional[str] = None
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     bar_timestamp: Optional[str] = None
     decision_feed: Optional[str] = None
+
+    def __post_init__(self):
+        if not self.setup_id:
+            strat = self.strategy.value if hasattr(self.strategy, "value") else str(self.strategy)
+            bar_ts = str(self.bar_timestamp or self.timestamp[:16]).replace(":", "").replace("-", "")
+            self.setup_id = f"stp_{self.symbol.upper()}_{strat.upper()}_{self.side.upper()}_{bar_ts}"
+
+    @property
+    def setup_key(self) -> str:
+        return self.setup_id or f"stp_{self.symbol.upper()}_{self.strategy}_{self.side.upper()}"
 
     @property
     def signal_hash(self) -> str:

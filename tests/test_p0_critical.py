@@ -28,9 +28,12 @@ def isolate_journal(tmp_path, monkeypatch):
     fake_journal = tmp_path / "test_trade_journal.jsonl"
     monkeypatch.setattr(config, "DAYTRADE_TRADE_JOURNAL_FILE", fake_journal)
     monkeypatch.setattr(config, "DAYTRADE_REQUIRE_ENTRY_READINESS", False)
-    # Clear any active idempotency locks
+    # Clear any active idempotency locks and trailing stop states
     from strategies.order_idempotency import idempotency_manager
     idempotency_manager.reservations.clear()
+    trailing_manager.states.clear()
+    trailing_manager._consecutive_persistence_failures = 0
+    trailing_manager._persistence_healthy = True
 
 
 def test_mean_reversion_builds_valid_trade_signal():
@@ -320,7 +323,9 @@ def test_h2_ambiguous_submit_preserves_idempotency():
         atr=1.0,
         risk_per_share=2.0,
         reason="Test ambiguous submit",
+        bar_timestamp="2026-10-09 15:30:00",
     )
+    sig.metadata = {"bar_duration_seconds": 300.0}
 
     b = MockBridgeNoParentID()
     import strategies.execution_quote as eq
@@ -374,7 +379,9 @@ def test_h3_lifecycle_registration_failure_is_fail_closed():
         atr=1.0,
         risk_per_share=2.0,
         reason="Test lifecycle failure",
+        bar_timestamp="2026-10-09 15:30:00",
     )
+    sig.metadata = {"bar_duration_seconds": 300.0}
 
     b = MockBridgeOK()
     import strategies.execution_quote as eq
@@ -476,7 +483,9 @@ def test_execute_signal_cache_key_defined():
         atr=0.50,
         risk_per_share=0.50,
         reason="Test cache_key defined",
+        bar_timestamp="2026-10-09 15:30:00",
     )
+    sig.metadata = {"bar_duration_seconds": 300.0}
 
     b = MockPlacementBridge()
     import config

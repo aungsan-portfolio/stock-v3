@@ -1165,6 +1165,103 @@ class DynamicTrailingStopManager:
                         continue
 
                     if total_filled < exp_qty - 1e-4:
+                        # Verify working orders on broker for symbol
+                        has_working_orders = False
+                        if hasattr(bridge, "working_orders_plain"):
+                            try:
+                                working = bridge.working_orders_plain()
+                                has_working_orders = any(
+                                    str(getattr(wo, "symbol", "") or (wo.get("symbol") if isinstance(wo, dict) else "")).upper().strip() == symbol.upper().strip()
+                                    for wo in (working or [])
+                                )
+                            except Exception:
+                                has_working_orders = True
+                        elif hasattr(bridge, "_get_active_orders"):
+                            try:
+                                raw_active = bridge._get_active_orders()
+                                has_working_orders = any(
+                                    str(getattr(ao, "symbol", "") or "").upper().strip() == symbol.upper().strip()
+                                    for ao in (raw_active or [])
+                                )
+                            except Exception:
+                                has_working_orders = True
+
+                        if has_working_orders:
+                            results[symbol] = "WORKING_ORDERS_PENDING_RETAINED"
+                            continue
+
+                        # Check if trade was already closed and recorded in the trade journal
+                        journal_has_closed_trade = False
+                        try:
+                            from strategies.trade_journal import read_journal
+                            j_records = read_journal()
+                            sig_id = str(exit_item.get("signal_id") or "").strip()
+                            ep_id = str(episode_id or "").strip()
+                            entry_time_epoch = _to_epoch(exit_item.get("entry_time"))
+                            known_exit_ids = {
+                                str(x).strip() for x in [
+                                    sig_id,
+                                    ep_id,
+                                    exit_item.get("order_id"),
+                                    exit_item.get("tp_order_id"),
+                                    exit_item.get("stop_order_id"),
+                                    exit_item.get("last_stop_order_id"),
+                                ] if x
+                            }
+
+                            for rec in reversed(j_records):
+                                if (
+                                    str(rec.get("symbol", "")).upper().strip() == symbol.upper().strip()
+                                    and rec.get("event_type") in ("TRADE_CLOSED", "EXIT")
+                                ):
+                                    # Guard 1: Timestamp must not precede entry time
+                                    rec_ts = _to_epoch(rec.get("timestamp"))
+                                    if rec_ts is not None and entry_time_epoch is not None and rec_ts < entry_time_epoch:
+                                        continue
+
+                                    # Guard 2: Lineage match (signal_id, order_id, or idempotency_key must match this episode)
+                                    rec_sig = str(rec.get("signal_id") or "").strip()
+                                    rec_oid = str(rec.get("order_id") or "").strip()
+                                    rec_idem = str(rec.get("idempotency_key") or "").strip()
+
+                                    matches_lineage = False
+                                    if sig_id and (rec_sig == sig_id or sig_id in rec_idem):
+                                        matches_lineage = True
+                                    elif ep_id and (ep_id in rec_idem or (rec_sig and rec_sig in ep_id)):
+                                        matches_lineage = True
+                                    elif rec_oid and rec_oid in known_exit_ids:
+                                        matches_lineage = True
+                                    elif not sig_id and entry_time_epoch is not None and rec_ts is not None and rec_ts >= entry_time_epoch:
+                                        matches_lineage = True
+
+                                    if not matches_lineage:
+                                        continue
+
+                                    j_qty = float(rec.get("qty") or 0.0)
+                                    if abs(j_qty - exp_qty) < 1e-4 or j_qty >= exp_qty:
+                                        journal_has_closed_trade = True
+                                        break
+                        except Exception as j_exc:
+                            logger.debug("Journal check non-fatal: %s", j_exc)
+
+                        if journal_has_closed_trade:
+                            logger.info(
+                                "[RECONCILE AUTHORITATIVE CONFIRMATION] %s: Verified broker flat (qty=0, working_orders=0) "
+                                "with trade journal closed record. Clearing pending exit '%s'.",
+                                symbol, episode_id
+                            )
+                            if episode_id in self.pending_exits:
+                                del self.pending_exits[episode_id]
+                            if symbol in self.pending_exits:
+                                del self.pending_exits[symbol]
+                            if symbol in self.states:
+                                self.states[symbol].reconciliation_status = "RECONCILED_FLAT_VERIFIED"
+                                self.states[symbol].active = False
+                                self.states[symbol].stop_reconciliation_required = False
+                            self._save_state()
+                            results[symbol] = "RECONCILED_FLAT_VERIFIED"
+                            continue
+
                         results[symbol] = "FLAT_PENDING_EXIT_RECONCILIATION"
                         continue
 

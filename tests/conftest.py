@@ -73,6 +73,30 @@ def test_isolation_root() -> Path:
 def enforce_test_isolation_roots(monkeypatch):
     """Autouse fixture ensuring config paths remain pinned to isolated test root."""
     config.init_isolated_test_env(_SESSION_TEST_ROOT)
+    try:
+        from strategies.halt_manager import reset_all_entry_halts
+        reset_all_entry_halts()
+    except Exception:
+        pass
+    try:
+        from observability.state_machine import get_state_machine
+        get_state_machine().clear_protection_latch("test_isolation_cleanup")
+    except Exception:
+        pass
+    try:
+        from strategies.trailing_stop import get_trailing_manager
+        ts_mgr = get_trailing_manager()
+        ts_mgr.persistence_healthy = True
+        ts_mgr.last_persistence_error = None
+        ts_mgr.consecutive_persistence_failures = 0
+    except Exception:
+        pass
+    yield
+    try:
+        from strategies.halt_manager import reset_all_entry_halts
+        reset_all_entry_halts()
+    except Exception:
+        pass
 
 
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)

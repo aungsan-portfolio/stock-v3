@@ -7939,8 +7939,14 @@ class AlpacaBridge:
                 logger.error("[RATCHET EXECUTE ERROR] %s", r_exc)
 
             if hasattr(self, "entry_gate") and getattr(self.entry_gate, "halted", False):
-                logger.info("[ROTATION GATE] Entry gate halted (%s) — stop ratchets completed; skipping new rotation entries",
-                            getattr(self.entry_gate, "halt_reason", "Halted"))
+                try:
+                    curr_eq = float(self.get_net_liquidation() or 0.0)
+                    sod_eq = float(getattr(self, "_start_of_day_equity", 0.0) or 0.0)
+                    live_pnl_str = f" | Live Equity: ${curr_eq:,.2f}, SOD Baseline: ${sod_eq:,.2f}, Live PnL: ${curr_eq - sod_eq:,.2f}" if (curr_eq > 0 and sod_eq > 0) else ""
+                except Exception:
+                    live_pnl_str = ""
+                logger.info("[ROTATION GATE] Entry gate halted (%s)%s — stop ratchets completed; skipping new rotation entries",
+                            getattr(self.entry_gate, "halt_reason", "Halted"), live_pnl_str)
                 return
 
             conf_lookup = {

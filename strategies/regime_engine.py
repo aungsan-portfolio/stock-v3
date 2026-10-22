@@ -220,6 +220,7 @@ def compute_vwap_breadth(
             batch_fetched, _ = fetch_intraday_batch(
                 candidates,
                 interval="1m",
+                lookback_days=1,
                 bridge=bridge,
                 purpose="REGIME_BREADTH",
                 total_timeout_seconds=10.0,

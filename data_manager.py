@@ -199,7 +199,30 @@ def fetch_ohlcv(
         if attempt < 3:
             time.sleep(attempt * 1.5)
 
-    if df.empty and interval in ("1d", "daily", None):
+    # Assess data freshness: check if yfinance data is empty or missing recent completed sessions
+    needs_alpaca_fallback = df.empty
+    if not needs_alpaca_fallback and interval in ("1d", "daily", None):
+        try:
+            from strategies.session import now_eastern
+            current_date = now_eastern().date()
+            last_bar_date = pd.to_datetime(df.index[-1]).date()
+            if last_bar_date >= current_date and len(df) > 1:
+                prev_completed_date = pd.to_datetime(df.index[-2]).date()
+            else:
+                prev_completed_date = last_bar_date
+            
+            # If the last completed session is more than 1 weekday old (or >3 over weekend), yfinance is stale/delayed
+            max_age_days = 4 if current_date.weekday() in (0, 1) else 2
+            if (current_date - prev_completed_date).days >= max_age_days:
+                logger.warning(
+                    "[DATA FRESHNESS] %s data from yfinance missing recent session (latest completed=%s, current=%s); falling back to Alpaca daily bars",
+                    symbol, prev_completed_date, current_date
+                )
+                needs_alpaca_fallback = True
+        except Exception as stale_err:
+            logger.debug("[DATA FRESHNESS] Staleness check skipped for %s: %s", symbol, stale_err)
+
+    if needs_alpaca_fallback and interval in ("1d", "daily", None):
         # Zero-budget fallback: Fetch free Alpaca IEX daily bars
         try:
             from strategies.intraday_data import fetch_daily_alpaca

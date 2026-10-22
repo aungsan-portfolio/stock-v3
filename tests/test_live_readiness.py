@@ -86,8 +86,11 @@ class TestOrderAudit(unittest.TestCase):
         self.path = Path(self.tmp.name) / "order_audit.jsonl"
         self._patch = mock.patch.object(order_audit, "AUDIT_FILE", self.path)
         self._patch.start()
+        self._patch_override = mock.patch.object(order_audit, "_audit_file_override", self.path, create=True)
+        self._patch_override.start()
 
     def tearDown(self):
+        self._patch_override.stop()
         self._patch.stop()
         self.tmp.cleanup()
 

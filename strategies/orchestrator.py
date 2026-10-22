@@ -127,8 +127,8 @@ def _inverse_etf_entry_allowed(regime_res, sig: TradeSignal) -> bool:
     if sig.side.upper() not in ("BUY", "LONG"):
         return False
 
-    if hasattr(regime_res, "allow_inverse_etf_longs") and regime_res.allow_inverse_etf_longs:
-        return True
+    if hasattr(regime_res, "allow_inverse_etf_longs"):
+        return bool(regime_res.allow_inverse_etf_longs)
 
     from strategies.regime_engine import MODE_RISK_OFF, MODE_CAUTION
     if getattr(regime_res, "mode", "") in (MODE_RISK_OFF, MODE_CAUTION):
@@ -259,7 +259,7 @@ def get_strategy_reachability_matrix(market_texture: Optional[str] = None) -> Li
         for tex in textures:
             admitted, is_exp, _ = is_strategy_admitted_for_texture(strat, tex)
             gen_supported = True
-            if strat == StrategyName.MEAN_REVERSION and tex != "SIDEWAYS":
+            if strat == StrategyName.MEAN_REVERSION and tex not in ("SIDEWAYS", "TRANSITIONING"):
                 gen_supported = False
             
             if not enabled:
@@ -671,7 +671,9 @@ def _should_bypass_lunch_chop(sig: TradeSignal, event_decision: Optional[object]
 
 def _evaluate_mean_reversion(symbol, df, market_texture, scorer, bridge=None):
     """Route MR with real execution context without relaxing any acceptance gate."""
-    if market_texture != "SIDEWAYS" or not getattr(config, "STRATEGY_MEAN_REVERSION_ENABLED", True):
+    allowed_textures = ("SIDEWAYS", "TRANSITIONING")
+    allowed_strats = config.MARKET_REGIME_SETTINGS.get(market_texture, {}).get("allowed_strategies", [])
+    if market_texture not in allowed_textures or "MEAN_REVERSION" not in allowed_strats or not getattr(config, "STRATEGY_MEAN_REVERSION_ENABLED", True):
         return None
     from strategies.mean_reversion import MeanReversionStrategy
     context = dict(getattr(df, "attrs", {}) or {})
@@ -954,8 +956,9 @@ def _evaluate_on_df(symbol: str, df, market_texture: str = "TRENDING", bridge: o
             logger.exception("Strategy %s crashed on %s", strategy.name, symbol)
             failures.append(f"{strategy.name}: CRASH ({e})")
 
-    # Evaluate MeanReversionStrategy when in SIDEWAYS market texture
-    if market_texture == "SIDEWAYS":
+    # Evaluate MeanReversionStrategy when allowed in current market texture (e.g. SIDEWAYS, TRANSITIONING)
+    allowed_mr_strats = config.MARKET_REGIME_SETTINGS.get(market_texture, {}).get("allowed_strategies", [])
+    if "MEAN_REVERSION" in allowed_mr_strats:
         try:
             mr_signal = _evaluate_mean_reversion(symbol, df, market_texture, scorer, bridge=bridge)
             if mr_signal is not None:
@@ -1756,7 +1759,9 @@ def evaluate_and_execute(
                 mode_str = getattr(regime_res, "mode", "UNKNOWN")
                 logger.warning("[MARKET ENTRY HALT] New long day trades disabled (mode=%s score=%d). Summary: %s", mode_str, regime_res.score, regime_res.summary())
                 inverse_exempt = getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
-                if inverse_exempt and regime_res is not None:
+                has_inverse_in_watchlist = any(str(sym).upper().strip() in getattr(config, "INVERSE_ETF_SYMBOLS", set()) for sym in watchlist)
+                regime_inverse_ok = bool(regime_res and getattr(regime_res, "allow_inverse_etf_longs", False))
+                if inverse_exempt and regime_inverse_ok and has_inverse_in_watchlist:
                     logger.info("[INVERSE ETF EXEMPT] Entry halt active; eligible inverse ETFs remain enabled (mode=%s score=%d)", mode_str, regime_res.score)
         elif regime_res.mode == MODE_CAUTION:
             logger.info("[MARKET REGIME CAUTION] Fallback watchlist active after 09:45 EST buffer (50%% sizing). Summary: %s", regime_res.summary())
@@ -2055,6 +2060,31 @@ def evaluate_and_execute(
                 should_run_eval = False
         else:
             logger.debug("[EXECUTION HEALTH GATE] %s", health_gate.summary)
+            if bridge is not None and getattr(bridge, "entry_gate", None) is not None:
+                gate = bridge.entry_gate
+                if getattr(gate, "halted", False):
+                    recovery_halts = {
+                        "TRADE_STREAM_DISCONNECTED",
+                        "BROKER_RECONCILIATION_PENDING",
+                        "STREAM_RECOVERY_REQUIRED",
+                        "STREAM_DEGRADED_OR_DESYNC",
+                        "OFF_MARKET_STANDBY",
+                        "STARTUP_HEALTH_GATE_HELD",
+                        "DATA_FEED_DEGRADED",
+                    }
+                    active_reasons = set(getattr(gate, "reasons", set()))
+                    if active_reasons and active_reasons.issubset(recovery_halts):
+                        logger.info(
+                            "[EXECUTION HEALTH GATE RECOVERY] All health checks passed; clearing transient recovery halts: %s",
+                            sorted(active_reasons),
+                        )
+                        if hasattr(bridge, "_clear_recovery_halts"):
+                            bridge._clear_recovery_halts()
+                        elif hasattr(gate, "clear_recovery_halts"):
+                            gate.clear_recovery_halts()
+                        if not getattr(gate, "halted", False):
+                            allow_new_entries = True
+                            can_evaluate_signals = True
     except Exception as h_err:
         logger.error("[EXECUTION HEALTH GATE] Evaluation failed, failing closed: %s", h_err)
         allow_new_entries = False
@@ -2120,7 +2150,7 @@ def evaluate_and_execute(
             pass
 
     total_universe_candidates = len(watchlist) if watchlist else 0
-    raw_screened_setups = len(all_signals)
+    raw_candidates_total = len(all_signals)
 
     # ── Lane 5: Pre-Correlation / Pre-Sizing Texture Admission Filter ──
     texture_admitted_signals = []
@@ -2203,7 +2233,7 @@ def evaluate_and_execute(
     def get_signal_sorting_key(sig):
         strat_cfg = getattr(config, "STRATEGY_SETTINGS", {}).get(sig.strategy)
         priority = getattr(strat_cfg, "priority", 10) if strat_cfg else 10
-        if market_tex == "SIDEWAYS" and getattr(sig, "strategy", None) == StrategyName.MEAN_REVERSION:
+        if market_tex in ("SIDEWAYS", "TRANSITIONING") and getattr(sig, "strategy", None) == StrategyName.MEAN_REVERSION:
             priority = 1
         return (priority, -sig.confidence)
 
@@ -2558,6 +2588,7 @@ def evaluate_and_execute(
 
     # ── Canonical Candidate Selection & Deduplication Gate ──
     all_signals = select_viable_cycle_candidates(screened_candidates)
+    screened_setups_count = len(screened_candidates)
 
     if near_misses:
         mean_near_miss_gap = sum(m["diff"] for m in near_misses) / len(near_misses)
@@ -2574,6 +2605,14 @@ def evaluate_and_execute(
     if error_handler is None:
         error_handler = TradingErrorHandler(bridge=bridge)
 
+    cached_day_trades_5d = None
+    if all_signals:
+        try:
+            cached_day_trades_5d = day_trades_in_last_5_days(bridge=bridge)
+        except Exception as dt_err:
+            logger.warning("[EXECUTION] Failed to pre-fetch day trades count: %s", dt_err)
+            cached_day_trades_5d = 0
+
     execution_results = []
     logger.debug("[HOOK] before execute")
     for sig in all_signals:
@@ -2581,9 +2620,45 @@ def evaluate_and_execute(
             from strategies.trailing_stop import manager
             if manager.has_unresolved_position_unknown():
                 logger.warning("[SAFETY GATE HALT] Rejecting signal %s: active POSITION_UNKNOWN state across portfolio", sig.symbol)
+                try:
+                    from strategies.gate_ledger import log_gate_decision
+                    log_gate_decision(
+                        evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sig.symbol}_{int(time.time())}",
+                        symbol=sig.symbol,
+                        bar=getattr(sig, "bar_timestamp", "") or "",
+                        strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                        stage="STAGE_POSITION_SAFETY",
+                        decision="REJECT",
+                        reason_code="ACTIVE_POSITION_UNKNOWN",
+                        human_message="Active POSITION_UNKNOWN state across portfolio",
+                        terminal_decision=True,
+                        blocked_by="STAGE_POSITION_SAFETY",
+                        raw_conf=getattr(sig, "confidence", 0.0),
+                        final_conf=getattr(sig, "confidence", 0.0),
+                    )
+                except Exception:
+                    pass
                 continue
             if manager.has_pending_exit(sig.symbol):
                 logger.warning("[SAFETY GATE REJECT] Rejecting signal %s: prior exit for %s pending broker reconciliation", sig.symbol, sig.symbol)
+                try:
+                    from strategies.gate_ledger import log_gate_decision
+                    log_gate_decision(
+                        evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sig.symbol}_{int(time.time())}",
+                        symbol=sig.symbol,
+                        bar=getattr(sig, "bar_timestamp", "") or "",
+                        strategy=getattr(sig.strategy, "name", str(sig.strategy)),
+                        stage="STAGE_POSITION_SAFETY",
+                        decision="REJECT",
+                        reason_code="PRIOR_EXIT_PENDING_RECONCILIATION",
+                        human_message=f"Prior exit for {sig.symbol} pending broker reconciliation",
+                        terminal_decision=True,
+                        blocked_by="STAGE_POSITION_SAFETY",
+                        raw_conf=getattr(sig, "confidence", 0.0),
+                        final_conf=getattr(sig, "confidence", 0.0),
+                    )
+                except Exception:
+                    pass
                 continue
         except Exception:
             pass
@@ -2601,7 +2676,7 @@ def evaluate_and_execute(
                 from strategies.gate_ledger import log_gate_decision
                 from strategies.veto_reasons import VetoReason
                 log_gate_decision(
-                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                    evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sig.symbol}_{int(time.time())}",
                     symbol=sig.symbol,
                     bar=getattr(sig, "bar_timestamp", "") or "",
                     strategy=getattr(sig.strategy, "name", str(sig.strategy)),
@@ -2650,9 +2725,55 @@ def evaluate_and_execute(
             )
 
         # Build cycle-bound EntryReadiness context for execution boundary validation
+        is_inverse_sig = _is_inverse_etf_signal(sig)
+        is_inverse_regime_allowed = _inverse_etf_entry_allowed(regime_res, sig)
+
+        if is_inverse_sig and is_inverse_regime_allowed and not allow_new_entries:
+            # Check all other non-regime hard gates (Fail-Closed composite)
+            from strategies.trailing_stop import manager as ts_manager
+            from strategies.halt_manager import halt_manager
+            is_conn = getattr(bridge, "is_connected", False) or getattr(bridge, "_connected", False) if bridge else True
+            broker_conn_ok = not live_paper or is_conn
+            daytrade_active = not getattr(bridge, "_daytrade_suspended", False)
+            entry_gate = getattr(bridge, "entry_gate", None)
+            gate_not_halted = not (entry_gate is not None and getattr(entry_gate, "halted", False) is True)
+
+            non_regime_gates_pass = (
+                bool(eval_result is not None and eval_result.entry_allowed)
+                and broker_fetch_ok
+                and broker_conn_ok
+                and daytrade_active
+                and gate_not_halted
+                and halt_manager.entries_allowed()
+                and not getattr(event_decision, "block_entries", False)
+                and not ts_manager.has_unresolved_position_unknown()
+            )
+            sig_entry_allowed = non_regime_gates_pass
+            if eval_result is not None and not eval_result.entry_allowed:
+                sig_suppression = eval_result.suppression_reason
+            elif not broker_conn_ok:
+                sig_suppression = "BROKER_DISCONNECTED"
+            elif not broker_fetch_ok:
+                sig_suppression = "BROKER_FETCH_FAILED"
+            elif not daytrade_active:
+                sig_suppression = "DAYTRADE_SUSPENDED"
+            elif not gate_not_halted:
+                sig_suppression = "ENTRY_GATE_HALTED"
+            elif not halt_manager.entries_allowed():
+                sig_suppression = halt_manager.summary()
+            elif getattr(event_decision, "block_entries", False):
+                sig_suppression = "EVENT_BLACKOUT"
+            elif ts_manager.has_unresolved_position_unknown():
+                sig_suppression = "UNRESOLVED_POSITION_UNKNOWN"
+            else:
+                sig_suppression = None
+        else:
+            sig_entry_allowed = bool(eval_result.entry_allowed and allow_new_entries) if eval_result is not None else allow_new_entries
+            sig_suppression = (eval_result.suppression_reason if eval_result is not None and not eval_result.entry_allowed else ("NEW_ENTRIES_HALTED" if not allow_new_entries else None))
+
         readiness = EntryReadiness(
-            entry_allowed=bool(eval_result.entry_allowed and allow_new_entries) if eval_result else allow_new_entries,
-            suppression_reason=(eval_result.suppression_reason if eval_result and not eval_result.entry_allowed else ("NEW_ENTRIES_HALTED" if not allow_new_entries else None)),
+            entry_allowed=sig_entry_allowed,
+            suppression_reason=sig_suppression,
             cycle_id=cycle_id,
             bar_ts=completed_5m_bar_str,
             created_at=time.time(),
@@ -2665,7 +2786,7 @@ def evaluate_and_execute(
                 bridge=bridge,
                 equity=effective_equity,
                 current_pnl=current_pnl,
-                day_trades_last_5_days=day_trades_in_last_5_days(bridge=bridge),
+                day_trades_last_5_days=cached_day_trades_5d,
                 dry_run=not live_paper,
                 regime_result=regime_res,
                 entry_readiness=readiness,
@@ -2676,7 +2797,7 @@ def evaluate_and_execute(
                 try:
                     from strategies.gate_ledger import log_gate_decision
                     log_gate_decision(
-                        evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                        evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sig.symbol}_{int(time.time())}",
                         symbol=sig.symbol,
                         bar=getattr(sig, "bar_timestamp", "") or "",
                         strategy=getattr(sig.strategy, "name", str(sig.strategy)),
@@ -2703,7 +2824,7 @@ def evaluate_and_execute(
                     from strategies.gate_ledger import log_gate_decision
                     c_stage, c_reason = _classify_execution_rejection(result.get("reason", ""))
                     log_gate_decision(
-                        evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sym}_{int(time.time())}",
+                        evaluation_id=getattr(sig, "signal_id", "") or f"sig_{sig.symbol}_{int(time.time())}",
                         symbol=sig.symbol,
                         bar=getattr(sig, "bar_timestamp", "") or "",
                         strategy=getattr(sig.strategy, "name", str(sig.strategy)),
@@ -2727,24 +2848,31 @@ def evaluate_and_execute(
             if error_handler:
                 error_handler.record(e)
 
-    # ── Lane 5: Funnel Telemetry v2.1 (Dual Denominators) ──
+    # ── Lane 5: Funnel Telemetry v2.1 (Dual Denominators & Unique Setup Conversion) ──
     placed_count = sum(1 for r in execution_results if r.get("status") in {"PLACED", "DRY_RUN"})
-    legacy_placed_pct_screened = (placed_count / raw_screened_setups * 100.0) if raw_screened_setups > 0 else 0.0
+    legacy_placed_pct_screened = (placed_count / screened_setups_count * 100.0) if screened_setups_count > 0 else 0.0
     legacy_placed_pct_universe = (placed_count / total_universe_candidates * 100.0) if total_universe_candidates > 0 else 0.0
     norm_placed_pct_admitted = (placed_count / texture_admitted_count * 100.0) if texture_admitted_count > 0 else 0.0
     norm_corr_pct_admitted = (correlated_count / texture_admitted_count * 100.0) if texture_admitted_count > 0 else 0.0
 
+    unique_screened_setups = len({getattr(s, "setup_id", None) or getattr(s, "signal_id", None) for s in screened_candidates})
+    unique_placed_setups = len({r.get("setup_id") for r in execution_results if r.get("status") in {"PLACED", "DRY_RUN"} and r.get("setup_id")})
+    if unique_placed_setups == 0 and placed_count > 0:
+        unique_placed_setups = placed_count
+
     logger.info(
-        "[FUNNEL TELEMETRY v2.1] raw_candidates_total=%d, universe_candidates=%d, screened_setups=%d, "
-        "texture_admitted=%d, correlated=%d, placed=%d | "
+        "[FUNNEL TELEMETRY v2.1] raw_eval_passes=%d, universe_candidates=%d, screened_passes=%d, "
+        "unique_screened=%d, texture_admitted=%d, correlated=%d, placed=%d, unique_placed=%d | "
         "legacy: placed/screened=%.1f%%, placed/universe=%.1f%% | "
         "normalized: placed/admitted=%.1f%%, correlated/admitted=%.1f%%",
-        raw_screened_setups,
+        raw_candidates_total,
         total_universe_candidates,
-        raw_screened_setups,
+        screened_setups_count,
+        unique_screened_setups,
         texture_admitted_count,
         correlated_count,
         placed_count,
+        unique_placed_setups,
         legacy_placed_pct_screened,
         legacy_placed_pct_universe,
         norm_placed_pct_admitted,

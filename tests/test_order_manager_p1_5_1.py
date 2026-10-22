@@ -44,9 +44,15 @@ def reset_order_manager_globals(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "DAYTRADE_TRADE_JOURNAL_FILE", test_journal)
     monkeypatch.setattr(config, "REQUIRE_REALTIME_DATA_FOR_ORDERS", False)
     monkeypatch.setattr(config, "SPY_TREND_GUARD_ENABLED", False)
+    monkeypatch.setattr(config, "DAYTRADE_REQUIRE_ENTRY_READINESS", False)
     with om._pending_order_contexts_lock:
         om._pending_order_contexts.clear()
     om.reset_session_skip_state()
+    from strategies.trailing_stop import get_trailing_manager
+    ts_mgr = get_trailing_manager()
+    ts_mgr.persistence_healthy = True
+    ts_mgr.last_persistence_error = None
+    ts_mgr.consecutive_persistence_failures = 0
     yield
     with om._pending_order_contexts_lock:
         om._pending_order_contexts.clear()

@@ -455,7 +455,8 @@ def compute_effective_noise_floor(
     signal: TradeSignal,
     df: Optional[object] = None,
     quote: Optional[dict] = None,
-) -> float:
+    return_components: bool = False,
+) -> Union[float, Tuple[float, Dict[str, float]]]:
     """Compute authoritative effective noise floor:
     max(atr_noise_floor, spread_noise_floor, tick_size_floor, configured_min)
     using shared execution geometry with use_buffer=False.
@@ -503,17 +504,29 @@ def compute_effective_noise_floor(
             except Exception:
                 pass
 
+    multiplier = float(getattr(config, "NOISE_FLOOR_ATR_MULTIPLIER", 0.75))
     if effective_atr is not None and effective_atr > 0:
+        atr_component = float(effective_atr * multiplier)
         base_geometry_noise = calculate_minimum_stop_distance(
             atr=effective_atr,
             spread_floor=spread_noise_floor,
             tick_size=tick_size_floor,
             use_buffer=False,
         )
-        return max(base_geometry_noise, configured_min)
+        effective_floor = max(base_geometry_noise, configured_min)
+    else:
+        atr_noise_floor = _compute_noise_floor(signal, df)
+        atr_component = atr_noise_floor
+        effective_floor = max(atr_noise_floor, spread_noise_floor, tick_size_floor, configured_min)
 
-    atr_noise_floor = _compute_noise_floor(signal, df)
-    return max(atr_noise_floor, spread_noise_floor, tick_size_floor, configured_min)
+    if return_components:
+        return effective_floor, {
+            "atr_component": atr_component,
+            "spread_component": spread_noise_floor,
+            "tick_component": tick_size_floor,
+            "configured_min": configured_min,
+        }
+    return effective_floor
 
 
 def validate_quote_health(
@@ -522,6 +535,7 @@ def validate_quote_health(
     max_age_seconds: Optional[float] = None,
     max_spread_pct: float = 0.015,
     atr: Optional[float] = None,
+    signal_entry_price: Optional[float] = None,
 ) -> Tuple[bool, str, dict]:
     """Validates real-time bid/ask quote health and returns normalized spread metrics."""
     if not quote:
@@ -560,6 +574,12 @@ def validate_quote_health(
     if spread_pct > max_spread_pct:
         return False, f"EXCESSIVE_SPREAD: {spread_pct*100:.2f}% > {max_spread_pct*100:.2f}%", metrics
 
+    if signal_entry_price is not None and signal_entry_price > 0 and mid > 0:
+        dev_pct = abs(mid - signal_entry_price) / signal_entry_price * 100.0
+        max_dev = float(getattr(config, "MAX_DECISION_DEVIATION_PCT", 1.5))
+        if dev_pct > max_dev:
+            return False, f"QUOTE_PRICE_DISCONTINUITY: mid ${mid:.4f} deviates {dev_pct:.2f}% > {max_dev:.2f}% from signal entry ${signal_entry_price:.4f}", metrics
+
     now = time.time() if now_ts is None else float(now_ts)
     raw_ts = quote.get("timestamp") or quote.get("quote_timestamp") or quote.get("ts")
     if raw_ts is not None:
@@ -594,14 +614,17 @@ def _pre_submission_veto(
     stop_distance < effective_noise_floor => REJECTED_NOISE_FLOOR_BREACH
     """
     stop_distance = abs(signal.entry_price - signal.stop_price)
-    effective_noise_floor = compute_effective_noise_floor(signal, df, quote=quote)
+    effective_noise_floor, comp = compute_effective_noise_floor(signal, df, quote=quote, return_components=True)
 
     policy = getattr(config, "NOISE_FLOOR_POLICY", "OPTION_A")
     if policy == "OPTION_A":
         if stop_distance < (effective_noise_floor - 1e-6):
+            atr_comp = comp.get("atr_component", 0.0)
+            spread_comp = comp.get("spread_component", 0.0)
             reason = (
                 f"[Pre-submission Veto] REJECTED_NOISE_FLOOR_BREACH: stop distance ${stop_distance:.4f} < "
-                f"effective noise floor ${effective_noise_floor:.4f}"
+                f"effective noise floor ${effective_noise_floor:.4f} "
+                f"(atr_component=${atr_comp:.4f}, spread_component=${spread_comp:.4f})"
             )
             return True, reason
     else:
@@ -1631,6 +1654,7 @@ def execute_signal(
             quote = get_quote_fn(signal.symbol)
         except Exception as q_exc:
             if not dry_run and (getattr(bridge, "is_connected", False) or getattr(bridge, "_connected", False)):
+                idempotency_manager.release(signal.symbol, side=signal.side, reason="quote_refetch_exception")
                 result["reason"] = f"QUOTE_REFETCH_FAILED: Exception during quote refetch for {signal.symbol}: {q_exc}"
                 logger.warning("[QUOTE REFETCH FAILED] Blocked %s: %s", signal.symbol, result["reason"])
                 return result
@@ -1639,7 +1663,8 @@ def execute_signal(
     if quote is None:
         quote = signal_metadata.get("quote") or getattr(signal, "quote", None)
 
-    if not dry_run and (getattr(bridge, "is_connected", False) or getattr(bridge, "_connected", False)) and not quote:
+    if callable(get_quote_fn) and not dry_run and (getattr(bridge, "is_connected", False) or getattr(bridge, "_connected", False)) and not quote:
+        idempotency_manager.release(signal.symbol, side=signal.side, reason="quote_refetch_missing")
         result["reason"] = f"QUOTE_REFETCH_FAILED: Realtime quote missing for {signal.symbol}"
         logger.warning("[QUOTE REFETCH FAILED] Blocked %s: %s", signal.symbol, result["reason"])
         return result
@@ -1660,6 +1685,7 @@ def execute_signal(
         quote_ok, quote_err, quote_metrics = validate_quote_health(
             quote,
             atr=getattr(signal, "atr", None),
+            signal_entry_price=signal.entry_price,
             max_age_seconds=max_quote_age,
         )
         result["metadata"]["quote_metrics"] = quote_metrics
@@ -1690,9 +1716,18 @@ def execute_signal(
     result["metadata"]["veto_evaluation_time"] = veto_evaluation_time
     result["metadata"]["execution_latency_ms"] = latency_ms
 
+    q_bid = float(quote.get("bid", 0.0) or 0.0) if quote else 0.0
+    q_ask = float(quote.get("ask", 0.0) or 0.0) if quote else 0.0
+    q_mid = float(quote.get("mid", 0.0) or ((q_bid + q_ask) / 2.0 if q_bid and q_ask else 0.0)) if quote else 0.0
+    q_spread = (q_ask - q_bid) if (q_ask > q_bid > 0) else 0.0
+    q_feed = quote.get("feed_identity", "unknown") if quote else "none"
+    delta_mid_entry = (q_mid - signal.entry_price) if q_mid > 0 else 0.0
+
     logger.info(
-        "[QUOTE TIMESTAMPS] %s: signal_gen=%.4f quote_fetch=%.4f veto_eval=%.4f (latency=%.1fms, quote_age=%.2fs)",
-        signal.symbol, sig_gen_time, quote_fetch_time, veto_evaluation_time, latency_ms, q_age
+        "[QUOTE OBSERVED] %s: bid=%.4f ask=%.4f mid=%.4f spread=%.4f feed=%s entry_px=%.4f (delta_mid_entry=%+.4f) | "
+        "signal_gen=%.4f quote_fetch=%.4f veto_eval=%.4f (latency=%.1fms, quote_age=%.2fs)",
+        signal.symbol, q_bid, q_ask, q_mid, q_spread, q_feed, signal.entry_price, delta_mid_entry,
+        sig_gen_time, quote_fetch_time, veto_evaluation_time, latency_ms, q_age
     )
 
     price_reason = _validate_signal_prices(signal, market_texture=market_texture, quote=quote)
@@ -1770,7 +1805,8 @@ def execute_signal(
 
     # ── SPY/QQQ Intraday Trend Guard ───────────────────────────────────────
     is_inverse_etf = signal.symbol.upper().strip() in set(getattr(config, "INVERSE_ETF_SYMBOLS", set()))
-    is_inverse_exempt = is_inverse_etf and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
+    regime_inverse_ok = bool(regime_result and getattr(regime_result, "allow_inverse_etf_longs", False))
+    is_inverse_exempt = is_inverse_etf and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False) and regime_inverse_ok
 
     if signal.side.upper() == "BUY" and not dry_run and getattr(config, "SPY_TREND_GUARD_ENABLED", True):
         guard_sym = "SPY"
@@ -1861,7 +1897,8 @@ def execute_signal(
 
     shares = calculate_shares(executable_signal, equity)
     is_inverse_etf = signal.symbol.upper().strip() in set(getattr(config, "INVERSE_ETF_SYMBOLS", set()))
-    is_inverse_exempt = is_inverse_etf and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
+    regime_inverse_ok = bool(regime_result and getattr(regime_result, "allow_inverse_etf_longs", False))
+    is_inverse_exempt = is_inverse_etf and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False) and regime_inverse_ok
     if not is_inverse_exempt and regime_result and getattr(regime_result, "position_scale", 1.0) < 1.0:
         shares = math.floor(shares * float(regime_result.position_scale))
 
@@ -2058,7 +2095,8 @@ def execute_signal(
                 return result
         else:
             is_inverse = signal.symbol.upper().strip() in getattr(config, "INVERSE_ETF_SYMBOLS", set())
-            inverse_exempt = is_inverse and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
+            regime_inverse_ok = bool(regime_result and getattr(regime_result, "allow_inverse_etf_longs", False))
+            inverse_exempt = is_inverse and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False) and regime_inverse_ok
             if not inverse_exempt:
                 if getattr(regime_result, "halt_new_entries", False) or not getattr(regime_result, "allow_new_longs", True):
                     result["reason"] = f"Regime score {getattr(regime_result, 'score', 0)} <= -3 → No new long entries allowed"
@@ -2067,9 +2105,13 @@ def execute_signal(
 
         if hasattr(regime_result, "max_trades_day") and regime_result.max_trades_day is not None:
             is_inverse = signal.symbol.upper().strip() in getattr(config, "INVERSE_ETF_SYMBOLS", set())
-            inverse_exempt = is_inverse and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
+            regime_inverse_ok = bool(regime_result and getattr(regime_result, "allow_inverse_etf_longs", False))
+            inverse_exempt = is_inverse and getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False) and regime_inverse_ok
             if is_inverse and inverse_exempt:
-                effective_max_trades = max(effective_max_trades, getattr(config, "MAX_DAILY_TRADES", 15))
+                if regime_result.max_trades_day > 0:
+                    effective_max_trades = max(effective_max_trades, getattr(config, "MAX_DAILY_TRADES", 15))
+                else:
+                    effective_max_trades = min(effective_max_trades, regime_result.max_trades_day)
             else:
                 effective_max_trades = min(effective_max_trades, regime_result.max_trades_day)
         elif getattr(regime_result, "mode", "") == "CAUTION":
@@ -2283,6 +2325,26 @@ def execute_signal(
             return result
 
         if not quote_res.valid:
+            try:
+                from strategies.shadow_stream_manager import get_shadow_stream_manager
+                q_raw = quote_res.quote
+                q_dict = {
+                    "bid": getattr(q_raw, "bid", None) if q_raw else None,
+                    "ask": getattr(q_raw, "ask", None) if q_raw else None,
+                }
+                sig_meta = getattr(signal, "metadata", None)
+                c_id = getattr(signal, "cycle_id", None) or (sig_meta.get("cycle_id") if isinstance(sig_meta, dict) else None)
+                get_shadow_stream_manager().record_shadow_comparison(
+                    symbol=signal.symbol,
+                    rest_quote=q_dict,
+                    rest_latency_ms=getattr(quote_res, "latency_ms", 0.0) or 0.0,
+                    is_spread_veto=("SPREAD" in str(quote_res.reason).upper()),
+                    cycle_id=c_id,
+                    rest_quote_timestamp=getattr(q_raw, "timestamp", None),
+                )
+            except Exception:
+                pass
+
             idempotency_manager.release(
                 signal.symbol,
                 side=signal.side,
@@ -2306,6 +2368,53 @@ def execute_signal(
         q_bid = _get_num(quote_res.quote, "bid")
         q_last = _get_num(quote_res.quote, "last")
 
+        quote_age_ms = 0.0
+        if quote_res.quote:
+            q_ts = getattr(quote_res.quote, "timestamp", 0.0)
+            if isinstance(q_ts, datetime):
+                quote_age_ms = max(0.0, (datetime.now(timezone.utc) - q_ts.astimezone(timezone.utc)).total_seconds() * 1000.0)
+            elif isinstance(q_ts, (int, float)) and q_ts > 0:
+                quote_age_ms = max(0.0, (time.time() - float(q_ts)) * 1000.0)
+            else:
+                quote_age_ms = 0.0
+
+        quote_fetch_duration_ms = float(getattr(quote_res, "latency_ms", 0.0) or 0.0)
+
+        sig_ts_raw = getattr(signal, "timestamp", None)
+        signal_age_ms = 0.0
+        if isinstance(sig_ts_raw, datetime):
+            signal_age_ms = max(0.0, (datetime.now(timezone.utc) - sig_ts_raw.astimezone(timezone.utc)).total_seconds() * 1000.0)
+        elif isinstance(sig_ts_raw, (int, float)) and sig_ts_raw > 0:
+            signal_age_ms = max(0.0, (time.time() - float(sig_ts_raw)) * 1000.0)
+        elif isinstance(sig_ts_raw, str) and sig_ts_raw.strip():
+            try:
+                dt_parsed = datetime.fromisoformat(sig_ts_raw.replace("Z", "+00:00"))
+                signal_age_ms = max(0.0, (datetime.now(timezone.utc) - dt_parsed.astimezone(timezone.utc)).total_seconds() * 1000.0)
+            except Exception:
+                signal_age_ms = 0.0
+
+        signal_to_exec_latency_ms = signal_age_ms
+
+        logger.info(
+            "[EXECUTION LATENCY] %s: signal_age=%.1fms, quote_fetch=%.1fms, quote_age=%.1fms, total_latency=%.1fms",
+            signal.symbol, signal_age_ms, quote_fetch_duration_ms, quote_age_ms, signal_to_exec_latency_ms
+        )
+
+        try:
+            from strategies.shadow_stream_manager import get_shadow_stream_manager
+            sig_meta = getattr(signal, "metadata", None)
+            c_id = getattr(signal, "cycle_id", None) or (sig_meta.get("cycle_id") if isinstance(sig_meta, dict) else None)
+            get_shadow_stream_manager().record_shadow_comparison(
+                symbol=signal.symbol,
+                rest_quote={"bid": q_bid, "ask": q_ask},
+                rest_latency_ms=getattr(quote_res, "latency_ms", 0.0) or 0.0,
+                is_spread_veto=False,
+                cycle_id=c_id,
+                rest_quote_timestamp=getattr(quote_res.quote, "timestamp", None),
+            )
+        except Exception:
+            pass
+
         if quote_res.quote and (q_ask > 0 or q_bid > 0 or q_last > 0 or hasattr(quote_res.quote, "executable_price")):
             exec_price = 0.0
             if hasattr(quote_res.quote, "executable_price") and callable(quote_res.quote.executable_price):
@@ -2328,13 +2437,6 @@ def execute_signal(
             if unf_chase > max_allowed_chase:
                 stop_dist = abs(signal.entry_price - signal.stop_price)
                 chase_to_stop_ratio_pct = (unf_chase / stop_dist * 100.0) if stop_dist > 1e-6 else 0.0
-                q_ts = getattr(quote_res.quote, "timestamp", 0.0)
-                if isinstance(q_ts, datetime):
-                    quote_age_ms = max(0.0, (datetime.now(timezone.utc) - q_ts.astimezone(timezone.utc)).total_seconds() * 1000.0)
-                elif isinstance(q_ts, (int, float)) and q_ts > 0:
-                    quote_age_ms = max(0.0, (time.time() - float(q_ts)) * 1000.0)
-                else:
-                    quote_age_ms = 0.0
 
                 idempotency_manager.release(
                     signal.symbol,
@@ -2474,6 +2576,7 @@ def execute_signal(
                 decision_price=signal.entry_price,
                 signal_id=getattr(signal, "signal_id", None),
                 signal_family_id=getattr(signal, "signal_family_id", None) or signal_metadata.get("signal_family_id"),
+                setup_id=getattr(signal, "setup_id", None),
                 feed_source=getattr(config, "ALPACA_FEED", "IEX"),
             )
         except Exception as audit_snap_exc:

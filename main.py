@@ -65,9 +65,16 @@ import argparse
 import csv
 import json
 import logging
+import os
 import sys
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except ImportError:
+    pass
 
 import config
 from logging_setup import setup_logging
@@ -292,8 +299,21 @@ def _place_paper_orders(signals, broker: str = "ibkr", bridge=None, dry_run: boo
                 recon = bridge.reconcile_startup_state(manage_stream_state=False, allow_policy_side_effects=False)
                 _print_startup_reconciliation(recon)
 
-            if getattr(bridge.entry_gate, "halted", False):
-                halt_msg = getattr(bridge.entry_gate, "halt_reason", "Risk gate active")
+            raw_buy_count = sum(
+                1 for s in signals
+                if (hasattr(s, "action") and str(s.action).upper() == "BUY")
+                or (isinstance(s, dict) and str(s.get("action", "")).upper() == "BUY")
+            )
+            raw_sell_count = sum(
+                1 for s in signals
+                if (hasattr(s, "action") and str(s.action).upper() == "SELL")
+                or (isinstance(s, dict) and str(s.get("action", "")).upper() == "SELL")
+            )
+            blocked_by_gate = 0
+            is_entry_halted = bool(getattr(bridge.entry_gate, "halted", False))
+            halt_msg = getattr(bridge.entry_gate, "halt_reason", "Risk gate active") if is_entry_halted else "None"
+            if is_entry_halted:
+                blocked_by_gate = raw_buy_count
                 print(f"⚠️ Entry gate halted ({halt_msg}). Skipping new BUY entries and rotations; processing protective stops and SELL exits.")
                 signals = [
                     s for s in signals
@@ -302,9 +322,17 @@ def _place_paper_orders(signals, broker: str = "ibkr", bridge=None, dry_run: boo
                 ]
 
             result = bridge.execute_all(signals)
-            print(f"\n✅ Orders accepted : {result.get('placed', 0)}")
-            print(f"   Skipped         : {result.get('skipped', 0)}")
-            print(f"   Total signals   : {result.get('total', len(signals))}")
+            eligible_count = len(signals)
+            placed_count = result.get('placed', 0) if isinstance(result, dict) else getattr(result, 'placed', 0)
+            skipped_count = result.get('skipped', 0) if isinstance(result, dict) else getattr(result, 'skipped', 0)
+
+            print("\n📊 --- CYCLE SIGNAL & EXECUTION TELEMETRY ---")
+            print(f"   Raw AI BUY signals         : {raw_buy_count}")
+            print(f"   Raw AI SELL signals        : {raw_sell_count}")
+            print(f"   Blocked by Risk Gates      : {blocked_by_gate} ({halt_msg})")
+            print(f"   Execution-eligible signals : {eligible_count}")
+            print(f"   Orders accepted / submitted: {placed_count}")
+            print(f"   Orders skipped             : {skipped_count}")
             if hasattr(bridge, "mutation_counters"):
                 import json
                 from pathlib import Path
@@ -386,16 +414,17 @@ def cmd_paper(args) -> int:
     interval = int(getattr(args, "interval", 1800))
     broker = getattr(args, "broker", "ibkr")
 
+    target_acct = os.environ.get("SWING_ACCOUNT_ID", "PA3R71I7JFDZ").strip().upper()
+    setup_logging(process_tag="SWING", account_tag=target_acct)
+
     lock_fd = None
     lock_path = None
     if str(broker).lower() == "alpaca":
         from strategies.startup_security import acquire_atomic_process_lock, release_atomic_process_lock, ProcessLockMetadata
         from pathlib import Path
-        import os
         import socket
         from strategies.session import now_eastern
 
-        target_acct = os.environ.get("SWING_ACCOUNT_ID", "PA3R71I7JFDZ").strip().upper()
         lock_path = Path(getattr(config, "DATA_DIR", "data")) / f"swing_bot_{target_acct}.lock"
         try:
             lock_meta = ProcessLockMetadata(
@@ -2417,6 +2446,8 @@ def cmd_daytrade_threshold_report(args) -> int:
 
 
 def cmd_daytrade_paper(args) -> int:
+    target_acct = str(getattr(config, "EXPECTED_PAPER_ACCOUNT_ID", None) or os.environ.get("DAYTRADE_APCA_API_KEY_ID", "PA3UODIC5JTA")).strip().upper()
+    setup_logging(process_tag="DAYTRADE", account_tag=target_acct)
     from strategies.session import session_status, is_market_open
     dry_run = args.dry_run
     raw_symbols = args.symbols or list(getattr(config, "DAYTRADE_WATCHLIST", []))
@@ -2437,10 +2468,9 @@ def cmd_daytrade_paper(args) -> int:
     from alpaca_bridge import AlpacaBridge
     bridge = AlpacaBridge()
 
-    if not dry_run:
-        if not bridge.connect():
-            print("  ERROR: Cannot connect to Alpaca paper broker.\n")
-            sys.exit(1)
+    if not bridge.connect():
+        print("  ERROR: Cannot connect to Alpaca paper broker.\n")
+        sys.exit(1)
 
     try:
         from strategies.orchestrator import evaluate_and_execute
@@ -2868,6 +2898,8 @@ def cmd_daytrade_status(args) -> int:
 
 
 def cmd_daytrade_bot(args) -> int:
+    target_acct = str(getattr(config, "EXPECTED_PAPER_ACCOUNT_ID", None) or os.environ.get("DAYTRADE_APCA_API_KEY_ID", "PA3UODIC5JTA")).strip().upper()
+    setup_logging(process_tag="DAYTRADE", account_tag=target_acct)
     # Runtime configuration validation (explicit execution startup only)
     try:
         config.validate_alpaca_runtime_config()
@@ -2883,7 +2915,6 @@ def cmd_daytrade_bot(args) -> int:
         StartupSafetyRejected,
     )
     from pathlib import Path
-    import os
     import socket
     from strategies.session import now_eastern
 
@@ -3054,7 +3085,8 @@ def _run_daytrade_bot_lifecycle(args) -> int:
         startup_health = get_execution_health(bridge=bridge, feed_telemetry=get_intraday_feed_telemetry())
         if not startup_health.allows_new_entries:
             print(f"  ⚠️ Startup health gate not HEALTHY ({startup_health.status.value}): {startup_health.summary}. Entries halted.")
-            bridge.entry_gate.halt(f"Startup health check: {startup_health.summary}")
+            logger.warning("[STARTUP HEALTH GATE] Halted entry gate: %s", startup_health.summary)
+            bridge.entry_gate.halt("STARTUP_HEALTH_GATE_HELD")
         else:
             lat = startup_health.broker_latency_ms
             lat_str = f"{lat:.1f}ms" if lat is not None else "N/A"
@@ -3183,6 +3215,15 @@ def _run_daytrade_bot_lifecycle(args) -> int:
     except Exception as r_exc:
         logger.warning("[STARTUP] Failed to start EntryOrderReaper background thread: %s", r_exc)
 
+    shadow_stream = None
+    try:
+        from strategies.shadow_stream_manager import get_shadow_stream_manager
+        shadow_stream = get_shadow_stream_manager()
+        shadow_stream.start()
+        print("  📡 Alpaca IEX ShadowStreamManager background thread active (30 streamed, 1 REST fallback).")
+    except Exception as s_exc:
+        logger.warning("[STARTUP] Failed to start Alpaca IEX ShadowStreamManager: %s", s_exc)
+
     shutdown_requested = threading.Event()
     shutdown_signal = None
     _shutdown_lock = threading.Lock()
@@ -3218,6 +3259,13 @@ def _run_daytrade_bot_lifecycle(args) -> int:
             print(f"\n{'='*60}")
             print(f"  PERFORMING CONTROLLED SHUTDOWN (Signal: {sig}, Reason: {reason})")
             print(f"{'='*60}\n")
+
+            if shadow_stream:
+                try:
+                    shadow_stream.stop()
+                    print("  📡 ShadowStreamManager stopped.")
+                except Exception:
+                    pass
 
             if entry_reaper:
                 try:
@@ -3260,7 +3308,9 @@ def _run_daytrade_bot_lifecycle(args) -> int:
                 logger.error("[SHUTDOWN] verify_shutdown_positions failed: %s", v_exc)
 
             if snapshot:
-                print(f"[SHUTDOWN STATUS] Overall: {snapshot.get('overall_status')} | Positions: {snapshot.get('position_status')} | Orders: {snapshot.get('order_status')}")
+                status_msg = f"[SHUTDOWN STATUS] Overall: {snapshot.get('overall_status')} | Positions: {snapshot.get('position_status')} | Orders: {snapshot.get('order_status')}"
+                print(status_msg)
+                logger.info(status_msg)
                 if snapshot.get("persisted_to"):
                     print(f"[SHUTDOWN SNAPSHOT] Persisted to: {snapshot.get('persisted_to')}")
                 if snapshot.get("exit_code") != 0:

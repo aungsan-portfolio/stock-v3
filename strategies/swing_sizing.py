@@ -48,6 +48,7 @@ AGGREGATE_OPEN_STOP_HEAT_PCT: float = 0.025 # 2.50% max total open risk (Hard en
 from strategies.rotation_config import MAX_CONCURRENT_POSITIONS  # Canonical Single Source of Truth
 MAX_DAILY_LOSS_DOLLARS: float = 300.00     # Bridge circuit breaker ceiling (Hard enforced)
 MAX_ADV_PARTICIPATION_RATE: float = 0.01   # 1.00% ADV liquidity ceiling (Hard enforced)
+MIN_ORDER_NOTIONAL: float = 500.00         # $500 minimum order notional (Hard enforced)
 
 ATR_MULTIPLIER_BY_REGIME = {
     "TRENDING_BULL": 1.50,
@@ -379,7 +380,7 @@ def validate_swing_order_safety(
 
     # Notional limits
     notional_value = shares * entry_price
-    require(notional_value >= 500.0, f"Order notional ${notional_value:.2f} below $500 minimum")
+    require(notional_value >= MIN_ORDER_NOTIONAL, f"Order notional ${notional_value:.2f} below ${MIN_ORDER_NOTIONAL:.0f} minimum")
     require(notional_value <= symbol_notional_cap, (
         f"Order notional ${notional_value:.2f} exceeds cap ${symbol_notional_cap:.2f}"
     ))
@@ -607,6 +608,29 @@ def calculate_swing_position_size(
             stop_distance=normalized_stop_distance,
             rejected=True,
             rejection_reason="NO_WHOLE_SHARE_WITHIN_ALL_RISK_LIMITS",
+        )
+
+    candidate_notional = final_shares * entry_price
+    if candidate_notional < MIN_ORDER_NOTIONAL:
+        return SizingDecision(
+            shares=0,
+            binding_constraint="MINIMUM_NOTIONAL",
+            risk_budget=risk_budget,
+            estimated_risk=0.0,
+            gross_notional=0.0,
+            q_risk=q_risk,
+            q_notional=q_notional,
+            q_liquidity=q_liquidity,
+            q_portfolio=q_portfolio,
+            q_broker=q_broker,
+            normalized_stop=normalized_stop,
+            stop_distance=round(normalized_stop_distance, 4),
+            rejected=True,
+            rejection_reason=(
+                f"MIN_ORDER_NOTIONAL_UNSATISFIABLE: Maximum permitted order notional "
+                f"${candidate_notional:.2f} ({final_shares} shares @ ${entry_price:.2f}) "
+                f"is below the ${MIN_ORDER_NOTIONAL:.2f} order minimum"
+            ),
         )
 
     # Identify primary binding constraint

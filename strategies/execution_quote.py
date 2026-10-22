@@ -93,6 +93,7 @@ class QuoteValidationResult:
     valid: bool
     reason: str
     quote: Optional[BrokerQuote] = None
+    latency_ms: float = 0.0
 
     @property
     def accepted(self) -> bool:
@@ -160,6 +161,7 @@ def validate_execution_quote(
             reason="Invalid quote-validation configuration",
         )
 
+    fetch_duration_ms = 0.0
     if quote is not None:
         raw_quote = quote
     else:
@@ -170,27 +172,39 @@ def validate_execution_quote(
                 reason=f"Broker bridge does not implement get_quote() contract for {symbol}",
             )
 
+        t_fetch_0 = time.perf_counter()
         try:
             raw_quote = get_quote_fn(symbol)
+            fetch_duration_ms = (time.perf_counter() - t_fetch_0) * 1000.0
         except Exception as exc:
+            fetch_duration_ms = (time.perf_counter() - t_fetch_0) * 1000.0
             return QuoteValidationResult(
                 valid=False,
                 reason=f"Failed to fetch quote for {symbol}: {exc}",
+                latency_ms=fetch_duration_ms,
             )
 
     if not raw_quote:
         return QuoteValidationResult(
             valid=False,
             reason=f"Broker returned empty/null quote for {symbol}",
+            latency_ms=fetch_duration_ms,
         )
 
     # Standardize mapping or dataclass with fail-closed conversion
+    def _parse_ts(val: Any) -> float:
+        if val is None:
+            return 0.0
+        if hasattr(val, "timestamp") and callable(getattr(val, "timestamp")):
+            return float(val.timestamp())
+        return float(val)
+
     try:
         if isinstance(raw_quote, dict):
             bid = float(raw_quote.get("bid", 0.0) or 0.0)
             ask = float(raw_quote.get("ask", 0.0) or 0.0)
             last = float(raw_quote.get("last", 0.0) or 0.0)
-            ts = float(raw_quote.get("timestamp", 0.0) or 0.0)
+            ts = _parse_ts(raw_quote.get("timestamp", 0.0))
             source = str(raw_quote.get("source", "broker"))
             is_realtime_raw = raw_quote.get("is_realtime", True)
             feed_id_raw = raw_quote.get("feed_identity")
@@ -198,7 +212,7 @@ def validate_execution_quote(
             bid = float(getattr(raw_quote, "bid", 0.0) or 0.0)
             ask = float(getattr(raw_quote, "ask", 0.0) or 0.0)
             last = float(getattr(raw_quote, "last", 0.0) or 0.0)
-            ts = float(getattr(raw_quote, "timestamp", 0.0) or 0.0)
+            ts = _parse_ts(getattr(raw_quote, "timestamp", 0.0))
             source = str(getattr(raw_quote, "source", "broker"))
             is_realtime_raw = getattr(raw_quote, "is_realtime", True)
             feed_id_raw = getattr(raw_quote, "feed_identity", None)
@@ -459,4 +473,4 @@ def validate_execution_quote(
             quote=quote,
         )
 
-    return QuoteValidationResult(valid=True, reason="Quote valid", quote=quote)
+    return QuoteValidationResult(valid=True, reason="Quote valid", quote=quote, latency_ms=fetch_duration_ms)
