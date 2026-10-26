@@ -157,6 +157,60 @@ def test_close_verified_cancel_timeout_with_zero_stops_marks_absent():
     assert result.protection_status == "ABSENT"
 
 
+def test_close_verified_cancel_timeout_order_query_failure_retains_unknown():
+    """FAIL-CLOSED: If broker orders query raises an Exception during post-timeout audit,
+    the coordinator must NOT treat unqueried orders as empty/absent.
+    It must retain protection_status='UNKNOWN', preserve local tracking, and refuse speculative orders."""
+    from alpaca_bridge import AlpacaBridge
+
+    bridge = AlpacaBridge.__new__(AlpacaBridge)
+    bridge._connected = True
+    bridge._paper = True
+    bridge.mode = "daytrade"
+    bridge.account_id = "PA3UODIC5JTA"
+    bridge._client = MagicMock()
+    bridge._client._paper = True
+    bridge._client._base_url = "https://paper-api.alpaca.markets"
+    bridge.mutation_counters = MagicMock()
+    bridge.dry_run = False
+    bridge.assert_account_mode_safety = MagicMock(return_value=True)
+
+    mock_pos = MagicMock()
+    mock_pos.qty = 4.0
+    mock_pos.side = "long"
+    bridge.get_position = MagicMock(return_value=mock_pos)
+    bridge._cancel_all_orders_for_symbol = MagicMock()
+
+    # Active orders query continuously fails with network/broker error
+    bridge._get_active_orders = MagicMock(side_effect=RuntimeError("Broker 504 Gateway Timeout"))
+
+    mono_values = iter([0.0, 0.0, 0.5, 3.5, 3.6, 3.7, 3.8, 3.9, 4.0] + [4.5] * 20)
+
+    with patch("time.sleep", return_value=None), patch("time.monotonic", side_effect=lambda: next(mono_values)):
+        result = bridge.close_position_verified("MU")
+
+    # MUST be UNKNOWN, NEVER ABSENT!
+    assert result.outcome == CloseOutcome.UNKNOWN
+    assert result.protection_status == "UNKNOWN"
+
+    # Orchestrator handling of UNKNOWN: preserves order_id, does NOT call handle_naked_position
+    mock_state = MagicMock()
+    mock_state.active = True
+    mock_state.order_id = "tracked_stop_123"
+    mock_manager = MagicMock()
+
+    prot_status = result.protection_status
+    if mock_state and mock_state.active:
+        mock_state.stop_reconciliation_required = True
+        if prot_status == "ABSENT":
+            mock_state.order_id = None
+            mock_manager.handle_naked_position("MU", 4.0, bridge=bridge, dry_run=False)
+
+    assert mock_state.order_id == "tracked_stop_123"
+    assert mock_state.stop_reconciliation_required is True
+    mock_manager.handle_naked_position.assert_not_called()
+
+
 def test_time_exit_failure_dispatches_immediate_remediation_on_absent():
     """If close_position_verified returns UNKNOWN with protection_status='ABSENT',
     orchestrator must NOT simply 'continue'; it must immediately trigger

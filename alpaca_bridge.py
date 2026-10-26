@@ -6973,20 +6973,28 @@ class AlpacaBridge:
 
             # Protection Coordinator: Audit active orders & position status to classify exposure
             protection_status = "UNKNOWN"
+            query_failed = False
             try:
                 curr_active = [
                     o for o in self._get_active_orders()
                     if getattr(o, "symbol", "").upper().strip() == sym_upper
                 ]
-            except Exception:
-                curr_active = []
+            except Exception as act_err:
+                logger.warning("[PROTECTION_COORDINATOR] Failed to query active orders for %s: %s", sym_upper, act_err)
+                curr_active = None
+                query_failed = True
 
             try:
                 curr_pos = normalize_position_qty(self.get_position(sym_upper))
-            except Exception:
+            except Exception as pos_err:
+                logger.warning("[PROTECTION_COORDINATOR] Failed to query position for %s: %s", sym_upper, pos_err)
                 curr_pos = initial_qty
+                query_failed = True
 
-            if abs(curr_pos) < 1e-6:
+            if query_failed or curr_active is None:
+                # FAIL-CLOSED: Order or position query failed; do NOT assume orders are absent or position is flat!
+                protection_status = "UNKNOWN"
+            elif abs(curr_pos) < 1e-6:
                 protection_status = "FLAT"
             else:
                 active_stops = [
@@ -7005,7 +7013,8 @@ class AlpacaBridge:
             logger.warning(
                 "[PROTECTION_COORDINATOR] %s cancel timeout: protection_status=%s position_qty=%.2f "
                 "active_orders=%s",
-                sym_upper, protection_status, curr_pos, [str(getattr(o, "id", "")) for o in curr_active]
+                sym_upper, protection_status, curr_pos,
+                [str(getattr(o, "id", "")) for o in curr_active] if curr_active is not None else "QUERY_FAILED"
             )
 
             return PositionCloseResult(
