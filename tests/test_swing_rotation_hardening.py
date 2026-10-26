@@ -353,6 +353,8 @@ def test_validate_quote_rejects_fallback_price_sources_for_entry():
 def test_is_daily_loss_halted_fail_closed_on_invalid_equity_and_sod(tmp_path):
     """Verify that _is_daily_loss_halted() strictly fails closed on invalid/missing equity and SOD baseline."""
     import config
+    from strategies.session import now_eastern
+    today_et = str(now_eastern().date())
     with patch.object(config, "DATA_DIR", tmp_path):
         bridge = AlpacaBridge(mode="swing", dry_run=True)
         bridge._connected = True
@@ -361,24 +363,33 @@ def test_is_daily_loss_halted_fail_closed_on_invalid_equity_and_sod(tmp_path):
         for bad_eq in [0.0, -100.0, float("nan"), float("inf"), float("-inf")]:
             with patch.object(bridge, "get_net_liquidation", return_value=bad_eq):
                 bridge._start_of_day_equity = 10000.0
+                bridge._start_of_day_equity_date = today_et
+                bridge._start_of_day_equity_source = "broker_last_equity"
                 assert bridge._is_daily_loss_halted() is True, f"Failed closed check for bad current equity {bad_eq}"
 
         # 2. Invalid or missing start_of_day_equity baseline -> Fails closed (returns True)
         with patch.object(bridge, "get_net_liquidation", return_value=10000.0):
             for bad_sod in [0.0, -500.0, float("nan"), float("inf"), None]:
                 bridge._start_of_day_equity = bad_sod
+                bridge._start_of_day_equity_date = today_et
+                bridge._start_of_day_equity_source = "unverified"
                 with patch.object(bridge, "snapshot_start_of_day_equity", return_value=bad_sod):
                     assert bridge._is_daily_loss_halted() is True, f"Failed closed check for bad SOD equity {bad_sod}"
 
-        # 3. Valid normal equity within daily loss limit -> Returns False
+        # 3. Valid normal equity within daily loss limit -> Returns False. The test fixture
+        # explicitly declares that this synthetic baseline has verified broker provenance.
         with patch.object(bridge, "get_net_liquidation", return_value=9950.0):
             bridge._start_of_day_equity = 10000.0
+            bridge._start_of_day_equity_date = today_et
+            bridge._start_of_day_equity_source = "broker_last_equity"
             # Loss is $50, well under $300 limit
             assert bridge._is_daily_loss_halted() is False
 
         # 4. Valid equity breaching daily loss limit -> Returns True (halts)
         with patch.object(bridge, "get_net_liquidation", return_value=9650.0):
             bridge._start_of_day_equity = 10000.0
+            bridge._start_of_day_equity_date = today_et
+            bridge._start_of_day_equity_source = "broker_last_equity"
             # Loss is $350 >= $300 limit
             assert bridge._is_daily_loss_halted() is True
 

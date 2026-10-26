@@ -82,7 +82,7 @@ def extract(name, class_name=None, members=None, global_names=None):
         ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
     ] + nodes, type_ignores=[])
     env = dict(math=math, logger=logger, config_module=CFG, config=CFG, pd=pd,
-               np=np, _dt=dt, time=time, Path=Path, os=__import__("os"))
+               np=np, _dt=dt, time=time, Path=Path, os=__import__("os"), json=json)
     env.update(global_names or {})
     exec(compile(ast.fix_missing_locations(code_tree), name, "exec"), env)
     return env
@@ -90,7 +90,7 @@ def extract(name, class_name=None, members=None, global_names=None):
 
 BRIDGE_METHODS = {
     "_positive_finite_equity", "_restore_session_baseline",
-    "snapshot_start_of_day_equity", "_is_daily_loss_halted",
+    "_reconcile_daily_loss_halt_if_needed", "snapshot_start_of_day_equity", "_is_daily_loss_halted",
     "get_order_quote", "validate_quote", "execute_signal"
 }
 
@@ -107,11 +107,15 @@ BENV = extract("alpaca_bridge.py", "AlpacaBridge", BRIDGE_METHODS, dict(
     check_regular_market_hours=lambda client: (True, "test"),
 ))
 B = BENV["AlpacaBridge"]
+GATE_METHODS = {"__init__", "_sync_state", "halt", "clear", "clear_recovery_halts", "resume", "entry_blocked"}
+GATEENV = extract("alpaca_bridge.py", "EntryGateMock", GATE_METHODS, dict())
+Gate = GATEENV["EntryGateMock"]
 
 
 def baseline_state(value=10000.0, date=TODAY, source="broker_last_equity"):
     return dict(account_id="PA3R71I7JFDZ", date=date, start_of_day_equity=value,
-                suspended=False, provenance=dict(source=source))
+                status="VERIFIED", suspended=False,
+                provenance=dict(source=source, status="VERIFIED"))
 
 
 def bridge(state=None):
@@ -207,11 +211,60 @@ class SourceGuards(unittest.TestCase):
         b._client = NS(get_account=lambda: NS(last_equity=0, equity=9950))
         self.assertTrue(b._is_daily_loss_halted())
 
+    def test_daily_check_fails_closed_if_refresh_does_not_upgrade_provenance(self):
+        b = bridge()
+        b._start_of_day_equity_source = "unverified"
+        b.snapshot_start_of_day_equity = lambda: 10000.0
+        self.assertTrue(b._is_daily_loss_halted())
+
     def test_daily_check_does_not_trust_previous_date_memory(self):
         b = bridge()
         b._start_of_day_equity_date = "2026-10-14"
         b._client = NS(get_account=lambda: NS(last_equity=0, equity=9950))
         self.assertTrue(b._is_daily_loss_halted())
+
+    def test_reasonless_halt_preserves_fail_closed_flag(self):
+        gate = Gate()
+        gate.halt()
+        self.assertTrue(gate.halted)
+        self.assertEqual(gate.halt_reason, "")
+
+    def test_entry_blocked_records_daily_loss_reason(self):
+        test_bridge = NS(
+            account_id="TEST", mode="swing",
+            account_daily_pnl=lambda: -301.0,
+            _start_of_day_equity=10000.0,
+            get_net_liquidation=lambda: 10000.0,
+        )
+        gate = Gate(bridge=test_bridge)
+        blocked, reason = gate.entry_blocked("AAPL", 0.0, "BUY")
+        self.assertTrue(blocked)
+        self.assertIn("Max daily loss limit reached", reason)
+        self.assertTrue(gate.halted)
+        self.assertIn("DAILY_LOSS_LIMIT", gate.reasons)
+        self.assertEqual(gate.halt_reason, "DAILY_LOSS_LIMIT")
+
+    def test_recovery_clear_keeps_halt_reason_in_sync_with_remaining_daily_loss(self):
+        gate = Gate()
+        gate.halt("DAILY_LOSS_LIMIT")
+        gate.halt("BROKER_RECONCILIATION_PENDING")
+
+        gate.clear_recovery_halts()
+
+        self.assertTrue(gate.halted)
+        self.assertEqual(gate.reasons, {"DAILY_LOSS_LIMIT"})
+        self.assertEqual(gate.halt_reason, "DAILY_LOSS_LIMIT")
+
+    def test_recovery_clear_cannot_release_latched_protection_failure(self):
+        gate = Gate()
+        gate.halt("LATCHED_PROTECTION_FAILURE")
+        gate.halt("TRADE_STREAM_DISCONNECTED")
+
+        gate.clear_recovery_halts()
+
+        self.assertTrue(gate.halted)
+        self.assertEqual(gate.reasons, {"LATCHED_PROTECTION_FAILURE"})
+        self.assertEqual(gate.halt_reason, "LATCHED_PROTECTION_FAILURE")
 
     def test_control_healthy_equity_allows_daily_gate(self):
         self.assertFalse(bridge(baseline_state())._is_daily_loss_halted())

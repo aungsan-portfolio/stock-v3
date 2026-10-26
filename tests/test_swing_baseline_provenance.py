@@ -34,7 +34,8 @@ def test_oct_15_incident_phantom_halt_cleared(test_env):
     - Result: False halt is cleared, halt file removed, baseline verified.
     """
     tmp_path, acct_id = test_env
-    session_date = "2026-10-15"
+    from strategies.session import now_eastern
+    session_date = str(now_eastern().date())
 
     stale_state = {
         "account_id": acct_id,
@@ -104,7 +105,8 @@ def test_repeated_reconnects_preserve_verified_baseline(test_env):
     strictly preserve the verified baseline without mutation or drift.
     """
     tmp_path, acct_id = test_env
-    session_date = "2026-10-15"
+    from strategies.session import now_eastern
+    session_date = str(now_eastern().date())
 
     verified_state = {
         "account_id": acct_id,
@@ -153,7 +155,8 @@ def test_genuine_loss_then_equity_recovery_preserves_halt(test_env):
     a subsequent recovery of equity to $99,800.00 MUST NOT clear the halt latch!
     """
     tmp_path, acct_id = test_env
-    session_date = "2026-10-15"
+    from strategies.session import now_eastern
+    session_date = str(now_eastern().date())
     verified_baseline = 99745.55
 
     halt_file = tmp_path / f"swing_daily_loss_halt_{acct_id}.json"
@@ -275,7 +278,8 @@ def test_clearing_false_halt_preserves_unrelated_halts(test_env):
     halt active and the engine halted.
     """
     tmp_path, acct_id = test_env
-    session_date = "2026-10-15"
+    from strategies.session import now_eastern
+    session_date = str(now_eastern().date())
 
     halt_file = tmp_path / f"swing_daily_loss_halt_{acct_id}.json"
     halt_file.write_text(json.dumps({

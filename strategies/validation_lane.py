@@ -974,7 +974,7 @@ def evaluate_and_route_validation_candidate(
 
         if not can_release:
             logger.info(
-                "[VALIDATION LANE SKIP] Release authorization unavailable for %s (principal release absent). Skipping broker submission.",
+                "[VALIDATION LANE SKIP] [SHADOW RECORDING ONLY] Candidate %s was already rejected by production gates. Validation-only broker execution skipped (principal release absent). Telemetry quarantined to shadow log.",
                 signal.symbol,
             )
             result["status"] = "VALIDATION_RELEASE_BLOCKED"

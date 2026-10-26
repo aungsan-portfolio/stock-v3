@@ -205,9 +205,9 @@ class TestChunkedBatchFetch:
             res = fetch_batch_intraday_alpaca(symbols)
             assert len(res) == 1
             # Coverage is 1/4 = 25.0%
-            mock_info.assert_any_call(
-                "[CHUNK FETCH DONE] Retrieved 1/4 symbols across 1 chunks in 0.00s (coverage=25.0%)"
-                if "0.00s" in str(mock_info.call_args_list) else mock_info.call_args_list[-1][0][0]
+            assert any(
+                "[CHUNK FETCH DONE] Retrieved 1/4 symbols" in str(call) and "coverage=25.0%" in str(call)
+                for call in mock_info.call_args_list
             )
 
     def test_compatibility_wrapper_alias(self):

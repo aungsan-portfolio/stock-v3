@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -464,13 +465,21 @@ class PositionRotator:
                 continue
 
             # ── Candidate: Confidence below weak threshold ────────────────────
+            u_r_val = getattr(pos, "unrealized_r", None)
+            u_r_str = f"{u_r_val:+.2f}R" if (u_r_val is not None and isinstance(u_r_val, (int, float)) and math.isfinite(u_r_val)) else "UNKNOWN"
+
             if pos.current_conf < ROTATION_WEAK_POSITION_CONF:
                 candidates.append(pos)
-                logger.debug(
-                    "[ROTATION CANDIDATE] %s  conf=%.2f  pnl=%.2f%%  "
-                    "score=%.3f",
-                    pos.symbol, pos.current_conf,
-                    pos.pnl_pct * 100, pos.rotation_score
+                logger.info(
+                    "[ROTATION CANDIDATE] %s | reason=CONFIDENCE_BELOW_WEAK_THRESHOLD | conf=%.2f < %.2f | pnl=%+.2f%% | u_r=%s | score=%.3f",
+                    pos.symbol, pos.current_conf, ROTATION_WEAK_POSITION_CONF,
+                    pos.pnl_pct * 100, u_r_str, pos.rotation_score
+                )
+            else:
+                logger.info(
+                    "[ROTATION NOT_CANDIDATE] %s | reason=CONFIDENCE_ABOVE_WEAK_THRESHOLD | conf=%.2f >= %.2f | pnl=%+.2f%% | u_r=%s",
+                    pos.symbol, pos.current_conf, ROTATION_WEAK_POSITION_CONF,
+                    pos.pnl_pct * 100, u_r_str
                 )
 
         # Sort: weakest rotation_score first (most likely to rotate out)

@@ -814,11 +814,22 @@ class EntryGateMock:
         self.reasons = set()
         self.bridge = bridge
 
+    def _sync_state(self):
+        """Keep the cached halt flag/reason consistent with active halt reasons."""
+        active_reasons = {str(reason) for reason in self.reasons if str(reason)}
+        self.halted = bool(active_reasons)
+        current_reason = str(self.halt_reason or "")
+        if current_reason not in active_reasons:
+            self.halt_reason = sorted(active_reasons)[0] if active_reasons else ""
+
     def halt(self, reason: str = ""):
         self.halted = True
         self.halt_reason = str(reason or "")
         if reason:
             self.reasons.add(str(reason))
+            self._sync_state()
+        # Preserve legacy fail-closed semantics for callers without a reason.
+        # Critical internal call sites should pass a durable reason explicitly.
         acct = getattr(self.bridge, "account_id", "UNKNOWN") if self.bridge else "NO_BRIDGE"
         logger.warning(
             "[ENTRY GATE HALT] [%s] Added reason: '%s' | Current active reasons: %s | halted=True",
@@ -830,9 +841,7 @@ class EntryGateMock:
     def clear(self, reason: str = ""):
         if reason:
             self.reasons.discard(str(reason))
-        if not self.reasons:
-            self.halted = False
-            self.halt_reason = ""
+        self._sync_state()
         acct = getattr(self.bridge, "account_id", "UNKNOWN") if self.bridge else "NO_BRIDGE"
         logger.info(
             "[ENTRY GATE CLEAR] [%s] Removed reason: '%s' | Remaining active reasons: %s | halted=%s",
@@ -854,9 +863,7 @@ class EntryGateMock:
         }
         cleared = sorted(self.reasons.intersection(recovery_reasons))
         self.reasons.difference_update(recovery_reasons)
-        if not self.reasons:
-            self.halted = False
-            self.halt_reason = ""
+        self._sync_state()
         acct = getattr(self.bridge, "account_id", "UNKNOWN") if self.bridge else "NO_BRIDGE"
         logger.info(
             "[ENTRY GATE RECOVERY CLEAR] [%s] Cleared recovery reasons: %s | Remaining active reasons: %s | halted=%s",
@@ -868,8 +875,7 @@ class EntryGateMock:
 
     def resume(self):
         self.reasons.clear()
-        self.halted = False
-        self.halt_reason = ""
+        self._sync_state()
         acct = getattr(self.bridge, "account_id", "UNKNOWN") if self.bridge else "NO_BRIDGE"
         logger.info("[ENTRY GATE RESUME] [%s] Resumed all entry gates | reasons=[] | halted=False", acct)
 
@@ -914,8 +920,7 @@ class EntryGateMock:
         halt_file = data_dir / f"swing_daily_loss_halt_{account_id.strip().upper()}.json"
         if not halt_file.exists() and ("DAILY_LOSS" in (self.halt_reason or "").upper() or "DAILY_LOSS_LIMIT" in self.reasons):
             self.reasons.discard("DAILY_LOSS_LIMIT")
-            self.halted = len(self.reasons) > 0
-            self.halt_reason = next(iter(self.reasons)) if self.reasons else ""
+            self._sync_state()
 
         if self.halted:
             return True, self.halt_reason or "Trading engine is halted"
@@ -936,8 +941,7 @@ class EntryGateMock:
 
         if "BASELINE_UNVERIFIED" in self.reasons:
             self.reasons.discard("BASELINE_UNVERIFIED")
-            self.halted = len(self.reasons) > 0
-            self.halt_reason = next(iter(self.reasons)) if self.reasons else ""
+            self._sync_state()
 
         d_daily_pnl = d_current_equity - d_sod_equity - d_cash_flows
 
@@ -1003,8 +1007,7 @@ class EntryGateMock:
         if not halt_file.exists():
             if "DAILY_LOSS_LIMIT" in self.reasons or (self.halt_reason and "DAILY_LOSS" in self.halt_reason.upper()):
                 self.reasons.discard("DAILY_LOSS_LIMIT")
-                self.halted = len(self.reasons) > 0
-                self.halt_reason = next(iter(self.reasons)) if self.reasons else ""
+                self._sync_state()
             return (self.halted, self.halt_reason) if self.halted else (False, "")
         try:
             with open(halt_file, "r", encoding="utf-8") as f:
@@ -1036,8 +1039,7 @@ class EntryGateMock:
             logger.info("[SESSION ROLLOVER RESET] Resetting previous session (%s) daily loss halt state for %s", rec_date, account_id)
             halt_file.unlink(missing_ok=True)
             self.reasons.discard("DAILY_LOSS_LIMIT")
-            self.halted = len(self.reasons) > 0
-            self.halt_reason = next(iter(self.reasons)) if self.reasons else ""
+            self._sync_state()
         except Exception as r_exc:
             logger.warning("Could not unlink previous halt file for %s: %s", account_id, r_exc)
         if self.halted:
@@ -1064,7 +1066,7 @@ class EntryGateMock:
                 else:
                     max_loss = float(getattr(config_module, "MAX_DAILY_LOSS_DAYTRADE", 300.0))
                 if round(daily_pnl, 2) <= -round(abs(max_loss), 2):
-                    self.halt()
+                    self.halt("DAILY_LOSS_LIMIT")
                     return True, f"Max daily loss limit reached (${daily_pnl:.2f} <= -${max_loss:.2f})"
             except Exception as e:
                 logger.error("Error checking daily loss limit in EntryGateMock: %s; blocking new entries only. Protective exits remain enabled.", e)
@@ -1224,6 +1226,7 @@ class AlpacaBridge:
         self._cached_active_orders: Optional[List[Any]] = None
         self._cached_active_orders_ts: float = 0.0
         self._cache_requires_reconciliation: bool = False
+        self._risk_state_dir: Optional[str] = None
 
     @property
     def account_id(self) -> str:
@@ -1922,22 +1925,33 @@ class AlpacaBridge:
             acct_id = getattr(self, "_account_id", "default")
 
             sod_date = getattr(self, "_start_of_day_equity_date", None)
+            sod_source = str(getattr(self, "_start_of_day_equity_source", "") or "").strip().lower()
             sod_equity = self._positive_finite_equity(getattr(self, "_start_of_day_equity", 0.0))
+            trusted_sod_sources = {"broker_last_equity", "net_liquidation"}
 
-            if sod_equity <= 0.0 or (sod_date is not None and sod_date != et_date):
+            # A positive number alone is not a verified risk baseline. Require today's
+            # baseline and an allowed provenance source; otherwise re-query the canonical
+            # snapshot path, which itself fails closed if broker last_equity is unavailable.
+            if sod_equity <= 0.0 or sod_date != et_date or sod_source not in trusted_sod_sources:
                 sod_equity = 0.0
                 if hasattr(self, "snapshot_start_of_day_equity"):
                     try:
                         raw_sod = self.snapshot_start_of_day_equity()
                         sod_equity = self._positive_finite_equity(raw_sod)
+                        sod_date = getattr(self, "_start_of_day_equity_date", None)
+                        sod_source = str(getattr(self, "_start_of_day_equity_source", "") or "").strip().lower()
                     except Exception as sod_err:
                         logger.error("[FAIL-CLOSED] Error fetching start of day equity in _is_daily_loss_halted: %s; failing closed.", sod_err)
                         return True
 
-            # If SOD baseline is still unavailable or <= 0 or non-finite: FAIL-CLOSED!
-            # Never fallback to sod_equity = current_equity as that masks all prior session losses.
-            if sod_equity <= 0.0:
-                logger.error("[FAIL-CLOSED] Valid session start-of-day equity baseline unavailable in _is_daily_loss_halted (got %r); failing closed to block entries/rotations.", sod_equity)
+            # A fresh value must also be tied to today's session and trusted provenance.
+            # Never fall back to current equity as that masks prior session losses.
+            if sod_equity <= 0.0 or sod_date != et_date or sod_source not in trusted_sod_sources:
+                logger.error(
+                    "[FAIL-CLOSED] Valid session start-of-day equity baseline unavailable in _is_daily_loss_halted "
+                    "(equity=%r, date=%r, source=%r); failing closed to block entries/rotations.",
+                    sod_equity, sod_date, sod_source,
+                )
                 return True
 
             if gate is not None and hasattr(gate, "daily_loss_blocked") and mode == "swing":
@@ -2292,8 +2306,13 @@ class AlpacaBridge:
                 halt_file.unlink(missing_ok=True)
                 if hasattr(self, "entry_gate") and self.entry_gate:
                     self.entry_gate.reasons.discard("DAILY_LOSS_LIMIT")
-                    self.entry_gate.halted = len(self.entry_gate.reasons) > 0
-                    self.entry_gate.halt_reason = next(iter(self.entry_gate.reasons)) if self.entry_gate.reasons else ""
+                    if hasattr(self.entry_gate, "_sync_state"):
+                        self.entry_gate._sync_state()
+                    else:
+                        remaining = set(getattr(self.entry_gate, "reasons", set()))
+                        self.entry_gate.halted = bool(remaining)
+                        if getattr(self.entry_gate, "halt_reason", "") not in remaining:
+                            self.entry_gate.halt_reason = sorted(remaining)[0] if remaining else ""
                 return
             if rec_date != str(et_date).strip():
                 return
@@ -2349,8 +2368,13 @@ class AlpacaBridge:
                 halt_file.unlink(missing_ok=True)
                 if hasattr(self, "entry_gate") and self.entry_gate:
                     self.entry_gate.reasons.discard("DAILY_LOSS_LIMIT")
-                    self.entry_gate.halted = len(self.entry_gate.reasons) > 0
-                    self.entry_gate.halt_reason = next(iter(self.entry_gate.reasons)) if self.entry_gate.reasons else ""
+                    if hasattr(self.entry_gate, "_sync_state"):
+                        self.entry_gate._sync_state()
+                    else:
+                        remaining = set(getattr(self.entry_gate, "reasons", set()))
+                        self.entry_gate.halted = bool(remaining)
+                        if getattr(self.entry_gate, "halt_reason", "") not in remaining:
+                            self.entry_gate.halt_reason = sorted(remaining)[0] if remaining else ""
             else:
                 logger.warning(
                     "[%s] Verified baseline ($%.2f) confirms breach occurred (pnl_at_halt=$%.2f, current_pnl=$%.2f, limit=-$%.2f); maintaining halt",
@@ -2398,6 +2422,8 @@ class AlpacaBridge:
                 self._reconcile_daily_loss_halt_if_needed(account_id, et_date, acct, broker_last_eq, prior_stale_baseline=saved_equity)
                 if hasattr(self, "entry_gate") and self.entry_gate:
                     self.entry_gate.reasons.discard("BASELINE_UNVERIFIED")
+                    if hasattr(self.entry_gate, "_sync_state"):
+                        self.entry_gate._sync_state()
                 return self._start_of_day_equity
 
             # If already verified or identical: strictly preserve across reconnects and restarts!
@@ -2409,11 +2435,16 @@ class AlpacaBridge:
                         account_id, self._start_of_day_equity, state_source, saved_status or "VERIFIED", self._daytrade_suspended)
             if hasattr(self, "entry_gate") and self.entry_gate:
                 self.entry_gate.reasons.discard("BASELINE_UNVERIFIED")
+                if hasattr(self.entry_gate, "_sync_state"):
+                    self.entry_gate._sync_state()
             return self._start_of_day_equity
 
         if broker_last_eq > 0.0:
             from strategies.session import is_market_open
-            market_live = is_market_open()
+            try:
+                market_live = is_market_open()
+            except Exception:
+                market_live = False
             init_status = "VERIFIED" if market_live else "PROVISIONAL"
             self._start_of_day_equity = broker_last_eq
             self._start_of_day_equity_date = et_date
@@ -2434,6 +2465,8 @@ class AlpacaBridge:
             self._reconcile_daily_loss_halt_if_needed(account_id, et_date, acct, broker_last_eq)
             if hasattr(self, "entry_gate") and self.entry_gate:
                 self.entry_gate.reasons.discard("BASELINE_UNVERIFIED")
+                if hasattr(self.entry_gate, "_sync_state"):
+                    self.entry_gate._sync_state()
             return self._start_of_day_equity
 
         self._start_of_day_equity = 0.0
@@ -3028,8 +3061,10 @@ class AlpacaBridge:
                     self.entry_gate.clear("OFF_MARKET_STANDBY")
                 elif hasattr(self.entry_gate, "reasons"):
                     self.entry_gate.reasons.discard("OFF_MARKET_STANDBY")
-                    if not self.entry_gate.reasons:
-                        self.entry_gate.halted = False
+                    remaining = set(getattr(self.entry_gate, "reasons", set()))
+                    self.entry_gate.halted = bool(remaining)
+                    if getattr(self.entry_gate, "halt_reason", "") not in remaining:
+                        self.entry_gate.halt_reason = sorted(remaining)[0] if remaining else ""
                 logger.info("[STREAM LIFECYCLE] Trade stream resumed and reconciled cleanly.")
                 return True
             else:
@@ -3740,6 +3775,8 @@ class AlpacaBridge:
             logger.info("[%s] Verified start-of-day equity: $%.2f for date %s (source=%s, status=%s)", acct_id, self._start_of_day_equity, et_date, state_source or "persisted", saved_status or "VERIFIED")
             if hasattr(self, "entry_gate") and self.entry_gate:
                 self.entry_gate.reasons.discard("BASELINE_UNVERIFIED")
+                if hasattr(self.entry_gate, "_sync_state"):
+                    self.entry_gate._sync_state()
             return self._start_of_day_equity
 
         # Also preserve if in-memory already set for today with positive finite equity AND verified broker_last_equity provenance
@@ -3752,6 +3789,8 @@ class AlpacaBridge:
             self._start_of_day_equity = mem_sod
             if hasattr(self, "entry_gate") and self.entry_gate:
                 self.entry_gate.reasons.discard("BASELINE_UNVERIFIED")
+                if hasattr(self.entry_gate, "_sync_state"):
+                    self.entry_gate._sync_state()
             return self._start_of_day_equity
 
         # 3. New date or legacy nominal state -> query broker last_equity and save once
@@ -3791,7 +3830,10 @@ class AlpacaBridge:
             return 0.0
 
         from strategies.session import is_market_open
-        market_live = is_market_open()
+        try:
+            market_live = is_market_open()
+        except Exception:
+            market_live = False
         init_status = "VERIFIED" if market_live else "PROVISIONAL"
 
         self._start_of_day_equity = current_equity
@@ -3812,6 +3854,8 @@ class AlpacaBridge:
             self._reconcile_daily_loss_halt_if_needed(acct_id, et_date, acct, current_equity)
         if hasattr(self, "entry_gate") and self.entry_gate:
             self.entry_gate.reasons.discard("BASELINE_UNVERIFIED")
+            if hasattr(self.entry_gate, "_sync_state"):
+                self.entry_gate._sync_state()
         if state and is_legacy_nominal:
             logger.warning("[%s] Legacy risk state without broker_last_equity provenance stamp rejected. Re-initialized from broker last_equity: $%.2f for date %s",
                            acct_id, self._start_of_day_equity, et_date)
@@ -5169,7 +5213,7 @@ class AlpacaBridge:
             positions = self._client.get_all_positions()
         except Exception as exc:
             logger.warning("Could not read positions for startup protection scan: %s", exc)
-            self.entry_gate.halt()
+            self.entry_gate.halt("LATCHED_PROTECTION_FAILURE")
             report["failed"].append("PORTFOLIO_FETCH_ERROR")
             return report
 
@@ -5184,7 +5228,7 @@ class AlpacaBridge:
             report["checked"] += 1
             basis = float(p.avg_entry_price)
             if basis <= 0:
-                self.entry_gate.halt()
+                self.entry_gate.halt("LATCHED_PROTECTION_FAILURE")
                 report["failed"].append(symbol)
                 logger.error("Startup: unprotected position %s with no valid avgCost -> HALT", symbol)
                 continue
@@ -5302,7 +5346,7 @@ class AlpacaBridge:
                         stop_placed = True
 
             if not stop_placed and symbol not in report["protected"]:
-                self.entry_gate.halt()
+                self.entry_gate.halt("LATCHED_PROTECTION_FAILURE")
                 if symbol not in report["failed"]:
                     report["failed"].append(symbol)
                 logger.error("Startup: position %s lacks confirmed downside protection -> HALT for safety", symbol)

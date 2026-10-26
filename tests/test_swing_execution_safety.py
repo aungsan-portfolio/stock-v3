@@ -943,9 +943,12 @@ def test_behavioral_production_path_and_concurrency():
             bridge = AlpacaBridge(mode="swing", dry_run=True)
             bridge._connected = True
             bridge._client = MagicMock()
-            bridge._client.get_account.return_value = MagicMock(account_number="PA3R71I7JFDZ", equity=100_000.0, buying_power=100_000.0)
+            bridge._client.get_account.return_value = MagicMock(account_number="PA3R71I7JFDZ", equity=100_000.0, buying_power=100_000.0, last_equity=100_000.0)
             bridge.get_order_quote = MagicMock(return_value=MagicMock(ok=True, price=100.0, source="alpaca"))
             bridge.get_net_liquidation = MagicMock(return_value=100_000.0)
+            bridge._start_of_day_equity = 100_000.0
+            if hasattr(bridge, "entry_gate") and bridge.entry_gate:
+                bridge.entry_gate.clear("BASELINE_UNVERIFIED")
             bridge._client.get_all_positions.return_value = []
             bridge._client.get_orders.return_value = []
 
@@ -993,6 +996,43 @@ def test_behavioral_production_path_and_concurrency():
 
             # Both threads ran through critical section in serialized order
             assert len(lock_acquisitions) == 2
+
+
+def test_baseline_unverified_strictly_blocks_dispatch():
+    """Verify fail-closed invariant: when baseline is unverified, order dispatch is strictly blocked."""
+    import tempfile
+    from pathlib import Path
+    from alpaca_bridge import AlpacaBridge
+    from predictor import Signal
+    import config as config_mod
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.object(config_mod, "DATA_DIR", Path(tmpdir)):
+            bridge = AlpacaBridge(mode="swing", dry_run=True)
+            bridge._connected = True
+            bridge._client = MagicMock()
+            # Omit last_equity to trigger BASELINE_UNVERIFIED
+            bridge._client.get_account.return_value = MagicMock(account_number="PA3R71I7JFDZ", equity=100_000.0, buying_power=100_000.0, last_equity=None)
+            bridge.get_order_quote = MagicMock(return_value=MagicMock(ok=True, price=100.0, source="alpaca"))
+            bridge.get_net_liquidation = MagicMock(return_value=100_000.0)
+            bridge._client.get_all_positions.return_value = []
+            bridge._client.get_orders.return_value = []
+
+            sig = Signal(
+                symbol="MSFT", action="BUY", confidence=0.75,
+                rf_score=0.5, lstm_score=0.5, xgb_score=0.5, trans_score=0.5, tech_score=0.5,
+                price=100.0, reason="test",
+                adx=30.0, vix=15.0, spy_price=500.0, spy_sma50=480.0, sma50_slope=0.50, quote_age_seconds=5.0,
+            )
+            setattr(sig, "atr_14", 2.0)
+            setattr(sig, "regime", "TRENDING_BULL")
+
+            with patch.object(bridge, "_place_open_bracket") as mock_bracket:
+                placed = bridge.execute_signal(sig)
+                assert placed is False, "Dispatch must be blocked when BASELINE_UNVERIFIED"
+                assert mock_bracket.call_count == 0, "_place_open_bracket must never be reached"
+                assert "BASELINE_UNVERIFIED" in bridge.entry_gate.reasons
+                assert bridge.entry_gate.halted is True
 
 
 # ─── 16. Comprehensive Behavioral Gate & Integrity Tests ─────────────────────
