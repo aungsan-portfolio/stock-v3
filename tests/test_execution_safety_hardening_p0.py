@@ -314,6 +314,107 @@ def test_pending_cancellation_late_stop_fill_reconciles_flat_without_duplicate_e
     assert state.active is False
 
 
+def test_pending_cancellation_partial_fill_residual_reconciles_residual_qty():
+    """When a stop in pending_cancel receives a partial fill (e.g. 1 of 4 shares filled,
+    3 shares remaining open at broker), the reconciler must update state.qty to exactly
+    3 shares and ensure any replacement protection covers strictly the remaining 3 shares."""
+    from strategies.trailing_stop import DynamicTrailingStopManager, TrailingStopState
+
+    manager = DynamicTrailingStopManager.__new__(DynamicTrailingStopManager)
+    manager.states = {}
+    manager.pending_exits = []
+    manager._lock = MagicMock()
+    manager._lock.__enter__ = MagicMock()
+    manager._lock.__exit__ = MagicMock()
+    manager._save_state = MagicMock()
+    manager._record_pending_exit = MagicMock()
+    manager.reconcile_pending_exits = MagicMock()
+
+    state = TrailingStopState(
+        symbol="MU",
+        side="BUY",
+        entry_price=889.365,
+        peak_price=889.365,
+        atr=5.0,
+        stop_price=881.64,
+        trail_multiple=1.5,
+        last_updated=time.time(),
+        qty=4.0,
+        order_id="stop_pending_cancel_partial",
+        active=True,
+        stop_reconciliation_required=True,
+    )
+    manager.states["MU"] = state
+
+    mock_bridge = MagicMock()
+    # Broker holds 3.0 shares remaining after 1.0 share filled
+    manager._query_broker_position_qty = MagicMock(return_value=(True, 3.0))
+
+    # Mock order placement to capture submitted replacement order qty
+    placed_order_kwargs = {}
+    def mock_submit_order(req):
+        placed_order_kwargs["qty"] = getattr(req, "qty", None)
+        placed_order_kwargs["symbol"] = getattr(req, "symbol", None)
+        mock_ret = MagicMock()
+        mock_ret.id = "new_replacement_stop_for_3_shares"
+        return mock_ret
+
+    mock_bridge._client.submit_order.side_effect = mock_submit_order
+    mock_bridge.working_orders_plain = MagicMock(return_value=[])
+
+    with patch("strategies.trailing_stop.is_market_open", return_value=True), \
+         patch("strategies.trailing_stop.send_discord_alert", return_value=None):
+        manager.handle_naked_position("MU", 4.0, bridge=mock_bridge, dry_run=False)
+
+    # Must update state quantity to 3.0 shares (residual), NOT the initial 4.0 shares
+    assert state.qty == 3.0
+
+
+def test_pending_cancellation_position_query_failure_retains_fail_closed_without_speculative_orders():
+    """If broker position query fails during reconciliation (e.g. 504 Gateway Timeout),
+    the system must NOT guess position or place speculative orders; it must latch
+    POSITION_UNKNOWN_RECONCILIATION_REQUIRED and fail closed."""
+    from strategies.trailing_stop import DynamicTrailingStopManager, TrailingStopState
+
+    manager = DynamicTrailingStopManager.__new__(DynamicTrailingStopManager)
+    manager.states = {}
+    manager.pending_exits = []
+    manager._lock = MagicMock()
+    manager._lock.__enter__ = MagicMock()
+    manager._lock.__exit__ = MagicMock()
+    manager._save_state = MagicMock()
+    manager._record_pending_exit = MagicMock()
+    manager.reconcile_pending_exits = MagicMock()
+
+    state = TrailingStopState(
+        symbol="MU",
+        side="BUY",
+        entry_price=889.365,
+        peak_price=889.365,
+        atr=5.0,
+        stop_price=881.64,
+        trail_multiple=1.5,
+        last_updated=time.time(),
+        qty=4.0,
+        order_id="stop_pending_cancel_unknown",
+        active=True,
+        stop_reconciliation_required=True,
+    )
+    manager.states["MU"] = state
+
+    mock_bridge = MagicMock()
+    # Broker position query fails (is_known=False)
+    manager._query_broker_position_qty = MagicMock(return_value=(False, None))
+
+    manager.handle_naked_position("MU", 4.0, bridge=mock_bridge, dry_run=False)
+
+    # Must NOT submit any speculative order!
+    mock_bridge._client.submit_order.assert_not_called()
+    assert state.reconciliation_status == "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+    assert state.stop_reconciliation_required is True
+    assert state.active is True
+
+
 def test_pending_cancellation_late_target_fill_reconciles_flat():
     """If a take-profit order in pending_cancel receives a late fill,
     position is flat (0.0). handle_naked_position must detect 0 shares
