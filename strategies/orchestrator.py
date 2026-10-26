@@ -1990,6 +1990,7 @@ def evaluate_and_execute(
 
     should_evaluate_5m_bar = False
     grace_seconds = float(getattr(config, "DAYTRADE_STARTUP_CADENCE_GRACE_S", 60.0))
+    pub_timeout = float(getattr(config, "DAYTRADE_BAR_PUBLICATION_TIMEOUT_S", 90.0))
     bar_age = (now_utc - current_5m_bar_ts).total_seconds()
 
     if can_evaluate_signals:
@@ -1999,41 +2000,25 @@ def evaluate_and_execute(
                 f"Rejecting late-arriving stale evaluation."
             )
             should_evaluate_5m_bar = False
-        elif _last_evaluated_5m_bar_str is None:
-            if bar_age <= grace_seconds:
-                # First evaluation after boot or buffer clear within fresh 60s cadence window
-                logger.info(
-                    "[STARTUP CADENCE SYNC] Completed bar %s is fresh (age=%.1fs <= grace=%.1fs). Evaluating immediately.",
-                    completed_5m_bar_str, bar_age, grace_seconds
-                )
-                _last_evaluated_5m_bar_str = completed_5m_bar_str
-                should_evaluate_5m_bar = True
-            else:
-                # Stale bar (>60s): synchronize forward to next boundary
-                _last_evaluated_5m_bar_str = completed_5m_bar_str
+        elif _last_evaluated_5m_bar_str is None and bar_age > grace_seconds:
+            # Mid-bar startup sync: synchronize forward to avoid evaluating stale bars (>60.0s)
+            _last_evaluated_5m_bar_str = completed_5m_bar_str
+            if bar_age > pub_timeout:
                 _skipped_bar_ids.add(completed_5m_bar_str)
-                next_boundary_ts = current_5m_bar_ts + timedelta(minutes=5)
-                boot_elapsed = time.time() - getattr(sys.modules[__name__], "_engine_boot_ts", time.time())
-                from strategies.session import is_past_opening_buffer
-                is_buffer_clear = boot_elapsed > 180.0 and is_past_opening_buffer(15)
-                sync_context = "Opening buffer cleared mid-bar" if is_buffer_clear else "Engine booted mid-bar"
-                logger.info(
-                    f"[STARTUP CADENCE SYNC] {sync_context} (elapsed: {bar_age:.1f}s > grace: {grace_seconds:.1f}s "
-                    f"since {current_5m_bar_ts.strftime('%H:%M:%S')} UTC close). "
-                    f"Synchronizing to next 5m bar boundary at {next_boundary_ts.strftime('%H:%M:%S')} UTC. "
-                    f"Skipping stale bar evaluation."
-                )
+            next_boundary_ts = current_5m_bar_ts + timedelta(minutes=5)
+            boot_elapsed = time.time() - getattr(sys.modules[__name__], "_engine_boot_ts", time.time())
+            from strategies.session import is_past_opening_buffer
+            is_buffer_clear = boot_elapsed > 180.0 and is_past_opening_buffer(15)
+            sync_context = "Opening buffer cleared mid-bar" if is_buffer_clear else "Engine booted mid-bar"
+            logger.info(
+                f"[STARTUP CADENCE SYNC] {sync_context} (elapsed: {bar_age:.1f}s > grace: {grace_seconds:.1f}s "
+                f"since {current_5m_bar_ts.strftime('%H:%M:%S')} UTC close). "
+                f"Synchronizing to next 5m bar boundary at {next_boundary_ts.strftime('%H:%M:%S')} UTC. "
+                f"Skipping stale bar evaluation."
+            )
         elif _last_evaluated_5m_bar_str != completed_5m_bar_str:
-            if bar_age <= grace_seconds:
-                _last_evaluated_5m_bar_str = completed_5m_bar_str
-                should_evaluate_5m_bar = True
-            else:
+            if bar_age > pub_timeout:
                 _skipped_bar_ids.add(completed_5m_bar_str)
-                _last_evaluated_5m_bar_str = completed_5m_bar_str
-                logger.warning(
-                    f"[LATE BAR SUPPRESSION] Completed bar {completed_5m_bar_str} is stale "
-                    f"(age={bar_age:.1f}s > grace={grace_seconds:.1f}s). Suppressing evaluation."
-                )
                 _last_evaluated_5m_bar_str = completed_5m_bar_str
                 logger.warning(
                     f"[BAR PUBLICATION TIMEOUT] Bar {completed_5m_bar_str} exceeded publication timeout "
