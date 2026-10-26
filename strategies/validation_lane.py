@@ -1115,12 +1115,13 @@ def get_production_risk_equity(bridge, include_validation: bool = False) -> Tupl
     if bridge is not None:
         try:
             if hasattr(bridge, "account_daily_pnl"):
-                import inspect
-                sig = inspect.signature(bridge.account_daily_pnl)
-                if "include_validation" in sig.parameters:
-                    raw_pnl = float(bridge.account_daily_pnl(include_validation=True))
-                else:
-                    raw_pnl = float(bridge.account_daily_pnl())
+                try:
+                    raw_pnl = float(bridge.account_daily_pnl(include_validation=True, current_equity=raw_equity))
+                except TypeError:
+                    try:
+                        raw_pnl = float(bridge.account_daily_pnl(include_validation=True))
+                    except TypeError:
+                        raw_pnl = float(bridge.account_daily_pnl())
             elif hasattr(bridge, "daily_pnl"):
                 raw_pnl = float(bridge.daily_pnl())
             else:

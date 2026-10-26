@@ -49,6 +49,18 @@ from strategies.atomic_rotation import CloseOutcome, PositionCloseResult
 logger = logging.getLogger(__name__)
 _broker_event_write_lock = threading.Lock()
 
+_STOP_ORDER_TYPES: Set[str] = {
+    "stop",
+    "stop_loss",
+    "stop_limit",
+    "trailing_stop",
+    "stp",
+    "stp lmt",
+    "stoplimit",
+    "trail",
+    "traillimit",
+}
+
 
 class AccountModeViolation(RuntimeError):
     """Raised when an account-mode safety invariant is violated (e.g. non-paper URL, mismatched account ID)."""
@@ -3686,8 +3698,8 @@ class AlpacaBridge:
         self._require_connection()
         return self._call_with_retry(lambda: self._client.get_clock())
 
-    def account_daily_pnl(self, include_validation: bool = False) -> float:
-        net_liq = self.get_net_liquidation()
+    def account_daily_pnl(self, include_validation: bool = False, current_equity: Optional[float] = None) -> float:
+        net_liq = float(current_equity) if current_equity is not None else self.get_net_liquidation()
         if getattr(self, "_start_of_day_equity", 0.0) <= 0.0:
             self.snapshot_start_of_day_equity()
         sod_eq = getattr(self, "_start_of_day_equity", net_liq)
@@ -6958,13 +6970,52 @@ class AlpacaBridge:
                 "Failing closed without submitting close order to prevent duplicate fills/accidental shorts: %s",
                 sym_upper, convergence_timeout, convergence_ms, failure_reason
             )
+
+            # Protection Coordinator: Audit active orders & position status to classify exposure
+            protection_status = "UNKNOWN"
+            try:
+                curr_active = [
+                    o for o in self._get_active_orders()
+                    if getattr(o, "symbol", "").upper().strip() == sym_upper
+                ]
+            except Exception:
+                curr_active = []
+
+            try:
+                curr_pos = normalize_position_qty(self.get_position(sym_upper))
+            except Exception:
+                curr_pos = initial_qty
+
+            if abs(curr_pos) < 1e-6:
+                protection_status = "FLAT"
+            else:
+                active_stops = [
+                    o for o in curr_active
+                    if str(getattr(o, "order_type", getattr(o, "type", ""))).lower().replace("ordertype.", "") in _STOP_ORDER_TYPES
+                ]
+                if active_stops:
+                    all_cancelling = all(
+                        str(getattr(o, "status", "")).lower() in ("pending_cancel", "canceling", "cancelling")
+                        for o in active_stops
+                    )
+                    protection_status = "PENDING_CANCELLATION" if all_cancelling else "ACTIVE"
+                else:
+                    protection_status = "ABSENT"
+
+            logger.warning(
+                "[PROTECTION_COORDINATOR] %s cancel timeout: protection_status=%s position_qty=%.2f "
+                "active_orders=%s",
+                sym_upper, protection_status, curr_pos, [str(getattr(o, "id", "")) for o in curr_active]
+            )
+
             return PositionCloseResult(
                 outcome=CloseOutcome.UNKNOWN,
                 symbol=sym_upper,
                 initial_qty=initial_qty,
-                remaining_qty=initial_qty,
+                remaining_qty=curr_pos,
                 filled_qty=0.0,
                 error=failure_reason,
+                protection_status=protection_status,
             )
 
         # 3. Submit broker close order

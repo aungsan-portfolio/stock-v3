@@ -40,6 +40,7 @@ class LineageOutcome(Enum):
 class ProtectionState(Enum):
     PROTECTED_COMPLETE = "protected_complete"
     PROTECTED_STOP_ONLY = "protected_stop_only"
+    PROTECTED_PENDING_PARENT_FILL = "protected_pending_parent_fill"
     CLOSED_BY_STOP = "closed_by_stop"
     CLOSED_BY_TARGET = "closed_by_target"
     CLOSED_BY_MIXED_EXITS = "closed_by_mixed_exits"
@@ -568,7 +569,22 @@ class EntryOrderLifecycle:
 
             # Position is open -> must have active stop covering remaining open quantity
             if active_stop_qty >= eff_pos_qty:
-                if active_target_qty >= eff_pos_qty:
+                if stop_status == "held":
+                    return ProtectionEvaluation(
+                        state=ProtectionState.PROTECTED_PENDING_PARENT_FILL,
+                        reason="Bracket child stop is held awaiting parent fill completion",
+                        broker_position_qty=eff_pos_qty,
+                        entry_filled_qty=entry_filled,
+                        stop_filled_qty=stop_filled,
+                        target_filled_qty=target_filled,
+                        active_stop_remaining_qty=active_stop_qty,
+                        active_target_remaining_qty=active_target_qty,
+                        resolved_stop_id=resolved_stop_id,
+                        resolved_target_id=resolved_target_id,
+                        stop_lineage_outcome=stop_outcome,
+                        target_lineage_outcome=target_outcome,
+                    )
+                elif active_target_qty >= eff_pos_qty:
                     return ProtectionEvaluation(
                         state=ProtectionState.PROTECTED_COMPLETE,
                         reason="Active stop and target orders cover open position",

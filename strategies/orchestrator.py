@@ -1758,6 +1758,10 @@ def evaluate_and_execute(
             else:
                 mode_str = getattr(regime_res, "mode", "UNKNOWN")
                 logger.warning("[MARKET ENTRY HALT] New long day trades disabled (mode=%s score=%d). Summary: %s", mode_str, regime_res.score, regime_res.summary())
+        elif broker_fetch_ok and not getattr(bridge, "_daytrade_suspended", False):
+            if not allow_new_entries:
+                allow_new_entries = True
+                logger.info("[ENTRY RE-ELIGIBILITY] Halts cleared mid-cycle; new entries re-enabled for evaluation.")
                 inverse_exempt = getattr(config, "INVERSE_ETF_RISK_OFF_EXEMPT", False)
                 has_inverse_in_watchlist = any(str(sym).upper().strip() in getattr(config, "INVERSE_ETF_SYMBOLS", set()) for sym in watchlist)
                 regime_inverse_ok = bool(regime_res and getattr(regime_res, "allow_inverse_etf_longs", False))
@@ -1865,16 +1869,46 @@ def evaluate_and_execute(
                             if time_exit:
                                 logger.warning(f"[TIME EXIT TRIGGERED] symbol={sym} side={side} reason={time_reason}")
                                 if live_paper:
-                                    closed = bridge.close_position(sym)
+                                    close_res = None
+                                    if hasattr(bridge, "close_position_verified"):
+                                        try:
+                                            close_res = bridge.close_position_verified(sym)
+                                            closed = getattr(close_res, "is_flat", False)
+                                        except Exception as c_err:
+                                            logger.critical(f"[TIME EXIT VERIFIED ERROR] {sym}: {c_err}")
+                                            closed = False
+                                    else:
+                                        closed = bridge.close_position(sym)
+
                                     if closed:
                                         logger.info(f"[TIME EXIT EXECUTED] symbol={sym} broker close confirmed. Resetting trailing stop.")
                                         manager.soft_reset(sym)
+                                        continue
                                     else:
-                                        logger.critical(f"[TIME EXIT FAILED] {sym} remains active because broker close was not confirmed")
+                                        prot_status = getattr(close_res, "protection_status", "UNKNOWN") if close_res else "UNKNOWN"
+                                        logger.critical(
+                                            f"[TIME EXIT FAILED] {sym} remains active because broker close was not confirmed "
+                                            f"(outcome={getattr(close_res, 'outcome', 'UNKNOWN')}, protection_status={prot_status})"
+                                        )
+                                        if state and state.active:
+                                            state.stop_reconciliation_required = True
+                                            if prot_status in ("ABSENT", "PENDING_CANCELLATION"):
+                                                state.order_id = None
+                                                logger.warning(
+                                                    f"[PROTECTION COORDINATION DISPATCH] {sym} stop {prot_status} after failed close. "
+                                                    f"Immediate remediation triggered in-cycle."
+                                                )
+                                                manager.handle_naked_position(
+                                                    symbol=sym,
+                                                    position_qty=p.position,
+                                                    bridge=bridge,
+                                                    dry_run=not live_paper
+                                                )
+                                        continue
                                 else:
                                     logger.info(f"[TIME EXIT EXECUTED DRY RUN] symbol={sym}. Resetting trailing stop.")
                                     manager.soft_reset(sym)
-                                continue
+                                    continue
 
                         if state and state.active and (state.order_id is None or getattr(state, "stop_reconciliation_required", False)):
                             manager.handle_naked_position(
@@ -1962,23 +1996,30 @@ def evaluate_and_execute(
             )
             should_evaluate_5m_bar = False
         elif _last_evaluated_5m_bar_str is None and bar_age > grace_seconds:
-            # Mid-bar startup/buffer sync: synchronize forward to avoid evaluating stale bars
-            _last_evaluated_5m_bar_str = completed_5m_bar_str
-            if bar_age > pub_timeout:
-                _skipped_bar_ids.add(completed_5m_bar_str)
-            next_boundary_ts = current_5m_bar_ts + timedelta(minutes=5)
             boot_elapsed = time.time() - getattr(sys.modules[__name__], "_engine_boot_ts", time.time())
             from strategies.session import is_past_opening_buffer
-            if boot_elapsed > 180.0 and is_past_opening_buffer(15):
-                sync_context = "Opening buffer cleared mid-bar"
+            is_buffer_clear = boot_elapsed > 180.0 and is_past_opening_buffer(15)
+            # If opening buffer cleared, allow evaluation within publication timeout (90s)
+            if is_buffer_clear and bar_age <= pub_timeout:
+                logger.info(
+                    "[STARTUP CADENCE SYNC] Post-buffer completed bar %s within publication window (age=%.1fs <= pub_timeout=%.1fs). Evaluating immediately.",
+                    completed_5m_bar_str, bar_age, pub_timeout
+                )
+                _last_evaluated_5m_bar_str = completed_5m_bar_str
+                should_evaluate_5m_bar = True
             else:
-                sync_context = "Engine booted mid-bar"
-            logger.info(
-                f"[STARTUP CADENCE SYNC] {sync_context} (elapsed: {bar_age:.1f}s > grace: {grace_seconds:.1f}s "
-                f"since {current_5m_bar_ts.strftime('%H:%M:%S')} UTC close). "
-                f"Synchronizing to next 5m bar boundary at {next_boundary_ts.strftime('%H:%M:%S')} UTC. "
-                f"Skipping stale bar evaluation."
-            )
+                # Mid-bar startup sync: synchronize forward to avoid evaluating stale bars
+                _last_evaluated_5m_bar_str = completed_5m_bar_str
+                if bar_age > pub_timeout:
+                    _skipped_bar_ids.add(completed_5m_bar_str)
+                next_boundary_ts = current_5m_bar_ts + timedelta(minutes=5)
+                sync_context = "Opening buffer cleared mid-bar" if is_buffer_clear else "Engine booted mid-bar"
+                logger.info(
+                    f"[STARTUP CADENCE SYNC] {sync_context} (elapsed: {bar_age:.1f}s > grace: {grace_seconds:.1f}s "
+                    f"since {current_5m_bar_ts.strftime('%H:%M:%S')} UTC close). "
+                    f"Synchronizing to next 5m bar boundary at {next_boundary_ts.strftime('%H:%M:%S')} UTC. "
+                    f"Skipping stale bar evaluation."
+                )
         elif _last_evaluated_5m_bar_str != completed_5m_bar_str:
             if bar_age > pub_timeout:
                 _skipped_bar_ids.add(completed_5m_bar_str)
@@ -2244,6 +2285,7 @@ def evaluate_and_execute(
     # and skip any signals past their strategy-specific entry cutoff time.
     screened_candidates = []
     near_misses = []
+    deferred_validation_candidates = []
 
     active_symbols = set()
     active_position_sides = {}
@@ -2422,24 +2464,15 @@ def evaluate_and_execute(
                         if not can_val:
                             logger.info("[VALIDATION ARBITRATION] Skipped %s: %s", sig.symbol, val_arb_reason)
                         else:
-                            try:
-                                from strategies.validation_lane import evaluate_and_route_validation_candidate
-                                val_res = evaluate_and_route_validation_candidate(
-                                    signal=sig,
-                                    bridge=bridge,
-                                    policy_stage="STAGE_LUNCH_CHOP",
-                                    policy_reason_code="LUNCH_CHOP_ZONE",
-                                    policy_reason_msg=f"Lunch score {l_score:.1f} < 60 | {l_reason}",
-                                    regime_mode=getattr(regime_res, "mode", "NEUTRAL") if regime_res else "NEUTRAL",
-                                    market_texture=market_tex if 'market_tex' in locals() else "UNKNOWN",
-                                    fixed_shares=getattr(config, "VALIDATION_LANE_SHARES", 1),
-                                    dry_run=not live_paper,
-                                    regime_result=regime_res,
-                                )
-                                if val_res and val_res.get("status") in ("PLACED", "DRY_RUN"):
-                                    validation_routed_symbols[sym] = sig.side.upper().strip()
-                            except Exception as val_err:
-                                logger.warning("[VALIDATION ROUTE ERROR] Failed to route %s: %s", sig.symbol, val_err)
+                            deferred_validation_candidates.append({
+                                "signal": sig,
+                                "policy_stage": "STAGE_LUNCH_CHOP",
+                                "policy_reason_code": "LUNCH_CHOP_ZONE",
+                                "policy_reason_msg": f"Lunch score {l_score:.1f} < 60 | {l_reason}",
+                                "regime_mode": getattr(regime_res, "mode", "NEUTRAL") if regime_res else "NEUTRAL",
+                                "market_texture": market_tex if 'market_tex' in locals() else "UNKNOWN",
+                                "decision_time": time.time(),
+                            })
                     continue
 
 
@@ -2564,24 +2597,15 @@ def evaluate_and_execute(
                 if not can_val:
                     logger.info("[VALIDATION ARBITRATION] Skipped %s: %s", sig.symbol, val_arb_reason)
                 else:
-                    try:
-                        from strategies.validation_lane import evaluate_and_route_validation_candidate
-                        val_res = evaluate_and_route_validation_candidate(
-                            signal=sig,
-                            bridge=bridge,
-                            policy_stage="STAGE_CONFIDENCE",
-                            policy_reason_code="CONFIDENCE_BELOW_FLOOR",
-                            policy_reason_msg=f"Confidence {sig.confidence:.4f} < {min_conf:.4f}",
-                            regime_mode=reg_mode,
-                            market_texture=market_tex if 'market_tex' in locals() else "UNKNOWN",
-                            fixed_shares=getattr(config, "VALIDATION_LANE_SHARES", 1),
-                            dry_run=not live_paper,
-                            regime_result=regime_res,
-                        )
-                        if val_res and val_res.get("status") in ("PLACED", "DRY_RUN"):
-                            validation_routed_symbols[sym] = sig.side.upper().strip()
-                    except Exception as val_err:
-                        logger.warning("[VALIDATION ROUTE ERROR] Failed to route %s: %s", sig.symbol, val_err)
+                    deferred_validation_candidates.append({
+                        "signal": sig,
+                        "policy_stage": "STAGE_CONFIDENCE",
+                        "policy_reason_code": "CONFIDENCE_BELOW_FLOOR",
+                        "policy_reason_msg": f"Confidence {sig.confidence:.4f} < {min_conf:.4f}",
+                        "regime_mode": reg_mode,
+                        "market_texture": market_tex if 'market_tex' in locals() else "UNKNOWN",
+                        "decision_time": time.time(),
+                    })
             continue
 
         screened_candidates.append(sig)
@@ -2847,6 +2871,30 @@ def evaluate_and_execute(
             print(f"Error executing signal: {e}")
             if error_handler:
                 error_handler.record(e)
+
+    # ── Post-Execution Deferred Shadow Validation Processing ──
+    # Non-blocking: processed strictly AFTER all production signals have been submitted
+    if deferred_validation_candidates and getattr(config, "VALIDATION_LANE_ENABLED", False):
+        for val_item in deferred_validation_candidates:
+            try:
+                from strategies.validation_lane import evaluate_and_route_validation_candidate
+                v_sig = val_item["signal"]
+                val_res = evaluate_and_route_validation_candidate(
+                    signal=v_sig,
+                    bridge=bridge,
+                    policy_stage=val_item["policy_stage"],
+                    policy_reason_code=val_item["policy_reason_code"],
+                    policy_reason_msg=val_item["policy_reason_msg"],
+                    regime_mode=val_item["regime_mode"],
+                    market_texture=val_item.get("market_texture", "UNKNOWN"),
+                    fixed_shares=getattr(config, "VALIDATION_LANE_SHARES", 1),
+                    dry_run=not live_paper,
+                    regime_result=regime_res,
+                )
+                if val_res and val_res.get("status") in ("PLACED", "DRY_RUN"):
+                    validation_routed_symbols[v_sig.symbol] = v_sig.side.upper().strip()
+            except Exception as val_err:
+                logger.warning("[DEFERRED VALIDATION ERROR] %s: %s", getattr(val_item.get("signal"), "symbol", ""), val_err)
 
     # ── Lane 5: Funnel Telemetry v2.1 (Dual Denominators & Unique Setup Conversion) ──
     placed_count = sum(1 for r in execution_results if r.get("status") in {"PLACED", "DRY_RUN"})

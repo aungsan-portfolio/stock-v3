@@ -72,6 +72,7 @@ class PositionCloseResult:
     filled_qty: float
     order_id: Optional[str] = None
     error: Optional[str] = None
+    protection_status: str = "UNKNOWN"
 
     @property
     def is_flat(self) -> bool:
