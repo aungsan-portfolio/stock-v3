@@ -25,6 +25,7 @@ import time
 import math
 import logging
 import threading
+import queue
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any, Tuple
@@ -1141,4 +1142,60 @@ def get_production_risk_equity(bridge, include_validation: bool = False) -> Tupl
     governing_equity = round(raw_equity - val_pnl, 2)
     prod_pnl = round(raw_pnl - val_pnl, 2)
     return governing_equity, prod_pnl
+
+
+# ── Non-Blocking Background Shadow Validation Dispatcher ──
+_validation_async_queue: queue.Queue = queue.Queue(maxsize=50)
+_validation_worker_lock = threading.Lock()
+_validation_worker_thread: Optional[threading.Thread] = None
+
+
+def _validation_worker_loop():
+    while True:
+        try:
+            item = _validation_async_queue.get(timeout=2.0)
+        except queue.Empty:
+            break
+        except Exception:
+            break
+
+        try:
+            evaluate_and_route_validation_candidate(
+                signal=item["signal"],
+                bridge=item["bridge"],
+                policy_stage=item["policy_stage"],
+                policy_reason_code=item["policy_reason_code"],
+                policy_reason_msg=item["policy_reason_msg"],
+                regime_mode=item["regime_mode"],
+                market_texture=item.get("market_texture", "UNKNOWN"),
+                fixed_shares=item.get("fixed_shares", 1),
+                dry_run=item.get("dry_run", False),
+                regime_result=item.get("regime_result"),
+            )
+        except Exception as exc:
+            logger.warning("[VALIDATION ASYNC WORKER ERROR] %s", exc)
+        finally:
+            _validation_async_queue.task_done()
+
+
+def dispatch_deferred_validation_candidate(item: dict) -> bool:
+    """Non-blocking dispatch of a deferred shadow candidate to a dedicated background worker thread.
+    Returns True if successfully queued, False if queue is full (dropping item to protect production latency).
+    """
+    global _validation_worker_thread
+    try:
+        _validation_async_queue.put_nowait(item)
+    except queue.Full:
+        logger.warning("[VALIDATION QUEUE FULL] Dropping shadow candidate to protect production cycle latency")
+        return False
+
+    with _validation_worker_lock:
+        if _validation_worker_thread is None or not _validation_worker_thread.is_alive():
+            _validation_worker_thread = threading.Thread(
+                target=_validation_worker_loop,
+                daemon=True,
+                name="ValidationLaneWorker"
+            )
+            _validation_worker_thread.start()
+    return True
 

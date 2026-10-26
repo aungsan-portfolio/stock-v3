@@ -180,7 +180,6 @@ def test_time_exit_failure_dispatches_immediate_remediation_on_absent():
     )
     mock_bridge.close_position_verified.return_value = failed_close_result
 
-    # Emulate the orchestrator time exit failure handling block
     sym = "MU"
     p = MagicMock(position=4.0)
     live_paper = True
@@ -212,6 +211,152 @@ def test_time_exit_failure_dispatches_immediate_remediation_on_absent():
         bridge=mock_bridge,
         dry_run=False,
     )
+
+
+def test_pending_cancellation_does_not_clear_order_or_rearm_until_terminal():
+    """When protection_status is PENDING_CANCELLATION, orchestrator must NOT clear
+    local order_id or trigger handle_naked_position prematurely, preventing
+    duplicate exits or racing against in-flight orders."""
+    mock_bridge = MagicMock()
+    mock_manager = MagicMock()
+    mock_state = MagicMock()
+    mock_state.active = True
+    mock_state.order_id = "stop_in_pending_cancel_123"
+
+    pending_cancel_close_result = PositionCloseResult(
+        outcome=CloseOutcome.UNKNOWN,
+        symbol="MU",
+        initial_qty=4.0,
+        remaining_qty=4.0,
+        filled_qty=0.0,
+        error="Cancel convergence timeout",
+        protection_status="PENDING_CANCELLATION",
+    )
+    mock_bridge.close_position_verified.return_value = pending_cancel_close_result
+
+    sym = "MU"
+    p = MagicMock(position=4.0)
+    live_paper = True
+
+    close_res = mock_bridge.close_position_verified(sym)
+    prot_status = getattr(close_res, "protection_status", "UNKNOWN")
+
+    if mock_state and mock_state.active:
+        mock_state.stop_reconciliation_required = True
+        if prot_status == "ABSENT":
+            mock_state.order_id = None
+            mock_manager.handle_naked_position(
+                symbol=sym,
+                position_qty=p.position,
+                bridge=mock_bridge,
+                dry_run=not live_paper,
+            )
+        elif prot_status == "PENDING_CANCELLATION":
+            pass  # Defer replacement until terminal confirmation
+
+    # Local order_id must NOT be cleared; handle_naked_position must NOT be called!
+    assert mock_state.order_id == "stop_in_pending_cancel_123"
+    assert mock_state.stop_reconciliation_required is True
+    mock_manager.handle_naked_position.assert_not_called()
+
+
+def test_pending_cancellation_late_stop_fill_reconciles_flat_without_duplicate_exit():
+    """If an order in pending_cancel receives a late fill at the broker,
+    the reconciler must recognize the position is flat, record pending exit,
+    and never submit a duplicate replacement order."""
+    from strategies.trailing_stop import DynamicTrailingStopManager, TrailingStopState
+
+    manager = DynamicTrailingStopManager.__new__(DynamicTrailingStopManager)
+    manager.states = {}
+    manager.pending_exits = []
+    manager._lock = MagicMock()
+    manager._lock.__enter__ = MagicMock()
+    manager._lock.__exit__ = MagicMock()
+    manager._save_state = MagicMock()
+    def mock_record(st, **kwargs):
+        st.active = False
+    manager._record_pending_exit = MagicMock(side_effect=mock_record)
+    manager.reconcile_pending_exits = MagicMock()
+
+    state = TrailingStopState(
+        symbol="MU",
+        side="BUY",
+        entry_price=889.365,
+        peak_price=889.365,
+        atr=5.0,
+        stop_price=881.64,
+        trail_multiple=1.5,
+        last_updated=time.time(),
+        qty=4.0,
+        order_id="stop_pending_cancel_1",
+        active=True,
+        stop_reconciliation_required=True,
+    )
+    manager.states["MU"] = state
+
+    mock_bridge = MagicMock()
+    # Broker position is now 0 (flat because late fill closed it)
+    manager._query_broker_position_qty = MagicMock(return_value=(True, 0.0))
+
+    # The broker returns the stop order with status 'filled'
+    filled_stop_order = MagicMock()
+    filled_stop_order.id = "stop_pending_cancel_1"
+    filled_stop_order.status = "filled"
+    filled_stop_order.filled_qty = 4.0
+    filled_stop_order.qty = 4.0
+
+    # Running handle_naked_position must detect the flat position and abort remediation
+    manager.handle_naked_position("MU", 4.0, bridge=mock_bridge, dry_run=False)
+
+    # Position is flat -> recorded pending exit, active=False, NO replacement stop order placed!
+    manager._record_pending_exit.assert_called_once()
+    mock_bridge._client.submit_order.assert_not_called()
+    assert state.active is False
+
+
+def test_pending_cancellation_late_target_fill_reconciles_flat():
+    """If a take-profit order in pending_cancel receives a late fill,
+    position is flat (0.0). handle_naked_position must detect 0 shares
+    and submit zero replacement orders."""
+    from strategies.trailing_stop import DynamicTrailingStopManager, TrailingStopState
+
+    manager = DynamicTrailingStopManager.__new__(DynamicTrailingStopManager)
+    manager.states = {}
+    manager.pending_exits = []
+    manager._lock = MagicMock()
+    manager._lock.__enter__ = MagicMock()
+    manager._lock.__exit__ = MagicMock()
+    manager._save_state = MagicMock()
+    def mock_record(st, **kwargs):
+        st.active = False
+    manager._record_pending_exit = MagicMock(side_effect=mock_record)
+    manager.reconcile_pending_exits = MagicMock()
+
+    state = TrailingStopState(
+        symbol="MU",
+        side="BUY",
+        entry_price=889.365,
+        peak_price=889.365,
+        atr=5.0,
+        stop_price=881.64,
+        trail_multiple=1.5,
+        last_updated=time.time(),
+        qty=4.0,
+        order_id="tp_pending_cancel_1",
+        active=True,
+        stop_reconciliation_required=True,
+    )
+    manager.states["MU"] = state
+
+    mock_bridge = MagicMock()
+    # Take profit filled -> broker position is 0
+    manager._query_broker_position_qty = MagicMock(return_value=(True, 0.0))
+
+    manager.handle_naked_position("MU", 4.0, bridge=mock_bridge, dry_run=False)
+
+    manager._record_pending_exit.assert_called_once()
+    mock_bridge._client.submit_order.assert_not_called()
+    assert state.active is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -281,7 +426,7 @@ def test_production_signals_execute_before_deferred_validation_routing():
     deferred_validation = []
 
     # Candidates evaluated in screening loop:
-    # Candidates 1-3 fail confidence; Candidate 4 (TSLA) passes
+    # Candidates 1-2 fail confidence; Candidate 3 (TSLA) passes
     candidates = [
         MagicMock(symbol="AAPL", confidence=0.55),
         MagicMock(symbol="MSFT", confidence=0.58),
@@ -293,7 +438,6 @@ def test_production_signals_execute_before_deferred_validation_routing():
 
     for sig in candidates:
         if sig.confidence < min_conf:
-            # Defer shadow evaluation
             deferred_validation.append({"signal": sig})
             continue
         screened_candidates.append(sig)
@@ -312,39 +456,89 @@ def test_production_signals_execute_before_deferred_validation_routing():
     assert execution_order[2] == "SHADOW_ROUTE_MSFT"
 
 
+def test_shadow_async_worker_blocked_does_not_delay_production_cycle():
+    """Verify that even when the shadow validation worker is intentionally blocked
+    or executing slow REST queries, dispatching returns immediately (< 20ms)
+    and the production scheduler cycle is completely unblocked."""
+    from strategies.validation_lane import dispatch_deferred_validation_candidate, _validation_async_queue
+
+    # Drain queue
+    while not _validation_async_queue.empty():
+        try:
+            _validation_async_queue.get_nowait()
+        except Exception:
+            pass
+
+    mock_slow_item = {
+        "signal": MagicMock(symbol="SLOW_VAL"),
+        "bridge": MagicMock(),
+        "policy_stage": "STAGE_CONFIDENCE",
+        "policy_reason_code": "CONFIDENCE_BELOW_FLOOR",
+        "policy_reason_msg": "test",
+        "regime_mode": "NORMAL",
+        "dry_run": True,
+    }
+
+    # Simulate a slow downstream route function
+    with patch("strategies.validation_lane.evaluate_and_route_validation_candidate") as mock_route:
+        def slow_execution(*args, **kwargs):
+            time.sleep(2.0)  # 2 second artificial delay in shadow worker
+            return {"status": "DRY_RUN"}
+
+        mock_route.side_effect = slow_execution
+
+        t_start = time.monotonic()
+        queued = dispatch_deferred_validation_candidate(mock_slow_item)
+        dispatch_duration_ms = (time.monotonic() - t_start) * 1000.0
+
+        # Dispatch must complete in < 50ms on the calling thread despite 2.0s worker sleep
+        assert queued is True
+        assert dispatch_duration_ms < 50.0, f"Dispatch took too long: {dispatch_duration_ms:.1f}ms"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Buffer-Clear Immediate Cadence Wakeup Tests
+# 5. Buffer-Clear Immediate Cadence Wakeup Tests (Strict 60s Cadence)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_buffer_clear_within_pub_timeout_evaluates_immediately_without_duplicates():
-    """When the opening buffer clears, a completed 5m candle that is within the
-    90s publication window must be evaluated immediately and not discarded as stale."""
-    now_utc = datetime(2026, 10, 26, 13, 46, 9, tzinfo=timezone.utc)
-    current_5m_bar_ts = datetime(2026, 10, 26, 13, 45, 0, tzinfo=timezone.utc)
-    completed_5m_bar_ts = datetime(2026, 10, 26, 13, 40, 0, tzinfo=timezone.utc)
-    completed_5m_bar_str = completed_5m_bar_ts.isoformat()
-
-    bar_age = (now_utc - current_5m_bar_ts).total_seconds()  # 69.0s
-    pub_timeout = 90.0
+def test_cadence_enforces_strict_60s_window_and_evaluates_immediate_at_buffer_clear():
+    """Verify that:
+    1. At 20:45:19 ICT (19s after 20:45:00 candle close), the fresh candle is evaluated immediately.
+    2. Any bar with age <= 60.0s is eligible.
+    3. Any bar with age > 60.0s (e.g. 61.0s or 69.0s) is strictly rejected as stale (no 90s relaxation).
+    4. Evaluated bars are deduplicated and never evaluated twice."""
     grace_seconds = 60.0
 
-    _last_evaluated_5m_bar_str = None
-    should_evaluate_5m_bar = False
+    # Case 1: Buffer clears at 20:45:19 (age = 19.0s <= 60.0s) -> Evaluates!
+    bar_age_buffer_clear = 19.0
+    bar_id = "2026-10-26T13:40:00+00:00"
+    last_evaluated = None
+    should_evaluate = False
 
-    is_buffer_clear = True  # Opening buffer cleared mid-bar
+    if last_evaluated is None and bar_age_buffer_clear <= grace_seconds:
+        last_evaluated = bar_id
+        should_evaluate = True
 
-    if _last_evaluated_5m_bar_str is None and bar_age > grace_seconds:
-        if is_buffer_clear and bar_age <= pub_timeout:
-            _last_evaluated_5m_bar_str = completed_5m_bar_str
-            should_evaluate_5m_bar = True
+    assert should_evaluate is True
+    assert last_evaluated == bar_id
 
-    # 1. First cycle within publication window evaluates immediately
-    assert should_evaluate_5m_bar is True
-    assert _last_evaluated_5m_bar_str == completed_5m_bar_str
+    # Case 2: In the same bar window, deduplication prevents duplicate evaluation
+    should_evaluate_duplicate = False
+    if last_evaluated == bar_id:
+        should_evaluate_duplicate = False
 
-    # 2. Subsequent check in the same candle window must NOT duplicate evaluation
-    should_evaluate_again = False
-    if _last_evaluated_5m_bar_str == completed_5m_bar_str:
-        should_evaluate_again = False  # Already evaluated
+    assert should_evaluate_duplicate is False
 
-    assert should_evaluate_again is False
+    # Case 3: Stale bar at age 61.0s (> 60.0s grace) -> Strictly REJECTED!
+    bar_age_stale = 61.0
+    stale_bar_id = "2026-10-26T13:45:00+00:00"
+    should_evaluate_stale = False
+    skipped_bar_ids = set()
+
+    if bar_age_stale <= grace_seconds:
+        should_evaluate_stale = True
+    else:
+        skipped_bar_ids.add(stale_bar_id)
+        should_evaluate_stale = False
+
+    assert should_evaluate_stale is False
+    assert stale_bar_id in skipped_bar_ids

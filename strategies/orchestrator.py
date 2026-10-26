@@ -1892,10 +1892,10 @@ def evaluate_and_execute(
                                         )
                                         if state and state.active:
                                             state.stop_reconciliation_required = True
-                                            if prot_status in ("ABSENT", "PENDING_CANCELLATION"):
+                                            if prot_status == "ABSENT":
                                                 state.order_id = None
                                                 logger.warning(
-                                                    f"[PROTECTION COORDINATION DISPATCH] {sym} stop {prot_status} after failed close. "
+                                                    f"[PROTECTION COORDINATION DISPATCH] {sym} stop ABSENT after failed close. "
                                                     f"Immediate remediation triggered in-cycle."
                                                 )
                                                 manager.handle_naked_position(
@@ -1903,6 +1903,11 @@ def evaluate_and_execute(
                                                     position_qty=p.position,
                                                     bridge=bridge,
                                                     dry_run=not live_paper
+                                                )
+                                            elif prot_status == "PENDING_CANCELLATION":
+                                                logger.warning(
+                                                    f"[PROTECTION COORDINATION AWAIT] {sym} stop order is in PENDING_CANCELLATION. "
+                                                    f"Preserving order tracking and deferring replacement to avoid duplicate exit / short race."
                                                 )
                                         continue
                                 else:
@@ -1985,7 +1990,6 @@ def evaluate_and_execute(
 
     should_evaluate_5m_bar = False
     grace_seconds = float(getattr(config, "DAYTRADE_STARTUP_CADENCE_GRACE_S", 60.0))
-    pub_timeout = float(getattr(config, "DAYTRADE_BAR_PUBLICATION_TIMEOUT_S", 90.0))
     bar_age = (now_utc - current_5m_bar_ts).total_seconds()
 
     if can_evaluate_signals:
@@ -1995,24 +1999,23 @@ def evaluate_and_execute(
                 f"Rejecting late-arriving stale evaluation."
             )
             should_evaluate_5m_bar = False
-        elif _last_evaluated_5m_bar_str is None and bar_age > grace_seconds:
-            boot_elapsed = time.time() - getattr(sys.modules[__name__], "_engine_boot_ts", time.time())
-            from strategies.session import is_past_opening_buffer
-            is_buffer_clear = boot_elapsed > 180.0 and is_past_opening_buffer(15)
-            # If opening buffer cleared, allow evaluation within publication timeout (90s)
-            if is_buffer_clear and bar_age <= pub_timeout:
+        elif _last_evaluated_5m_bar_str is None:
+            if bar_age <= grace_seconds:
+                # First evaluation after boot or buffer clear within fresh 60s cadence window
                 logger.info(
-                    "[STARTUP CADENCE SYNC] Post-buffer completed bar %s within publication window (age=%.1fs <= pub_timeout=%.1fs). Evaluating immediately.",
-                    completed_5m_bar_str, bar_age, pub_timeout
+                    "[STARTUP CADENCE SYNC] Completed bar %s is fresh (age=%.1fs <= grace=%.1fs). Evaluating immediately.",
+                    completed_5m_bar_str, bar_age, grace_seconds
                 )
                 _last_evaluated_5m_bar_str = completed_5m_bar_str
                 should_evaluate_5m_bar = True
             else:
-                # Mid-bar startup sync: synchronize forward to avoid evaluating stale bars
+                # Stale bar (>60s): synchronize forward to next boundary
                 _last_evaluated_5m_bar_str = completed_5m_bar_str
-                if bar_age > pub_timeout:
-                    _skipped_bar_ids.add(completed_5m_bar_str)
+                _skipped_bar_ids.add(completed_5m_bar_str)
                 next_boundary_ts = current_5m_bar_ts + timedelta(minutes=5)
+                boot_elapsed = time.time() - getattr(sys.modules[__name__], "_engine_boot_ts", time.time())
+                from strategies.session import is_past_opening_buffer
+                is_buffer_clear = boot_elapsed > 180.0 and is_past_opening_buffer(15)
                 sync_context = "Opening buffer cleared mid-bar" if is_buffer_clear else "Engine booted mid-bar"
                 logger.info(
                     f"[STARTUP CADENCE SYNC] {sync_context} (elapsed: {bar_age:.1f}s > grace: {grace_seconds:.1f}s "
@@ -2021,8 +2024,16 @@ def evaluate_and_execute(
                     f"Skipping stale bar evaluation."
                 )
         elif _last_evaluated_5m_bar_str != completed_5m_bar_str:
-            if bar_age > pub_timeout:
+            if bar_age <= grace_seconds:
+                _last_evaluated_5m_bar_str = completed_5m_bar_str
+                should_evaluate_5m_bar = True
+            else:
                 _skipped_bar_ids.add(completed_5m_bar_str)
+                _last_evaluated_5m_bar_str = completed_5m_bar_str
+                logger.warning(
+                    f"[LATE BAR SUPPRESSION] Completed bar {completed_5m_bar_str} is stale "
+                    f"(age={bar_age:.1f}s > grace={grace_seconds:.1f}s). Suppressing evaluation."
+                )
                 _last_evaluated_5m_bar_str = completed_5m_bar_str
                 logger.warning(
                     f"[BAR PUBLICATION TIMEOUT] Bar {completed_5m_bar_str} exceeded publication timeout "
@@ -2873,28 +2884,22 @@ def evaluate_and_execute(
                 error_handler.record(e)
 
     # ── Post-Execution Deferred Shadow Validation Processing ──
-    # Non-blocking: processed strictly AFTER all production signals have been submitted
+    # Non-blocking: dispatched asynchronously to dedicated background worker
+    # strictly AFTER all production signals have been submitted, never blocking the main loop
     if deferred_validation_candidates and getattr(config, "VALIDATION_LANE_ENABLED", False):
-        for val_item in deferred_validation_candidates:
-            try:
-                from strategies.validation_lane import evaluate_and_route_validation_candidate
+        try:
+            from strategies.validation_lane import dispatch_deferred_validation_candidate
+            for val_item in deferred_validation_candidates:
                 v_sig = val_item["signal"]
-                val_res = evaluate_and_route_validation_candidate(
-                    signal=v_sig,
-                    bridge=bridge,
-                    policy_stage=val_item["policy_stage"],
-                    policy_reason_code=val_item["policy_reason_code"],
-                    policy_reason_msg=val_item["policy_reason_msg"],
-                    regime_mode=val_item["regime_mode"],
-                    market_texture=val_item.get("market_texture", "UNKNOWN"),
-                    fixed_shares=getattr(config, "VALIDATION_LANE_SHARES", 1),
-                    dry_run=not live_paper,
-                    regime_result=regime_res,
-                )
-                if val_res and val_res.get("status") in ("PLACED", "DRY_RUN"):
+                val_item["bridge"] = bridge
+                val_item["dry_run"] = not live_paper
+                val_item["regime_result"] = regime_res
+                val_item["fixed_shares"] = getattr(config, "VALIDATION_LANE_SHARES", 1)
+                queued = dispatch_deferred_validation_candidate(val_item)
+                if queued:
                     validation_routed_symbols[v_sig.symbol] = v_sig.side.upper().strip()
-            except Exception as val_err:
-                logger.warning("[DEFERRED VALIDATION ERROR] %s: %s", getattr(val_item.get("signal"), "symbol", ""), val_err)
+        except Exception as async_err:
+            logger.warning("[DEFERRED VALIDATION DISPATCH ERROR] %s", async_err)
 
     # ── Lane 5: Funnel Telemetry v2.1 (Dual Denominators & Unique Setup Conversion) ──
     placed_count = sum(1 for r in execution_results if r.get("status") in {"PLACED", "DRY_RUN"})
