@@ -35,6 +35,7 @@ def test_stop_leg_fill_dispatches_directly_to_exit(tmp_path):
     # Mock bridge instance
     bridge = MagicMock(spec=alpaca_bridge.AlpacaBridge)
     bridge.on_exit_order_update = alpaca_bridge.AlpacaBridge.on_exit_order_update.__get__(bridge, alpaca_bridge.AlpacaBridge)
+    bridge.get_trailing_stop_manager = alpaca_bridge.AlpacaBridge.get_trailing_stop_manager.__get__(bridge, alpaca_bridge.AlpacaBridge)
 
     # Mock order and role info
     mock_order = MagicMock()

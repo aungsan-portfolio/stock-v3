@@ -351,16 +351,50 @@ def _classify_held_order(order) -> str:
     return "unrelated"
 
 
-def get_trailing_state_file() -> Path:
-    """Dynamically resolve trailing stop state file against config.DATA_DIR."""
+DEFAULT_ACCOUNT_IDS: Dict[str, str] = {
+    "daytrade": "PA3UODIC5JTA",
+    "swing": "PA3R71I7JFDZ",
+}
+
+_default_context: Dict[str, Optional[str]] = {"mode": None, "account_id": None}
+
+
+def set_default_trailing_context(mode: Optional[str] = None, account_id: Optional[str] = None) -> None:
+    """Set the process-level default trailing stop context (mode, account_id)."""
+    global manager, trailing_stop_manager
+    if mode:
+        _default_context["mode"] = str(mode).strip().lower()
+    if account_id and str(account_id).strip() != "default":
+        _default_context["account_id"] = str(account_id).strip()
+    mgr = get_trailing_manager(mode=_default_context.get("mode"), account_id=_default_context.get("account_id"))
+    manager = mgr
+    trailing_stop_manager = mgr
+
+
+def get_trailing_state_file(mode: Optional[str] = None, account_id: Optional[str] = None) -> Path:
+    """Dynamically resolve trailing stop state file against config.DATA_DIR partitioned by mode/account."""
     override = globals().get("_trailing_state_override")
     if override is not None:
         return Path(override)
     try:
         import config
-        return Path(config.DATA_DIR) / "trailing_state.json"
+        base_dir = Path(config.DATA_DIR)
     except Exception:
-        return Path(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'trailing_state.json'))
+        base_dir = Path(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data'))
+
+    clean_mode = str(mode).strip().lower() if mode else (_default_context.get("mode") or "")
+    clean_acct = str(account_id).strip() if account_id else (_default_context.get("account_id") or "")
+    if clean_mode and (not clean_acct or clean_acct == "default"):
+        clean_acct = DEFAULT_ACCOUNT_IDS.get(clean_mode, clean_acct)
+
+    parts = ["trailing_state"]
+    if clean_mode:
+        parts.append(clean_mode)
+    if clean_acct and clean_acct != "default":
+        parts.append(clean_acct)
+
+    filename = "_".join(parts) + ".json"
+    return base_dir / filename
 
 
 STATE_FILE = str(get_trailing_state_file())
@@ -3377,8 +3411,28 @@ class DynamicTrailingStopManager:
 manager = DynamicTrailingStopManager()
 trailing_stop_manager = manager
 
+_managers_by_key: Dict[str, DynamicTrailingStopManager] = {}
+_managers_lock = threading.Lock()
 
-def get_trailing_manager() -> DynamicTrailingStopManager:
-    """Returns the singleton DynamicTrailingStopManager instance."""
-    global manager
-    return manager
+
+def get_trailing_manager(mode: Optional[str] = None, account_id: Optional[str] = None) -> DynamicTrailingStopManager:
+    """Returns the DynamicTrailingStopManager instance for the given mode and account_id."""
+    override = globals().get("_trailing_state_override")
+    if override is not None:
+        global manager
+        return manager
+
+    clean_mode = str(mode).strip().lower() if mode else (_default_context.get("mode") or "")
+    clean_acct = str(account_id).strip() if account_id else (_default_context.get("account_id") or "")
+    if clean_mode and (not clean_acct or clean_acct == "default"):
+        clean_acct = DEFAULT_ACCOUNT_IDS.get(clean_mode, clean_acct)
+
+    key = f"{clean_mode}_{clean_acct}".strip("_")
+    if not key:
+        return manager
+
+    with _managers_lock:
+        if key not in _managers_by_key:
+            state_file = get_trailing_state_file(mode=clean_mode, account_id=clean_acct)
+            _managers_by_key[key] = DynamicTrailingStopManager(state_file=state_file)
+        return _managers_by_key[key]

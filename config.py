@@ -1972,6 +1972,8 @@ REGIME_BREADTH_MAX_DELAY_SECONDS = 300.0
 
 # ── Strategy Feature Flags (Group C) - Default=ON ─────────────
 EARNINGS_BLACKOUT = True
+DAYTRADE_EARNINGS_BLACKOUT = False
+SWING_EARNINGS_BLACKOUT = True
 EARNINGS_BLACKOUT_DAYS = 2
 EARNINGS_EXIT_MODE = "exit"  # "exit" | "half" | "hold"
 EARNINGS_CALENDAR = {
@@ -2009,7 +2011,7 @@ def log_strategy_feature_flags():
     import logging
     _log = logging.getLogger("strategy_flags")
     _log.info("[STRATEGY FEATURE FLAGS]")
-    _log.info("  C1. EARNINGS_BLACKOUT: %s (days=%d, exit_mode=%s)", EARNINGS_BLACKOUT, EARNINGS_BLACKOUT_DAYS, EARNINGS_EXIT_MODE)
+    _log.info("  C1. EARNINGS_BLACKOUT: Day=%s, Swing=%s (days=%d, exit_mode=%s)", DAYTRADE_EARNINGS_BLACKOUT, SWING_EARNINGS_BLACKOUT, EARNINGS_BLACKOUT_DAYS, EARNINGS_EXIT_MODE)
     _log.info("  C2. MACRO_EVENT_BLACKOUT: %s (window=±%dm)", MACRO_EVENT_BLACKOUT, MACRO_EVENT_WINDOW_MINUTES)
     _log.info("  C3. MR_STOP_ATR_MULT: %.2f (breakeven profit=%.1f ATR, lock=%.1f ATR)", MR_STOP_ATR_MULT, MR_BREAKEVEN_PROFIT_ATR, MR_BREAKEVEN_LOCK_ATR)
     _log.info("  C4. MR_RS_FILTER: %s (threshold=%.1f%%)", MR_RS_FILTER, MR_RS_FILTER_THRESHOLD)

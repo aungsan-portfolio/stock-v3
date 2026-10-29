@@ -680,7 +680,7 @@ def _evaluate_mean_reversion(symbol, df, market_texture, scorer, bridge=None):
     # Daily ATR here must already be a dollar distance. Broker's daily ATR percent
     # API is not substituted: its reference price and fallback provenance differ.
     quote = context.get("quote")
-    # A8: Check low-latency streaming quote first (<1ms) to minimize serial REST fetch latency
+    # A8 & P4: Check low-latency streaming quote first (<1ms), require age <= 2.0s
     if quote is None:
         try:
             from strategies.shadow_stream_manager import get_shadow_stream_manager
@@ -688,7 +688,12 @@ def _evaluate_mean_reversion(symbol, df, market_texture, scorer, bridge=None):
             if mgr and hasattr(mgr, "get_latest_quote"):
                 stream_q = mgr.get_latest_quote(symbol)
                 if stream_q is not None and getattr(stream_q, "bid", 0) > 0 and getattr(stream_q, "ask", 0) > 0:
-                    quote = stream_q
+                    q_ts = getattr(stream_q, "timestamp", None) or getattr(stream_q, "received_at", None)
+                    q_age = (time.time() - float(q_ts)) if (q_ts is not None and isinstance(q_ts, (int, float))) else 999.0
+                    if q_age <= 2.0:
+                        quote = stream_q
+                    else:
+                        logger.debug("[SHADOW QUOTE STALE] %s quote age %.2fs > 2.0s; falling back to REST", symbol, q_age)
         except Exception:
             pass
 
@@ -1557,8 +1562,11 @@ def evaluate_and_execute(
     # Phase 0 Poller Invariant: Unconditionally reconcile pending exits at cycle entry,
     # before any data health check, broker query, market regime evaluation, or entry halt.
     try:
-        from strategies.trailing_stop import manager as cycle_ts_mgr
-        if bridge is not None:
+        cycle_ts_mgr = bridge.get_trailing_stop_manager() if (bridge and hasattr(bridge, "get_trailing_stop_manager")) else None
+        if cycle_ts_mgr is None:
+            from strategies.trailing_stop import get_trailing_manager
+            cycle_ts_mgr = get_trailing_manager()
+        if cycle_ts_mgr is not None and bridge is not None:
             cycle_ts_mgr.reconcile_pending_exits(bridge)
     except Exception as entry_poller_err:
         logger.error("[ENTRY POLLER ERROR] Failed reconciling pending exits at cycle entry: %s", entry_poller_err)
@@ -1824,13 +1832,16 @@ def evaluate_and_execute(
 
 
     try:
-        from strategies.trailing_stop import manager
-        if bridge is not None:
+        mid_ts_mgr = bridge.get_trailing_stop_manager() if (bridge and hasattr(bridge, "get_trailing_stop_manager")) else None
+        if mid_ts_mgr is None:
+            from strategies.trailing_stop import get_trailing_manager
+            mid_ts_mgr = get_trailing_manager()
+        if mid_ts_mgr is not None and bridge is not None:
             # 1. ALWAYS reconcile pending exits every cycle, regardless of open positions count or halts
-            manager.reconcile_pending_exits(bridge)
+            mid_ts_mgr.reconcile_pending_exits(bridge)
 
         # 2. Safety Check: Halt new entries if any active position has unresolved broker query failure
-        if manager.has_unresolved_position_unknown():
+        if mid_ts_mgr is not None and mid_ts_mgr.has_unresolved_position_unknown():
             logger.warning("[SAFETY GATE HALT] Unresolved POSITION_UNKNOWN state in trailing stops — halting NEW entries this cycle")
             allow_new_entries = False
             can_evaluate_signals = False
@@ -2206,21 +2217,23 @@ def evaluate_and_execute(
     texture_admitted_signals = []
     for sig in all_signals:
         # C1: Earnings Blackout Filter (suppress entries within 2 trading days prior to earnings)
-        if getattr(config, "EARNINGS_BLACKOUT", True):
+        # P2/P3: DAYTRADE_EARNINGS_BLACKOUT (default False for Day Bot), future dates only, fail-open
+        if getattr(config, "DAYTRADE_EARNINGS_BLACKOUT", False):
             cal = getattr(config, "EARNINGS_CALENDAR", {})
             b_days = int(getattr(config, "EARNINGS_BLACKOUT_DAYS", 2))
             sym_u = sig.symbol.upper().strip()
             if sym_u in cal:
                 try:
-                    from datetime import datetime, timedelta
+                    from datetime import datetime
                     from strategies.session import now_eastern
                     e_date = datetime.strptime(cal[sym_u], "%Y-%m-%d").date()
                     now_date = now_eastern().date()
-                    if (e_date - timedelta(days=b_days)) <= now_date <= e_date:
-                        logger.warning("[EARNINGS BLACKOUT VETO] %s reports on %s (within %d days). Signal rejected.", sym_u, e_date, b_days)
+                    days_until = (e_date - now_date).days
+                    if 0 <= days_until <= b_days:
+                        logger.warning("[EARNINGS BLACKOUT VETO] %s reports in %d days (on %s). Signal rejected.", sym_u, days_until, e_date)
                         continue
                 except Exception as e_err:
-                    logger.debug("[EARNINGS BLACKOUT] %s check error: %s", sym_u, e_err)
+                    logger.warning("[EARNINGS BLACKOUT] Data source error evaluating %s: %s -- failing open to allow trading", sym_u, e_err)
 
         # C5: Sector Trend Override for semiconductors
         eval_texture = market_tex
@@ -2683,8 +2696,11 @@ def evaluate_and_execute(
     logger.debug("[HOOK] before execute")
     for sig in all_signals:
         try:
-            from strategies.trailing_stop import manager
-            if manager.has_unresolved_position_unknown():
+            sig_ts_mgr = bridge.get_trailing_stop_manager() if (bridge and hasattr(bridge, "get_trailing_stop_manager")) else None
+            if sig_ts_mgr is None:
+                from strategies.trailing_stop import get_trailing_manager
+                sig_ts_mgr = get_trailing_manager()
+            if sig_ts_mgr is not None and sig_ts_mgr.has_unresolved_position_unknown():
                 logger.warning("[SAFETY GATE HALT] Rejecting signal %s: active POSITION_UNKNOWN state across portfolio", sig.symbol)
                 try:
                     from strategies.gate_ledger import log_gate_decision
@@ -2796,7 +2812,10 @@ def evaluate_and_execute(
 
         if is_inverse_sig and is_inverse_regime_allowed and not allow_new_entries:
             # Check all other non-regime hard gates (Fail-Closed composite)
-            from strategies.trailing_stop import manager as ts_manager
+            ts_manager = bridge.get_trailing_stop_manager() if (bridge and hasattr(bridge, "get_trailing_stop_manager")) else None
+            if ts_manager is None:
+                from strategies.trailing_stop import get_trailing_manager
+                ts_manager = get_trailing_manager()
             from strategies.halt_manager import halt_manager
             is_conn = getattr(bridge, "is_connected", False) or getattr(bridge, "_connected", False) if bridge else True
             broker_conn_ok = not live_paper or is_conn

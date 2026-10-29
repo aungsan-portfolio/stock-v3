@@ -1189,6 +1189,11 @@ class AlpacaBridge:
     def __init__(self, cfg=None, mode: str = "daytrade", dry_run: bool = False) -> None:
         self.mode = str(mode or "daytrade").lower()
         try:
+            from strategies.trailing_stop import set_default_trailing_context
+            set_default_trailing_context(mode=self.mode)
+        except Exception:
+            pass
+        try:
             from logging_setup import set_log_context
             set_log_context(process_tag=self.mode.upper())
         except Exception:
@@ -2207,6 +2212,11 @@ class AlpacaBridge:
                 return False
 
             self._account_id = str(getattr(acct, "account_number", "") or getattr(acct, "id", "") or "default")
+            try:
+                from strategies.trailing_stop import set_default_trailing_context
+                set_default_trailing_context(mode=self.mode, account_id=self._account_id)
+            except Exception:
+                pass
             if self.mode == "swing":
                 from strategies.startup_security import verify_authenticated_account_identity
                 expected_acct = os.environ.get("SWING_ACCOUNT_ID", "PA3R71I7JFDZ")
@@ -2744,8 +2754,7 @@ class AlpacaBridge:
             return False
 
         try:
-            from strategies.trailing_stop import get_trailing_manager
-            ts_mgr = get_trailing_manager()
+            ts_mgr = self.get_trailing_stop_manager()
             if ts_mgr is None:
                 return False
 
@@ -4871,6 +4880,15 @@ class AlpacaBridge:
             self._conn_health.mark_unhealthy(f"positions_plain error: {exc}")
             raise RuntimeError(f"Alpaca API outage while fetching positions: {exc}")
 
+    def get_trailing_stop_manager(self):
+        """Returns the DynamicTrailingStopManager instance for this bridge's mode and account."""
+        try:
+            from strategies.trailing_stop import get_trailing_manager
+            return get_trailing_manager(mode=getattr(self, "mode", "daytrade"), account_id=getattr(self, "_account_id", None))
+        except Exception as exc:
+            logger.debug("[TRAILING MGR ERROR] Could not get trailing manager: %s", exc)
+            return None
+
     def working_orders_plain(self) -> list:
         try:
             # Canonical order flattening: _get_active_orders() already expands bracket legs into
@@ -5039,7 +5057,7 @@ class AlpacaBridge:
 
         # Reconcile local trailing stop states against broker open positions
         try:
-            from strategies.trailing_stop import manager as trailing_manager
+            trailing_manager = self.get_trailing_stop_manager()
             open_symbols = {
                 (p.get("symbol") if isinstance(p, dict) else getattr(p, "symbol", "")).upper().strip()
                 for p in positions
@@ -6670,8 +6688,8 @@ class AlpacaBridge:
                             from strategies.trade_journal import get_today_closed_trades
 
                             is_loss = False
-                            mgr = get_trailing_manager()
-                            state_obj = mgr.states.get(o.symbol)
+                            mgr = self.get_trailing_stop_manager()
+                            state_obj = mgr.states.get(o.symbol) if mgr else None
 
                             if state_obj and state_obj.entry_price > 0:
                                 is_loss = (fill_price_float < state_obj.entry_price)
@@ -8269,22 +8287,25 @@ class AlpacaBridge:
                 continue
 
             # C1: Earnings Blackout Filter (suppress BUY within 2 trading days before earnings)
-            if action == "BUY" and getattr(config_module, "EARNINGS_BLACKOUT", True):
+            # P2/P3: Enforce SWING_EARNINGS_BLACKOUT, check future dates only, fail-open on data error
+            swing_blackout = getattr(config_module, "SWING_EARNINGS_BLACKOUT", getattr(config_module, "EARNINGS_BLACKOUT", True))
+            if action == "BUY" and swing_blackout:
                 cal = getattr(config_module, "EARNINGS_CALENDAR", {})
                 b_days = int(getattr(config_module, "EARNINGS_BLACKOUT_DAYS", 2))
                 if symbol in cal:
                     try:
-                        from datetime import datetime, timedelta
+                        from datetime import datetime
                         from strategies.session import now_eastern
                         e_date = datetime.strptime(cal[symbol], "%Y-%m-%d").date()
                         now_date = now_eastern().date()
-                        if (e_date - timedelta(days=b_days)) <= now_date <= e_date:
-                            logger.warning("[EARNINGS BLACKOUT VETO] %s reports on %s (within %d days). Direct BUY suppressed.", symbol, e_date, b_days)
+                        days_until = (e_date - now_date).days
+                        if 0 <= days_until <= b_days:
+                            logger.warning("[EARNINGS BLACKOUT VETO] %s reports in %d days (on %s). Direct BUY suppressed.", symbol, days_until, e_date)
                             skipped += 1
                             rejections.append({"symbol": symbol, "reason": "EARNINGS_BLACKOUT"})
                             continue
                     except Exception as e_err:
-                        logger.debug("[EARNINGS BLACKOUT] Error checking %s: %s", symbol, e_err)
+                        logger.warning("[EARNINGS BLACKOUT] Data source error evaluating %s: %s -- failing open to allow trading", symbol, e_err)
 
             # C6: Signal Hysteresis (require 2 consecutive cycles for SELL exit confirmation)
             if action == "SELL" and getattr(config_module, "SIGNAL_HYSTERESIS", True):

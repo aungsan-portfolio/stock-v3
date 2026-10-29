@@ -1198,8 +1198,10 @@ def on_broker_fill_event(
             ctx["post_fill_status"] = "POST_FILL_GEOMETRY_VALID"
 
     try:
-        from strategies.trailing_stop import get_trailing_manager
-        manager = get_trailing_manager()
+        manager = bridge.get_trailing_stop_manager() if (bridge and hasattr(bridge, "get_trailing_stop_manager")) else None
+        if manager is None:
+            from strategies.trailing_stop import get_trailing_manager
+            manager = get_trailing_manager()
 
         manager.apply_confirmed_fill(
             signal=signal,
@@ -2232,8 +2234,10 @@ def execute_signal(
     # attribute missing, read exception occurs, persistence unhealthy, or state unknown.
     if not dry_run and is_connected:
         try:
-            from strategies.trailing_stop import get_trailing_manager
-            ts_mgr = get_trailing_manager()
+            ts_mgr = bridge.get_trailing_stop_manager() if (bridge and hasattr(bridge, "get_trailing_stop_manager")) else None
+            if ts_mgr is None:
+                from strategies.trailing_stop import get_trailing_manager
+                ts_mgr = get_trailing_manager()
             if ts_mgr is None:
                 idempotency_manager.release(signal.symbol, side=signal.side, reason="trailing_manager_missing")
                 result["status"] = "VETOED"
@@ -2600,8 +2604,10 @@ def execute_signal(
         # re-verify the canonical trailing stop manager's persistence health.
         if not dry_run and is_connected:
             try:
-                from strategies.trailing_stop import get_trailing_manager
-                final_ts_mgr = get_trailing_manager()
+                final_ts_mgr = bridge.get_trailing_stop_manager() if (bridge and hasattr(bridge, "get_trailing_stop_manager")) else None
+                if final_ts_mgr is None:
+                    from strategies.trailing_stop import get_trailing_manager
+                    final_ts_mgr = get_trailing_manager()
                 if final_ts_mgr is None:
                     idempotency_manager.release(
                         signal.symbol,

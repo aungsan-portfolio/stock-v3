@@ -3441,18 +3441,19 @@ def _run_daytrade_bot_lifecycle(args) -> int:
 
             earnings_cal = getattr(config, "EARNINGS_CALENDAR", {})
             blackout_days = getattr(config, "EARNINGS_BLACKOUT_DAYS", 2)
-            if earnings_cal:
-                from datetime import datetime, timedelta
+            swing_blackout = getattr(config, "SWING_EARNINGS_BLACKOUT", getattr(config, "EARNINGS_BLACKOUT", True))
+            if earnings_cal and swing_blackout:
+                from datetime import datetime
                 today = now_eastern().date()
                 blacked_out = []
                 for sym, date_str in earnings_cal.items():
                     try:
                         earnings_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-                        blackout_start = earnings_date - timedelta(days=blackout_days)
-                        if blackout_start <= today <= earnings_date:
+                        days_until = (earnings_date - today).days
+                        if 0 <= days_until <= blackout_days:
                             blacked_out.append(sym)
-                    except ValueError:
-                        pass
+                    except Exception as e_err:
+                        print(f"  [EARNINGS BLACKOUT] Data source error evaluating {sym}: {e_err} -- failing open")
                 if blacked_out:
                     watchlist = [s for s in watchlist if s not in blacked_out]
                     print(f"  [EARNINGS BLACKOUT] Removed {blacked_out} from watchlist")
