@@ -3441,8 +3441,8 @@ def _run_daytrade_bot_lifecycle(args) -> int:
 
             earnings_cal = getattr(config, "EARNINGS_CALENDAR", {})
             blackout_days = getattr(config, "EARNINGS_BLACKOUT_DAYS", 2)
-            swing_blackout = getattr(config, "SWING_EARNINGS_BLACKOUT", getattr(config, "EARNINGS_BLACKOUT", True))
-            if earnings_cal and swing_blackout:
+            daytrade_blackout = getattr(config, "DAYTRADE_EARNINGS_BLACKOUT", False)
+            if earnings_cal and daytrade_blackout:
                 from datetime import datetime
                 today = now_eastern().date()
                 blacked_out = []

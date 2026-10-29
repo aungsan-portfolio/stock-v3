@@ -17,7 +17,7 @@ def test_c1_earnings_blackout_flag_and_window():
     """Verify C1 EARNINGS_BLACKOUT blocks entries within 2 days of earnings."""
     assert config.EARNINGS_BLACKOUT is True
     assert config.EARNINGS_BLACKOUT_DAYS == 2
-    assert config.EARNINGS_EXIT_MODE == "exit"
+    assert config.EARNINGS_EXIT_MODE == "hold"
     assert "META" in config.EARNINGS_CALENDAR
 
 

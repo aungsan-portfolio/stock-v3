@@ -1975,7 +1975,7 @@ EARNINGS_BLACKOUT = True
 DAYTRADE_EARNINGS_BLACKOUT = False
 SWING_EARNINGS_BLACKOUT = True
 EARNINGS_BLACKOUT_DAYS = 2
-EARNINGS_EXIT_MODE = "exit"  # "exit" | "half" | "hold"
+EARNINGS_EXIT_MODE = "hold"  # "exit" | "half" | "hold"
 EARNINGS_CALENDAR = {
     "META": "2026-10-29",
     "AAPL": "2026-10-29",
@@ -1983,7 +1983,12 @@ EARNINGS_CALENDAR = {
     "GOOGL": "2026-10-28",
     "MSFT": "2026-10-28",
     "INTC": "2026-10-29",
-    "V": "2026-10-28",
+    "V": "2026-10-27",
+    "LLY": "2026-10-29",
+    "CAT": "2026-10-29",
+    "XOM": "2026-10-30",
+    "CVX": "2026-10-30",
+    "ABBV": "2026-10-30",
     "TSLA": "2026-10-21",
 }
 
