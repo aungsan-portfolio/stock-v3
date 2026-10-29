@@ -1561,13 +1561,14 @@ def evaluate_and_execute(
 
     # Phase 0 Poller Invariant: Unconditionally reconcile pending exits at cycle entry,
     # before any data health check, broker query, market regime evaluation, or entry halt.
+    manager = None
     try:
-        cycle_ts_mgr = bridge.get_trailing_stop_manager() if (bridge and hasattr(bridge, "get_trailing_stop_manager")) else None
-        if cycle_ts_mgr is None:
+        manager = bridge.get_trailing_stop_manager() if (bridge and hasattr(bridge, "get_trailing_stop_manager")) else None
+        if manager is None:
             from strategies.trailing_stop import get_trailing_manager
-            cycle_ts_mgr = get_trailing_manager()
-        if cycle_ts_mgr is not None and bridge is not None:
-            cycle_ts_mgr.reconcile_pending_exits(bridge)
+            manager = get_trailing_manager()
+        if manager is not None and bridge is not None:
+            manager.reconcile_pending_exits(bridge)
     except Exception as entry_poller_err:
         logger.error("[ENTRY POLLER ERROR] Failed reconciling pending exits at cycle entry: %s", entry_poller_err)
 
@@ -1832,16 +1833,17 @@ def evaluate_and_execute(
 
 
     try:
-        mid_ts_mgr = bridge.get_trailing_stop_manager() if (bridge and hasattr(bridge, "get_trailing_stop_manager")) else None
-        if mid_ts_mgr is None:
-            from strategies.trailing_stop import get_trailing_manager
-            mid_ts_mgr = get_trailing_manager()
-        if mid_ts_mgr is not None and bridge is not None:
+        if manager is None:
+            manager = bridge.get_trailing_stop_manager() if (bridge and hasattr(bridge, "get_trailing_stop_manager")) else None
+            if manager is None:
+                from strategies.trailing_stop import get_trailing_manager
+                manager = get_trailing_manager()
+        if manager is not None and bridge is not None:
             # 1. ALWAYS reconcile pending exits every cycle, regardless of open positions count or halts
-            mid_ts_mgr.reconcile_pending_exits(bridge)
+            manager.reconcile_pending_exits(bridge)
 
         # 2. Safety Check: Halt new entries if any active position has unresolved broker query failure
-        if mid_ts_mgr is not None and mid_ts_mgr.has_unresolved_position_unknown():
+        if manager is not None and manager.has_unresolved_position_unknown():
             logger.warning("[SAFETY GATE HALT] Unresolved POSITION_UNKNOWN state in trailing stops — halting NEW entries this cycle")
             allow_new_entries = False
             can_evaluate_signals = False
@@ -2224,7 +2226,6 @@ def evaluate_and_execute(
             sym_u = sig.symbol.upper().strip()
             if sym_u in cal:
                 try:
-                    from datetime import datetime
                     from strategies.session import now_eastern
                     e_date = datetime.strptime(cal[sym_u], "%Y-%m-%d").date()
                     now_date = now_eastern().date()
@@ -2696,11 +2697,7 @@ def evaluate_and_execute(
     logger.debug("[HOOK] before execute")
     for sig in all_signals:
         try:
-            sig_ts_mgr = bridge.get_trailing_stop_manager() if (bridge and hasattr(bridge, "get_trailing_stop_manager")) else None
-            if sig_ts_mgr is None:
-                from strategies.trailing_stop import get_trailing_manager
-                sig_ts_mgr = get_trailing_manager()
-            if sig_ts_mgr is not None and sig_ts_mgr.has_unresolved_position_unknown():
+            if manager is not None and manager.has_unresolved_position_unknown():
                 logger.warning("[SAFETY GATE HALT] Rejecting signal %s: active POSITION_UNKNOWN state across portfolio", sig.symbol)
                 try:
                     from strategies.gate_ledger import log_gate_decision

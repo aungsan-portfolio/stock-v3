@@ -8294,7 +8294,6 @@ class AlpacaBridge:
                 b_days = int(getattr(config_module, "EARNINGS_BLACKOUT_DAYS", 2))
                 if symbol in cal:
                     try:
-                        from datetime import datetime
                         from strategies.session import now_eastern
                         e_date = datetime.strptime(cal[symbol], "%Y-%m-%d").date()
                         now_date = now_eastern().date()
