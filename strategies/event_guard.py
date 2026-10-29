@@ -44,6 +44,33 @@ HIGH_IMPACT_EVENTS: Dict[str, Dict[str, Any]] = {
         "atr_floor_mult": 2.0,
         "affected_symbols": set(),
     },
+    # FOMC Decision: Oct 28, 2026 14:00 ET ± 15m to 15:00 ET press conference (C2)
+    "2026-10-28": {
+        "reason": "FOMC_RATE_DECISION",
+        "mode": "HEADLINE_BLACKOUT",
+        "blackout": (time(13, 45), time(15, 0)),
+        "throttle": 0.5,
+        "atr_floor_mult": 2.0,
+        "affected_symbols": set(),
+    },
+    # NFP Employment Report: Nov 6, 2026 08:30 ET ± 15m (C2)
+    "2026-11-06": {
+        "reason": "NFP_EMPLOYMENT_REPORT",
+        "mode": "HEADLINE_BLACKOUT",
+        "blackout": (time(8, 15), time(9, 45)),
+        "throttle": 0.5,
+        "atr_floor_mult": 1.5,
+        "affected_symbols": set(),
+    },
+    # CPI Inflation Report: Nov 13, 2026 08:30 ET ± 15m (C2)
+    "2026-11-13": {
+        "reason": "CPI_INFLATION_REPORT",
+        "mode": "HEADLINE_BLACKOUT",
+        "blackout": (time(8, 15), time(9, 45)),
+        "throttle": 0.5,
+        "atr_floor_mult": 1.5,
+        "affected_symbols": set(),
+    },
 }
 
 
@@ -69,8 +96,10 @@ def evaluate_event(now_et: Optional[datetime] = None) -> EventDecision:
         reason = evt.get("reason", "SCHEDULED_EVENT")
         affected = set(evt.get("affected_symbols", set()))
 
-        # Full blackout window (e.g. Fed keynote) -> hard block entries
-        if "blackout" in evt:
+        # Full blackout window (e.g. Fed keynote / FOMC / CPI / NFP) -> hard block entries
+        import config
+        macro_blackout_enabled = getattr(config, "MACRO_EVENT_BLACKOUT", True)
+        if "blackout" in evt and macro_blackout_enabled:
             start, end = evt["blackout"]
             current_time = now_et.time()
             if start <= current_time <= end:

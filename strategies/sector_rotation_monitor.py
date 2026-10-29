@@ -102,6 +102,22 @@ class SectorRotationMonitor:
         now_ts = now_eastern().isoformat()
         eval_date = now_date or now_eastern().date()
 
+        # ── 1b. Exclude Partial Daily Candle During Live Trading (B3) ─────────
+        # During live market hours (< 16:00 ET), today's daily bar is incomplete/partial.
+        # Stripping today's partial bar aligns both ETF and Benchmark strictly to the
+        # latest completed daily bar, eliminating persistent daily VETO_TIMESTAMP_MISALIGNMENT.
+        if now_date is None and symbol_df is not None and benchmark_df is not None:
+            try:
+                now_et_b3 = now_eastern()
+                if now_et_b3.hour < 16:
+                    today_date = now_et_b3.date()
+                    if isinstance(symbol_df.index, pd.DatetimeIndex):
+                        symbol_df = symbol_df[symbol_df.index.date < today_date]
+                    if isinstance(benchmark_df.index, pd.DatetimeIndex):
+                        benchmark_df = benchmark_df[benchmark_df.index.date < today_date]
+            except Exception as b3_err:
+                logger.debug("[SECTOR MONITOR B3] Partial bar alignment error: %s", b3_err)
+
         # ── 1. Null / Empty Validation ───────────────────────────────────────
         if symbol_df is None or symbol_df.empty:
             return self._fail_closed(

@@ -136,24 +136,13 @@ The following are prohibited without a separately ratified governance amendment:
 * **Real-money promotion blockers**: UNCHANGED
 * **Swing Engine Canonical Status**: Option C shadow running; production models remain on verified Aug-29 vintage (`models/lstm_checkpoint.pt`, `models/rf_models.joblib`); gate audit scheduled for November 6; real-money trading strictly BLOCKED without passing quantitative promotion gates.
 
-## 6. Runtime Code Freeze & Phase C Empirical Sample Collection Gate
-* **Date Ratified**: 2026-09-25
-* **Verification Baseline**: **76 / 76 Automated Tests Passed (100% Zero Regressions)**
-* **Operational Phase**: **Fixing Phase is Officially CLOSED**. The system is transitioned to **Paper Runtime Sample Collection ($N \ge 30$)**.
-
-### Strict Code Freeze Protocol
-1. **No Routine Code Modifications**:
-   Normal runtime events (e.g. routine WebSocket reconnect backoffs, soft gate rejections, lunch chop skips, or zero-trade market sessions) are **NOT defects** and must **NOT** trigger code changes.
-2. **Observe + Record Only**:
-   Telemetry, warnings, and gate rejections must be observed and recorded without modifying strategy thresholds or operational code.
-3. **Critical Defect Re-Opening Criteria**:
-   Code modifications (Tier 1 / Tier 2) are **strictly forbidden** unless one of the following 6 critical invariants is breached with empirical evidence:
-   * **Breach 1: Trading safety violation** (fail-closed invariant broken, orders placed during stream disconnection).
-   * **Breach 2: Broker truth discrepancy** (unreconciled state or desynchronization with Alpaca API).
-   * **Breach 3: Protection failure** (missing, dropped, or cancelled stop-loss on open positions).
-   * **Breach 4: Idempotency failure** (duplicate order submission or client order ID collision).
-   * **Breach 5: Accounting leak** (validation lane orders or P&L polluting production ledger).
-   * **Breach 6: Invariant regression** (failure of any of the 76 locked regression test cases).
+## 6. Development & Operational Window Policy (Outside Live Session Bug Fixes Allowed)
+* **Date Ratified**: 2026-10-29
+* **Operational Policy**:
+  - **Code changes allowed outside live session (ICT 20:30–03:00)**: Bug fixes, bookkeeping repairs, telemetry improvements, and safety invariant hardening are authorized during off-market hours.
+  - **Live session code freeze (ICT 20:30–03:00)**: Strictly zero code edits or process mutations while the live/paper market trading session is running.
+  - **Strategy changes must be behind config flags**: Any new strategy logic, stop modifiers, or filter changes must be guarded by feature flags (default=True/False as specified) and logged at startup.
+  - **Regression baseline**: All automated test suites must pass 100% cleanly before deployment to any live session.
 
 ### Current Operational Directives
 * **Tier 2 WebSocket Defect**: ✅ **CLOSED & FROZEN**

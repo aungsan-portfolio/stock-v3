@@ -229,6 +229,7 @@ def compute_vwap_breadth(
             logger.debug("[BREADTH] Batch fetch failed: %s", b_err)
             batch_fetched = {}
 
+    candidate_dfs = {}
     for sym in candidates:
         df = None
         if symbol_data and sym in symbol_data:
@@ -255,13 +256,33 @@ def compute_vwap_breadth(
             except Exception:
                 pass
 
-        if df is not None and not df.empty and len(df) >= 2:
+        if df is not None and not df.empty and len(df) >= 5:
+            candidate_dfs[sym] = df
+
+    # Timestamp alignment: align all candidates to the common latest minute
+    # to avoid evaluating leading symbols against lagging symbols
+    common_cutoff_ts = None
+    if candidate_dfs:
+        try:
+            latest_timestamps = [df.index[-1] for df in candidate_dfs.values() if not df.empty]
+            if latest_timestamps:
+                common_cutoff_ts = min(latest_timestamps)
+        except Exception:
+            common_cutoff_ts = None
+
+    for sym, df in candidate_dfs.items():
+        if common_cutoff_ts is not None:
+            df_aligned = df.loc[:common_cutoff_ts]
+        else:
+            df_aligned = df
+
+        if df_aligned is not None and not df_aligned.empty and len(df_aligned) >= 5:
             try:
                 from strategies.indicators import add_vwap
-                if "vwap" not in df.columns:
-                    df = add_vwap(df)
-                last_close = float(df["close"].iloc[-1])
-                last_vwap = float(df["vwap"].iloc[-1])
+                if "vwap" not in df_aligned.columns:
+                    df_aligned = add_vwap(df_aligned)
+                last_close = float(df_aligned["close"].iloc[-1])
+                last_vwap = float(df_aligned["vwap"].iloc[-1])
                 if math.isfinite(last_close) and math.isfinite(last_vwap) and last_vwap > 0:
                     valid_count += 1
                     is_above = last_close > last_vwap
@@ -271,17 +292,46 @@ def compute_vwap_breadth(
             except Exception:
                 pass
 
+    global _last_valid_breadth_cache
+    if "_last_valid_breadth_cache" not in globals():
+        _last_valid_breadth_cache = None
+
     if valid_count >= 5:
-        breadth_pct = round((above_vwap / valid_count) * 100.0, 2)
-        mode = "WATCHLIST_VWAP"
-        details = {
-            "mode": mode,
-            "evaluated": valid_count,
-            "above_vwap": above_vwap,
-            "breadth_pct": breadth_pct,
-            "symbols": [s[0] for s in evaluated_symbols],
-        }
-        return breadth_pct, mode, details
+        coverage_ratio = (valid_count / len(candidates)) if candidates else 1.0
+        # If coverage is acceptable (>=95%) or no previous cache exists, record new calculation
+        if coverage_ratio >= 0.95 or _last_valid_breadth_cache is None:
+            breadth_pct = round((above_vwap / valid_count) * 100.0, 2)
+            mode = "WATCHLIST_VWAP"
+            details = {
+                "mode": mode,
+                "evaluated": valid_count,
+                "above_vwap": above_vwap,
+                "breadth_pct": breadth_pct,
+                "symbols": [s[0] for s in evaluated_symbols],
+            }
+            _last_valid_breadth_cache = (breadth_pct, mode, details)
+            return breadth_pct, mode, details
+        else:
+            # Low coverage (< 95%) but >= 5: hold last valid breadth to prevent false jumps
+            last_pct, last_mode, last_det = _last_valid_breadth_cache
+            logger.info(
+                "[BREADTH LOW COVERAGE HOLD] Coverage %.1f%% (%d/%d) < 95%% threshold. Holding last valid breadth %.2f%%.",
+                coverage_ratio * 100.0, valid_count, len(candidates), last_pct
+            )
+            det = dict(last_det)
+            det["fallback_reason"] = f"Coverage {coverage_ratio*100.0:.1f}% < 95% threshold; hold-last applied"
+            return last_pct, last_mode, det
+
+    # If valid_count < 5, hold last valid breadth if available
+    if _last_valid_breadth_cache is not None:
+        last_pct, last_mode, last_det = _last_valid_breadth_cache
+        logger.info(
+            "[BREADTH HOLD LAST] Valid count %d < 5 threshold. Holding last valid breadth %.2f%% instead of jumping.",
+            valid_count, last_pct
+        )
+        det = dict(last_det)
+        det["fallback_reason"] = f"Watchlist valid count {valid_count} < 5 minimum threshold; hold-last applied"
+        return last_pct, last_mode, det
 
     # Fallback to Index Breadth
     dt = data or {}
@@ -596,6 +646,23 @@ def _get_premarket_pct_change(symbol: str, bridge=None) -> Tuple[Optional[float]
                 price = bridge.get_price(symbol, allow_historical=True)
 
             if price is not None and price > 0:
+                    global _last_index_prices
+                    if "_last_index_prices" not in globals():
+                        _last_index_prices = {}
+                    sym_upper = symbol.upper().strip()
+                    if sym_upper in ("SPY", "QQQ", "SOXX", "IWM") and sym_upper in _last_index_prices:
+                        last_p, last_t = _last_index_prices[sym_upper]
+                        if (now_epoch - last_t) < 120.0 and last_p > 0:
+                            jump_pct = abs(price - last_p) / last_p * 100.0
+                            if jump_pct > 1.0:
+                                logger.warning(
+                                    "[INDEX OUTLIER REJECTED] %s quote $%.2f jumped %.2f%% from previous $%.2f within %.1fs. Suppressing outlier.",
+                                    sym_upper, price, jump_pct, last_p, now_epoch - last_t
+                                )
+                                price = last_p
+                    if sym_upper in ("SPY", "QQQ", "SOXX", "IWM"):
+                        _last_index_prices[sym_upper] = (price, now_epoch)
+
                     prev_close = None
                     baseline_source = "alpaca_quote_vs_prev_close" if is_live_quote else "alpaca_historical_fallback"
                     session_date_str = None

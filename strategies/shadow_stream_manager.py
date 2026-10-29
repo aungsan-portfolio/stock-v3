@@ -156,6 +156,10 @@ if ALPACA_STREAM_AVAILABLE and StockDataStream is not None:
 
                     if not self._running:
                         logger.info("[SHADOW STREAM] Initiating data websocket connection (attempt %d)", self._reconnect_attempt + 1)
+                        try:
+                            await self.close()
+                        except Exception:
+                            pass
                         await self._start_ws()
                         await self._send_subscribe_msg()
                         self._running = True
@@ -209,7 +213,8 @@ if ALPACA_STREAM_AVAILABLE and StockDataStream is not None:
 
         async def _handle_backoff(self, error_type: str, error_msg: str) -> None:
             self._reconnect_attempt += 1
-            raw_delay = min(self._max_delay, self._base_delay * (2 ** (self._reconnect_attempt - 1)))
+            base = 15.0 if "connection limit exceeded" in str(error_msg).lower() else self._base_delay
+            raw_delay = min(self._max_delay, base * (2 ** (self._reconnect_attempt - 1)))
             delay = raw_delay * (1.0 + random.uniform(-self._jitter_ratio, self._jitter_ratio))
             delay = max(0.5, delay)
 

@@ -1165,16 +1165,21 @@ def _log_sizing_diag(symbol, sizing, entry_price, rejection_reason=None):
         if evaluated and min_q is not None else []
     )
 
+    port_used = getattr(sizing, "portfolio_exposure_used", None)
+    port_cap = getattr(sizing, "portfolio_exposure_cap", None)
+    port_diag = f" exposure_used=${port_used:,.2f} exposure_cap=${port_cap:,.2f}" if (port_used is not None and port_cap is not None) else ""
+
     logger.info(
         "[SIZING DIAG] symbol=%s caps=%s final_qty=%s "
         "min_q=%s matches_min=%s limiting_constraints=%s "
-        "entry_price=%s gross_notional=%s "
+        "entry_price=%s gross_notional=%s%s "
         "sizing_rejected=%s sizing_reason=%s stage_reason=%s",
         symbol, caps, getattr(sizing, "shares", 0),
         min_q,
         getattr(sizing, "shares", 0) == min_q if evaluated else "NOT_EVALUATED",
         limiting,
         entry_price, getattr(sizing, "gross_notional", 0.0),
+        port_diag,
         getattr(sizing, "rejected", False), getattr(sizing, "rejection_reason", None) or "NONE",
         rejection_reason or "NONE",
     )
@@ -1186,6 +1191,11 @@ class AlpacaBridge:
         try:
             from logging_setup import set_log_context
             set_log_context(process_tag=self.mode.upper())
+        except Exception:
+            pass
+        try:
+            if hasattr(config_module, "log_strategy_feature_flags"):
+                config_module.log_strategy_feature_flags()
         except Exception:
             pass
         self.dry_run = bool(dry_run)
@@ -2665,13 +2675,25 @@ class AlpacaBridge:
             from strategies.entry_lifecycle import entry_lifecycle
             was_pending_entry = parent_order_id in entry_lifecycle.pending_snapshot()
 
-            self.on_entry_order_update(
-                parent_order_id=parent_order_id,
-                cumulative_filled_qty=cumulative_filled_qty,
-                average_fill_price=average_fill_price,
-                execution_id=execution_id,
-                status=status,
-            )
+            if was_pending_entry:
+                self.on_entry_order_update(
+                    parent_order_id=parent_order_id,
+                    cumulative_filled_qty=cumulative_filled_qty,
+                    average_fill_price=average_fill_price,
+                    execution_id=execution_id,
+                    status=status,
+                )
+            else:
+                self.on_exit_order_update(
+                    order_id=parent_order_id,
+                    cumulative_filled_qty=cumulative_filled_qty,
+                    average_fill_price=average_fill_price,
+                    execution_id=execution_id,
+                    status=status,
+                    event_name=event_name,
+                    order=order,
+                    role_info=role_info,
+                )
 
             if status == "replaced":
                 if was_pending_entry:
@@ -2698,6 +2720,62 @@ class AlpacaBridge:
                 self.entry_gate.halt("TRADE_STREAM_DISPATCH_ERROR")
             logger.exception("[TRADE STREAM] Lifecycle dispatch failed; caches invalidated, entry gate halted, forcing fresh reconciliation")
             self._schedule_forced_reconciliation(reason=f"dispatch_exception:{exc}")
+
+    def on_exit_order_update(
+        self,
+        order_id: str,
+        cumulative_filled_qty: float,
+        average_fill_price: float,
+        execution_id: Optional[str] = None,
+        status: str = "",
+        event_name: str = "",
+        order: Optional[object] = None,
+        role_info: Optional[dict] = None,
+    ) -> bool:
+        """Route bracket stop/TP leg or exit order fill updates directly to trailing_stop and authoritative reconciliation."""
+        order_sym = str(getattr(order, "symbol", "") if order else "").upper().strip()
+        if not order_sym and role_info:
+            order_sym = str(role_info.get("symbol", "")).upper().strip()
+        if not order_sym:
+            return False
+
+        is_fill = (event_name in ("fill", "partial_fill") or status in ("filled", "partially_filled"))
+        if not is_fill:
+            return False
+
+        try:
+            from strategies.trailing_stop import get_trailing_manager
+            ts_mgr = get_trailing_manager()
+            if ts_mgr is None:
+                return False
+
+            with ts_mgr._lock:
+                state = ts_mgr.states.get(order_sym)
+                is_active = state is not None and getattr(state, "active", False)
+                matches_leg = False
+                if state is not None:
+                    matches_leg = str(order_id) in {
+                        str(getattr(state, "order_id", None) or ""),
+                        str(getattr(state, "tp_order_id", None) or ""),
+                        str(getattr(state, "last_stop_order_id", None) or ""),
+                    }
+                r_info = role_info or {}
+                is_exit_role = r_info.get("role") in ("STOP", "TRAILING_STOP", "TAKE_PROFIT")
+
+                if is_active and (matches_leg or is_exit_role or getattr(state, "side", "").lower() != str(getattr(order, "side", "")).lower()):
+                    logger.info(
+                        "[TRADE STREAM EXIT FILL] %s fill received for %s order %s (qty=%.4f @ %.4f, role=%s). "
+                        "Recording pending exit for authoritative reconciliation.",
+                        status, order_sym, order_id, cumulative_filled_qty, average_fill_price, r_info.get("role", "UNKNOWN")
+                    )
+                    ts_mgr._record_pending_exit(state, qty_closed=cumulative_filled_qty)
+
+            # Atomically reconcile pending exit using authoritative broker truth & journal sync
+            ts_mgr.reconcile_pending_exits(bridge=self)
+            return True
+        except Exception as exc:
+            logger.error("[TRADE STREAM EXIT DISPATCH FAILED] %s order %s: %s", order_sym, order_id, exc)
+            return False
 
     def on_entry_order_update(self, parent_order_id: str, cumulative_filled_qty: float, average_fill_price: float, execution_id: Optional[str] = None, status: str = ""):
         """Route entry parent order fill updates into entry_lifecycle."""
@@ -8017,8 +8095,20 @@ class AlpacaBridge:
             activity_fills=tuple(activity_fills),
         )
 
-    def _evaluate_and_execute_rotation(self, signals: List[Signal]) -> None:
+    def _evaluate_and_execute_rotation(self, signals: List[Signal]) -> Set[str]:
+        locked_symbols: Set[str] = set()
         try:
+            # B2: Market Close Buffer Guard: skip rotator if within 15m of market close
+            from strategies.session import now_eastern
+            now_et = now_eastern()
+            if now_et.hour == 15 and now_et.minute >= 45:
+                logger.info("[MARKET CLOSE BUFFER] Within 15 mins of market close (> 15:45 EDT). Skipping swing rotation.")
+                return locked_symbols
+
+            if not signals:
+                logger.info("[ROTATION SKIP] No signals provided; skipping position rotation.")
+                return locked_symbols
+
             self.rotator.state.reset_cycle()
             raw_positions = self._client.get_all_positions()
             if not raw_positions:
@@ -8128,11 +8218,22 @@ class AlpacaBridge:
                         "[ROTATION NOT COMPLETED] %s -> %s: state=%s, error=%s",
                         exit_sym, enter_sig.symbol, summary.state.value, summary.error_message
                     )
+                    # B1: Lock symbol against direct BUY execution within same cycle on STAY_IN_CASH
+                    st_val = getattr(summary.state, "value", str(summary.state))
+                    if st_val == "STAY_IN_CASH" or not summary.replacement_entered:
+                        locked_sym = enter_sig.symbol.upper().strip()
+                        locked_symbols.add(locked_sym)
+                        if hasattr(self.rotator, "state"):
+                            self.rotator.state.lock_symbol(locked_sym)
+                        logger.warning(
+                            "[ROTATION STAY_IN_CASH VETO] Locking %s from direct BUY execution this cycle", locked_sym
+                        )
         except Exception as exc:
             logger.error("Error during position rotation evaluation: %s", exc)
+        return locked_symbols
 
     def execute_all(self, signals: List[Signal]) -> dict:
-        self._evaluate_and_execute_rotation(signals)
+        locked_symbols = self._evaluate_and_execute_rotation(signals) or set()
 
         open_positions = self.get_open_positions()
         if isinstance(open_positions, dict):
@@ -8159,6 +8260,46 @@ class AlpacaBridge:
                 logger.info("[SHADOW GATE] Skipping broker actions for shadow symbol %s (zero mutation)", symbol)
                 skipped += 1
                 continue
+
+            # B1: Lock symbol if vetoed in atomic rotation (STAY_IN_CASH)
+            if action == "BUY" and (symbol in locked_symbols or (hasattr(self.rotator, "state") and self.rotator.state.is_locked(symbol))):
+                logger.warning("[CYCLE LOCK VETO] %s was vetoed in atomic rotation (STAY_IN_CASH). Direct BUY locked for this cycle.", symbol)
+                skipped += 1
+                rejections.append({"symbol": symbol, "reason": "ROTATION_STAY_IN_CASH_LOCK"})
+                continue
+
+            # C1: Earnings Blackout Filter (suppress BUY within 2 trading days before earnings)
+            if action == "BUY" and getattr(config_module, "EARNINGS_BLACKOUT", True):
+                cal = getattr(config_module, "EARNINGS_CALENDAR", {})
+                b_days = int(getattr(config_module, "EARNINGS_BLACKOUT_DAYS", 2))
+                if symbol in cal:
+                    try:
+                        from datetime import datetime, timedelta
+                        from strategies.session import now_eastern
+                        e_date = datetime.strptime(cal[symbol], "%Y-%m-%d").date()
+                        now_date = now_eastern().date()
+                        if (e_date - timedelta(days=b_days)) <= now_date <= e_date:
+                            logger.warning("[EARNINGS BLACKOUT VETO] %s reports on %s (within %d days). Direct BUY suppressed.", symbol, e_date, b_days)
+                            skipped += 1
+                            rejections.append({"symbol": symbol, "reason": "EARNINGS_BLACKOUT"})
+                            continue
+                    except Exception as e_err:
+                        logger.debug("[EARNINGS BLACKOUT] Error checking %s: %s", symbol, e_err)
+
+            # C6: Signal Hysteresis (require 2 consecutive cycles for SELL exit confirmation)
+            if action == "SELL" and getattr(config_module, "SIGNAL_HYSTERESIS", True):
+                if not hasattr(self, "_sell_signal_cycles"):
+                    self._sell_signal_cycles = {}
+                current_count = self._sell_signal_cycles.get(symbol, 0) + 1
+                self._sell_signal_cycles[symbol] = current_count
+                min_cycles = int(getattr(config_module, "SIGNAL_HYSTERESIS_CYCLES", 2))
+                if current_count < min_cycles:
+                    logger.info("[SIGNAL HYSTERESIS] %s SELL signal observed (cycle %d/%d). Awaiting confirmation before exit.", symbol, current_count, min_cycles)
+                    skipped += 1
+                    rejections.append({"symbol": symbol, "reason": "SIGNAL_HYSTERESIS_PENDING"})
+                    continue
+            elif action != "SELL" and hasattr(self, "_sell_signal_cycles"):
+                self._sell_signal_cycles.pop(symbol, None)
 
             if action == "HOLD":
                 self._cancel_working_entry_orders(symbol)

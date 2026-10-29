@@ -107,12 +107,23 @@ class RotationState:
     cooldown_remaining:    int             = 0
     rotations_this_cycle:  int             = 0
     rotation_history:      list[dict]      = field(default_factory=list)
+    locked_symbols:        set[str]        = field(default_factory=set)
 
     def reset_cycle(self):
         """Scan Cycle အသစ်တိုင်း ဒါကို ခေါ်ပါ"""
         if self.cooldown_remaining > 0:
             self.cooldown_remaining -= 1
         self.rotations_this_cycle = 0
+        self.locked_symbols.clear()
+
+    def lock_symbol(self, symbol: str) -> None:
+        """Lock a symbol from entry for the remainder of this cycle (e.g. on STAY_IN_CASH)."""
+        if symbol:
+            self.locked_symbols.add(symbol.upper().strip())
+
+    def is_locked(self, symbol: str) -> bool:
+        """Check if symbol is locked from entry in this cycle."""
+        return symbol.upper().strip() in self.locked_symbols if symbol else False
 
     def record_rotation(self, decision: RotationDecision):
         self.cooldown_remaining   = ROTATION_COOLDOWN_CYCLES

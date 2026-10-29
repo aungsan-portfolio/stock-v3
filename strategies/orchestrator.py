@@ -680,14 +680,27 @@ def _evaluate_mean_reversion(symbol, df, market_texture, scorer, bridge=None):
     # Daily ATR here must already be a dollar distance. Broker's daily ATR percent
     # API is not substituted: its reference price and fallback provenance differ.
     quote = context.get("quote")
-    get_quote = getattr(bridge, "get_quote", None) if bridge is not None else None
-    if callable(get_quote):
+    # A8: Check low-latency streaming quote first (<1ms) to minimize serial REST fetch latency
+    if quote is None:
         try:
-            fresh_quote = get_quote(symbol)
-            if fresh_quote is not None:
-                quote = fresh_quote
-        except Exception as exc:
-            logger.debug("[MEAN REVERSION] %s: upstream quote unavailable: %s", symbol, exc)
+            from strategies.shadow_stream_manager import get_shadow_stream_manager
+            mgr = get_shadow_stream_manager()
+            if mgr and hasattr(mgr, "get_latest_quote"):
+                stream_q = mgr.get_latest_quote(symbol)
+                if stream_q is not None and getattr(stream_q, "bid", 0) > 0 and getattr(stream_q, "ask", 0) > 0:
+                    quote = stream_q
+        except Exception:
+            pass
+
+    if quote is None:
+        get_quote = getattr(bridge, "get_quote", None) if bridge is not None else None
+        if callable(get_quote):
+            try:
+                fresh_quote = get_quote(symbol)
+                if fresh_quote is not None:
+                    quote = fresh_quote
+            except Exception as exc:
+                logger.debug("[MEAN REVERSION] %s: upstream quote unavailable: %s", symbol, exc)
     signal = MeanReversionStrategy().generate_signal(
         symbol, df, market_texture=market_texture, quote=quote, metadata=context,
     )
@@ -2192,9 +2205,42 @@ def evaluate_and_execute(
     # ── Lane 5: Pre-Correlation / Pre-Sizing Texture Admission Filter ──
     texture_admitted_signals = []
     for sig in all_signals:
+        # C1: Earnings Blackout Filter (suppress entries within 2 trading days prior to earnings)
+        if getattr(config, "EARNINGS_BLACKOUT", True):
+            cal = getattr(config, "EARNINGS_CALENDAR", {})
+            b_days = int(getattr(config, "EARNINGS_BLACKOUT_DAYS", 2))
+            sym_u = sig.symbol.upper().strip()
+            if sym_u in cal:
+                try:
+                    from datetime import datetime, timedelta
+                    from strategies.session import now_eastern
+                    e_date = datetime.strptime(cal[sym_u], "%Y-%m-%d").date()
+                    now_date = now_eastern().date()
+                    if (e_date - timedelta(days=b_days)) <= now_date <= e_date:
+                        logger.warning("[EARNINGS BLACKOUT VETO] %s reports on %s (within %d days). Signal rejected.", sym_u, e_date, b_days)
+                        continue
+                except Exception as e_err:
+                    logger.debug("[EARNINGS BLACKOUT] %s check error: %s", sym_u, e_err)
+
+        # C5: Sector Trend Override for semiconductors
+        eval_texture = market_tex
+        if getattr(config, "SECTOR_TREND_OVERRIDE", True):
+            semis = getattr(config, "SEMICONDUCTOR_SYMBOLS", {"NVDA", "AMD", "AVGO", "MU", "INTC", "TSM", "QCOM", "TXN", "AMAT", "LRCX", "ADI", "MRVL"})
+            if sig.symbol.upper().strip() in semis:
+                soxx_pct = None
+                if hasattr(regime_res, "data") and isinstance(regime_res.data, dict):
+                    from strategies.regime_engine import extract_benchmark_pct
+                    soxx_pct = extract_benchmark_pct(regime_res.data, "SOXX")
+                breadth_val = getattr(regime_res, "breadth_pct", 50.0)
+                soxx_thresh = float(getattr(config, "SOXX_TREND_THRESHOLD", 1.5))
+                breadth_thresh = float(getattr(config, "SOXX_BREADTH_THRESHOLD", 60.0))
+                if soxx_pct is not None and abs(float(soxx_pct)) >= soxx_thresh and breadth_val >= breadth_thresh:
+                    eval_texture = "TRENDING"
+                    logger.info("[SECTOR TREND OVERRIDE] %s (semis): SOXX %+.2f%% and breadth %.1f%% override texture to TRENDING", sig.symbol, float(soxx_pct), breadth_val)
+
         admitted, is_experiment, cell_tag = is_strategy_admitted_for_texture(
             strategy=sig.strategy,
-            market_texture=market_tex,
+            market_texture=eval_texture,
             bridge=bridge,
             signal=sig,
         )

@@ -42,7 +42,11 @@ CONFIGURED_MAX_RISK_DOLLARS: float = 500.00  # Hard dollar ceiling at $100k equi
 TARGET_DEPLOYED_EXPOSURE_PCT: float = 0.20  # 20% target deployment (Soft guideline)
 STAGE_0_GROSS_EXPOSURE_PCT: float = 0.28   # 28% hard portfolio exposure ceiling (Hard enforced)
 MAX_SYMBOL_EXPOSURE_PCT: float = 0.10      # 10% max per symbol (Hard enforced)
-SECTOR_EXPOSURE_CAP_PCT: float = 0.25      # 25% max gross notional exposure per sector (Hard enforced)
+try:
+    import config
+    SECTOR_EXPOSURE_CAP_PCT: float = float(getattr(config, "CLUSTER_NOTIONAL_CAP", 0.15))
+except Exception:
+    SECTOR_EXPOSURE_CAP_PCT: float = 0.15      # 15% max gross notional exposure per sector (C7)
 MAX_CLUSTER_RISK_PCT: float = 0.0125       # 1.25% max cumulative open stop risk per correlated cluster (Hard enforced)
 AGGREGATE_OPEN_STOP_HEAT_PCT: float = 0.025 # 2.50% max total open risk (Hard enforced)
 from strategies.rotation_config import MAX_CONCURRENT_POSITIONS  # Canonical Single Source of Truth
@@ -462,6 +466,8 @@ class SizingDecision:
     stop_distance: float
     rejected: bool = False
     rejection_reason: str = ""
+    portfolio_exposure_used: float = 0.0
+    portfolio_exposure_cap: float = 0.0
 
     @classmethod
     def reject(cls, reason: str, normalized_stop: float = 0.0) -> SizingDecision:
@@ -638,6 +644,7 @@ def calculate_swing_position_size(
 
     gross_notional = final_shares * entry_price
     estimated_risk = (final_shares * per_share_risk) + estimated_total_fees
+    port_used = existing_portfolio_exposure + reserved_portfolio_exposure
 
     return SizingDecision(
         shares=final_shares,
@@ -654,6 +661,8 @@ def calculate_swing_position_size(
         stop_distance=round(normalized_stop_distance, 4),
         rejected=False,
         rejection_reason="",
+        portfolio_exposure_used=round(port_used, 2),
+        portfolio_exposure_cap=round(max_portfolio_budget, 2),
     )
 
 

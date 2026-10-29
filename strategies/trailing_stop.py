@@ -1126,11 +1126,17 @@ class DynamicTrailingStopManager:
                         try:
                             from alpaca.trading.requests import GetOrdersRequest
                             from alpaca.trading.enums import QueryOrderStatus
-                            req = GetOrdersRequest(
-                                status=QueryOrderStatus.CLOSED,
-                                symbols=[symbol.upper().strip()],
-                                limit=10,
-                            )
+                            req_kwargs = {
+                                "status": QueryOrderStatus.CLOSED,
+                                "symbols": [symbol.upper().strip()],
+                                "limit": 50,
+                            }
+                            entry_epoch = _to_epoch(exit_item.get("entry_time"))
+                            if entry_epoch is not None:
+                                from datetime import datetime, timezone
+                                after_dt = datetime.fromtimestamp(max(0.0, entry_epoch - 60.0), tz=timezone.utc)
+                                req_kwargs["after"] = after_dt
+                            req = GetOrdersRequest(**req_kwargs)
                             closed_orders = bridge._client.get_orders(req)
                             if closed_orders:
                                 for co in closed_orders:
@@ -1139,7 +1145,7 @@ class DynamicTrailingStopManager:
                             logger.debug("Failed querying closed orders for %s: %s", symbol, co_err)
                     elif hasattr(bridge, "get_orders"):
                         try:
-                            closed_orders = bridge.get_orders(status="closed", symbols=[symbol.upper().strip()])
+                            closed_orders = bridge.get_orders(status="closed", symbols=[symbol.upper().strip()], limit=50)
                             if closed_orders:
                                 for co in closed_orders:
                                     _process_candidate_order(co)
@@ -1260,6 +1266,28 @@ class DynamicTrailingStopManager:
                                 self.states[symbol].stop_reconciliation_required = False
                             self._save_state()
                             results[symbol] = "RECONCILED_FLAT_VERIFIED"
+                            continue
+
+                        # Auto-expire / purge stale pending exits older than 24 hours when broker is verified flat
+                        now_epoch = time.time()
+                        entry_epoch = _to_epoch(exit_item.get("entry_time")) or _to_epoch(exit_item.get("registered_at"))
+                        is_stale_exit = (entry_epoch is not None and (now_epoch - entry_epoch) > 86400.0)
+
+                        if is_stale_exit or (not has_working_orders and cur_pos_qty is not None and abs(cur_pos_qty) < 1e-6 and int(exit_item.get("attempts", 0)) >= 5):
+                            logger.warning(
+                                "[STALE PENDING EXIT PURGED] %s: Pending exit '%s' (age=%.1fs, attempts=%s) purged because broker position is confirmed 0 with 0 working orders.",
+                                symbol, episode_id, (now_epoch - (entry_epoch or now_epoch)), exit_item.get("attempts", 0)
+                            )
+                            if episode_id in self.pending_exits:
+                                del self.pending_exits[episode_id]
+                            if symbol in self.pending_exits:
+                                del self.pending_exits[symbol]
+                            if symbol in self.states:
+                                self.states[symbol].reconciliation_status = "RECONCILED_FLAT_VERIFIED"
+                                self.states[symbol].active = False
+                                self.states[symbol].stop_reconciliation_required = False
+                            self._save_state()
+                            results[symbol] = "STALE_PENDING_EXIT_PURGED"
                             continue
 
                         results[symbol] = "FLAT_PENDING_EXIT_RECONCILIATION"
@@ -2538,10 +2566,11 @@ class DynamicTrailingStopManager:
             new_stop = state.stop_price
             should_update = False
 
-            # --- Breakeven Stop Lock Logic ---
+            # --- Breakeven Stop Lock Logic (C3) ---
             breakeven_enabled = getattr(config, "BREAKEVEN_LOCK_ENABLED", True)
-            breakeven_threshold_atr = getattr(config, "BREAKEVEN_LOCK_THRESHOLD_ATR", 1.0)
-            cushion = 0.01 if getattr(config, "BREAKEVEN_SLIPPAGE_CUSHION", True) else 0.0
+            # C3: 1.5 ATR profit threshold to lock breakeven; move stop to entry + 0.1 ATR
+            breakeven_threshold_atr = float(getattr(config, "MR_BREAKEVEN_PROFIT_ATR", getattr(config, "BREAKEVEN_LOCK_THRESHOLD_ATR", 1.5)))
+            lock_offset_atr = float(getattr(config, "MR_BREAKEVEN_LOCK_ATR", 0.1))
 
             if state.side == "BUY":
                 if current_price > state.peak_price:
@@ -2551,7 +2580,7 @@ class DynamicTrailingStopManager:
                 profit_atr = (state.peak_price - state.entry_price) / state.atr if state.atr > 0 else 0.0
 
                 if breakeven_enabled and state.atr > 0 and profit_atr >= breakeven_threshold_atr:
-                    breakeven_stop = state.entry_price + cushion
+                    breakeven_stop = round(state.entry_price + (lock_offset_atr * state.atr), 2)
                     if breakeven_stop > new_stop:
                         old_stop_disp = new_stop
                         new_stop = breakeven_stop

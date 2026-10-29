@@ -809,8 +809,21 @@ def _cap_submission_shares(shares, checked_risk_dollars, checked_notional, risk_
     if not all(math.isfinite(float(v)) and float(v) > 0 for v in
                (shares, checked_risk_dollars, checked_notional, risk_per_share, entry_price)):
         return 0
-    return min(int(shares), math.floor(checked_risk_dollars / risk_per_share + 1e-9),
-               math.floor(checked_notional / entry_price + 1e-9))
+    orig_shares = int(shares)
+    risk_capped = math.floor(checked_risk_dollars / risk_per_share + 1e-9)
+    notional_capped = math.floor(checked_notional / entry_price + 1e-9)
+    capped_shares = min(orig_shares, risk_capped, notional_capped)
+    if capped_shares < orig_shares:
+        reason_parts = []
+        if risk_capped < orig_shares:
+            reason_parts.append(f"risk_budget_cap (${checked_risk_dollars:.2f} / ${risk_per_share:.4f} = {risk_capped} shares)")
+        if notional_capped < orig_shares:
+            reason_parts.append(f"notional_cap (${checked_notional:.2f} / ${entry_price:.2f} = {notional_capped} shares)")
+        logger.warning(
+            "[SIZER CAP REDUCTION] Shares reduced from %d to %d: %s",
+            orig_shares, capped_shares, ", ".join(reason_parts)
+        )
+    return capped_shares
 
 
 def _executable_signal(signal: TradeSignal, entry_limit_price: Optional[float]) -> TradeSignal:

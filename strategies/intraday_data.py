@@ -1031,6 +1031,8 @@ def _validate_intraday_data(
                     grace_seconds = float(getattr(config, "PREFLIGHT_MAX_RECOVERABLE_DELAY_SECONDS", 360.0))
                 elif purpose == "POSITION_MONITORING":
                     grace_seconds = float(getattr(config, "POSITION_ATR_MAX_AGE_SECONDS", 360.0))
+                elif str(purpose or "").upper() == "REGIME_BREADTH":
+                    grace_seconds = float(getattr(config, "REGIME_BREADTH_MAX_DELAY_SECONDS", 300.0))
                 else:
                     grace_seconds = float(getattr(config, "ENTRY_BAR_CLOSE_GRACE_SECONDS", getattr(config, "BAR_CLOSE_GRACE_SECONDS", 60.0)))
 

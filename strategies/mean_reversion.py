@@ -145,11 +145,29 @@ class MeanReversionStrategy:
                     return None
                 spread_floor = ask - bid
 
+            # C4: Intraday Relative Strength Filter vs SPY
+            if getattr(self.cfg, "MR_RS_FILTER", True):
+                spy_pct = context.get("spy_pct")
+                if spy_pct is not None and math.isfinite(float(spy_pct)):
+                    sym_open = context.get("open") or (df["open"].iloc[0] if "open" in df.columns else None)
+                    if sym_open and float(sym_open) > 0:
+                        sym_intraday_pct = ((close - float(sym_open)) / float(sym_open)) * 100.0
+                        rs_diff = sym_intraday_pct - float(spy_pct)
+                        min_rs_threshold = float(getattr(self.cfg, "MR_RS_FILTER_THRESHOLD", -1.0))
+                        if rs_diff < min_rs_threshold:
+                            logger.info(
+                                "[MR RS VETO] %s: Intraday %+.2f%% vs SPY %+.2f%% (diff=%+.2f%% < %.2f%%). Vetoing MR long.",
+                                symbol, sym_intraday_pct, float(spy_pct), rs_diff, min_rs_threshold
+                            )
+                            return None
+
             # Use the emitted entry precision consistently; do not round ATR/risk independently.
             entry_price = round(close, 4)
             tick_size = 0.01 if entry_price >= 1.0 else 0.0001
+            # C3: Mean reversion stop minimum 1.25 ATR multiplier
+            stop_mult = float(getattr(self.cfg, "MR_STOP_ATR_MULT", 1.25))
             geom = calculate_directional_stop_and_validate(
-                side="long", price=entry_price, raw_risk=0.50 * atr,
+                side="long", price=entry_price, raw_risk=stop_mult * atr,
                 atr=atr, spread_floor=spread_floor, tick_size=tick_size,
                 precision=2 if tick_size == 0.01 else 4, cfg=self.cfg,
             )

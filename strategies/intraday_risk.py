@@ -81,9 +81,19 @@ _RECENT_SYMBOL_LOSS_TIMESTAMPS: dict = {}
 
 def register_symbol_loss(symbol: str, timestamp: Optional[datetime] = None) -> None:
     """Register an in-memory loss timestamp for a symbol to enforce re-entry cooldown instantly."""
+    sym = symbol.upper().strip()
     ts = timestamp or datetime.now(timezone.utc)
-    _RECENT_SYMBOL_LOSS_TIMESTAMPS[symbol.upper().strip()] = ts
-    logger.info(f"Registered instant loss cooldown timestamp for {symbol} at {ts}")
+    prev_ts = _RECENT_SYMBOL_LOSS_TIMESTAMPS.get(sym)
+    if prev_ts is not None:
+        try:
+            delta = abs((ts - prev_ts).total_seconds())
+            if delta < 60.0:
+                logger.debug(f"Skipping duplicate loss cooldown registration for {sym} (delta={delta:.1f}s)")
+                return
+        except Exception:
+            pass
+    _RECENT_SYMBOL_LOSS_TIMESTAMPS[sym] = ts
+    logger.info(f"Registered instant loss cooldown timestamp for {sym} at {ts}")
 
 
 def get_recent_symbol_loss_time(symbol: str, journal_file=None) -> Optional[datetime]:

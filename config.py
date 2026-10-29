@@ -1966,3 +1966,54 @@ if _TEST_ROOT_ENV:
     init_isolated_test_env(_TEST_ROOT_ENV)
     install_production_write_guard()
 
+
+# Regime Breadth Stale Delay Grace (A4)
+REGIME_BREADTH_MAX_DELAY_SECONDS = 300.0
+
+# ── Strategy Feature Flags (Group C) - Default=ON ─────────────
+EARNINGS_BLACKOUT = True
+EARNINGS_BLACKOUT_DAYS = 2
+EARNINGS_EXIT_MODE = "exit"  # "exit" | "half" | "hold"
+EARNINGS_CALENDAR = {
+    "META": "2026-10-29",
+    "AAPL": "2026-10-29",
+    "AMZN": "2026-10-29",
+    "GOOGL": "2026-10-28",
+    "MSFT": "2026-10-28",
+    "INTC": "2026-10-29",
+    "V": "2026-10-28",
+    "TSLA": "2026-10-21",
+}
+
+MACRO_EVENT_BLACKOUT = True
+MACRO_EVENT_WINDOW_MINUTES = 15
+
+MR_STOP_ATR_MULT = 1.25
+MR_BREAKEVEN_PROFIT_ATR = 1.5
+MR_BREAKEVEN_LOCK_ATR = 0.1
+
+MR_RS_FILTER = True
+MR_RS_FILTER_THRESHOLD = -1.0
+
+SECTOR_TREND_OVERRIDE = True
+SOXX_TREND_THRESHOLD = 1.5
+SOXX_BREADTH_THRESHOLD = 60.0
+
+SIGNAL_HYSTERESIS = True
+SIGNAL_HYSTERESIS_CYCLES = 2
+
+CLUSTER_NOTIONAL_CAP = 0.15
+
+def log_strategy_feature_flags():
+    """Log authoritative state of all Phase C Strategy Feature Flags at startup."""
+    import logging
+    _log = logging.getLogger("strategy_flags")
+    _log.info("[STRATEGY FEATURE FLAGS]")
+    _log.info("  C1. EARNINGS_BLACKOUT: %s (days=%d, exit_mode=%s)", EARNINGS_BLACKOUT, EARNINGS_BLACKOUT_DAYS, EARNINGS_EXIT_MODE)
+    _log.info("  C2. MACRO_EVENT_BLACKOUT: %s (window=±%dm)", MACRO_EVENT_BLACKOUT, MACRO_EVENT_WINDOW_MINUTES)
+    _log.info("  C3. MR_STOP_ATR_MULT: %.2f (breakeven profit=%.1f ATR, lock=%.1f ATR)", MR_STOP_ATR_MULT, MR_BREAKEVEN_PROFIT_ATR, MR_BREAKEVEN_LOCK_ATR)
+    _log.info("  C4. MR_RS_FILTER: %s (threshold=%.1f%%)", MR_RS_FILTER, MR_RS_FILTER_THRESHOLD)
+    _log.info("  C5. SECTOR_TREND_OVERRIDE: %s (SOXX threshold=%.1f%%, breadth=%.1f)", SECTOR_TREND_OVERRIDE, SOXX_TREND_THRESHOLD, SOXX_BREADTH_THRESHOLD)
+    _log.info("  C6. SIGNAL_HYSTERESIS: %s (min_cycles=%d)", SIGNAL_HYSTERESIS, SIGNAL_HYSTERESIS_CYCLES)
+    _log.info("  C7. CLUSTER_NOTIONAL_CAP: %.2f (<= %.1f%% equity per sector)", CLUSTER_NOTIONAL_CAP, CLUSTER_NOTIONAL_CAP * 100)
+
