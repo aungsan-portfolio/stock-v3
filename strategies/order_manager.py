@@ -12,7 +12,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from collections import defaultdict
-from typing import Optional, Tuple, Any, Union, List
+from typing import Optional, Tuple, Any, Union, List, Dict
 
 import config
 from strategies.base import TradeSignal
