@@ -22,11 +22,22 @@ from unittest.mock import patch
 import config
 from strategies.base import TradeSignal, StrategyName
 from strategies.gap_strategy import GapAndGoStrategy
-from evidence.candidates.gap_strategy_candidate import (
-    GapAndGoStrategyCandidate,
-    _safe_volume_ma,
-    _compute_volume_ma,
-    _safe_atr,
+try:
+    from evidence.candidates.gap_strategy_candidate import (
+        GapAndGoStrategyCandidate,
+        _safe_volume_ma,
+        _compute_volume_ma,
+        _safe_atr,
+    )
+except ImportError:
+    GapAndGoStrategyCandidate = None
+    _safe_volume_ma = None
+    _compute_volume_ma = None
+    _safe_atr = None
+
+pytestmark = pytest.mark.skipif(
+    GapAndGoStrategyCandidate is None,
+    reason="evidence module is excluded by .gitignore and not present in repository",
 )
 
 
