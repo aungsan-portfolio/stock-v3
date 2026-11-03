@@ -80,3 +80,5 @@ backups/
 *.zip
 *results.json
 pytest_junit_report.xml
+
+stock_bot_audit_snapshot/
