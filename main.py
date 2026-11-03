@@ -67,6 +67,7 @@ import json
 import logging
 import os
 import sys
+from typing import Any, Optional, Dict, List, Tuple, Union
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
