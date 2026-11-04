@@ -3241,10 +3241,30 @@ class AlpacaBridge:
                         delay = base_retry_delay * (2 ** (attempt_idx - 1))
                         time.sleep(delay)
 
+            # Results from an old transport belong to its recovery owner, not
+            # a newer stream that may already be authenticated or healthy.
+            def recovery_owner_changed():
+                return (recovery_generation != self._stream_generation
+                        or self._trade_stream is not recovery_stream)
+
+            with self._trade_stream_lock, self._stream_state_lock:
+                if recovery_owner_changed():
+                    logger.warning("[RECONNECT RECOVERY] Discarding result for superseded transport generation %s", recovery_generation)
+                    return False
+
             # If all attempts failed due to timeout/network error
             if last_recon_err is not None or recon is None:
-                self._cache_requires_reconciliation = True
-                self.invalidate_broker_caches(reason="post_reconnect_reconciliation_timeout")
+                with self._trade_stream_lock, self._stream_state_lock:
+                    if recovery_owner_changed():
+                        logger.warning("[RECONNECT RECOVERY] Discarding timeout for superseded transport")
+                        return False
+                    self._cache_requires_reconciliation = True
+                    self.invalidate_broker_caches(reason="post_reconnect_reconciliation_timeout")
+                    self._transition_stream_state(
+                        expected={StreamState.RECONCILING, StreamState.AUTHENTICATED_UNRECONCILED},
+                        new_state=StreamState.DEGRADED,
+                        reason=f"Post-reconnect reconciliation timed out after {max_attempts} attempts: {last_recon_err}",
+                    )
                 acct = getattr(self, "account_id", "UNKNOWN")
                 active_reasons = sorted(getattr(self.entry_gate, "reasons", []))
                 retries_exhausted = max(0, max_attempts - 1)
@@ -3255,11 +3275,6 @@ class AlpacaBridge:
                     retries_exhausted,
                     last_recon_err,
                     active_reasons,
-                )
-                self._transition_stream_state(
-                    expected={StreamState.RECONCILING, StreamState.AUTHENTICATED_UNRECONCILED},
-                    new_state=StreamState.DEGRADED,
-                    reason=f"Post-reconnect reconciliation timed out after {max_attempts} attempts (1 initial + {retries_exhausted} retries): {last_recon_err}",
                 )
                 return False
 
@@ -3274,6 +3289,9 @@ class AlpacaBridge:
                 # reconciliation. Commit readiness and clear recovery halts only
                 # if this same generation still accepts the HEALTHY transition.
                 with self._trade_stream_lock, self._stream_state_lock:
+                    if recovery_owner_changed():
+                        logger.warning("[RECONNECT RECOVERY] Discarding clean result for superseded transport")
+                        return False
                     transitioned = (
                         recovery_generation == self._stream_generation
                         and recovery_stream is not None
@@ -3314,14 +3332,17 @@ class AlpacaBridge:
                     logger.info("[RECONNECT RECOVERY] Full broker reconciliation clean; recovery_required=False, conn_health=HEALTHY, entry halts cleared.")
                 return True
             else:
-                self._cache_requires_reconciliation = True
-                self.invalidate_broker_caches(reason="post_reconnect_reconciliation_dirty")
-                self._transition_stream_state(
-                    expected={StreamState.RECONCILING},
-                    new_state=StreamState.LATCHED_DESYNC,
-                    reason="Broker reconciliation clean=False (desync/unprotected)",
-                )
-                with self._trade_stream_lock:
+                with self._trade_stream_lock, self._stream_state_lock:
+                    if recovery_owner_changed():
+                        logger.warning("[RECONNECT RECOVERY] Discarding dirty result for superseded transport; fresh reconciliation required")
+                        return False
+                    self._cache_requires_reconciliation = True
+                    self.invalidate_broker_caches(reason="post_reconnect_reconciliation_dirty")
+                    self._transition_stream_state(
+                        expected={StreamState.RECONCILING},
+                        new_state=StreamState.LATCHED_DESYNC,
+                        reason="Broker reconciliation clean=False (desync/unprotected)",
+                    )
                     self._trade_stream_recovery_required = True
                 acct = getattr(self, "account_id", "UNKNOWN")
                 active_reasons = sorted(getattr(self.entry_gate, "reasons", []))
