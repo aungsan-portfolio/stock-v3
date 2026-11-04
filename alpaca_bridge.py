@@ -3189,17 +3189,28 @@ class AlpacaBridge:
         try:
             self.invalidate_broker_caches(reason="post_reconnect_reconciliation_start")
             self._cache_requires_reconciliation = True
-            self._transition_stream_state(
-                expected={
-                    StreamState.HEALTHY,
-                    StreamState.AUTHENTICATED_UNRECONCILED,
-                    StreamState.RECONNECTING,
-                    StreamState.DEGRADED,
-                    StreamState.LATCHED_DESYNC,
-                },
-                new_state=StreamState.RECONCILING,
-                reason="Executing broker truth reconciliation check",
-            )
+            # Transport state and readiness use the same lock order as stream
+            # startup/shutdown. Never hold either lock across REST requests.
+            with self._trade_stream_lock, self._stream_state_lock:
+                recovery_generation = self._stream_generation
+                recovery_stream = self._trade_stream
+                started = self._transition_stream_state(
+                    expected={
+                        StreamState.HEALTHY,
+                        StreamState.AUTHENTICATED_UNRECONCILED,
+                        StreamState.RECONNECTING,
+                        StreamState.DEGRADED,
+                        StreamState.LATCHED_DESYNC,
+                    },
+                    new_state=StreamState.RECONCILING,
+                    reason="Executing broker truth reconciliation check",
+                )
+                if not started:
+                    self._trade_stream_recovery_required = True
+                    self._trade_stream_ready = False
+                    self.entry_gate.halt("BROKER_RECONCILIATION_PENDING")
+                    logger.warning("[RECONNECT RECOVERY] Reconciliation start rejected; recovery halts retained")
+                    return False
 
             # Hardened Retry Loop for Transient Network / HTTP / Timeout Errors
             # Semantics: POST_RECONNECT_RECONCILE_MAX_ATTEMPTS = 3 total attempts
@@ -3259,17 +3270,37 @@ class AlpacaBridge:
             protection_clean = (len(protect_failed) == 0 and len(unprotected_longs) == 0)
 
             if is_clean and protection_clean:
-                self._cache_requires_reconciliation = False
-                self._transition_stream_state(
-                    expected={StreamState.RECONCILING},
-                    new_state=StreamState.HEALTHY,
-                    reason="Broker reconciliation clean=True",
-                )
-                with self._trade_stream_lock:
+                # A socket can disconnect or be replaced during a slow REST
+                # reconciliation. Commit readiness and clear recovery halts only
+                # if this same generation still accepts the HEALTHY transition.
+                with self._trade_stream_lock, self._stream_state_lock:
+                    transitioned = (
+                        recovery_generation == self._stream_generation
+                        and recovery_stream is not None
+                        and self._trade_stream is recovery_stream
+                        and self._trade_stream_ready
+                        and self._transition_stream_state(
+                            expected={StreamState.RECONCILING},
+                            new_state=StreamState.HEALTHY,
+                            reason="Broker reconciliation clean=True",
+                        )
+                    )
+                    if not transitioned:
+                        self._cache_requires_reconciliation = True
+                        self._trade_stream_recovery_required = True
+                        self._trade_stream_ready = False
+                        self.entry_gate.halt("BROKER_RECONCILIATION_PENDING")
+                        logger.warning(
+                            "[RECONNECT RECOVERY] Clean broker snapshot belongs to an interrupted recovery "
+                            "(generation=%s current=%s state=%s); recovery halts retained",
+                            recovery_generation, self._stream_generation, self._stream_state.value,
+                        )
+                        return False
+                    self._cache_requires_reconciliation = False
                     self._trade_stream_recovery_required = False
                     self._trade_stream_ready = True
-                self._conn_health.mark_healthy("Trade stream reconnected and broker truth reconciled clean")
-                self._clear_recovery_halts()
+                    self._conn_health.mark_healthy("Trade stream reconnected and broker truth reconciled clean")
+                    self._clear_recovery_halts()
 
                 # Diagnostic check: Did the gate successfully open, or do non-recovery reasons remain?
                 gate_halted = getattr(self.entry_gate, "halted", False)
@@ -5090,7 +5121,7 @@ class AlpacaBridge:
         # Update Stream State Machine if in startup or reconciling phase
         if manage_stream_state:
             try:
-                with self._stream_state_lock:
+                with self._trade_stream_lock, self._stream_state_lock:
                     if self._stream_state in (StreamState.AUTHENTICATED_UNRECONCILED, StreamState.LATCHED_DESYNC):
                         self._transition_stream_state(
                             expected={StreamState.AUTHENTICATED_UNRECONCILED, StreamState.LATCHED_DESYNC},

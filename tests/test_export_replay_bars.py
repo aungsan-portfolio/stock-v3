@@ -3,6 +3,8 @@
 All data here are synthetic; no broker or market-data service is contacted.
 """
 from datetime import date
+import csv
+import gzip
 import json
 import sys
 
@@ -96,6 +98,41 @@ def test_extended_hours_bars_do_not_inflate_regular_session_coverage():
     result = exporter.assess_bar_coverage(frame, "AAPL", date(2026, 11, 3), extended=True)
     assert result["invalid_rows"] == 0
     assert result["observed_minutes"] == 1
+
+
+@pytest.mark.parametrize("day", [date(2026, 11, 3), date(2026, 11, 27)])
+def test_exact_session_close_is_recorded_separately_from_regular_minutes(day):
+    start, end = exporter.session_bounds(day, False)
+    times = pd.date_range(start, end, freq="min", inclusive="both")
+    result = exporter.assess_bar_coverage(pd.DataFrame([_bar(t) for t in times]), "AAPL", day)
+    assert result["observed_minutes"] == exporter.expected_regular_minutes(day)
+    assert result["end_boundary_rows"] == 1
+    assert result["invalid_rows"] == result["duplicate_rows"] == 0
+    assert result["missing_minutes"] == []
+
+
+def test_accepting_close_boundary_does_not_hide_real_invalid_or_duplicate_rows():
+    day = date(2026, 11, 3)
+    start, end = exporter.session_bounds(day, False)
+    frame = pd.DataFrame([_bar(start), _bar(start), _bar(end),
+                          _bar(end + pd.Timedelta(minutes=1))])
+    result = exporter.assess_bar_coverage(frame, "AAPL", day)
+    assert result["observed_minutes"] == 1
+    assert result["end_boundary_rows"] == 1
+    assert result["duplicate_rows"] == 1
+    assert result["invalid_rows"] == result["out_of_session_rows"] == 1
+
+
+def test_invalid_or_duplicate_close_boundary_is_still_flagged():
+    day = date(2026, 11, 3)
+    end = exporter.session_bounds(day, False)[1]
+    result = exporter.assess_bar_coverage(pd.DataFrame([
+        _bar(end), _bar(end), _bar(end, low=102),
+    ]), "AAPL", day)
+    assert result["end_boundary_rows"] == 2
+    assert result["duplicate_rows"] == 1
+    assert result["invalid_rows"] == 1
+    assert result["observed_minutes"] == 0
 
 
 def test_quote_after_event_cannot_cover_decision():
@@ -221,3 +258,68 @@ def test_end_to_end_full_sip_bars_and_prior_quotes_pass_configured_checks(source
     code, manifest = _run_fake_export(sources, monkeypatch, full_bars, prior_quote, capsys)
     assert code == 0
     assert manifest["status"] == "checks_passed"
+
+
+def test_end_to_end_close_boundary_is_preserved_and_warned_without_failing(sources, monkeypatch, capsys):
+    def inclusive_bars(_client, symbols, day, feed, adjustment, extended):
+        start, end = exporter.session_bounds(day, False)
+        times = pd.date_range(start, end, freq="min", inclusive="both")
+        return pd.DataFrame([_bar(t, symbol=s) for s in symbols for t in times])
+
+    def prior_quote(_client, symbol, start, end, feed):
+        return pd.DataFrame([{"symbol": symbol, "timestamp": pd.Timestamp("2026-11-03T14:30:09Z"),
+                              "bid_price": 99.9, "ask_price": 100.1, "bid_size": 100, "ask_size": 100}])
+
+    code, manifest = _run_fake_export(sources, monkeypatch, inclusive_bars, prior_quote, capsys)
+    assert code == 0
+    assert manifest["status"] == "checks_passed"
+    feed = manifest["bars"]["feeds"]["sip"]
+    assert feed["end_boundary_rows"] == len(feed["pair_coverage"])
+    assert any("boundary" in warning for warning in manifest["warnings"])
+    for pair in feed["pair_coverage"].values():
+        assert pair["end_boundary_rows"] == 1
+        assert pair["observed_minutes"] == pair["expected_minutes"]
+    path = next((sources / "synthetic_exports").glob("replay_*/bars_1m_sip.csv.gz"))
+    with gzip.open(path, "rt", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) == feed["rows"]
+    assert sum(pd.Timestamp(row["timestamp"]).tz_convert(exporter.ET).strftime("%H:%M") == "16:00" for row in rows) == feed["end_boundary_rows"]
+
+
+def test_end_to_end_close_boundary_cannot_cover_missing_sip_minutes(sources, monkeypatch, capsys):
+    def sparse_with_boundary(_client, symbols, day, feed, adjustment, extended):
+        start, end = exporter.session_bounds(day, False)
+        return pd.DataFrame([_bar(t, symbol=s) for s in symbols
+                             for t in [start, end]])
+
+    def prior_quote(_client, symbol, start, end, feed):
+        return pd.DataFrame([{"symbol": symbol, "timestamp": pd.Timestamp("2026-11-03T14:30:09Z"),
+                              "bid_price": 99.9, "ask_price": 100.1, "bid_size": 100, "ask_size": 100}])
+
+    code, manifest = _run_fake_export(sources, monkeypatch, sparse_with_boundary, prior_quote, capsys)
+    assert code == 2
+    assert manifest["status"] == "incomplete"
+    assert manifest["bars"]["feeds"]["sip"]["low_coverage_pairs"]
+    assert any("below" in reason for reason in manifest["incomplete_reasons"])
+    assert not manifest["quotes"]["uncovered_events"]
+
+
+@pytest.mark.parametrize("corruption", ["duplicate", "off_session"])
+def test_full_coverage_with_boundary_still_fails_actual_corruption(sources, monkeypatch, capsys, corruption):
+    def bad_bars(_client, symbols, day, feed, adjustment, extended):
+        start, end = exporter.session_bounds(day, False)
+        times = list(pd.date_range(start, end, freq="min", inclusive="both"))
+        times.append(start if corruption == "duplicate" else end + pd.Timedelta(minutes=1))
+        return pd.DataFrame([_bar(t, symbol=s) for s in symbols for t in times])
+
+    def prior_quote(_client, symbol, start, end, feed):
+        return pd.DataFrame([{"symbol": symbol, "timestamp": pd.Timestamp("2026-11-03T14:30:09Z"),
+                              "bid_price": 99.9, "ask_price": 100.1, "bid_size": 100, "ask_size": 100}])
+
+    code, manifest = _run_fake_export(sources, monkeypatch, bad_bars, prior_quote, capsys)
+    assert code == 2
+    feed = manifest["bars"]["feeds"]["sip"]
+    assert not feed["missing_pairs"]
+    assert not feed["low_coverage_pairs"]
+    assert any("invalid or duplicate" in reason for reason in manifest["incomplete_reasons"])
+    assert not manifest["quotes"]["uncovered_events"]

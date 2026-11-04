@@ -1825,6 +1825,7 @@ def execute_signal(
 
     if signal.side.upper() == "BUY" and not dry_run and getattr(config, "SPY_TREND_GUARD_ENABLED", True):
         guard_sym = "SPY"
+        guard_label = "Trend Guard" if is_inverse_exempt else "SPY Trend Guard"
         try:
             from strategies.intraday_data import fetch_intraday
             from strategies.orchestrator import _prepare_closed_bars
@@ -1840,6 +1841,18 @@ def execute_signal(
             if spy_df is not None and not spy_df.empty and len(spy_df) >= 2:
                 last_close = float(spy_df["close"].iloc[-1])
                 last_open  = float(spy_df["open"].iloc[-1])
+                if not all(math.isfinite(value) and value > 0 for value in (last_open, last_close)):
+                    raise ValueError("benchmark candle has invalid open/close prices")
+                # Full OHLC bars also need internally consistent extremes.
+                # Missing/non-numeric open or close already fails closed above.
+                for column in ("high", "low"):
+                    if column not in spy_df.columns:
+                        continue
+                    extreme = float(spy_df[column].iloc[-1])
+                    if (not math.isfinite(extreme) or extreme <= 0
+                            or (column == "high" and extreme < max(last_open, last_close))
+                            or (column == "low" and extreme > min(last_open, last_close))):
+                        raise ValueError(f"benchmark candle has invalid {column} price")
                 if is_inverse_exempt:
                     # Inverted Trend Guard for Bear Hedges: block inverse long only if benchmark candle is surging bullish
                     if last_close > last_open:
@@ -1881,21 +1894,18 @@ def execute_signal(
                             "[SPY TREND GUARD SHADOW] %s: legacy_decision=ALLOW shadow_decision=%s",
                             signal.symbol, shadow_decision
                         )
-            elif is_inverse_exempt:
-                # Conservative safety: block inverse ETF if benchmark data is unavailable
-                guard_reason = f"Trend Guard: Benchmark {guard_sym} intraday data unavailable for {signal.symbol}. Entry blocked for safety."
+            else:
+                # The enabled guard cannot approve a BUY without enough closed
+                # benchmark bars, for normal longs as well as inverse hedges.
+                guard_reason = f"{guard_label}: Benchmark {guard_sym} intraday data unavailable for {signal.symbol}. Entry blocked for safety."
                 logger.warning("[TREND GUARD] Blocked %s: %s", signal.symbol, guard_reason)
                 result["reason"] = guard_reason
                 return result
         except Exception as spy_err:
-            if is_inverse_exempt:
-                guard_reason = f"Trend Guard error fetching {guard_sym}: {spy_err}. Entry blocked for safety."
-                logger.warning("[TREND GUARD] Blocked %s: %s", signal.symbol, guard_reason)
-                result["reason"] = guard_reason
-                return result
-            else:
-                # Fail-open for normal longs if SPY data unavailable
-                logger.debug("[SPY TREND GUARD] Skipped for %s: %s", signal.symbol, spy_err)
+            guard_reason = f"{guard_label} error fetching {guard_sym}: {spy_err}. Entry blocked for safety."
+            logger.warning("[TREND GUARD] Blocked %s: %s", signal.symbol, guard_reason)
+            result["reason"] = guard_reason
+            return result
     # ────────────────────────────────────────────────────────────────────────
 
     # Commodity Correlation Guard (GDX/GLD, etc.)

@@ -173,6 +173,7 @@ def test_funnel_telemetry_dual_denominators_logged(caplog):
              patch("strategies.orchestrator.evaluate_symbols_parallel", return_value=eval_result), \
              patch("strategies.orchestrator.apply_portfolio_correlation", side_effect=lambda sigs, p, bridge=None: sigs), \
              patch("strategies.orchestrator.execute_signal", return_value={"status": "PLACED", "shares": 15}), \
+             patch("strategies.intraday_data.get_intraday_feed_telemetry", return_value={"last_batch_coverage": 1.0}), \
              patch("strategies.session.is_market_open", return_value=True), \
              patch("strategies.session.is_past_opening_buffer", return_value=True), \
              patch("strategies.session.now_eastern", return_value=now_et), \

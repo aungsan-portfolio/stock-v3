@@ -328,13 +328,17 @@ def assess_bar_coverage(df, symbol, day, extended=False):
     """Count unique valid regular-session minutes, recording duplicate and invalid rows.
 
     A missing minute can mean no trade rather than missing provider data. Extended-hour
-    rows are permitted but never counted as regular-session observations.
+    rows are permitted but never counted as regular-session observations. The
+    request's exact end timestamp may be returned by an inclusive API response;
+    retain and count that boundary separately without treating it as a regular
+    minute. Other out-of-session timestamps remain invalid.
     """
     start, end = session_bounds(day, False)
     extended_start, extended_end = session_bounds(day, True)
     expected = pd.date_range(start, end, freq="min", inclusive="left")
     seen = set()
-    duplicate = invalid = 0
+    boundary_seen = set()
+    duplicate = invalid = boundary_rows = out_of_session = 0
     if not df.empty:
         for row in df.itertuples(index=False):
             if str(getattr(row, 'symbol', '')).upper() != symbol.upper():
@@ -345,13 +349,23 @@ def assess_bar_coverage(df, symbol, day, extended=False):
                     raise ValueError('naive timestamp')
                 ts = ts.tz_convert(UTC)
                 low_bound, high_bound = (extended_start, extended_end) if extended else (start, end)
-                if not low_bound <= ts < high_bound or ts != ts.floor('min'):
+                if not low_bound <= ts <= high_bound:
+                    out_of_session += 1
+                    invalid += 1
+                    continue
+                if ts != ts.floor('min'):
                     invalid += 1
                     continue
                 o, h, l, c = (float(getattr(row, k)) for k in ('open', 'high', 'low', 'close'))
                 volume = float(row.volume)
                 if not all(math.isfinite(v) for v in (o, h, l, c, volume)) or min(o, h, l, c) <= 0 or volume < 0 or not (l <= min(o, c) <= max(o, c) <= h):
                     invalid += 1
+                    continue
+                if ts == high_bound:
+                    boundary_rows += 1
+                    if ts in boundary_seen:
+                        duplicate += 1
+                    boundary_seen.add(ts)
                     continue
                 if not start <= ts < end:
                     continue
@@ -362,7 +376,8 @@ def assess_bar_coverage(df, symbol, day, extended=False):
                 invalid += 1
     return {'expected_minutes': len(expected), 'observed_minutes': len(seen),
             'missing_minutes': [t.isoformat() for t in expected if t not in seen],
-            'duplicate_rows': duplicate, 'invalid_rows': invalid}
+            'duplicate_rows': duplicate, 'invalid_rows': invalid,
+            'out_of_session_rows': out_of_session, 'end_boundary_rows': boundary_rows}
 
 
 def assess_quote_events(df, symbol, events, max_age_seconds=10):
@@ -463,7 +478,7 @@ def main() -> int:
                  "session": "extended 04:00-20:00 ET" if args.extended_hours else "regular",
                  "warmup_calendar_days": args.warmup_days, "decision_days": len(decision_days),
                  "bar_days": len(pairs), "feeds": {}},
-        "errors": {},
+        "errors": {}, "warnings": [],
         "notes": [
             "signals_*.csv excludes candidates rejected at texture admission and portfolio correlation.",
             "Bot live bars may use IEX and Adjustment.ALL with 5-calendar-day lookback. Feed, adjustment, revisions and availability can differ from historical exports.",
@@ -471,6 +486,7 @@ def main() -> int:
             "Quotes are not the bot's exact snapshot and do not show queue position; fills remain estimates.",
             "Status records configured checks only: a missing bar may mean no trades; a passing threshold does not establish complete feed data.",
             "Calendar is limited to documented 2026 sessions; unexpected closures and late data revisions are not verified.",
+            "Exact request-end boundary bars are retained in CSV and counted separately; they do not add regular-session minute coverage. Other out-of-session rows and duplicates fail checks.",
         ],
     }
 
@@ -478,7 +494,8 @@ def main() -> int:
     for feed in feeds:
         path = out_dir / f"bars_1m_{feed}.csv.gz"
         tmp = path.with_name(path.name + ".partial")
-        fs = {"file": path.name, "rows": 0, "missing_pairs": [], "low_coverage_pairs": [], "coverage_median": None, "pair_coverage": {}}
+        fs = {"file": path.name, "rows": 0, "missing_pairs": [], "low_coverage_pairs": [], "coverage_median": None,
+              "pair_coverage": {}, "end_boundary_rows": 0, "end_boundary_pairs": []}
         closes, covs = {}, []
         with gzip.open(tmp, "xt", newline="", encoding="utf-8") as gz:
             w = csv.writer(gz)
@@ -494,6 +511,9 @@ def main() -> int:
                 for s in sorted(syms):
                     coverage = assess_bar_coverage(df, s, d, args.extended_hours)
                     fs["pair_coverage"][f"{d}:{s}"] = coverage
+                    if coverage['end_boundary_rows']:
+                        fs['end_boundary_rows'] += coverage['end_boundary_rows']
+                        fs['end_boundary_pairs'].append(f"{d}:{s}")
                     n, exp = coverage['observed_minutes'], coverage['expected_minutes']
                     if coverage['invalid_rows'] or coverage['duplicate_rows']:
                         reasons.append(f"bars {feed} {d}:{s}: invalid or duplicate timestamps")
@@ -523,6 +543,10 @@ def main() -> int:
         fs["coverage_median"] = round(statistics.median(covs), 3) if covs else None
         manifest["bars"]["feeds"][feed] = fs
         closes_by_feed[feed] = closes
+        if fs["end_boundary_rows"]:
+            manifest["warnings"].append(
+                f"bars {feed}: {fs['end_boundary_rows']} valid request-end boundary rows retained and excluded from regular-session coverage"
+            )
         if fs["missing_pairs"]:
             reasons.append(f"bars {feed}: {len(fs['missing_pairs'])} (symbol, day) pairs with no bars")
         if fs["low_coverage_pairs"]:
@@ -576,6 +600,8 @@ def main() -> int:
 
     print(f"\nOutput folder: {out_dir}")
     print(f"Status: {manifest['status']}")
+    for warning in manifest['warnings']:
+        print(f"  [WARNING] {warning}")
     for r in reasons:
         print(f"  - {r}")
     return 0 if not reasons else 2

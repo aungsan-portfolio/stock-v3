@@ -318,6 +318,10 @@ class TestWebSocketReconnectContractAmendments:
         from alpaca_bridge import AlpacaBridge
         bridge = AlpacaBridge(dry_run=True)
         bridge._stream_state = StreamState.AUTHENTICATED_UNRECONCILED
+        # A valid reconciliation must belong to a still-ready authenticated
+        # transport, not merely a state value and a clean REST response.
+        bridge._trade_stream = object()
+        bridge._trade_stream_ready = True
         bridge._trade_stream_recovery_required = True
 
         with patch.object(bridge, "reconcile_startup_state", return_value={"clean": True}), \

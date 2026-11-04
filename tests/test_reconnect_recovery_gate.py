@@ -32,6 +32,9 @@ def bridge():
     b.account_id = "PA3UODIC5JTA"
     b._connected = True
     b._client = mock.MagicMock()
+    # Clean recovery scenarios assume an authenticated stream remains alive.
+    b._trade_stream = object()
+    b._trade_stream_ready = True
     return b
 
 
@@ -234,6 +237,9 @@ def test_mock_ib_positions_recovery_delegates_to_single_recovery_owner(bridge):
     it delegates to _run_post_reconnect_reconciliation() (single recovery owner), clearing the gate
     only after a complete and clean reconciliation.
     """
+    # REST recovery can release entries only for an authenticated stream;
+    # a clean positions response alone cannot recover DISCONNECTED transport.
+    bridge._stream_state = StreamState.AUTHENTICATED_UNRECONCILED
     bridge._conn_health.mark_unhealthy("Prior timeout")
     bridge.entry_gate.halt("BROKER_RECONCILIATION_PENDING")
     assert bridge.entry_gate.halted is True

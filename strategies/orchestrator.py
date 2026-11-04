@@ -1832,6 +1832,7 @@ def evaluate_and_execute(
         )
 
 
+    position_management_failed = False
     try:
         if manager is None:
             manager = bridge.get_trailing_stop_manager() if (bridge and hasattr(bridge, "get_trailing_stop_manager")) else None
@@ -1845,6 +1846,7 @@ def evaluate_and_execute(
         # 2. Safety Check: Halt new entries if any active position has unresolved broker query failure
         if manager is not None and manager.has_unresolved_position_unknown():
             logger.warning("[SAFETY GATE HALT] Unresolved POSITION_UNKNOWN state in trailing stops — halting NEW entries this cycle")
+            position_management_failed = True
             allow_new_entries = False
             can_evaluate_signals = False
 
@@ -1868,100 +1870,133 @@ def evaluate_and_execute(
                     broker_fetch_ok = False
 
             for p in cached_open_positions:
-                if p.position != 0:
-                    sym = p.contract.symbol
-                    price = bridge.market_price(sym)
-                    if price:
-                        side = "BUY" if p.position > 0 else "SELL"
-                        state = manager.ensure_initialized(
-                            symbol=sym,
-                            side=side,
-                            avg_cost=p.avgCost,
-                            open_orders=open_orders,
-                            current_price=price,
-                            qty=p.position,
-                            bridge=bridge,
-                        )
-                        if state and state.active and getattr(state, "entry_time", 0) > 0:
-                            from strategies.trailing_stop import check_time_based_exit
-                            time_exit, time_reason = check_time_based_exit(
+                sym = str(getattr(getattr(p, "contract", None), "symbol", "UNKNOWN"))
+                try:
+                    if p.position != 0:
+                        sym = p.contract.symbol
+                        price = bridge.market_price(sym)
+                        if price:
+                            side = "BUY" if p.position > 0 else "SELL"
+                            state = manager.ensure_initialized(
                                 symbol=sym,
                                 side=side,
-                                entry_price=state.entry_price,
+                                avg_cost=p.avgCost,
+                                open_orders=open_orders,
                                 current_price=price,
-                                entry_timestamp=state.entry_time,
-                                peak_price=getattr(state, "peak_price", None),
+                                qty=p.position,
+                                bridge=bridge,
                             )
-                            if time_exit:
-                                logger.warning(f"[TIME EXIT TRIGGERED] symbol={sym} side={side} reason={time_reason}")
-                                if live_paper:
-                                    close_res = None
-                                    if hasattr(bridge, "close_position_verified"):
-                                        try:
-                                            close_res = bridge.close_position_verified(sym)
-                                            closed = getattr(close_res, "is_flat", False)
-                                        except Exception as c_err:
-                                            logger.critical(f"[TIME EXIT VERIFIED ERROR] {sym}: {c_err}")
-                                            closed = False
-                                    else:
-                                        closed = bridge.close_position(sym)
+                            if state and state.active and getattr(state, "entry_time", 0) > 0:
+                                from strategies.trailing_stop import check_time_based_exit
+                                time_exit, time_reason = check_time_based_exit(
+                                    symbol=sym,
+                                    side=side,
+                                    entry_price=state.entry_price,
+                                    current_price=price,
+                                    entry_timestamp=state.entry_time,
+                                    peak_price=getattr(state, "peak_price", None),
+                                )
+                                if time_exit:
+                                    logger.warning(f"[TIME EXIT TRIGGERED] symbol={sym} side={side} reason={time_reason}")
+                                    if live_paper:
+                                        close_res = None
+                                        if hasattr(bridge, "close_position_verified"):
+                                            try:
+                                                close_res = bridge.close_position_verified(sym)
+                                                closed = getattr(close_res, "is_flat", False)
+                                            except Exception as c_err:
+                                                logger.critical(f"[TIME EXIT VERIFIED ERROR] {sym}: {c_err}")
+                                                closed = False
+                                        else:
+                                            closed = bridge.close_position(sym)
 
-                                    if closed:
-                                        logger.info(f"[TIME EXIT EXECUTED] symbol={sym} broker close confirmed. Resetting trailing stop.")
+                                        if closed:
+                                            logger.info(f"[TIME EXIT EXECUTED] symbol={sym} broker close confirmed. Resetting trailing stop.")
+                                            manager.soft_reset(sym)
+                                            continue
+                                        else:
+                                            position_management_failed = True
+                                            allow_new_entries = False
+                                            prot_status = getattr(close_res, "protection_status", "UNKNOWN") if close_res else "UNKNOWN"
+                                            logger.critical(
+                                                f"[TIME EXIT FAILED] {sym} remains active because broker close was not confirmed "
+                                                f"(outcome={getattr(close_res, 'outcome', 'UNKNOWN')}, protection_status={prot_status})"
+                                            )
+                                            if state and state.active:
+                                                state.stop_reconciliation_required = True
+                                                if prot_status == "ABSENT":
+                                                    state.order_id = None
+                                                    logger.warning(
+                                                        f"[PROTECTION COORDINATION DISPATCH] {sym} stop ABSENT after failed close. "
+                                                        f"Immediate remediation triggered in-cycle."
+                                                    )
+                                                    manager.handle_naked_position(
+                                                        symbol=sym,
+                                                        position_qty=p.position,
+                                                        bridge=bridge,
+                                                        dry_run=not live_paper
+                                                    )
+                                                elif prot_status == "PENDING_CANCELLATION":
+                                                    logger.warning(
+                                                        f"[PROTECTION COORDINATION AWAIT] {sym} stop order is in PENDING_CANCELLATION. "
+                                                        f"Preserving order tracking and deferring replacement to avoid duplicate exit / short race."
+                                                    )
+                                            continue
+                                    else:
+                                        logger.info(f"[TIME EXIT EXECUTED DRY RUN] symbol={sym}. Resetting trailing stop.")
                                         manager.soft_reset(sym)
                                         continue
-                                    else:
-                                        prot_status = getattr(close_res, "protection_status", "UNKNOWN") if close_res else "UNKNOWN"
-                                        logger.critical(
-                                            f"[TIME EXIT FAILED] {sym} remains active because broker close was not confirmed "
-                                            f"(outcome={getattr(close_res, 'outcome', 'UNKNOWN')}, protection_status={prot_status})"
-                                        )
-                                        if state and state.active:
-                                            state.stop_reconciliation_required = True
-                                            if prot_status == "ABSENT":
-                                                state.order_id = None
-                                                logger.warning(
-                                                    f"[PROTECTION COORDINATION DISPATCH] {sym} stop ABSENT after failed close. "
-                                                    f"Immediate remediation triggered in-cycle."
-                                                )
-                                                manager.handle_naked_position(
-                                                    symbol=sym,
-                                                    position_qty=p.position,
-                                                    bridge=bridge,
-                                                    dry_run=not live_paper
-                                                )
-                                            elif prot_status == "PENDING_CANCELLATION":
-                                                logger.warning(
-                                                    f"[PROTECTION COORDINATION AWAIT] {sym} stop order is in PENDING_CANCELLATION. "
-                                                    f"Preserving order tracking and deferring replacement to avoid duplicate exit / short race."
-                                                )
-                                        continue
-                                else:
-                                    logger.info(f"[TIME EXIT EXECUTED DRY RUN] symbol={sym}. Resetting trailing stop.")
-                                    manager.soft_reset(sym)
-                                    continue
 
-                        if state and state.active and (state.order_id is None or getattr(state, "stop_reconciliation_required", False)):
-                            manager.handle_naked_position(
-                                symbol=sym,
-                                position_qty=p.position,
-                                bridge=bridge,
-                                dry_run=not live_paper
-                            )
-                        else:
-                            sym_atr = None
-                            try:
-                                from strategies.intraday_data import get_position_atr_if_fresh, get_intraday_features
-                                sym_atr = get_position_atr_if_fresh(sym, interval="5m", max_age_seconds=float(getattr(config, "POSITION_ATR_MAX_AGE_SECONDS", 360.0)))
-                                if sym_atr is None:
-                                    df_feat = get_intraday_features(sym, interval="5m")
-                                    if df_feat is not None and not df_feat.empty and "atr" in df_feat.columns:
-                                        sym_atr = float(df_feat["atr"].iloc[-1])
-                            except Exception:
-                                pass
-                            manager.update_stop(sym, price, bridge=bridge, dry_run=not live_paper, current_atr=sym_atr)
-    except Exception as e:
-        logger.error(f"Failed to update trailing stops: {e}")
+                            if state and state.active and (state.order_id is None or getattr(state, "stop_reconciliation_required", False)):
+                                manager.handle_naked_position(
+                                    symbol=sym,
+                                    position_qty=p.position,
+                                    bridge=bridge,
+                                    dry_run=not live_paper
+                                )
+                            else:
+                                sym_atr = None
+                                try:
+                                    from strategies.intraday_data import get_position_atr_if_fresh, get_intraday_features
+                                    sym_atr = get_position_atr_if_fresh(sym, interval="5m", max_age_seconds=float(getattr(config, "POSITION_ATR_MAX_AGE_SECONDS", 360.0)))
+                                    if sym_atr is None:
+                                        df_feat = get_intraday_features(sym, interval="5m")
+                                        if df_feat is not None and not df_feat.empty and "atr" in df_feat.columns:
+                                            sym_atr = float(df_feat["atr"].iloc[-1])
+                                except Exception:
+                                    pass
+                                manager.update_stop(sym, price, bridge=bridge, dry_run=not live_paper, current_atr=sym_atr)
+
+                            # Broker mutation helpers can report uncertainty by
+                            # retaining reconciliation state instead of raising.
+                            # Keep that state for reconciliation next cycle,
+                            # without permitting new exposure this cycle.
+                            managed_state = manager.states.get(sym)
+                            if managed_state and managed_state.active and (
+                                getattr(managed_state, "stop_reconciliation_required", False)
+                                or getattr(managed_state, "reconciliation_status", None) == "POSITION_UNKNOWN_RECONCILIATION_REQUIRED"
+                                or managed_state.order_id is None
+                            ):
+                                position_management_failed = True
+                                allow_new_entries = False
+                                logger.error(
+                                    "[POSITION MANAGEMENT UNCONFIRMED] symbol=%s; protection reconciliation remains required; "
+                                    "new entries blocked for this cycle", sym
+                                )
+                except Exception:
+                    # A failed symbol must not prevent protection/exit checks
+                    # for other held positions. Do not retry an uncertain
+                    # broker mutation or discard the failed symbol's state.
+                    position_management_failed = True
+                    allow_new_entries = False
+                    logger.exception(
+                        "[POSITION MANAGEMENT ERROR] symbol=%s; new entries blocked for this cycle; "
+                        "continuing management of remaining positions", sym
+                    )
+    except Exception:
+        position_management_failed = True
+        allow_new_entries = False
+        logger.exception("[POSITION MANAGEMENT ERROR] Portfolio reconciliation/setup failed; new entries blocked for this cycle")
 
     try:
         from strategies.watchdog import touch_orchestrator_heartbeat
@@ -1971,6 +2006,7 @@ def evaluate_and_execute(
                 "open_positions": len(cached_open_positions),
                 "broker_pnl": broker_pnl,
                 "allow_new_entries": allow_new_entries,
+                "position_management_failed": position_management_failed,
             },
         )
     except Exception:
@@ -2154,6 +2190,13 @@ def evaluate_and_execute(
         can_evaluate_signals = False
         should_run_eval = False
 
+    # Execution-health recovery and inverse-ETF exemptions must not override
+    # a failed protection/exit-management pass in this same cycle.
+    if position_management_failed:
+        allow_new_entries = False
+        can_evaluate_signals = False
+        should_run_eval = False
+
     import uuid
     cycle_id = uuid.uuid4().hex[:12]
     eval_result: Optional[EvaluationResult] = None
@@ -2189,7 +2232,7 @@ def evaluate_and_execute(
         eval_result = EvaluationResult(
             entry_signals=(),
             entry_allowed=False,
-            suppression_reason="CYCLE_EVALUATION_SKIPPED",
+            suppression_reason="POSITION_MANAGEMENT_FAILED" if position_management_failed else "CYCLE_EVALUATION_SKIPPED",
             coverage=0.0,
             required_coverage=0.95,
             received_symbols=(),

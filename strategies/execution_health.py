@@ -184,7 +184,7 @@ class ExecutionHealthGate:
             elif hasattr(raw_stream_state, "name") and not hasattr(raw_stream_state.name, "_mock_name"):
                 stream_val = str(raw_stream_state.name).upper().strip()
 
-            KNOWN_DEGRADED = {"RECONNECTING", "AUTHENTICATED_UNRECONCILED", "RECONCILING"}
+            KNOWN_DEGRADED = {"DEGRADED", "RECONNECTING", "AUTHENTICATED_UNRECONCILED", "RECONCILING"}
             KNOWN_BROKEN = {"DISCONNECTED", "LATCHED_DESYNC", "STOPPED", "SHUTTING_DOWN"}
             if stream_val in KNOWN_DEGRADED:
                 return BrokerExecutionHealth(
