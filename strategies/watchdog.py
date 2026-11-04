@@ -254,6 +254,12 @@ class EODFlattenWatchdog:
 
         if in_window:
             positions = self._get_broker_positions()
+            if positions is None:
+                # Broker truth is unavailable; it cannot establish a flat account.
+                status["positions_count"] = None
+                status["recheck_passed"] = False
+                logger.error("[WATCHDOG] EOD position state UNKNOWN; flatness could not be verified.")
+                return status
             status["positions_count"] = len(positions)
 
             if len(positions) > 0 and not self._flatten_executed:
@@ -269,7 +275,10 @@ class EODFlattenWatchdog:
                 # ── Tier 4: Mandatory Post-Flatten Re-Verification ──
                 time.sleep(1.0)  # Brief pause for broker matching engine
                 recheck_positions = self._get_broker_positions()
-                if len(recheck_positions) > 0:
+                if recheck_positions is None:
+                    status["recheck_passed"] = False
+                    logger.error("[WATCHDOG] Post-flatten position state UNKNOWN; flatness could not be verified.")
+                elif len(recheck_positions) > 0:
                     status["recheck_passed"] = False
                     msg = (
                         f"🚨 [WATCHDOG CRITICAL INCIDENT] Emergency flatten executed but {len(recheck_positions)} "
@@ -285,19 +294,25 @@ class EODFlattenWatchdog:
 
             elif len(positions) == 0:
                 status["clean_eod"] = True
+            else:
+                # A prior flatten was issued but exposure is still present.
+                status["recheck_passed"] = False
 
         return status
 
-    def _get_broker_positions(self) -> list:
-        """Fetch open positions directly from broker with fail-fast handling."""
+    def _get_broker_positions(self) -> Optional[list]:
+        """Return broker positions, or None when their state cannot be verified."""
         if not self._client:
-            return []
+            return None
         try:
             positions = self._client.get_all_positions()
-            return list(positions or [])
+            if positions is None:
+                logger.error("[WATCHDOG] Broker positions query returned no result.")
+                return None
+            return list(positions)
         except Exception as exc:
             logger.error("[WATCHDOG] Failed to query broker positions: %s", exc)
-            return []
+            return None
 
     def _execute_broker_flatten(self) -> None:
         """Cancel all orders and close all positions via dedicated client."""

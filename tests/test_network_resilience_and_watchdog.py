@@ -175,6 +175,71 @@ def test_watchdog_reverification_catches_unclosed_position():
     assert mock_client.close_all_positions.call_count == 2
 
 
+@pytest.mark.parametrize("failure", [TimeoutError("position query timed out"), None, "missing_client"])
+def test_watchdog_unknown_initial_positions_are_not_clean(failure):
+    client = MagicMock()
+    if isinstance(failure, Exception):
+        client.get_all_positions.side_effect = failure
+    else:
+        client.get_all_positions.return_value = failure
+    watchdog = EODFlattenWatchdog(trading_client=client, auto_exit_on_clean_eod=True)
+    if failure == "missing_client":
+        watchdog._client = None
+    watchdog.is_in_flatten_window = MagicMock(return_value=True)
+
+    cycle = watchdog.check_and_execute_cycle()
+
+    assert cycle["positions_count"] is None
+    assert cycle["clean_eod"] is False
+    assert cycle["recheck_passed"] is False
+    assert cycle["flatten_attempted"] is False
+    client.cancel_orders.assert_not_called()
+    client.close_all_positions.assert_not_called()
+
+
+@pytest.mark.parametrize("failed_recheck", [TimeoutError("recheck timed out"), None])
+def test_watchdog_failed_post_flatten_query_never_reports_flat_and_rechecks(failed_recheck):
+    client = MagicMock()
+    position = MagicMock(symbol="NFLX", qty=63)
+    client.get_all_positions.side_effect = [
+        [position], failed_recheck, [position], [],
+    ]
+    watchdog = EODFlattenWatchdog(trading_client=client, auto_exit_on_clean_eod=True)
+    watchdog.is_in_flatten_window = MagicMock(return_value=True)
+
+    with patch("time.sleep", return_value=None):
+        first = watchdog.check_and_execute_cycle()
+        still_open = watchdog.check_and_execute_cycle()
+        confirmed_flat = watchdog.check_and_execute_cycle()
+
+    assert first["flatten_attempted"] is True
+    assert first["recheck_passed"] is False
+    assert first["clean_eod"] is False
+    assert still_open["positions_count"] == 1
+    assert still_open["recheck_passed"] is False
+    assert still_open["clean_eod"] is False
+    assert confirmed_flat["positions_count"] == 0
+    assert confirmed_flat["clean_eod"] is True
+    # Do not blindly send another close while an earlier request may still be active.
+    assert client.close_all_positions.call_count == 1
+
+
+def test_watchdog_unknown_postmarket_state_does_not_log_clean_session(caplog):
+    client = MagicMock()
+    client.get_all_positions.side_effect = TimeoutError("position query timed out")
+    watchdog = EODFlattenWatchdog(trading_client=client, auto_exit_on_clean_eod=True)
+    watchdog.is_in_flatten_window = MagicMock(return_value=True)
+    watchdog._stop_event.is_set = MagicMock(side_effect=[False, True])
+    watchdog._stop_event.wait = MagicMock()
+
+    with patch("strategies.watchdog.is_postmarket", return_value=True):
+        watchdog._run_loop()
+
+    assert not getattr(watchdog, "_clean_eod_logged", False)
+    assert "Session completed cleanly" not in caplog.text
+    client.close_all_positions.assert_not_called()
+
+
 # ── Test 7: Incident 2026-09-03 Reproduction (Shared Client Hang vs Isolated Watchdog) ──
 def test_incident_reproduction_shared_client_hang_watchdog_flattens():
     """

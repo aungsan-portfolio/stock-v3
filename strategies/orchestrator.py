@@ -2299,7 +2299,7 @@ def evaluate_and_execute(
                     strategy=getattr(sig.strategy, "name", str(sig.strategy)),
                     stage="STAGE_REGIME",
                     decision="REJECT",
-                    reason_code=VetoReason.REGIME_TEXTURE_FILTER,
+                    reason_code=VetoReason.TEXTURE_NOT_ALLOWED,
                     human_message=f"Strategy {sig.strategy} not allowed in market texture '{market_tex}'",
                     terminal_decision=True,
                     blocked_by="STAGE_REGIME",

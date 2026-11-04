@@ -2642,7 +2642,7 @@ class DynamicTrailingStopManager:
                 profit_atr = (state.entry_price - state.peak_price) / state.atr if state.atr > 0 else 0.0
 
                 if breakeven_enabled and state.atr > 0 and profit_atr >= breakeven_threshold_atr:
-                    breakeven_stop = state.entry_price - cushion
+                    breakeven_stop = round(state.entry_price - (lock_offset_atr * state.atr), 2)
                     if breakeven_stop < new_stop:
                         old_stop_disp = new_stop
                         new_stop = breakeven_stop

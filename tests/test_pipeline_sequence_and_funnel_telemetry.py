@@ -25,7 +25,7 @@ def _make_signal(symbol: str, strategy: StrategyName, confidence: float = 0.85, 
     )
 
 
-def test_pre_sizer_texture_admission_filtering(caplog):
+def test_pre_sizer_texture_admission_filtering(caplog, test_isolation_root):
     """Signals disallowed by market texture must be rejected BEFORE portfolio correlation and sizer."""
     import strategies.orchestrator as orch
     from strategies.orchestrator import EvaluationResult
@@ -38,12 +38,15 @@ def test_pre_sizer_texture_admission_filtering(caplog):
     orch._regime_state_tracker._candidate_texture_count = 0
 
     sig_mom = _make_signal("TSLA", StrategyName.MOMENTUM_SCALP, confidence=0.8)
+    sig_mom.signal_id = "texture-rejection-regression"
     sig_mr = _make_signal("SPY", StrategyName.MEAN_REVERSION, confidence=0.75)
 
     bridge_mock = MagicMock()
     bridge_mock.get_positions.return_value = []
     bridge_mock.get_open_orders.return_value = []
     bridge_mock.get_account.return_value = MagicMock(equity=100000.0)
+    bridge_mock.get_trailing_stop_manager.return_value.has_unresolved_position_unknown.return_value = False
+    bridge_mock.get_trailing_stop_manager.return_value.states = {}
 
     # In TRANSITIONING texture, MOMENTUM_SCALP is strictly forbidden
     regime = MarketRegimeResult(
@@ -105,6 +108,17 @@ def test_pre_sizer_texture_admission_filtering(caplog):
     # Verify texture admission reject log
     assert any("[TEXTURE ADMISSION REJECT] Skipped TSLA" in rec.message for rec in caplog.records)
 
+    # The rejected candidate must also appear as a terminal structured decision.
+    import json
+    ledger_path = test_isolation_root / "data" / "trade_gate_decision.jsonl"
+    entries = [json.loads(line) for line in ledger_path.read_text().splitlines()]
+    rejected = [r for r in entries if r["evaluation_id"] == "texture-rejection-regression"]
+    assert len(rejected) == 1
+    assert rejected[0]["symbol"] == "TSLA"
+    assert rejected[0]["decision"] == "REJECT"
+    assert rejected[0]["reason_code"] == "TEXTURE_NOT_ALLOWED"
+    assert rejected[0]["terminal_decision"] is True
+
 
 def test_funnel_telemetry_dual_denominators_logged(caplog):
     """Funnel Telemetry v2.1 must log raw candidates, texture admitted, placed, and dual ratios."""
@@ -125,6 +139,9 @@ def test_funnel_telemetry_dual_denominators_logged(caplog):
     bridge_mock.get_positions.return_value = []
     bridge_mock.get_open_orders.return_value = []
     bridge_mock.get_account.return_value = MagicMock(equity=100000.0)
+    bridge_mock.get_trailing_stop_manager.return_value.has_unresolved_position_unknown.return_value = False
+    bridge_mock.get_trailing_stop_manager.return_value.has_pending_exit.return_value = False
+    bridge_mock.get_trailing_stop_manager.return_value.states = {}
 
     regime = MarketRegimeResult(
         mode=MODE_RISK_ON,
@@ -175,9 +192,9 @@ def test_funnel_telemetry_dual_denominators_logged(caplog):
     log_text = funnel_logs[0]
 
     # Verify both denominators and fields are present
-    assert "raw_candidates_total=2" in log_text
+    assert "raw_eval_passes=2" in log_text
     assert "universe_candidates=4" in log_text
-    assert "screened_setups=2" in log_text
+    assert "screened_passes=2" in log_text
     assert "texture_admitted=2" in log_text
     assert "placed=2" in log_text
     assert "legacy: placed/screened=100.0%" in log_text
