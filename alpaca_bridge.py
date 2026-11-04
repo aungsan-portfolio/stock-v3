@@ -3601,7 +3601,7 @@ class AlpacaBridge:
                 else:
                     raise
 
-    def _get_active_orders(self, force_refresh: bool = False) -> list:
+    def _get_active_orders(self, force_refresh: bool = False, require_complete: bool = False) -> list:
         self._require_connection()
         now_t = time.time()
         if not force_refresh and not getattr(self, "_cache_requires_reconciliation", False):
@@ -3620,6 +3620,8 @@ class AlpacaBridge:
                 limit=500,
                 direction="desc"
             )))
+            if require_complete and (not isinstance(open_orders, list) or len(open_orders) >= 500):
+                raise RuntimeError("Open-order snapshot unavailable or possibly truncated")
             orders_map: Dict[str, Any] = {}
             for o in (open_orders or []):
                 o_id = str(getattr(o, "id", "") or "")
@@ -3644,6 +3646,41 @@ class AlpacaBridge:
                     limit=200,
                     direction="desc"
                 )))
+                if require_complete:
+                    if not isinstance(all_recent, list):
+                        raise RuntimeError("Recent-order snapshot unavailable")
+                    # Walk older pages rather than permanently halting accounts
+                    # with 200 historical orders. Overlap the boundary so
+                    # timestamp ties are not silently discarded. If the API
+                    # cannot advance, its history is unknown and we fail closed.
+                    page = all_recent
+                    all_recent = list(page)
+                    previous_oldest = None
+                    page_count = 1
+                    while len(page) >= 200:
+                        if page_count >= 20:
+                            raise RuntimeError("Recent-order pagination limit reached")
+                        timestamps = []
+                        for order in page:
+                            submitted = getattr(order, "submitted_at", None)
+                            if isinstance(submitted, str):
+                                submitted = _dt.datetime.fromisoformat(submitted.replace("Z", "+00:00"))
+                            if not isinstance(submitted, _dt.datetime) or submitted.tzinfo is None:
+                                raise RuntimeError("Recent-order page lacks submitted timestamps")
+                            timestamps.append(submitted.astimezone(_dt.timezone.utc))
+                        oldest = min(timestamps)
+                        if previous_oldest is not None and oldest >= previous_oldest:
+                            raise RuntimeError("Recent-order pagination did not advance")
+                        previous_oldest = oldest
+                        until = oldest + _dt.timedelta(microseconds=1)
+                        page = self._call_with_retry(lambda: self._client.get_orders(filter=GetOrdersRequest(
+                            status=QueryOrderStatus.ALL, nested=True, limit=200,
+                            direction="desc", until=until,
+                        )))
+                        if not isinstance(page, list):
+                            raise RuntimeError("Recent-order page unavailable")
+                        all_recent.extend(page)
+                        page_count += 1
                 active_statuses = {
                     "new", "partially_filled", "submitted", "queued", "held",
                     "accepted", "pending_new", "accepted_for_bidding", "stopped",
@@ -3672,6 +3709,8 @@ class AlpacaBridge:
                                     pass
                             orders_map[leg_id] = leg
             except Exception as all_err:
+                if require_complete:
+                    raise RuntimeError("Cannot verify conditional order snapshot") from all_err
                 logger.debug("Non-fatal: could not query QueryOrderStatus.ALL orders: %s", all_err)
 
             orders_list = list(orders_map.values())
@@ -4889,11 +4928,11 @@ class AlpacaBridge:
             logger.debug("[TRAILING MGR ERROR] Could not get trailing manager: %s", exc)
             return None
 
-    def working_orders_plain(self) -> list:
+    def working_orders_plain(self, strict: bool = False) -> list:
         try:
             # Canonical order flattening: _get_active_orders() already expands bracket legs into
             # individual orders while deduplicating by ID. Do not re-append o.legs here.
-            raw_orders = self._get_active_orders()
+            raw_orders = self._get_active_orders(force_refresh=True, require_complete=True) if strict else self._get_active_orders()
             al_orders = raw_orders
 
             active_statuses = {"new", "partially_filled", "submitted", "queued", "held", "accepted", "pending_new", "accepted_for_bidding", "stopped", "suspended", "calculated", "pending_cancel"}
@@ -4947,17 +4986,26 @@ class AlpacaBridge:
                     "symbol": o.symbol,
                     "action": action,
                     "side": raw_side.lower() if raw_side else action.lower(),
+                    "broker_side": str(raw_side or "").lower(),
                     "order_type": order_type,
                     "order_ref": o.client_order_id,
                     "qty": qty_val,
+                    # Keep the broker's raw status and filled quantity: qty is
+                    # the original order size, not necessarily the remainder.
+                    "filled_qty": getattr(o, "filled_qty", None),
+                    "broker_status": raw_status.lower(),
                     "status": status,
                     "tif": tif,
                     "stop_price": stp_price,
+                    "trail_price": getattr(o, "trail_price", None),
+                    "trail_percent": getattr(o, "trail_percent", None),
                     "limit_price": lmt_price
                 })
             return res
         except Exception as exc:
             logger.error("working_orders_plain failed: %s", exc)
+            if strict:
+                raise
             return []
 
     def working_order_count(self) -> int:
@@ -5310,22 +5358,64 @@ class AlpacaBridge:
           Tier 4: In-memory _order_role_registry
 
         Invariants:
-          - If sl_coverage >= abs_qty: preserve both SL and TP (never modify).
-          - If tp_coverage >= abs_qty and sl_coverage < abs_qty: repair missing SL without destroying TP.
-          - Never cancel a TP leg if a companion SL exists or broker confirms bracket!
-          - Only truly unrecognized rogue non-bracket orders holding shares may be cancelled.
+          - Preserve confirmed, correctly sized protective stops and TP orders.
+          - Halt for ambiguous or partially filled stops and unrecognized orders.
+          - Attempt missing-stop repair only against stable position snapshots,
+            and require broker evidence before reporting successful protection.
         """
         report = {"checked": 0, "protected": [], "unprotected": [], "repaired": [], "failed": [], "clean": False}
         self._require_connection()
         try:
             positions = self._client.get_all_positions()
+            if not isinstance(positions, (list, tuple)):
+                raise ValueError("broker returned no valid positions snapshot")
         except Exception as exc:
             logger.warning("Could not read positions for startup protection scan: %s", exc)
             self.entry_gate.halt("LATCHED_PROTECTION_FAILURE")
             report["failed"].append("PORTFOLIO_FETCH_ERROR")
             return report
 
-        working = self.working_orders_plain()
+        # This method checks protection for existing positions. A verified
+        # empty position snapshot requires no stop-order repair.
+        if not positions:
+            report["clean"] = True
+            return report
+
+        try:
+            working = self.working_orders_plain(strict=True)
+            if not isinstance(working, list):
+                raise ValueError("broker returned no valid working-order snapshot")
+        except Exception as exc:
+            logger.error("Could not verify working orders for startup protection scan: %s", exc)
+            self.entry_gate.halt("LATCHED_PROTECTION_FAILURE")
+            report["failed"].append("ORDER_FETCH_ERROR")
+            return report
+
+        # Positions may change while order history is queried. A changed or
+        # unreadable snapshot is not a safe basis for any cancel or repair.
+        try:
+            refreshed_positions = self._client.get_all_positions()
+            if not isinstance(refreshed_positions, (list, tuple)):
+                raise ValueError("broker returned no valid refreshed positions")
+
+            def quantities(snapshot):
+                result = {}
+                for position in snapshot:
+                    sym = str(position.symbol or "").upper().strip()
+                    amount = float(position.qty)
+                    if not sym or not math.isfinite(amount) or sym in result:
+                        raise ValueError("invalid or duplicate position")
+                    result[sym] = amount
+                return result
+
+            if quantities(positions) != quantities(refreshed_positions):
+                raise ValueError("position snapshot changed during order lookup")
+            positions = refreshed_positions
+        except Exception as exc:
+            logger.error("Cannot verify stable position snapshot for protection scan: %s", exc)
+            self.entry_gate.halt("LATCHED_PROTECTION_FAILURE")
+            report["failed"].append("POSITION_RECHECK_ERROR")
+            return report
         for p in positions:
             symbol = p.symbol.upper().strip()
             qty = float(p.qty)
@@ -5379,11 +5469,64 @@ class AlpacaBridge:
                 else:
                     rogue_orders.append(wo)
 
-            sl_coverage = sum(float(o.get("qty") if isinstance(o, dict) else getattr(o, "qty", 0.0) or 0.0) for o in sl_orders)
+            # A stop on the entry side increases exposure instead of protecting
+            # it. Unknown/pending cancellation state or uncertain remaining qty
+            # must not be interpreted as a verified stop or blindly repaired.
+            expected_stop_side = "SELL" if is_long else "BUY"
+            sl_coverage = 0.0
+            ambiguous_stop = False
+            partially_filled_stop = False
+            for stop in sl_orders:
+                def stop_value(name, default=None):
+                    return stop.get(name, default) if isinstance(stop, dict) else getattr(stop, name, default)
+
+                raw_side = stop_value("broker_side")
+                side = str(raw_side if raw_side is not None else (stop_value("action") or stop_value("side") or "")).upper().strip()
+                status = str(stop_value("broker_status") or stop_value("status") or "").lower().replace("_", "").replace(" ", "")
+                order_type = str(stop_value("order_type") or stop_value("type") or "").upper().strip()
+                filled_raw = stop_value("filled_qty")
+                try:
+                    qty_value = float(stop_value("qty"))
+                    if "TRAIL" in order_type:
+                        distance = stop_value("trail_price") or stop_value("trail_percent")
+                        stop_parameter = float(distance)
+                    elif "STOP" in order_type or order_type in {"STP", "STP LMT"}:
+                        stop_parameter = float(stop_value("stop_price"))
+                        if "LIMIT" in order_type or order_type == "STP LMT":
+                            limit_parameter = float(stop_value("limit_price"))
+                            if not math.isfinite(limit_parameter) or limit_parameter <= 0:
+                                raise ValueError("invalid stop-limit price")
+                            if (side == "BUY" and limit_parameter < stop_parameter) or (side == "SELL" and limit_parameter > stop_parameter):
+                                raise ValueError("invalid stop-limit geometry")
+                    else:
+                        raise ValueError("unverified stop order type")
+                    if not math.isfinite(stop_parameter) or stop_parameter <= 0:
+                        raise ValueError("invalid stop parameter")
+                    if filled_raw is None:
+                        raise ValueError("unknown remaining quantity")
+                    filled_value = float(filled_raw)
+                    if not (math.isfinite(qty_value) and math.isfinite(filled_value)) or qty_value <= 0 or filled_value < 0 or filled_value > qty_value:
+                        raise ValueError("invalid stop quantity")
+                except (TypeError, ValueError, OverflowError):
+                    ambiguous_stop = True
+                    continue
+                if side != expected_stop_side or status not in {"new", "accepted", "open", "partiallyfilled"}:
+                    ambiguous_stop = True
+                    continue
+                partially_filled_stop = partially_filled_stop or filled_value > 0 or status == "partiallyfilled"
+                sl_coverage += max(0.0, qty_value - filled_value)
+
+            if (ambiguous_stop or partially_filled_stop or sl_coverage > abs_qty + 1e-6
+                    or (sl_orders and sl_coverage + 1e-6 < abs_qty)):
+                logger.error("Startup: %s stop coverage is ambiguous, mismatched or partially filled; broker reconciliation required", symbol)
+                self.entry_gate.halt("LATCHED_PROTECTION_FAILURE")
+                report["unprotected"].append(symbol)
+                report["failed"].append(symbol)
+                continue
             tp_coverage = sum(float(o.get("qty") if isinstance(o, dict) else getattr(o, "qty", 0.0) or 0.0) for o in tp_orders)
 
             # Evaluate group-level coverage
-            if sl_coverage + 1e-6 >= abs_qty or (sl_orders and order_exec.has_gtc_protective_stop(symbol, abs_qty, working)):
+            if sl_coverage + 1e-6 >= abs_qty:
                 if symbol not in report["protected"]:
                     report["protected"].append(symbol)
                 logger.info("Startup: %s is fully covered by protective stop(s) (sl_coverage=%.2f >= %.2f, tp_coverage=%.2f)",
@@ -5394,6 +5537,20 @@ class AlpacaBridge:
             report["unprotected"].append(symbol)
             logger.warning("Startup: %s has deficient stop coverage (sl_coverage=%.2f < required=%.2f, tp_coverage=%.2f)",
                            symbol, sl_coverage, abs_qty, tp_coverage)
+
+            # The legacy repair rounds up to one share. For a fractional
+            # position that would over-close and could reverse the position.
+            if abs_qty - sl_coverage < 1.0:
+                logger.error("Startup: %s fractional stop shortfall requires broker reconciliation", symbol)
+                self.entry_gate.halt("LATCHED_PROTECTION_FAILURE")
+                report["failed"].append(symbol)
+                continue
+
+            if rogue_orders:
+                logger.error("Startup: %s has unrecognized working orders; broker reconciliation required", symbol)
+                self.entry_gate.halt("LATCHED_PROTECTION_FAILURE")
+                report["failed"].append(symbol)
+                continue
 
             if is_long:
                 target_stop = self._initial_stop_price("BUY", basis, symbol=symbol)
@@ -5410,48 +5567,49 @@ class AlpacaBridge:
                 target_stop = round(target_stop, 2)
                 stop_side = OrderSide.BUY
 
-            # Clean ONLY truly rogue unrecognized orders (never cancel verified bracket/TP legs!)
-            for ro in rogue_orders:
-                ro_id = ro.get("id") if isinstance(ro, dict) else getattr(ro, "id", None)
-                if ro_id:
-                    try:
-                        self._client.cancel_order_by_id(ro_id)
-                        logger.info("Startup: Cancelled unrecognized non-bracket order %s for %s", ro_id, symbol)
-                    except Exception as c_err:
-                        logger.warning("Failed cancelling rogue order %s for %s: %s", ro_id, symbol, c_err)
-
             needed_qty = max(1.0, round(abs_qty - sl_coverage, 4))
             stop_placed = False
             try:
                 from alpaca.trading.requests import StopOrderRequest
-                self._client.submit_order(StopOrderRequest(
+                from strategies.trailing_stop import verify_broker_stop_order_evidence
+                pre_submit = self._client.get_all_positions()
+                if not isinstance(pre_submit, (list, tuple)) or quantities(pre_submit) != quantities(positions):
+                    raise ValueError("position changed before stop submission")
+                submitted = self._client.submit_order(StopOrderRequest(
                     symbol=symbol, qty=needed_qty,
                     side=stop_side,
                     time_in_force=TimeInForce.GTC,
                     stop_price=target_stop
                 ))
+                order_id = submitted.get("id") if isinstance(submitted, dict) else getattr(submitted, "id", None)
+                if not order_id or not str(order_id).strip():
+                    raise ValueError("stop submission did not return an order id")
+                snapshot = self.get_order_snapshot(str(order_id))
+                status = str((snapshot or {}).get("status") or "").lower()
+                if status not in {"new", "accepted", "open"} or (snapshot or {}).get("filled_qty") is None:
+                    raise ValueError("stop order status or remaining quantity is unconfirmed")
+                snapshot_qty = float(snapshot.get("qty"))
+                snapshot_filled = float(snapshot.get("filled_qty"))
+                if (not math.isfinite(snapshot_qty) or not math.isfinite(snapshot_filled)
+                        or abs(snapshot_qty - needed_qty) > 1e-6 or snapshot_filled != 0):
+                    raise ValueError("stop quantity differs from requested unfilled coverage")
+                valid, reason = verify_broker_stop_order_evidence(
+                    order_data=snapshot, expected_order_id=str(order_id), expected_symbol=symbol,
+                    position_side="BUY" if is_long else "SELL", expected_stop_price=target_stop,
+                    expected_qty=needed_qty, require_qty=True,
+                )
+                if not valid:
+                    raise ValueError(f"stop evidence not confirmed: {reason}")
+                post_submit = self._client.get_all_positions()
+                if not isinstance(post_submit, (list, tuple)) or quantities(post_submit) != quantities(positions):
+                    raise ValueError("position changed after stop submission")
                 report["repaired"].append(symbol)
                 if symbol not in report["protected"]:
                     report["protected"].append(symbol)
                 stop_placed = True
                 logger.warning("Startup: repaired GTC protection stop for %s x%.2f at %.2f", symbol, needed_qty, target_stop)
             except Exception as exc:
-                err_str = str(exc)
                 logger.warning("Startup: GTC stop submission for %s: %s", symbol, exc)
-                # Check if shares are held within bracket structure
-                if "insufficient qty" in err_str.lower() or "held_for_orders" in err_str.lower() or "40310000" in err_str:
-                    has_companion = False
-                    for tpo in tp_orders:
-                        tpo_id = str(tpo.get("id") if isinstance(tpo, dict) else getattr(tpo, "id", "") or "")
-                        r_info = self.get_order_role_info(tpo_id) if hasattr(self, "get_order_role_info") else {}
-                        if r_info.get("stop_order_id") or r_info.get("parent_order_id"):
-                            has_companion = True
-                            break
-                    if has_companion or sl_orders:
-                        logger.info("Startup: %s shares held within verified bracket structure. Preserving TP and stop.", symbol)
-                        if symbol not in report["protected"]:
-                            report["protected"].append(symbol)
-                        stop_placed = True
 
             if not stop_placed and symbol not in report["protected"]:
                 self.entry_gate.halt("LATCHED_PROTECTION_FAILURE")
