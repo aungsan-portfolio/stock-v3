@@ -6214,7 +6214,9 @@ class AlpacaBridge:
                         "id": str(order.id),
                         "symbol": sym,
                         "side": side_str,
+                        "type": otype,
                         "qty": float(getattr(order, "qty", 0.0) or 0.0),
+                        "filled_qty": float(getattr(order, "filled_qty", 0.0) or 0.0),
                         "stop_price": float(getattr(order, "stop_price", 0.0) or 0.0),
                         "status": st_str,
                     })
