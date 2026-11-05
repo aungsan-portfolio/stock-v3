@@ -959,6 +959,7 @@ class DynamicTrailingStopManager:
                     stop_id = exit_item.get("stop_order_id") or exit_item.get("last_stop_order_id")
                     expected_exit_side = "sell" if str(exit_item.get("side", "")).upper() in ("BUY", "LONG") else "buy"
                     exp_qty = float(exit_item.get("qty") or 0.0)
+                    overfill_note = ""
 
                     # Check current broker position fail-closed using canonical query
                     is_known, cur_pos_qty = self._query_broker_position_qty(bridge, symbol)
@@ -1197,12 +1198,50 @@ class DynamicTrailingStopManager:
                     # Enforce Quantity Conservation
                     total_filled = sum(m["qty"] for m in collected_orders.values())
                     if total_filled > exp_qty + 1e-4:
-                        logger.error(
-                            f"[RECONCILE OVERFILL] {symbol}: total_filled={total_filled:.4f} > exp_qty={exp_qty:.4f}. "
-                            f"Excess quantity discrepancy detected across {len(collected_orders)} order(s). Retaining fail-closed."
-                        )
-                        results[symbol] = "EXCESS_EXIT_QTY_DISCREPANCY"
-                        continue
+                        # Narrow, evidence-based exception: the recorded qty is a stale undercount
+                        # (e.g. an adopted/RECONCILED state whose entry_qty was never raised after
+                        # later entry fills) and ONE order belonging to this very episode filled the
+                        # larger quantity. Requires broker verified flat AND no working orders.
+                        # Multi-order excess (possible duplicate exits) still fails closed.
+                        overfill_resolved = False
+                        if (
+                            len(collected_orders) == 1
+                            and cur_pos_qty is not None
+                            and abs(cur_pos_qty) < 1e-6
+                            and str(next(iter(collected_orders))).strip() in known_ids
+                        ):
+                            working_state: Optional[bool] = None  # None = unknown -> fail closed
+                            try:
+                                if hasattr(bridge, "working_orders_plain"):
+                                    working_state = any(
+                                        str(getattr(wo, "symbol", "") or (wo.get("symbol") if isinstance(wo, dict) else "")).upper().strip() == symbol.upper().strip()
+                                        for wo in (bridge.working_orders_plain() or [])
+                                    )
+                                elif hasattr(bridge, "_get_active_orders"):
+                                    working_state = any(
+                                        str(getattr(ao, "symbol", "") or "").upper().strip() == symbol.upper().strip()
+                                        for ao in (bridge._get_active_orders() or [])
+                                    )
+                            except Exception:
+                                working_state = None
+                            overfill_resolved = working_state is False
+
+                        if overfill_resolved:
+                            logger.warning(
+                                "[RECONCILE OVERFILL RESOLVED] %s: recorded qty %.4f was a stale undercount; single episode order "
+                                "filled %.4f, broker verified flat with no working orders. Reconciling with qty=%.4f.",
+                                symbol, exp_qty, total_filled, total_filled
+                            )
+                            overfill_note = f" [recorded qty {exp_qty:.2f} corrected to {total_filled:.2f} by broker evidence]"
+                            exp_qty = total_filled
+                            exit_item["qty"] = total_filled
+                        else:
+                            logger.error(
+                                f"[RECONCILE OVERFILL] {symbol}: total_filled={total_filled:.4f} > exp_qty={exp_qty:.4f}. "
+                                f"Excess quantity discrepancy detected across {len(collected_orders)} order(s). Retaining fail-closed."
+                            )
+                            results[symbol] = "EXCESS_EXIT_QTY_DISCREPANCY"
+                            continue
 
                     if total_filled < exp_qty - 1e-4:
                         # Verify working orders on broker for symbol
@@ -1342,7 +1381,7 @@ class DynamicTrailingStopManager:
                         exit_reason = "SPLIT_EXIT"
 
                     exit_price = weighted_px
-                    notes = f"Authoritative exit confirmed across {len(collected_orders)} order(s) (total={total_filled:.2f} shares @ weighted ${weighted_px:.4f})"
+                    notes = f"Authoritative exit confirmed across {len(collected_orders)} order(s) (total={total_filled:.2f} shares @ weighted ${weighted_px:.4f})" + overfill_note
 
                     # 5. Compute PnL and commit to journal atomically
                     qty_closed = float(exit_item.get("qty") or 0.0)
