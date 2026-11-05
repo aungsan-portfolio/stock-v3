@@ -6228,8 +6228,9 @@ class AlpacaBridge:
         try:
             p = self._call_with_retry(lambda: self._client.get_open_position(sym))
             qty = float(getattr(p, "qty", 0.0) or 0.0)
-            side_val = getattr(p, "side", "long")
-            side_str = "BUY" if str(side_val).lower() in ("long", "buy") else "SELL"
+            side_val = getattr(p, "side", None)
+            raw_side = str(getattr(side_val, "value", side_val) or "").strip().lower()
+            side_str = "BUY" if raw_side in ("long", "buy") else "SELL" if raw_side in ("short", "sell") else "UNKNOWN"
             avg_px = float(getattr(p, "avg_entry_price", 0.0) or 0.0)
             return PositionTruth(
                 symbol=sym,
