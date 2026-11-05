@@ -2694,16 +2694,36 @@ class AlpacaBridge:
                     status=status,
                 )
             else:
-                self.on_exit_order_update(
-                    order_id=parent_order_id,
-                    cumulative_filled_qty=cumulative_filled_qty,
-                    average_fill_price=average_fill_price,
-                    execution_id=execution_id,
-                    status=status,
-                    event_name=event_name,
-                    order=order,
-                    role_info=role_info,
-                )
+                # Entry fills can arrive after the reaper has removed in-memory
+                # tracking, or after a restart. An ENTRY role must NEVER be
+                # misclassified as a stop/TP fill and close the trailing state.
+                # Halt and require broker reconciliation before any new entry.
+                if (str((role_info or {}).get("role") or "").upper() == "ENTRY"
+                        and (event_name in ("fill", "partial_fill")
+                             or status in ("filled", "partially_filled"))):
+                    self._cache_requires_reconciliation = True
+                    self.entry_gate.halt("UNTRACKED_ENTRY_FILL_RECONCILIATION_REQUIRED")
+                    self._daytrade_suspended = True
+                    logger.critical(
+                        "[UNTRACKED ENTRY FILL] %s parent=%s cum_fill=%.4f; "
+                        "not an exit; new entries halted pending broker stop/position audit",
+                        getattr(order, "symbol", "UNKNOWN"), parent_order_id,
+                        cumulative_filled_qty,
+                    )
+                    self._schedule_forced_reconciliation(
+                        reason=f"untracked_entry_fill:{parent_order_id}"
+                    )
+                else:
+                    self.on_exit_order_update(
+                        order_id=parent_order_id,
+                        cumulative_filled_qty=cumulative_filled_qty,
+                        average_fill_price=average_fill_price,
+                        execution_id=execution_id,
+                        status=status,
+                        event_name=event_name,
+                        order=order,
+                        role_info=role_info,
+                    )
 
             if status == "replaced":
                 if was_pending_entry:
@@ -2769,9 +2789,27 @@ class AlpacaBridge:
                         str(getattr(state, "last_stop_order_id", None) or ""),
                     }
                 r_info = role_info or {}
-                is_exit_role = r_info.get("role") in ("STOP", "TRAILING_STOP", "TAKE_PROFIT")
+                is_exit_role = r_info.get("role") in ("STOP", "STOP_LOSS", "TRAILING_STOP", "TAKE_PROFIT")
+                raw_side = getattr(order, "side", None) if order is not None else None
+                order_side = str(getattr(raw_side, "value", raw_side) or "").lower().replace("orderside.", "").strip()
+                state_side = str(getattr(state, "side", "") or "").lower().strip() if state is not None else ""
+                if is_active and (not order_side or not state_side or order_side == state_side):
+                    # Ambiguous / same-side fill is NOT evidence of a closing
+                    # stop. Preserve trailing state and latch broker recovery.
+                    self._cache_requires_reconciliation = True
+                    self.entry_gate.halt("AMBIGUOUS_EXIT_FILL_RECONCILIATION_REQUIRED")
+                    self._daytrade_suspended = True
+                    logger.critical(
+                        "[TRADE STREAM FILL SIDE CONFLICT] symbol=%s order=%s side=%s state_side=%s; "
+                        "state preserved, broker reconciliation required",
+                        order_sym, order_id, order_side, state_side,
+                    )
+                    self._schedule_forced_reconciliation(
+                        reason=f"ambiguous_exit_fill:{order_id}"
+                    )
+                    return True
 
-                if is_active and (matches_leg or is_exit_role or getattr(state, "side", "").lower() != str(getattr(order, "side", "")).lower()):
+                if is_active and (matches_leg or is_exit_role or order_side != state_side):
                     logger.info(
                         "[TRADE STREAM EXIT FILL] %s fill received for %s order %s (qty=%.4f @ %.4f, role=%s). "
                         "Recording pending exit for authoritative reconciliation.",
