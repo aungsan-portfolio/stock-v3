@@ -1259,163 +1259,196 @@ def reap_expired_entry_orders(
     worker_id: Optional[str] = None,
     lifecycle: Optional[object] = None,
 ) -> List[dict]:
-    """
-    Scans pending entries for TTL expiry or closed-bar supersession (Amendment 1 & 2).
-    Coordinates via CAS lock so concurrent background reaper and synchronous sweep
-    never double-cancel or race (Amendment 1).
-    Enforces exact protective stop verification before releasing idempotency (Amendment 3 & 4).
+    """Reap entries only after authoritative, stable broker cancellation evidence.
+
+    Cancellation of a PARTIALLY FILLED bracket parent may cancel its attached
+    protective legs. Therefore, never automatically cancel a parent with any
+    known fill. If a fill races a requested cancellation, do not submit a second
+    stop or release its reservation on an ambiguous snapshot. Latch and require
+    reconciliation rather than assuming a zero-fill or a safely protected exit.
+
+    No strategy, sizing, risk thresholds, or execution permissions change here.
     """
     target_lifecycle = lifecycle if lifecycle is not None else entry_lifecycle
     wid = worker_id or f"worker_{threading.get_ident()}"
     expired = target_lifecycle.get_expired_entries(
-        now=time.time(),
-        current_closed_bar_start=current_closed_bar_start,
+        now=time.time(), current_closed_bar_start=current_closed_bar_start,
     )
-    if not expired:
-        return []
-
     reaped_results = []
+    terminal_statuses = {
+        "filled", "canceled", "cancelled", "rejected", "expired", "done_for_day",
+    }
+
+    def read_order_truth(entry):
+        getter = getattr(bridge, "get_order_truth", None)
+        if not callable(getter):
+            raise RuntimeError("Canonical get_order_truth is unavailable")
+        truth = getter(str(entry.parent_order_id))
+        if truth is None:
+            raise RuntimeError("Broker order truth unavailable")
+        oid = str(getattr(truth, "id", "") or "").strip()
+        sym = str(getattr(truth, "symbol", "") or "").upper().strip()
+        side = str(getattr(truth, "side", "") or "").upper().strip()
+        status = str(getattr(truth, "status", "") or "").lower().strip()
+        qty = float(getattr(truth, "qty", float("nan")))
+        filled = float(getattr(truth, "filled_qty", float("nan")))
+        if oid != str(entry.parent_order_id) or sym != entry.symbol.upper().strip():
+            raise RuntimeError("Parent order identity mismatch")
+        if side != str(entry.signal.side).upper().strip():
+            raise RuntimeError("Parent order side mismatch")
+        if not (math.isfinite(qty) and math.isfinite(filled)):
+            raise RuntimeError("Non-finite order quantity")
+        if qty <= 0 or filled < 0 or filled > qty + 1e-6:
+            raise RuntimeError("Invalid cumulative fill quantity")
+        if status not in terminal_statuses and bool(getattr(truth, "is_terminal", False)):
+            raise RuntimeError("Inconsistent terminal classification")
+        return status, filled, bool(getattr(truth, "is_terminal", False))
+
+    def read_position_qty(entry):
+        getter = getattr(bridge, "get_position_truth", None)
+        if not callable(getter):
+            raise RuntimeError("Canonical get_position_truth is unavailable")
+        p = getter(entry.symbol.upper().strip())
+        if p is None:
+            raise RuntimeError("Broker position truth unavailable")
+        if str(getattr(p, "symbol", "") or "").upper().strip() != entry.symbol.upper().strip():
+            raise RuntimeError("Position identity mismatch")
+        qty = float(getattr(p, "qty", float("nan")))
+        if not math.isfinite(qty):
+            raise RuntimeError("Invalid broker position quantity")
+        return qty
+
+    def hold(entry, reason):
+        order_id = str(entry.parent_order_id)
+        msg = f"REAPER_RECONCILIATION_REQUIRED:{entry.symbol}:{order_id}:{reason}"
+        logger.critical("[REAPER FAIL-CLOSED] %s; reservation retained, no new orders", msg)
+        target_lifecycle.update_state(order_id, EntryLifecycleState.RECONCILING)
+        target_lifecycle._halt_entries(bridge, msg)
+        try:
+            send_discord_alert(msg)
+        except Exception:
+            logger.exception("[REAPER] Could not send alert for %s", order_id)
+        scheduler = getattr(bridge, "_schedule_forced_reconciliation", None)
+        if callable(scheduler):
+            try:
+                scheduler(reason=msg)
+            except Exception:
+                logger.exception("[REAPER] Could not schedule reconciliation for %s", order_id)
+        reaped_results.append({
+            "order_id": order_id,
+            "symbol": entry.symbol,
+            "status": "RECONCILIATION_REQUIRED",
+            "reason": reason,
+        })
 
     for entry in expired:
-        order_id = entry.parent_order_id
-        sym = entry.symbol
-        side = entry.signal.side
-
-        # 1. CAS transition from WORKING -> TTL_EXPIRED (Amendment 1)
-        cas_ok = target_lifecycle.compare_and_swap_state(
+        order_id = str(entry.parent_order_id)
+        if not target_lifecycle.compare_and_swap_state(
             order_id=order_id,
             expected=EntryLifecycleState.WORKING,
             new_state=EntryLifecycleState.TTL_EXPIRED,
             worker_id=wid,
-        )
-        if not cas_ok:
+        ):
             continue
 
-        logger.info(
-            "[REAPER] Claimed expired entry order_id=%s symbol=%s worker=%s (expired_at=%.1f, age=%.1fs)",
-            order_id, sym, wid, entry.expires_at, time.time() - entry.submitted_at
-        )
-
-        # 2. Transition to CANCEL_REQUESTED and dispatch broker cancel
-        target_lifecycle.update_state(order_id, EntryLifecycleState.CANCEL_REQUESTED)
-        cancel_res = None
+        # Pre-cancel broker truth is mandatory. A same-side fill can arrive
+        # between TTL expiry and the cancel request; never cancel a partly
+        # filled bracket automatically (Alpaca can cancel the attached stop).
         try:
-            if hasattr(bridge, "cancel_order"):
-                cancel_res = bridge.cancel_order(order_id)
-        except Exception as c_exc:
-            logger.warning("[REAPER] Error requesting cancel for %s parent=%s: %s", sym, order_id, c_exc)
+            pre_status, pre_filled, pre_terminal = read_order_truth(entry)
+        except Exception as exc:
+            hold(entry, f"PRE_CANCEL_ORDER_TRUTH_UNKNOWN:{exc}")
+            continue
 
-        # 3. Transition to RECONCILING
+        if pre_filled > 1e-6 or float(entry.cumulative_filled_qty or 0.0) > 1e-6:
+            hold(entry, "PARENT_ALREADY_FILLED_BEFORE_CANCEL_BRACKET_LEGS_AT_RISK")
+            continue
+
+        if not pre_terminal:
+            target_lifecycle.update_state(order_id, EntryLifecycleState.CANCEL_REQUESTED)
+            cancel = getattr(bridge, "cancel_order", None)
+            if not callable(cancel):
+                hold(entry, "NO_VERIFIED_CANCEL_INTERFACE")
+                continue
+            try:
+                cancel(order_id)
+            except Exception as exc:
+                hold(entry, f"CANCEL_REQUEST_FAILED:{exc}")
+                continue
+
         target_lifecycle.update_state(order_id, EntryLifecycleState.RECONCILING)
 
-        # 4. Query broker order truth
-        order_truth = None
-        if hasattr(bridge, "get_order_truth"):
-            try:
-                order_truth = bridge.get_order_truth(order_id)
-            except Exception as t_exc:
-                logger.warning("[REAPER] Error fetching order truth for %s: %s", order_id, t_exc)
+        # A successful HTTP cancel request is not an acknowledged terminal
+        # order. Read again after cancel and reject pending_cancel/unknown.
+        try:
+            post_status, post_filled, post_terminal = read_order_truth(entry)
+            if not post_terminal or post_status not in terminal_statuses:
+                hold(entry, f"PARENT_NOT_TERMINAL:{post_status}")
+                continue
 
-        filled_qty = 0.0
-        avg_price = 0.0
-        is_terminal = False
+            if post_filled > 1e-6 or float(entry.cumulative_filled_qty or 0.0) > 1e-6:
+                # The parent filled while the cancel was in flight. Its stop/TP
+                # legs may be canceled asynchronously. Never place a duplicate
+                # stop from a possibly truncated/lagged order list.
+                hold(entry, "LATE_FILL_DURING_CANCEL_BRACKET_CASCADE_REQUIRES_BROKER_RECONCILIATION")
+                continue
 
-        if order_truth is not None:
-            filled_qty = float(order_truth.filled_qty or 0.0)
-            avg_price = float(order_truth.filled_avg_price or 0.0)
-            is_terminal = order_truth.is_terminal
-        else:
-            # Fallback for mock bridges or legacy adapters
-            if hasattr(bridge, "get_order"):
-                try:
-                    raw_o = bridge.get_order(order_id)
-                    if isinstance(raw_o, dict):
-                        filled_qty = float(raw_o.get("filled_qty", 0.0) or 0.0)
-                        avg_price = float(raw_o.get("filled_avg_price", 0.0) or 0.0)
-                        status_str = str(raw_o.get("status", "")).lower().strip()
-                        is_terminal = status_str in ("filled", "canceled", "cancelled", "expired", "rejected")
-                    elif raw_o is not None:
-                        filled_qty = float(getattr(raw_o, "filled_qty", 0.0) or 0.0)
-                        avg_price = float(getattr(raw_o, "filled_avg_price", 0.0) or 0.0)
-                        status_str = str(getattr(raw_o, "status", "")).lower().strip()
-                        is_terminal = status_str in ("filled", "canceled", "cancelled", "expired", "rejected")
-                except Exception as get_err:
-                    logger.warning("[REAPER] Fallback get_order failed for %s: %s", order_id, get_err)
-            else:
-                filled_qty = float(entry.cumulative_filled_qty or 0.0)
-                avg_price = float(entry.average_fill_price or 0.0)
-                is_terminal = (cancel_res is not None and bool(getattr(cancel_res, "is_already_terminal", False)))
+            # Broker truth is re-read on both sides of the position snapshot.
+            # A single zero-fill response cannot release idempotency.
+            pos_before = read_position_qty(entry)
+            confirm_status, confirm_filled, confirm_terminal = read_order_truth(entry)
+            pos_after = read_position_qty(entry)
+            if (not confirm_terminal or confirm_status != post_status
+                    or confirm_filled > 1e-6 or abs(pos_before) > 1e-6
+                    or abs(pos_after) > 1e-6):
+                hold(entry, "UNSTABLE_ORDER_OR_NONFLAT_POSITION_AFTER_CANCEL")
+                continue
 
-        # Update entry with canonical fill stats
-        if filled_qty > 0:
-            entry.cumulative_filled_qty = filled_qty
-        if avg_price > 0:
-            entry.average_fill_price = avg_price
+            # All known bracket children must be broker-confirmed terminal,
+            # or a later orphan held stop could reverse a flat position.
+            snapshot_getter = getattr(bridge, "get_order_snapshot", None)
+            if not callable(snapshot_getter):
+                hold(entry, "CHILD_ORDER_SNAPSHOT_UNAVAILABLE")
+                continue
+            child_safe = True
+            for child_id in (entry.stop_order_id, entry.target_order_id):
+                clean_id = str(child_id or "").strip()
+                if not clean_id or clean_id.lower() == "none":
+                    continue
+                child = snapshot_getter(clean_id)
+                raw_child_status = (
+                    child.get("status") if isinstance(child, dict)
+                    else getattr(child, "status", None)
+                ) if child is not None else None
+                child_status = str(getattr(raw_child_status, "value", raw_child_status) or "").lower().strip()
+                if child_status not in terminal_statuses:
+                    child_safe = False
+                    break
+            if not child_safe:
+                hold(entry, "CHILD_LEG_NOT_CONFIRMED_TERMINAL")
+                continue
 
-        # 5. Evaluate fill state
-        if filled_qty <= 0:
-            # Clean cancel: no fill at broker
-            idempotency_manager.release(sym, side=side, reason="ttl_expired_unfilled")
-            target_lifecycle.finalize_entry(order_id, reason="TTL_EXPIRED_UNFILLED")
-            with _pending_order_contexts_lock:
-                _pending_order_contexts.pop(order_id, None)
-            logger.info(
-                "[REAPER SUCCESS] Parent %s for %s cleanly reaped (0 filled). Reservation released.",
-                order_id, sym
-            )
-            reaped_results.append({
-                "order_id": order_id,
-                "symbol": sym,
-                "filled_qty": 0.0,
-                "status": "CANCELED_UNFILLED",
-            })
-        else:
-            # Partial or full fill during cancellation (Amendment 3 & 4)
-            logger.warning(
-                "[REAPER PARTIAL FILL DETECTED] Parent %s for %s filled %.4f shares @ $%.4f. Protecting position...",
-                order_id, sym, filled_qty, avg_price
-            )
-            target_lifecycle.update_state(order_id, EntryLifecycleState.PARTIAL_FILL_PROTECTING)
+        except Exception as exc:
+            hold(entry, f"POST_CANCEL_BROKER_EVIDENCE_UNKNOWN:{exc}")
+            continue
 
-            prot_ok, prot_msg = target_lifecycle.reconcile_and_protect_partial_entry(
-                bridge=bridge,
-                entry=entry,
-                intended_filled_qty=filled_qty,
-            )
-
-            if prot_ok:
-                # Exact protection verified: safely release reservation (Amendment 3)
-                idempotency_manager.release(sym, side=side, reason="partial_fill_protected")
-                target_lifecycle.finalize_entry(order_id, reason=f"PARTIAL_FILL_PROTECTED:{prot_msg}")
-                with _pending_order_contexts_lock:
-                    _pending_order_contexts.pop(order_id, None)
-                logger.info(
-                    "[REAPER SUCCESS] Parent %s for %s protected with stop %s. Reservation released.",
-                    order_id, sym, prot_msg
-                )
-                reaped_results.append({
-                    "order_id": order_id,
-                    "symbol": sym,
-                    "filled_qty": filled_qty,
-                    "status": "PARTIAL_FILL_PROTECTED",
-                    "stop_id": prot_msg,
-                })
-            else:
-                # Protection failed: FAIL CLOSED (Amendment 3/4)
-                # Keep symbol reservation locked, log critical alert
-                logger.critical(
-                    "[REAPER PROTECTION FAILURE] Parent %s for %s failed protection: %s. "
-                    "FAIL-CLOSED: Reservation retained to block further entries.",
-                    order_id, sym, prot_msg
-                )
-                target_lifecycle._fail_protection(bridge, entry, f"Reaper protection failure: {prot_msg}")
-                reaped_results.append({
-                    "order_id": order_id,
-                    "symbol": sym,
-                    "filled_qty": filled_qty,
-                    "status": "PROTECTION_FAILED",
-                    "error": prot_msg,
-                })
+        # Release the reservation only after terminal/flat/child-leg evidence.
+        idempotency_manager.release(
+            entry.symbol, side=entry.signal.side, reason="ttl_expired_unfilled_verified",
+        )
+        target_lifecycle.finalize_entry(order_id, reason="TTL_EXPIRED_UNFILLED_VERIFIED")
+        with _pending_order_contexts_lock:
+            _pending_order_contexts.pop(order_id, None)
+        logger.info(
+            "[REAPER VERIFIED] Parent %s %s canceled unfilled, flat, child legs terminal",
+            order_id, entry.symbol,
+        )
+        reaped_results.append({
+            "order_id": order_id,
+            "symbol": entry.symbol,
+            "filled_qty": 0.0,
+            "status": "CANCELED_UNFILLED_VERIFIED",
+        })
 
     return reaped_results
 

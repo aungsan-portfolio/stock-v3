@@ -995,20 +995,28 @@ class EntryOrderLifecycle:
         return True
 
     def on_parent_terminal(self, parent_order_id: object, status: str) -> None:
-        """Remove a pending record after an unfilled terminal parent state."""
+        """Retain terminal parent tracking until broker fill/position/leg reconciliation.
+
+        Stream terminal events may precede a late fill callback or the final
+        broker position update. Never release a reservation or discard the
+        parent solely because a canceled/expired/rejected status arrived.
+        The verified reaper owns zero-fill finalization and protected fills
+        follow on_parent_fill's broker-authoritative path.
+        """
         parent_id = self._order_id(parent_order_id)
         if parent_id is None:
             return
         with self._lock:
-            entry = self._pending.pop(parent_id, None)
-        if entry:
-            logger.info("[ENTRY LIFECYCLE] Terminal parent=%s symbol=%s status=%s", parent_id, entry.symbol, status)
-
-        try:
-            from strategies.order_idempotency import idempotency_manager
-            idempotency_manager.release_on_terminal(str(parent_id), status)
-        except Exception as e:
-            logger.debug("[ENTRY LIFECYCLE] Idempotency release error: %s", e)
+            entry = self._pending.get(parent_id)
+            if entry is not None:
+                entry.state = EntryLifecycleState.RECONCILING
+        if entry is not None:
+            logger.warning(
+                "[ENTRY LIFECYCLE] Terminal event deferred: parent=%s symbol=%s "
+                "status=%s cumulative_fill=%.4f; reservation retained until "
+                "authoritative broker position/stop reconciliation",
+                parent_id, entry.symbol, status, entry.cumulative_filled_qty,
+            )
 
 
     def pending_snapshot(self) -> Dict[str, Dict[str, object]]:
